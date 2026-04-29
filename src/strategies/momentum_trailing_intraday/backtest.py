@@ -29,6 +29,10 @@ MAX_ENTRY_RISK_PCT = 2.0
 MAX_POSITIONS_PER_DAY = 3
 MIN_DAILY_TREND_PCT = 0.0
 
+# Portfolio simulation settings.
+INITIAL_CAPITAL = 10_000.0
+POSITION_WEIGHTS = [0.40, 0.30, 0.30]
+
 # Market regime filter based on the current top30 universe breadth.
 ENABLE_MARKET_REGIME_FILTER = True
 MIN_POSITIVE_BREADTH_PCT = 50.0
@@ -54,6 +58,8 @@ class BacktestTrade:
     entry_risk_pct: float
     daily_trend_pct: float
     setup_type: str
+    position_weight: float = 0.0
+    capital_pnl: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -62,6 +68,14 @@ class MarketRegime:
     positive_breadth_pct: float
     average_opening_range_return_pct: float
     tradable: bool
+
+
+@dataclass(frozen=True)
+class PortfolioResult:
+    initial_capital: float
+    final_capital: float
+    total_return_pct: float
+    max_drawdown_pct: float
 
 
 def calculate_close_strength(row: pd.Series) -> float:
@@ -280,27 +294,73 @@ def load_all_data() -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     return intraday_data, daily_data
 
 
-def limit_positions_per_day(trades: list[BacktestTrade]) -> list[BacktestTrade]:
+def apply_position_sizing(trades: list[BacktestTrade]) -> list[BacktestTrade]:
     by_day: dict[str, list[BacktestTrade]] = {}
     for trade in trades:
         by_day.setdefault(trade.session_date, []).append(trade)
 
-    selected: list[BacktestTrade] = []
+    sized_trades: list[BacktestTrade] = []
     for day_trades in by_day.values():
-        selected.extend(
-            sorted(
-                day_trades,
-                key=lambda trade: (
-                    trade.daily_trend_pct,
-                    trade.breakout_pct,
-                    trade.close_strength,
-                    -trade.entry_risk_pct,
-                ),
-                reverse=True,
-            )[:MAX_POSITIONS_PER_DAY]
-        )
+        ranked = sorted(
+            day_trades,
+            key=lambda trade: (
+                trade.daily_trend_pct,
+                trade.breakout_pct,
+                trade.close_strength,
+                -trade.entry_risk_pct,
+            ),
+            reverse=True,
+        )[:MAX_POSITIONS_PER_DAY]
 
-    return sorted(selected, key=lambda trade: (trade.session_date, trade.entry_time))
+        for i, trade in enumerate(ranked):
+            weight = POSITION_WEIGHTS[i] if i < len(POSITION_WEIGHTS) else 0.0
+            capital_pnl = INITIAL_CAPITAL * weight * trade.pnl_pct / 100.0
+            sized_trades.append(
+                BacktestTrade(
+                    symbol=trade.symbol,
+                    session_date=trade.session_date,
+                    entry_time=trade.entry_time,
+                    exit_time=trade.exit_time,
+                    entry_price=trade.entry_price,
+                    exit_price=trade.exit_price,
+                    pnl_pct=trade.pnl_pct,
+                    exit_reason=trade.exit_reason,
+                    breakout_pct=trade.breakout_pct,
+                    close_strength=trade.close_strength,
+                    entry_risk_pct=trade.entry_risk_pct,
+                    daily_trend_pct=trade.daily_trend_pct,
+                    setup_type=trade.setup_type,
+                    position_weight=weight,
+                    capital_pnl=capital_pnl,
+                )
+            )
+
+    return sorted(sized_trades, key=lambda trade: (trade.session_date, trade.entry_time))
+
+
+def simulate_portfolio(trades: list[BacktestTrade]) -> PortfolioResult:
+    capital = INITIAL_CAPITAL
+    peak = INITIAL_CAPITAL
+    max_drawdown_pct = 0.0
+
+    by_day: dict[str, list[BacktestTrade]] = {}
+    for trade in trades:
+        by_day.setdefault(trade.session_date, []).append(trade)
+
+    for session_date in sorted(by_day):
+        day_return_pct = sum(trade.position_weight * trade.pnl_pct for trade in by_day[session_date])
+        capital *= 1.0 + day_return_pct / 100.0
+        peak = max(peak, capital)
+        drawdown_pct = (capital - peak) / peak * 100.0
+        max_drawdown_pct = min(max_drawdown_pct, drawdown_pct)
+
+    total_return_pct = (capital - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100.0
+    return PortfolioResult(
+        initial_capital=INITIAL_CAPITAL,
+        final_capital=capital,
+        total_return_pct=total_return_pct,
+        max_drawdown_pct=max_drawdown_pct,
+    )
 
 
 def summarize(trades: list[BacktestTrade], market_regimes: dict[str, MarketRegime]) -> None:
@@ -321,6 +381,10 @@ def summarize(trades: list[BacktestTrade], market_regimes: dict[str, MarketRegim
         f"min_avg_or_return={MIN_AVERAGE_OPENING_RANGE_RETURN_PCT:.2f}%"
     )
     print(
+        f"Position sizing: initial_capital={INITIAL_CAPITAL:.2f}, "
+        f"weights={POSITION_WEIGHTS}"
+    )
+    print(
         f"Exit: stop={INITIAL_STOP_LOSS_PCT:.2f}%, "
         f"trail_activation={TRAILING_ACTIVATION_PROFIT_PCT:.2f}%, "
         f"trail_stop={TRAILING_STOP_PCT:.2f}%"
@@ -334,6 +398,7 @@ def summarize(trades: list[BacktestTrade], market_regimes: dict[str, MarketRegim
         print("No trades found.")
         return
 
+    portfolio = simulate_portfolio(trades)
     pnl_values = [trade.pnl_pct for trade in trades]
     wins = [pnl for pnl in pnl_values if pnl > 0]
     losses = [pnl for pnl in pnl_values if pnl <= 0]
@@ -349,23 +414,30 @@ def summarize(trades: list[BacktestTrade], market_regimes: dict[str, MarketRegim
     if wins:
         print(f"Average win: {sum(wins) / len(wins):.2f}%")
 
+    print("\nPortfolio simulation")
+    print(f"Initial capital: {portfolio.initial_capital:.2f}")
+    print(f"Final capital:   {portfolio.final_capital:.2f}")
+    print(f"Return:          {portfolio.total_return_pct:.2f}%")
+    print(f"Max drawdown:    {portfolio.max_drawdown_pct:.2f}%")
+
     setup_counts: dict[str, int] = {}
     for trade in trades:
         setup_counts[trade.setup_type] = setup_counts.get(trade.setup_type, 0) + 1
     print("Setup counts:", setup_counts)
 
     print("\nRecent trades\n")
-    print("Date | Symbol | Setup | Entry | Exit | PnL % | Trend % | Break % | CloseStr | Risk % | Reason")
-    print("----------------------------------------------------------------------------------------------")
+    print("Date | Symbol | Weight | Entry | Exit | PnL % | Capital PnL | Trend % | Break % | CloseStr | Risk % | Reason")
+    print("------------------------------------------------------------------------------------------------------------")
 
     for trade in trades[-20:]:
         print(
             f"{trade.session_date} | "
             f"{trade.symbol:<6} | "
-            f"{trade.setup_type:<8} | "
+            f"{trade.position_weight:>6.2f} | "
             f"{trade.entry_price:>7.2f} | "
             f"{trade.exit_price:>7.2f} | "
             f"{trade.pnl_pct:>5.2f} | "
+            f"{trade.capital_pnl:>11.2f} | "
             f"{trade.daily_trend_pct:>7.2f} | "
             f"{trade.breakout_pct:>7.2f} | "
             f"{trade.close_strength:>8.2f} | "
@@ -382,8 +454,8 @@ def main() -> None:
     for symbol, intraday in intraday_data.items():
         all_trades.extend(backtest_symbol(symbol, intraday, daily_data[symbol], market_regimes))
 
-    selected_trades = limit_positions_per_day(all_trades)
-    summarize(selected_trades, market_regimes)
+    sized_trades = apply_position_sizing(all_trades)
+    summarize(sized_trades, market_regimes)
 
 
 if __name__ == "__main__":
