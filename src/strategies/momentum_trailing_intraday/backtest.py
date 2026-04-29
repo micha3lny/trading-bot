@@ -28,6 +28,11 @@ MIN_CLOSE_STRENGTH = 0.60
 MAX_ENTRY_RISK_PCT = 2.0
 MAX_POSITIONS_PER_DAY = 3
 
+# Market regime filter based on the current top30 universe breadth.
+ENABLE_MARKET_REGIME_FILTER = True
+MIN_POSITIVE_BREADTH_PCT = 55.0
+MIN_AVERAGE_OPENING_RANGE_RETURN_PCT = 0.05
+
 # Pullback/retest is kept as an experiment, but disabled by default after weak results.
 ENABLE_PULLBACK_RETEST_ENTRY = False
 PULLBACK_RETEST_TOLERANCE_PCT = 0.35
@@ -48,6 +53,14 @@ class BacktestTrade:
     entry_risk_pct: float
     daily_trend_pct: float
     setup_type: str
+
+
+@dataclass(frozen=True)
+class MarketRegime:
+    session_date: str
+    positive_breadth_pct: float
+    average_opening_range_return_pct: float
+    tradable: bool
 
 
 def calculate_close_strength(row: pd.Series) -> float:
@@ -84,19 +97,58 @@ def prepare_daily_data(symbol: str) -> pd.DataFrame:
 
 
 def get_daily_trend_before_session(daily: pd.DataFrame, session_date) -> float:
-    """Return daily trend using only candles before the intraday session.
-
-    This avoids lookahead: for a session on 2026-04-27, the daily trend is based
-    on daily candles strictly before 2026-04-27.
-    """
     history = daily[daily["session_date"] < session_date].dropna(subset=["daily_trend_pct"])
     if history.empty:
         return 0.0
     return float(history.iloc[-1]["daily_trend_pct"])
 
 
+def calculate_session_opening_range_return(session: pd.DataFrame) -> float | None:
+    if len(session) <= OPENING_RANGE_BARS:
+        return None
+
+    first_close = float(session.iloc[0]["close"])
+    post_or_close = float(session.iloc[OPENING_RANGE_BARS]["close"])
+    if first_close == 0:
+        return None
+
+    return (post_or_close - first_close) / first_close * 100.0
+
+
+def build_market_regimes(intraday_data: dict[str, pd.DataFrame]) -> dict[str, MarketRegime]:
+    values_by_day: dict[str, list[float]] = {}
+
+    for df in intraday_data.values():
+        for session_date, session in df.groupby("session_date"):
+            session = session.sort_values("date").reset_index(drop=True)
+            opening_range_return = calculate_session_opening_range_return(session)
+            if opening_range_return is None:
+                continue
+            values_by_day.setdefault(str(session_date), []).append(opening_range_return)
+
+    regimes: dict[str, MarketRegime] = {}
+    for session_date, values in values_by_day.items():
+        if not values:
+            continue
+
+        positive_breadth_pct = sum(1 for value in values if value > 0) / len(values) * 100.0
+        average_opening_range_return_pct = sum(values) / len(values)
+        tradable = (
+            positive_breadth_pct >= MIN_POSITIVE_BREADTH_PCT
+            and average_opening_range_return_pct >= MIN_AVERAGE_OPENING_RANGE_RETURN_PCT
+        )
+
+        regimes[session_date] = MarketRegime(
+            session_date=session_date,
+            positive_breadth_pct=positive_breadth_pct,
+            average_opening_range_return_pct=average_opening_range_return_pct,
+            tradable=tradable,
+        )
+
+    return regimes
+
+
 def find_entry_bar(session: pd.DataFrame) -> tuple[int, float, float, float, str] | None:
-    """Find first confirmed breakout after opening range."""
     if len(session) <= OPENING_RANGE_BARS:
         return None
 
@@ -156,8 +208,8 @@ def simulate_exit(
 
     highest_price = entry_price
     trailing_activated = False
-
     bars_after_entry = session.iloc[entry_position + 1 :]
+
     if bars_after_entry.empty:
         return BacktestTrade(symbol, session_date, entry_time, entry_time, entry_price, entry_price, 0.0, "no bars after entry", breakout_pct, close_strength, entry_risk_pct, daily_trend_pct, setup_type)
 
@@ -167,7 +219,6 @@ def simulate_exit(
         bar_high = float(bar["high"])
         bar_low = float(bar["low"])
         bar_time = str(bar["date"])
-
         highest_price = max(highest_price, bar_high)
 
         if bar_low <= initial_stop_price:
@@ -188,14 +239,15 @@ def simulate_exit(
     return BacktestTrade(symbol, session_date, entry_time, str(last_bar["date"]), entry_price, exit_price, pnl_pct, "end of session", breakout_pct, close_strength, entry_risk_pct, daily_trend_pct, setup_type)
 
 
-def backtest_symbol(symbol: str) -> list[BacktestTrade]:
-    intraday = load_intraday(symbol).copy()
-    intraday["session_date"] = intraday["date"].dt.date
-    daily = prepare_daily_data(symbol)
-
+def backtest_symbol(symbol: str, intraday: pd.DataFrame, daily: pd.DataFrame, market_regimes: dict[str, MarketRegime]) -> list[BacktestTrade]:
     trades: list[BacktestTrade] = []
 
     for session_date, session in intraday.groupby("session_date"):
+        session_date_str = str(session_date)
+        regime = market_regimes.get(session_date_str)
+        if ENABLE_MARKET_REGIME_FILTER and (regime is None or not regime.tradable):
+            continue
+
         session = session.sort_values("date").reset_index(drop=True)
         entry = find_entry_bar(session)
         if entry is None:
@@ -203,20 +255,25 @@ def backtest_symbol(symbol: str) -> list[BacktestTrade]:
 
         entry_position, breakout_pct, close_strength, entry_risk_pct, setup_type = entry
         daily_trend_pct = get_daily_trend_before_session(daily, session_date)
-        trades.append(
-            simulate_exit(
-                symbol=symbol,
-                session=session,
-                entry_position=entry_position,
-                breakout_pct=breakout_pct,
-                close_strength=close_strength,
-                entry_risk_pct=entry_risk_pct,
-                daily_trend_pct=daily_trend_pct,
-                setup_type=setup_type,
-            )
-        )
+        trades.append(simulate_exit(symbol, session, entry_position, breakout_pct, close_strength, entry_risk_pct, daily_trend_pct, setup_type))
 
     return trades
+
+
+def load_all_data() -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+    intraday_data: dict[str, pd.DataFrame] = {}
+    daily_data: dict[str, pd.DataFrame] = {}
+
+    for spec in UNIVERSE:
+        try:
+            intraday = load_intraday(spec.symbol).copy()
+            intraday["session_date"] = intraday["date"].dt.date
+            intraday_data[spec.symbol] = intraday
+            daily_data[spec.symbol] = prepare_daily_data(spec.symbol)
+        except Exception as exc:  # noqa: BLE001 - backtest should continue for other symbols
+            print(f"Skipping {spec.symbol}: {exc}")
+
+    return intraday_data, daily_data
 
 
 def limit_positions_per_day(trades: list[BacktestTrade]) -> list[BacktestTrade]:
@@ -242,7 +299,7 @@ def limit_positions_per_day(trades: list[BacktestTrade]) -> list[BacktestTrade]:
     return sorted(selected, key=lambda trade: (trade.session_date, trade.entry_time))
 
 
-def summarize(trades: list[BacktestTrade]) -> None:
+def summarize(trades: list[BacktestTrade], market_regimes: dict[str, MarketRegime]) -> None:
     print("\nBacktest: Momentum Trailing Intraday\n")
     print(
         f"Params: opening_range_bars={OPENING_RANGE_BARS}, "
@@ -251,13 +308,21 @@ def summarize(trades: list[BacktestTrade]) -> None:
         f"max_entry_risk={MAX_ENTRY_RISK_PCT:.2f}%, "
         f"max_positions_per_day={MAX_POSITIONS_PER_DAY}, "
         f"pullback_retest={ENABLE_PULLBACK_RETEST_ENTRY}, "
+        f"market_regime={ENABLE_MARKET_REGIME_FILTER}, "
         "selection=daily_trend+breakout"
+    )
+    print(
+        f"Regime: min_positive_breadth={MIN_POSITIVE_BREADTH_PCT:.1f}%, "
+        f"min_avg_or_return={MIN_AVERAGE_OPENING_RANGE_RETURN_PCT:.2f}%"
     )
     print(
         f"Exit: stop={INITIAL_STOP_LOSS_PCT:.2f}%, "
         f"trail_activation={TRAILING_ACTIVATION_PROFIT_PCT:.2f}%, "
         f"trail_stop={TRAILING_STOP_PCT:.2f}%"
     )
+
+    tradable_days = sum(1 for regime in market_regimes.values() if regime.tradable)
+    print(f"Tradable regime days: {tradable_days}/{len(market_regimes)}")
     print()
 
     if not trades:
@@ -305,16 +370,15 @@ def summarize(trades: list[BacktestTrade]) -> None:
 
 
 def main() -> None:
-    all_trades: list[BacktestTrade] = []
+    intraday_data, daily_data = load_all_data()
+    market_regimes = build_market_regimes(intraday_data)
 
-    for spec in UNIVERSE:
-        try:
-            all_trades.extend(backtest_symbol(spec.symbol))
-        except Exception as exc:  # noqa: BLE001 - backtest should continue for other symbols
-            print(f"Skipping {spec.symbol}: {exc}")
+    all_trades: list[BacktestTrade] = []
+    for symbol, intraday in intraday_data.items():
+        all_trades.extend(backtest_symbol(symbol, intraday, daily_data[symbol], market_regimes))
 
     selected_trades = limit_positions_per_day(all_trades)
-    summarize(selected_trades)
+    summarize(selected_trades, market_regimes)
 
 
 if __name__ == "__main__":
