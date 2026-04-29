@@ -16,9 +16,10 @@ from src.strategies.momentum_trailing_intraday.ranking import get_last_intraday_
 
 
 # Strategy-specific exit parameters.
-INITIAL_STOP_LOSS_PCT = 1.2
-TRAILING_ACTIVATION_PROFIT_PCT = 1.5
-TRAILING_STOP_PCT = 1.7
+# These are initial intraday 15m defaults. Backtesting will tune them later.
+INITIAL_STOP_LOSS_PCT = 1.0
+TRAILING_ACTIVATION_PROFIT_PCT = 0.8
+TRAILING_STOP_PCT = 1.2
 FORCE_EXIT_BEFORE_MARKET_CLOSE = True
 FORCE_EXIT_BARS_BEFORE_CLOSE = 1
 
