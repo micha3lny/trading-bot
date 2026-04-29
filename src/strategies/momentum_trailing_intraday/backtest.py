@@ -25,8 +25,11 @@ from src.strategies.momentum_trailing_intraday.exit import (
 OPENING_RANGE_BARS = 4
 MIN_BREAKOUT_PCT = 0.25
 MIN_CLOSE_STRENGTH = 0.60
-MAX_ENTRY_RISK_PCT = 4.0
+MAX_ENTRY_RISK_PCT = 2.0
 MAX_POSITIONS_PER_DAY = 3
+
+ENABLE_PULLBACK_RETEST_ENTRY = True
+PULLBACK_RETEST_TOLERANCE_PCT = 0.35
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,7 @@ class BacktestTrade:
     breakout_pct: float
     close_strength: float
     entry_risk_pct: float
+    setup_type: str
 
 
 def calculate_close_strength(row: pd.Series) -> float:
@@ -69,33 +73,43 @@ def calculate_entry_risk_pct(entry_price: float, opening_range_low: float) -> fl
     return (entry_price - opening_range_low) / entry_price * 100.0
 
 
-def find_entry_bar(session: pd.DataFrame) -> tuple[int, float, float, float, float] | None:
-    """Find first confirmed breakout after opening range.
-
-    Returns: index position, breakout %, close strength, risk %, opening range low.
-    """
+def find_entry_bar(session: pd.DataFrame) -> tuple[int, float, float, float, str] | None:
+    """Find first confirmed breakout or pullback/retest after opening range."""
     if len(session) <= OPENING_RANGE_BARS:
         return None
 
     opening_range = session.iloc[:OPENING_RANGE_BARS]
     opening_range_high = float(opening_range["high"].max())
     opening_range_low = float(opening_range["low"].min())
+    retest_low_threshold = opening_range_high * (1.0 - PULLBACK_RETEST_TOLERANCE_PCT / 100.0)
+
+    broke_out = False
+    retested = False
 
     for position in range(OPENING_RANGE_BARS, len(session)):
         row = session.iloc[position]
         close = float(row["close"])
+        low = float(row["low"])
         breakout_pct = calculate_breakout_pct(close, opening_range_high)
         close_strength = calculate_close_strength(row)
         entry_risk_pct = calculate_entry_risk_pct(close, opening_range_low)
 
-        if breakout_pct < MIN_BREAKOUT_PCT:
-            continue
-        if close_strength < MIN_CLOSE_STRENGTH:
-            continue
-        if entry_risk_pct > MAX_ENTRY_RISK_PCT:
-            continue
+        if close > opening_range_high:
+            if not broke_out:
+                broke_out = True
 
-        return position, breakout_pct, close_strength, entry_risk_pct, opening_range_low
+            if (
+                breakout_pct >= MIN_BREAKOUT_PCT
+                and close_strength >= MIN_CLOSE_STRENGTH
+                and entry_risk_pct <= MAX_ENTRY_RISK_PCT
+            ):
+                return position, breakout_pct, close_strength, entry_risk_pct, "breakout"
+
+            if ENABLE_PULLBACK_RETEST_ENTRY and retested and entry_risk_pct <= MAX_ENTRY_RISK_PCT:
+                return position, breakout_pct, close_strength, entry_risk_pct, "pullback_retest"
+
+        if broke_out and low <= opening_range_high and low >= retest_low_threshold:
+            retested = True
 
     return None
 
@@ -107,6 +121,7 @@ def simulate_exit(
     breakout_pct: float,
     close_strength: float,
     entry_risk_pct: float,
+    setup_type: str,
 ) -> BacktestTrade:
     entry_bar = session.iloc[entry_position]
     entry_price = float(entry_bar["close"])
@@ -133,6 +148,7 @@ def simulate_exit(
             breakout_pct=breakout_pct,
             close_strength=close_strength,
             entry_risk_pct=entry_risk_pct,
+            setup_type=setup_type,
         )
 
     last_bar = bars_after_entry.iloc[-1]
@@ -140,7 +156,6 @@ def simulate_exit(
     for _, bar in bars_after_entry.iterrows():
         bar_high = float(bar["high"])
         bar_low = float(bar["low"])
-        bar_close = float(bar["close"])
         bar_time = str(bar["date"])
 
         highest_price = max(highest_price, bar_high)
@@ -159,6 +174,7 @@ def simulate_exit(
                 breakout_pct=breakout_pct,
                 close_strength=close_strength,
                 entry_risk_pct=entry_risk_pct,
+                setup_type=setup_type,
             )
 
         if highest_price >= activation_price:
@@ -180,6 +196,7 @@ def simulate_exit(
                     breakout_pct=breakout_pct,
                     close_strength=close_strength,
                     entry_risk_pct=entry_risk_pct,
+                    setup_type=setup_type,
                 )
 
     exit_price = float(last_bar["close"])
@@ -197,6 +214,7 @@ def simulate_exit(
         breakout_pct=breakout_pct,
         close_strength=close_strength,
         entry_risk_pct=entry_risk_pct,
+        setup_type=setup_type,
     )
 
 
@@ -213,7 +231,7 @@ def backtest_symbol(symbol: str) -> list[BacktestTrade]:
         if entry is None:
             continue
 
-        entry_position, breakout_pct, close_strength, entry_risk_pct, _ = entry
+        entry_position, breakout_pct, close_strength, entry_risk_pct, setup_type = entry
         trades.append(
             simulate_exit(
                 symbol=symbol,
@@ -222,6 +240,7 @@ def backtest_symbol(symbol: str) -> list[BacktestTrade]:
                 breakout_pct=breakout_pct,
                 close_strength=close_strength,
                 entry_risk_pct=entry_risk_pct,
+                setup_type=setup_type,
             )
         )
 
@@ -229,7 +248,6 @@ def backtest_symbol(symbol: str) -> list[BacktestTrade]:
 
 
 def limit_positions_per_day(trades: list[BacktestTrade]) -> list[BacktestTrade]:
-    """Limit trades per session using breakout strength as first simple selector."""
     by_day: dict[str, list[BacktestTrade]] = {}
     for trade in trades:
         by_day.setdefault(trade.session_date, []).append(trade)
@@ -237,7 +255,11 @@ def limit_positions_per_day(trades: list[BacktestTrade]) -> list[BacktestTrade]:
     selected: list[BacktestTrade] = []
     for day_trades in by_day.values():
         selected.extend(
-            sorted(day_trades, key=lambda trade: trade.breakout_pct, reverse=True)[:MAX_POSITIONS_PER_DAY]
+            sorted(
+                day_trades,
+                key=lambda trade: (trade.breakout_pct, trade.close_strength, -trade.entry_risk_pct),
+                reverse=True,
+            )[:MAX_POSITIONS_PER_DAY]
         )
 
     return sorted(selected, key=lambda trade: (trade.session_date, trade.entry_time))
@@ -250,7 +272,8 @@ def summarize(trades: list[BacktestTrade]) -> None:
         f"min_breakout={MIN_BREAKOUT_PCT:.2f}%, "
         f"min_close_strength={MIN_CLOSE_STRENGTH:.2f}, "
         f"max_entry_risk={MAX_ENTRY_RISK_PCT:.2f}%, "
-        f"max_positions_per_day={MAX_POSITIONS_PER_DAY}"
+        f"max_positions_per_day={MAX_POSITIONS_PER_DAY}, "
+        f"pullback_retest={ENABLE_PULLBACK_RETEST_ENTRY}"
     )
     print(
         f"Exit: stop={INITIAL_STOP_LOSS_PCT:.2f}%, "
@@ -278,14 +301,20 @@ def summarize(trades: list[BacktestTrade]) -> None:
     if wins:
         print(f"Average win: {sum(wins) / len(wins):.2f}%")
 
+    setup_counts: dict[str, int] = {}
+    for trade in trades:
+        setup_counts[trade.setup_type] = setup_counts.get(trade.setup_type, 0) + 1
+    print("Setup counts:", setup_counts)
+
     print("\nRecent trades\n")
-    print("Date | Symbol | Entry | Exit | PnL % | Break % | CloseStr | Risk % | Reason")
-    print("----------------------------------------------------------------------------")
+    print("Date | Symbol | Setup | Entry | Exit | PnL % | Break % | CloseStr | Risk % | Reason")
+    print("------------------------------------------------------------------------------------")
 
     for trade in trades[-20:]:
         print(
             f"{trade.session_date} | "
             f"{trade.symbol:<6} | "
+            f"{trade.setup_type:<14} | "
             f"{trade.entry_price:>7.2f} | "
             f"{trade.exit_price:>7.2f} | "
             f"{trade.pnl_pct:>5.2f} | "
