@@ -34,301 +34,106 @@ Utworzono i uzupełniono:
 README.md
 ```
 
-Zawiera ogólną wizję systemu, architekturę i roadmapę.
-
 ### 2. Phase 1: Market Data Foundation
-
-Utworzono:
 
 ```text
 docs/phase-1-market-data.md
 ```
 
-Dokument opisuje pierwszy etap projektu:
-
-- połączenie z IBKR,
-- baza spółek,
-- dane historyczne,
-- lokalny storage,
-- aktualizacja danych.
-
 ### 3. IBKR setup
-
-Utworzono:
 
 ```text
 docs/ibkr-setup.md
 ```
 
-Ustalony setup:
-
-```text
-IB Gateway
-Paper Trading
-IB API
-host: 127.0.0.1
-port: 4002
-client id: 1
-```
-
-Bot na tym etapie nie składa żadnych zleceń.
-
 ### 4. Strategie
-
-Utworzono:
 
 ```text
 docs/strategies.md
 ```
 
-Zdefiniowane strategie:
+---
 
-1. Momentum Trailing Intraday
-2. Momentum Trailing Overnight
-3. Swing Trend Momentum
+## Historia prac nad Momentum Trailing Intraday (90D intraday)
 
-Najważniejsza ustalona zasada dla Momentum Trailing Intraday:
-
-```text
-najpierw działa zwykły stop-loss
-trailing stop aktywuje się dopiero po osiągnięciu minimalnego zysku
-```
-
-Wstępne parametry intraday:
-
-```text
-initial_stop_loss_pct = 1.2
-trailing_activation_profit_pct = 1.5
-trailing_stop_pct = 1.7
-force_exit_before_market_close = true
-```
+### Pipeline
+- 1D + 15m intraday
+- 90 dni historii
+- parquet storage
+- ranking → entry → exit → portfolio sim
 
 ---
 
-## Co działa technicznie
+## Eksperymenty
 
-### 1. Lokalny test połączenia z IBKR
+### 1. 30 spółek / 30 dni
+- winrate ~73%
+- return ~1.5%
+👉 Wniosek: overfitting
 
-Plik:
+### 2. 30 spółek / 90 dni
+- return ~ -0.30%
+👉 brak edge
 
-```text
-src/ibkr/test_connection.py
-```
+### 3. Trailing tuning
+- brak wpływu
+👉 NIE jest bottleneck
 
-Cel:
+### 4. Universe 99 spółek
+- return ~ +0.65%
+- DD ~ -2.7%
+👉 poprawa, ale mała
 
-- połączyć się z IB Gateway / TWS,
-- pobrać czas serwera,
-- odczytać konta,
-- rozłączyć się,
-- nie składać zleceń.
+### 5. OR range filter
+- return ~ -1%
+👉 NIE działa
 
-Test wykonany lokalnie przez użytkownika zakończył się sukcesem.
+### 6. Aggressive universe
+- return ~ -0.74%
+👉 NIE działa
 
-Wynik przykładowy:
-
-```text
-Connecting to IBKR...
-Connected: True
-Server time: 2026-04-28 10:03:58+00:00
-Accounts: ['DUM541958']
-Disconnected
-```
-
-### 2. Pobranie danych historycznych AAPL
-
-Plik:
-
-```text
-src/data/fetch_aapl_history.py
-```
-
-Cel:
-
-- pobrać dane historyczne AAPL,
-- interwał: 1D,
-- zakres: 3 lata,
-- zapisać lokalnie do Parquet.
-
-Dane zostały poprawnie pobrane i zapisane lokalnie:
-
-```text
-data/market_data/AAPL_1D.parquet
-```
-
-### 3. Pobieranie danych dla 30 spółek
-
-Plik:
-
-```text
-src/data/fetch_top30.py
-```
-
-Cel:
-
-- pobrać dane daily 1D z ostatnich 3 lat dla początkowego universe 30 spółek,
-- zapisać lokalnie do Parquet.
-
-Ważna poprawka:
-
-```text
-SQ został zastąpiony przez XYZ
-```
-
-Powód: Square / Block zmienił ticker na XYZ.
+### 7. Luzowanie entry
+- więcej tradów
+- gorsza jakość
+👉 NIE działa
 
 ---
 
-## Jak uruchomić projekt lokalnie
+## Najlepsza konfiguracja
 
-### 1. Pobranie repo
+- Universe: ~99 spółek
+- Selection: daily_trend + breakout
+- stop: 1%
+- trailing: 0.8 / 1.2
 
-```bash
-git clone https://github.com/micha3lny/trading-bot.git
-cd trading-bot
-```
-
-Jeśli repo już istnieje lokalnie:
-
-```bash
-git pull
-```
-
-### 2. Środowisko Python
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-### 3. Konfiguracja `.env`
-
-```bash
-cp .env.example .env
-```
-
-Domyślne ustawienia:
-
-```env
-IB_HOST=127.0.0.1
-IB_PORT=4002
-IB_CLIENT_ID=1
-```
-
-### 4. Uruchomienie IB Gateway
-
-Należy uruchomić lokalnie:
-
-```text
-IB Gateway
-```
-
-Ustawienia:
-
-```text
-Trading Mode: Paper Trading
-API Type: IB API
-Socket port: 4002
-Allow connections from localhost only: enabled
-Trusted IP: 127.0.0.1
-```
-
-### 5. Test połączenia
-
-```bash
-python src/ibkr/test_connection.py
-```
-
-### 6. Pobranie AAPL 1D / 3 lata
-
-```bash
-python src/data/fetch_aapl_history.py
-```
-
-### 7. Pobranie top 30 universe 1D / 3 lata
-
-```bash
-python src/data/fetch_top30.py
-```
+Wynik:
+- return ~0.6–1%
+- DD ~2–3%
 
 ---
 
-## Lokalny storage danych
+## GŁÓWNY PROBLEM
 
-Dane historyczne są zapisywane lokalnie, nie w repozytorium:
-
-```text
-data/market_data/*.parquet
-```
-
-Tego folderu nie należy commitować do GitHub.
-
-Do repo trafia tylko:
-
-- kod,
-- dokumentacja,
-- konfiguracja przykładowa,
-- testy.
-
-Lokalnie zostają:
-
-- `.env`,
-- `data/`,
-- cache,
-- logi,
-- wyniki backtestów.
+👉 brak follow-through po breakout
 
 ---
 
-## Aktualne ustalenia o danych
+## NEXT STEP
 
-Na tym etapie pobierane są tylko dane:
+### Follow-through entry
 
-```text
-bar size: 1 day
-history: 3 Y
-whatToShow: TRADES
-useRTH: true
-```
+Zamiast:
+- wejście na breakout
 
-Do pierwszego rankingu strategii Momentum Trailing Intraday potrzebujemy rozszerzyć dane o intraday:
-
-```text
-1D + intraday, np. 15m / 5m
-```
-
-Użytkownik zdecydował, że ranking strategii ma od razu uwzględniać dane dzienne + intraday.
+Zrobić:
+1. breakout
+2. kolejna świeca potwierdza
+3. entry
 
 ---
 
-## Najbliższy następny krok
+## START NEXT SESSION
 
-Następny etap:
-
-```text
-B: ranking oparty o 1D + intraday
+```bash
+python -m src.strategies.momentum_trailing_intraday.backtest
 ```
-
-Czyli należy zbudować pipeline:
-
-1. pobieranie danych 1D,
-2. pobieranie danych intraday, np. 15m lub 5m,
-3. zapis do Parquet,
-4. loader danych,
-5. pierwsza wersja rankingu dla Momentum Trailing Intraday.
-
-Ranking musi być per strategia, nie ogólny.
-
----
-
-## Ważne zasady projektowe
-
-- Nie robimy ogólnego rankingu spółek.
-- Ranking jest zawsze częścią konkretnej strategii.
-- Strategia składa się z: ranking → entry → exit.
-- Bot nie kupuje od razu po rankingu; ranking wybiera kandydatów do obserwacji.
-- Entry decyduje, kiedy kupić na podstawie bieżących świec.
-- Exit decyduje, kiedy sprzedać.
-- W Phase 1 nie składamy zleceń.
-- Najpierw backtest, potem paper trading, dopiero potem live trading.
