@@ -27,6 +27,7 @@ MIN_BREAKOUT_PCT = 0.25
 MIN_CLOSE_STRENGTH = 0.60
 MAX_ENTRY_RISK_PCT = 2.0
 MAX_POSITIONS_PER_DAY = 3
+MIN_DAILY_TREND_PCT = 0.0
 
 # Market regime filter based on the current top30 universe breadth.
 ENABLE_MARKET_REGIME_FILTER = True
@@ -255,6 +256,9 @@ def backtest_symbol(symbol: str, intraday: pd.DataFrame, daily: pd.DataFrame, ma
 
         entry_position, breakout_pct, close_strength, entry_risk_pct, setup_type = entry
         daily_trend_pct = get_daily_trend_before_session(daily, session_date)
+        if daily_trend_pct < MIN_DAILY_TREND_PCT:
+            continue
+
         trades.append(simulate_exit(symbol, session, entry_position, breakout_pct, close_strength, entry_risk_pct, daily_trend_pct, setup_type))
 
     return trades
@@ -306,6 +310,7 @@ def summarize(trades: list[BacktestTrade], market_regimes: dict[str, MarketRegim
         f"min_breakout={MIN_BREAKOUT_PCT:.2f}%, "
         f"min_close_strength={MIN_CLOSE_STRENGTH:.2f}, "
         f"max_entry_risk={MAX_ENTRY_RISK_PCT:.2f}%, "
+        f"min_daily_trend={MIN_DAILY_TREND_PCT:.2f}%, "
         f"max_positions_per_day={MAX_POSITIONS_PER_DAY}, "
         f"pullback_retest={ENABLE_PULLBACK_RETEST_ENTRY}, "
         f"market_regime={ENABLE_MARKET_REGIME_FILTER}, "
