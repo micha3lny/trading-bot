@@ -1,4 +1,4 @@
-"""Fetch initial daily historical data for a small liquid stock universe.
+"""Fetch daily historical data for a liquid high-beta stock universe.
 
 This script is intentionally simple and safe:
 - connects to local IB Gateway / TWS
@@ -38,7 +38,11 @@ class StockSpec:
     currency: str = "USD"
 
 
+# High-beta / liquid day-trading universe.
+# Kept mostly to liquid US names: mega-cap tech, semis, AI/software, crypto-related,
+# EV/auto, fintech, growth, and selected high-volume ETFs.
 UNIVERSE = [
+    # Mega-cap / core liquidity
     StockSpec("AAPL", "NASDAQ"),
     StockSpec("MSFT", "NASDAQ"),
     StockSpec("NVDA", "NASDAQ"),
@@ -48,27 +52,114 @@ UNIVERSE = [
     StockSpec("AMZN", "NASDAQ"),
     StockSpec("TSLA", "NASDAQ"),
     StockSpec("NFLX", "NASDAQ"),
-    StockSpec("INTC", "NASDAQ"),
     StockSpec("AVGO", "NASDAQ"),
-    StockSpec("ADBE", "NASDAQ"),
-    StockSpec("CRM", "NYSE"),
-    StockSpec("CSCO", "NASDAQ"),
-    StockSpec("QCOM", "NASDAQ"),
-    StockSpec("TXN", "NASDAQ"),
+
+    # Semiconductors / hardware momentum
+    StockSpec("SMCI", "NASDAQ"),
+    StockSpec("ARM", "NASDAQ"),
     StockSpec("MU", "NASDAQ"),
+    StockSpec("QCOM", "NASDAQ"),
     StockSpec("AMAT", "NASDAQ"),
-    StockSpec("PYPL", "NASDAQ"),
-    StockSpec("SHOP", "NYSE"),
+    StockSpec("LRCX", "NASDAQ"),
+    StockSpec("KLAC", "NASDAQ"),
+    StockSpec("MRVL", "NASDAQ"),
+    StockSpec("ON", "NASDAQ"),
+    StockSpec("INTC", "NASDAQ"),
+    StockSpec("TSM", "NYSE"),
+    StockSpec("ASML", "NASDAQ"),
+
+    # AI / software / cloud / cybersecurity
     StockSpec("PLTR", "NASDAQ"),
     StockSpec("SNOW", "NYSE"),
+    StockSpec("CRWD", "NASDAQ"),
+    StockSpec("NET", "NYSE"),
+    StockSpec("DDOG", "NASDAQ"),
+    StockSpec("MDB", "NASDAQ"),
+    StockSpec("ZS", "NASDAQ"),
+    StockSpec("PANW", "NASDAQ"),
+    StockSpec("NOW", "NYSE"),
+    StockSpec("CRM", "NYSE"),
+    StockSpec("ADBE", "NASDAQ"),
+    StockSpec("TEAM", "NASDAQ"),
+    StockSpec("PATH", "NYSE"),
+    StockSpec("AI", "NYSE"),
+    StockSpec("SOUN", "NASDAQ"),
+    StockSpec("BBAI", "NYSE"),
+
+    # Crypto / high-beta fintech
+    StockSpec("COIN", "NASDAQ"),
+    StockSpec("MSTR", "NASDAQ"),
+    StockSpec("MARA", "NASDAQ"),
+    StockSpec("RIOT", "NASDAQ"),
+    StockSpec("HOOD", "NASDAQ"),
+    StockSpec("SOFI", "NASDAQ"),
+    StockSpec("PYPL", "NASDAQ"),
+    StockSpec("XYZ", "NYSE"),  # Block Inc. formerly SQ
+    StockSpec("AFRM", "NASDAQ"),
+    StockSpec("UPST", "NASDAQ"),
+
+    # EV / auto / mobility / energy transition
+    StockSpec("RIVN", "NASDAQ"),
+    StockSpec("LCID", "NASDAQ"),
+    StockSpec("NIO", "NYSE"),
+    StockSpec("XPEV", "NYSE"),
+    StockSpec("LI", "NASDAQ"),
     StockSpec("UBER", "NYSE"),
     StockSpec("LYFT", "NASDAQ"),
-    StockSpec("COIN", "NASDAQ"),
-    StockSpec("XYZ", "NYSE"),  # Block Inc. formerly SQ
+    StockSpec("ENPH", "NASDAQ"),
+    StockSpec("SEDG", "NASDAQ"),
+
+    # Growth / internet / consumer momentum
+    StockSpec("SHOP", "NYSE"),
     StockSpec("ROKU", "NASDAQ"),
     StockSpec("ZM", "NASDAQ"),
     StockSpec("DOCU", "NASDAQ"),
     StockSpec("PINS", "NYSE"),
+    StockSpec("SNAP", "NYSE"),
+    StockSpec("RDDT", "NYSE"),
+    StockSpec("DASH", "NASDAQ"),
+    StockSpec("ABNB", "NASDAQ"),
+    StockSpec("SE", "NYSE"),
+    StockSpec("MELI", "NASDAQ"),
+    StockSpec("BABA", "NYSE"),
+    StockSpec("JD", "NASDAQ"),
+    StockSpec("PDD", "NASDAQ"),
+    StockSpec("BIDU", "NASDAQ"),
+
+    # Biotech / healthcare movers
+    StockSpec("MRNA", "NASDAQ"),
+    StockSpec("BNTX", "NASDAQ"),
+    StockSpec("RXRX", "NASDAQ"),
+    StockSpec("DNA", "NYSE"),
+    StockSpec("ILMN", "NASDAQ"),
+
+    # Industrials / defense / space / energy high beta
+    StockSpec("BA", "NYSE"),
+    StockSpec("GE", "NYSE"),
+    StockSpec("RKLB", "NASDAQ"),
+    StockSpec("LUNR", "NASDAQ"),
+    StockSpec("ACHR", "NYSE"),
+    StockSpec("JOBY", "NYSE"),
+    StockSpec("CCJ", "NYSE"),
+    StockSpec("UUUU", "NYSE"),
+    StockSpec("RIG", "NYSE"),
+
+    # Financial / trading / meme liquidity
+    StockSpec("JPM", "NYSE"),
+    StockSpec("BAC", "NYSE"),
+    StockSpec("GS", "NYSE"),
+    StockSpec("GME", "NYSE"),
+    StockSpec("AMC", "NYSE"),
+
+    # Liquid ETFs useful for market context and high-beta movement
+    StockSpec("QQQ", "NASDAQ"),
+    StockSpec("SPY", "ARCA"),
+    StockSpec("IWM", "ARCA"),
+    StockSpec("TQQQ", "NASDAQ"),
+    StockSpec("SQQQ", "NASDAQ"),
+    StockSpec("SOXL", "ARCA"),
+    StockSpec("SOXS", "ARCA"),
+    StockSpec("ARKK", "ARCA"),
 ]
 
 
