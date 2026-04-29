@@ -15,6 +15,7 @@ import pandas as pd
 
 from src.data.fetch_top30 import UNIVERSE
 from src.data.load_market_data import load_daily, load_intraday
+from src.strategies.momentum_trailing_intraday.analysis import analyze, export_trades
 from src.strategies.momentum_trailing_intraday.exit import (
     INITIAL_STOP_LOSS_PCT,
     TRAILING_ACTIVATION_PROFIT_PCT,
@@ -471,7 +472,12 @@ def main() -> None:
     all_trades: list[BacktestTrade] = []
     for symbol, intraday in intraday_data.items():
         all_trades.extend(backtest_symbol(symbol, intraday, daily_data[symbol], market_regimes))
-    summarize(apply_position_sizing(all_trades), market_regimes)
+
+    trades = apply_position_sizing(all_trades)
+    summarize(trades, market_regimes)
+
+    trades_df = export_trades(trades)
+    analyze(trades_df)
 
 
 if __name__ == "__main__":
