@@ -27,8 +27,8 @@ PORT = int(os.getenv("IB_PORT", "4002"))
 CLIENT_ID = int(os.getenv("IB_INTRADAY_CLIENT_ID", "2"))
 
 # Conservative defaults for IBKR pacing limits.
-# 15-minute bars over 30 days are enough for the first intraday ranking version.
-INTRADAY_DURATION = os.getenv("INTRADAY_DURATION", "30 D")
+# 15-minute bars over 90 days give a better first validation sample than 30 days.
+INTRADAY_DURATION = os.getenv("INTRADAY_DURATION", "90 D")
 INTRADAY_BAR_SIZE = os.getenv("INTRADAY_BAR_SIZE", "15 mins")
 WHAT_TO_SHOW = os.getenv("INTRADAY_WHAT_TO_SHOW", "TRADES")
 USE_RTH = os.getenv("INTRADAY_USE_RTH", "true").lower() == "true"
