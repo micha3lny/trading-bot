@@ -20,6 +20,7 @@ class RankingRow:
     score: float
     intraday_momentum_pct: float
     daily_trend_pct: float
+    volume_ratio: float
     last_intraday_date: str
 
 
@@ -65,12 +66,52 @@ def compute_daily_trend(df_daily: pd.DataFrame) -> float:
     return (last_row["close"] - last_row["ma20"]) / last_row["ma20"] * 100.0
 
 
+def compute_volume_ratio(df_intraday: pd.DataFrame) -> float:
+    """Latest session volume vs average session volume in loaded intraday data."""
+    if df_intraday.empty or "volume" not in df_intraday.columns or "date" not in df_intraday.columns:
+        return 1.0
+
+    df = df_intraday.copy()
+    df["session_date"] = df["date"].dt.date
+    session_volumes = df.groupby("session_date")["volume"].sum()
+
+    if len(session_volumes) < 2:
+        return 1.0
+
+    latest_volume = session_volumes.iloc[-1]
+    average_volume = session_volumes.iloc[:-1].mean()
+
+    if average_volume == 0:
+        return 1.0
+
+    return float(latest_volume / average_volume)
+
+
 def get_last_intraday_date(df_intraday: pd.DataFrame) -> str:
     latest_session = get_last_intraday_session(df_intraday)
     if latest_session.empty:
         return "n/a"
 
     return str(latest_session.iloc[-1]["date"].date())
+
+
+def compute_score(
+    intraday_momentum_pct: float,
+    daily_trend_pct: float,
+    volume_ratio: float,
+) -> float:
+    """Compute strategy-specific ranking score.
+
+    Negative intraday momentum is penalized heavily because this strategy
+    is looking for symbols with current-session continuation potential.
+    """
+    if intraday_momentum_pct <= 0:
+        return intraday_momentum_pct * 10.0
+
+    trend_component = max(daily_trend_pct, 0.0) * 0.10
+    volume_component = min(max(volume_ratio - 1.0, 0.0), 2.0) * 0.50
+
+    return intraday_momentum_pct + trend_component + volume_component
 
 
 def rank_symbols() -> list[RankingRow]:
@@ -82,10 +123,8 @@ def rank_symbols() -> list[RankingRow]:
 
             intraday_momentum = compute_intraday_momentum(bundle.intraday)
             daily_trend = compute_daily_trend(bundle.daily)
-
-            # Intraday ranking should mostly react to the latest session,
-            # with daily trend as a supporting filter.
-            score = intraday_momentum * 0.75 + daily_trend * 0.25
+            volume_ratio = compute_volume_ratio(bundle.intraday)
+            score = compute_score(intraday_momentum, daily_trend, volume_ratio)
 
             rows.append(
                 RankingRow(
@@ -93,6 +132,7 @@ def rank_symbols() -> list[RankingRow]:
                     score=score,
                     intraday_momentum_pct=intraday_momentum,
                     daily_trend_pct=daily_trend,
+                    volume_ratio=volume_ratio,
                     last_intraday_date=get_last_intraday_date(bundle.intraday),
                 )
             )
@@ -108,8 +148,8 @@ def main() -> None:
     ranking = rank_symbols()
 
     print("\nTop 10 (Momentum Trailing Intraday)\n")
-    print("Rank | Symbol | Score | Intraday % | Daily trend % | Date")
-    print("----------------------------------------------------------")
+    print("Rank | Symbol | Score | Intraday % | Daily trend % | Vol ratio | Date")
+    print("---------------------------------------------------------------------")
 
     for i, row in enumerate(ranking[:10], start=1):
         print(
@@ -118,6 +158,7 @@ def main() -> None:
             f"{row.score:>6.2f} | "
             f"{row.intraday_momentum_pct:>10.2f} | "
             f"{row.daily_trend_pct:>13.2f} | "
+            f"{row.volume_ratio:>9.2f} | "
             f"{row.last_intraday_date}"
         )
 
