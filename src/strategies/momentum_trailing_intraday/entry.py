@@ -27,6 +27,7 @@ MAX_POSITIONS = 3
 OPENING_RANGE_BARS = 4  # 4 x 15m = first hour
 MIN_INTRADAY_MOMENTUM_PCT = 0.5
 MIN_VOLUME_RATIO = 0.8
+MIN_BREAKOUT_PCT = 0.25
 MAX_ENTRY_RISK_PCT = 4.0
 
 
@@ -110,6 +111,7 @@ def check_opening_range_breakout(row: RankingRow, df_intraday: pd.DataFrame) -> 
         )
 
     last_price, opening_range_high, opening_range_low = get_opening_range_values(latest_session)
+    breakout_pct = calculate_breakout_pct(last_price, opening_range_high)
 
     if row.intraday_momentum_pct < MIN_INTRADAY_MOMENTUM_PCT:
         return build_signal(
@@ -131,6 +133,16 @@ def check_opening_range_breakout(row: RankingRow, df_intraday: pd.DataFrame) -> 
             opening_range_low=opening_range_low,
         )
 
+    if breakout_pct < MIN_BREAKOUT_PCT:
+        return build_signal(
+            row=row,
+            has_signal=False,
+            reason=f"breakout below {MIN_BREAKOUT_PCT:.2f}%",
+            last_price=last_price,
+            opening_range_high=opening_range_high,
+            opening_range_low=opening_range_low,
+        )
+
     entry_risk_pct = calculate_entry_risk_pct(last_price, opening_range_low)
     if entry_risk_pct > MAX_ENTRY_RISK_PCT:
         return build_signal(
@@ -142,12 +154,10 @@ def check_opening_range_breakout(row: RankingRow, df_intraday: pd.DataFrame) -> 
             opening_range_low=opening_range_low,
         )
 
-    has_breakout = last_price > opening_range_high
-
     return build_signal(
         row=row,
-        has_signal=has_breakout,
-        reason="breakout above opening range" if has_breakout else "no breakout above opening range",
+        has_signal=True,
+        reason="strong breakout above opening range",
         last_price=last_price,
         opening_range_high=opening_range_high,
         opening_range_low=opening_range_low,
