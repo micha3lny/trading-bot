@@ -35,6 +35,12 @@ ENABLE_MARKET_REGIME_FILTER = True
 MIN_POSITIVE_BREADTH_PCT = 50.0
 MIN_AVERAGE_OPENING_RANGE_RETURN_PCT = 0.02
 
+ENABLE_FOLLOW_THROUGH_ENTRY = True
+FOLLOW_THROUGH_BARS = 1
+MIN_FOLLOW_THROUGH_PCT = 0.10
+MIN_FOLLOW_THROUGH_CLOSE_STRENGTH = 0.55
+REQUIRE_FOLLOW_THROUGH_ABOVE_BREAKOUT_HIGH = False
+
 ENABLE_PULLBACK_RETEST_ENTRY = False
 PULLBACK_RETEST_TOLERANCE_PCT = 0.35
 
@@ -107,6 +113,12 @@ def calculate_entry_risk_pct(entry_price: float, opening_range_low: float) -> fl
     return (entry_price - opening_range_low) / entry_price * 100.0
 
 
+def calculate_follow_through_pct(close: float, breakout_close: float) -> float:
+    if breakout_close == 0:
+        return 0.0
+    return (close - breakout_close) / breakout_close * 100.0
+
+
 def prepare_daily_data(symbol: str) -> pd.DataFrame:
     daily = load_daily(symbol).copy()
     daily["session_date"] = daily["date"].dt.date
@@ -153,6 +165,51 @@ def build_market_regimes(intraday_data: dict[str, pd.DataFrame]) -> dict[str, Ma
     return regimes
 
 
+def is_valid_breakout_candidate(close: float, opening_range_high: float, opening_range_low: float, row: pd.Series) -> tuple[bool, float, float, float]:
+    breakout_pct = calculate_breakout_pct(close, opening_range_high)
+    close_strength = calculate_close_strength(row)
+    entry_risk_pct = calculate_entry_risk_pct(close, opening_range_low)
+    is_valid = (
+        breakout_pct >= MIN_BREAKOUT_PCT
+        and close_strength >= MIN_CLOSE_STRENGTH
+        and entry_risk_pct <= MAX_ENTRY_RISK_PCT
+    )
+    return is_valid, breakout_pct, close_strength, entry_risk_pct
+
+
+def find_follow_through_entry(
+    session: pd.DataFrame,
+    breakout_position: int,
+    opening_range_high: float,
+    opening_range_low: float,
+) -> tuple[int, float, float, float] | None:
+    breakout_bar = session.iloc[breakout_position]
+    breakout_close = float(breakout_bar["close"])
+    breakout_high = float(breakout_bar["high"])
+    last_confirmation_position = min(len(session), breakout_position + 1 + FOLLOW_THROUGH_BARS)
+
+    for confirmation_position in range(breakout_position + 1, last_confirmation_position):
+        row = session.iloc[confirmation_position]
+        close = float(row["close"])
+        follow_through_pct = calculate_follow_through_pct(close, breakout_close)
+        close_strength = calculate_close_strength(row)
+        entry_risk_pct = calculate_entry_risk_pct(close, opening_range_low)
+        breakout_pct = calculate_breakout_pct(close, opening_range_high)
+
+        confirms_breakout = close > opening_range_high and follow_through_pct >= MIN_FOLLOW_THROUGH_PCT
+        if REQUIRE_FOLLOW_THROUGH_ABOVE_BREAKOUT_HIGH:
+            confirms_breakout = confirms_breakout and close > breakout_high
+
+        if (
+            confirms_breakout
+            and close_strength >= MIN_FOLLOW_THROUGH_CLOSE_STRENGTH
+            and entry_risk_pct <= MAX_ENTRY_RISK_PCT
+        ):
+            return confirmation_position, breakout_pct, close_strength, entry_risk_pct
+
+    return None
+
+
 def find_entry_bar(session: pd.DataFrame) -> tuple[int, float, float, float, str] | None:
     if len(session) <= OPENING_RANGE_BARS:
         return None
@@ -169,16 +226,25 @@ def find_entry_bar(session: pd.DataFrame) -> tuple[int, float, float, float, str
         row = session.iloc[position]
         close = float(row["close"])
         low = float(row["low"])
-        breakout_pct = calculate_breakout_pct(close, opening_range_high)
-        close_strength = calculate_close_strength(row)
-        entry_risk_pct = calculate_entry_risk_pct(close, opening_range_low)
+        is_valid_breakout, breakout_pct, close_strength, entry_risk_pct = is_valid_breakout_candidate(
+            close,
+            opening_range_high,
+            opening_range_low,
+            row,
+        )
 
         if close > opening_range_high:
             if not broke_out:
                 broke_out = True
 
-            if breakout_pct >= MIN_BREAKOUT_PCT and close_strength >= MIN_CLOSE_STRENGTH and entry_risk_pct <= MAX_ENTRY_RISK_PCT:
-                return position, breakout_pct, close_strength, entry_risk_pct, "breakout"
+            if is_valid_breakout:
+                if ENABLE_FOLLOW_THROUGH_ENTRY:
+                    follow_through_entry = find_follow_through_entry(session, position, opening_range_high, opening_range_low)
+                    if follow_through_entry is not None:
+                        entry_position, breakout_pct, close_strength, entry_risk_pct = follow_through_entry
+                        return entry_position, breakout_pct, close_strength, entry_risk_pct, "follow_through_breakout"
+                else:
+                    return position, breakout_pct, close_strength, entry_risk_pct, "breakout"
 
             if ENABLE_PULLBACK_RETEST_ENTRY and retested and entry_risk_pct <= MAX_ENTRY_RISK_PCT:
                 return position, breakout_pct, close_strength, entry_risk_pct, "pullback_retest"
@@ -344,8 +410,12 @@ def summarize(trades: list[BacktestTrade], market_regimes: dict[str, MarketRegim
         f"Params: opening_range_bars={OPENING_RANGE_BARS}, min_breakout={MIN_BREAKOUT_PCT:.2f}%, "
         f"min_close_strength={MIN_CLOSE_STRENGTH:.2f}, max_entry_risk={MAX_ENTRY_RISK_PCT:.2f}%, "
         f"min_daily_trend={MIN_DAILY_TREND_PCT:.2f}%, max_positions_per_day={MAX_POSITIONS_PER_DAY}, "
+        f"follow_through={ENABLE_FOLLOW_THROUGH_ENTRY}, follow_through_bars={FOLLOW_THROUGH_BARS}, "
+        f"min_follow_through={MIN_FOLLOW_THROUGH_PCT:.2f}%, "
+        f"min_follow_through_close_strength={MIN_FOLLOW_THROUGH_CLOSE_STRENGTH:.2f}, "
+        f"require_follow_through_above_breakout_high={REQUIRE_FOLLOW_THROUGH_ABOVE_BREAKOUT_HIGH}, "
         f"pullback_retest={ENABLE_PULLBACK_RETEST_ENTRY}, market_regime={ENABLE_MARKET_REGIME_FILTER}, "
-        "selection=day_trading_universe+daily_trend+breakout"
+        "selection=day_trading_universe+daily_trend+follow_through_breakout"
     )
     print(f"Regime: min_positive_breadth={MIN_POSITIVE_BREADTH_PCT:.1f}%, min_avg_or_return={MIN_AVERAGE_OPENING_RANGE_RETURN_PCT:.2f}%")
     print(f"Position sizing: initial_capital={INITIAL_CAPITAL:.2f}, weights={POSITION_WEIGHTS}")
