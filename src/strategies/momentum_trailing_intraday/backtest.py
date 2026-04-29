@@ -30,8 +30,8 @@ MAX_POSITIONS_PER_DAY = 3
 
 # Market regime filter based on the current top30 universe breadth.
 ENABLE_MARKET_REGIME_FILTER = True
-MIN_POSITIVE_BREADTH_PCT = 55.0
-MIN_AVERAGE_OPENING_RANGE_RETURN_PCT = 0.05
+MIN_POSITIVE_BREADTH_PCT = 50.0
+MIN_AVERAGE_OPENING_RANGE_RETURN_PCT = 0.02
 
 # Pullback/retest is kept as an experiment, but disabled by default after weak results.
 ENABLE_PULLBACK_RETEST_ENTRY = False
@@ -135,7 +135,7 @@ def build_market_regimes(intraday_data: dict[str, pd.DataFrame]) -> dict[str, Ma
         average_opening_range_return_pct = sum(values) / len(values)
         tradable = (
             positive_breadth_pct >= MIN_POSITIVE_BREADTH_PCT
-            and average_opening_range_return_pct >= MIN_AVERAGE_OPENING_RANGE_RETURN_PCT
+            or average_opening_range_return_pct >= MIN_AVERAGE_OPENING_RANGE_RETURN_PCT
         )
 
         regimes[session_date] = MarketRegime(
