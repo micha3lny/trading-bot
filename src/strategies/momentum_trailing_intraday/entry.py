@@ -1,7 +1,7 @@
 """Entry logic for Momentum Trailing Intraday strategy.
 
 This module does not place orders.
-It only checks whether ranked symbols have a confirmed breakout entry signal.
+It checks whether ranked symbols have a confirmed breakout or pullback/retest entry signal.
 """
 
 from __future__ import annotations
@@ -23,13 +23,18 @@ from src.strategies.momentum_trailing_intraday.ranking import (
 RANKING_CANDIDATES_LIMIT = 10
 MAX_POSITIONS = 3
 
-# Entry setup settings.
+# Entry setup settings from the first positive optimization result.
 OPENING_RANGE_BARS = 4  # 4 x 15m = first hour
 MIN_INTRADAY_MOMENTUM_PCT = 0.5
 MIN_VOLUME_RATIO = 0.8
 MIN_BREAKOUT_PCT = 0.25
-MAX_ENTRY_RISK_PCT = 4.0
-MIN_CLOSE_STRENGTH = 0.60  # close must be in upper 40% of last candle range
+MAX_ENTRY_RISK_PCT = 2.0
+MIN_CLOSE_STRENGTH = 0.60
+
+# Pullback/retest settings.
+# A retest means price came back close to the opening range high and closed back above it.
+ENABLE_PULLBACK_RETEST_ENTRY = True
+PULLBACK_RETEST_TOLERANCE_PCT = 0.35
 
 
 @dataclass(frozen=True)
@@ -38,6 +43,7 @@ class EntrySignal:
     has_signal: bool
     is_final_pick: bool
     reason: str
+    setup_type: str
     last_price: float
     opening_range_high: float
     opening_range_low: float
@@ -55,18 +61,10 @@ def calculate_breakout_pct(last_price: float, opening_range_high: float) -> floa
     return (last_price - opening_range_high) / opening_range_high * 100.0
 
 
-def calculate_close_strength(latest_session: pd.DataFrame) -> float:
-    """Return where the last close sits in the last candle range.
-
-    1.0 means close at candle high, 0.0 means close at candle low.
-    """
-    if latest_session.empty:
-        return 0.0
-
-    last_row = latest_session.iloc[-1]
-    high = float(last_row["high"])
-    low = float(last_row["low"])
-    close = float(last_row["close"])
+def calculate_close_strength_from_row(row: pd.Series) -> float:
+    high = float(row["high"])
+    low = float(row["low"])
+    close = float(row["close"])
 
     if high == low:
         return 0.0
@@ -74,17 +72,32 @@ def calculate_close_strength(latest_session: pd.DataFrame) -> float:
     return (close - low) / (high - low)
 
 
+def calculate_close_strength(latest_session: pd.DataFrame) -> float:
+    if latest_session.empty:
+        return 0.0
+    return calculate_close_strength_from_row(latest_session.iloc[-1])
+
+
 def calculate_entry_risk_pct(last_price: float, opening_range_low: float) -> float:
-    """Approximate risk if initial stop is placed below opening range low."""
     if last_price == 0:
         return 0.0
     return (last_price - opening_range_low) / last_price * 100.0
+
+
+def get_opening_range_values(latest_session: pd.DataFrame) -> tuple[float, float, float]:
+    opening_range = latest_session.iloc[:OPENING_RANGE_BARS]
+    opening_range_high = float(opening_range["high"].max())
+    opening_range_low = float(opening_range["low"].min())
+    last_price = float(latest_session.iloc[-1]["close"])
+
+    return last_price, opening_range_high, opening_range_low
 
 
 def build_signal(
     row: RankingRow,
     has_signal: bool,
     reason: str,
+    setup_type: str,
     last_price: float,
     opening_range_high: float,
     opening_range_low: float,
@@ -98,6 +111,7 @@ def build_signal(
         has_signal=has_signal,
         is_final_pick=False,
         reason=reason,
+        setup_type=setup_type,
         last_price=last_price,
         opening_range_high=opening_range_high,
         opening_range_low=opening_range_low,
@@ -110,17 +124,41 @@ def build_signal(
     )
 
 
-def get_opening_range_values(latest_session: pd.DataFrame) -> tuple[float, float, float]:
-    opening_range = latest_session.iloc[:OPENING_RANGE_BARS]
-    opening_range_high = float(opening_range["high"].max())
-    opening_range_low = float(opening_range["low"].min())
-    last_price = float(latest_session.iloc[-1]["close"])
+def has_pullback_retest(latest_session: pd.DataFrame, opening_range_high: float) -> bool:
+    """Check whether price retested OR high after the initial breakout.
 
-    return last_price, opening_range_high, opening_range_low
+    Retest is useful when the last close is not an ideal immediate breakout entry,
+    but price already broke out, came back close to OR high, and reclaimed it.
+    """
+    if not ENABLE_PULLBACK_RETEST_ENTRY or len(latest_session) <= OPENING_RANGE_BARS + 1:
+        return False
+
+    after_opening_range = latest_session.iloc[OPENING_RANGE_BARS:]
+    retest_low_threshold = opening_range_high * (1.0 - PULLBACK_RETEST_TOLERANCE_PCT / 100.0)
+
+    broke_out = False
+    retested = False
+
+    for _, bar in after_opening_range.iterrows():
+        bar_high = float(bar["high"])
+        bar_low = float(bar["low"])
+        bar_close = float(bar["close"])
+
+        if not broke_out and bar_close > opening_range_high:
+            broke_out = True
+            continue
+
+        if broke_out and bar_low <= opening_range_high and bar_low >= retest_low_threshold:
+            retested = True
+
+        if retested and bar_close > opening_range_high:
+            return True
+
+    return False
 
 
 def check_opening_range_breakout(row: RankingRow, df_intraday: pd.DataFrame) -> EntrySignal:
-    """Check whether the latest session broke above the opening range high."""
+    """Check whether the latest session has a valid breakout or pullback/retest entry."""
     latest_session = get_last_intraday_session(df_intraday)
 
     if len(latest_session) <= OPENING_RANGE_BARS:
@@ -128,6 +166,7 @@ def check_opening_range_breakout(row: RankingRow, df_intraday: pd.DataFrame) -> 
             row=row,
             has_signal=False,
             reason="not enough intraday bars after opening range",
+            setup_type="none",
             last_price=0.0,
             opening_range_high=0.0,
             opening_range_low=0.0,
@@ -138,84 +177,35 @@ def check_opening_range_breakout(row: RankingRow, df_intraday: pd.DataFrame) -> 
     breakout_pct = calculate_breakout_pct(last_price, opening_range_high)
     close_strength = calculate_close_strength(latest_session)
     entry_risk_pct = calculate_entry_risk_pct(last_price, opening_range_low)
+    has_retest = has_pullback_retest(latest_session, opening_range_high)
 
     if row.intraday_momentum_pct < MIN_INTRADAY_MOMENTUM_PCT:
-        return build_signal(
-            row=row,
-            has_signal=False,
-            reason=f"intraday momentum below {MIN_INTRADAY_MOMENTUM_PCT:.2f}%",
-            last_price=last_price,
-            opening_range_high=opening_range_high,
-            opening_range_low=opening_range_low,
-            close_strength=close_strength,
-        )
+        return build_signal(row, False, f"intraday momentum below {MIN_INTRADAY_MOMENTUM_PCT:.2f}%", "none", last_price, opening_range_high, opening_range_low, close_strength)
 
     if row.volume_ratio < MIN_VOLUME_RATIO:
-        return build_signal(
-            row=row,
-            has_signal=False,
-            reason=f"volume ratio below {MIN_VOLUME_RATIO:.2f}",
-            last_price=last_price,
-            opening_range_high=opening_range_high,
-            opening_range_low=opening_range_low,
-            close_strength=close_strength,
-        )
+        return build_signal(row, False, f"volume ratio below {MIN_VOLUME_RATIO:.2f}", "none", last_price, opening_range_high, opening_range_low, close_strength)
 
     if breakout_pct < MIN_BREAKOUT_PCT:
-        return build_signal(
-            row=row,
-            has_signal=False,
-            reason=f"breakout below {MIN_BREAKOUT_PCT:.2f}%",
-            last_price=last_price,
-            opening_range_high=opening_range_high,
-            opening_range_low=opening_range_low,
-            close_strength=close_strength,
-        )
-
-    if close_strength < MIN_CLOSE_STRENGTH:
-        return build_signal(
-            row=row,
-            has_signal=False,
-            reason=f"weak candle close below {MIN_CLOSE_STRENGTH:.2f}",
-            last_price=last_price,
-            opening_range_high=opening_range_high,
-            opening_range_low=opening_range_low,
-            close_strength=close_strength,
-        )
+        return build_signal(row, False, f"breakout below {MIN_BREAKOUT_PCT:.2f}%", "none", last_price, opening_range_high, opening_range_low, close_strength)
 
     if entry_risk_pct > MAX_ENTRY_RISK_PCT:
-        return build_signal(
-            row=row,
-            has_signal=False,
-            reason=f"entry risk above {MAX_ENTRY_RISK_PCT:.2f}%",
-            last_price=last_price,
-            opening_range_high=opening_range_high,
-            opening_range_low=opening_range_low,
-            close_strength=close_strength,
-        )
+        return build_signal(row, False, f"entry risk above {MAX_ENTRY_RISK_PCT:.2f}%", "none", last_price, opening_range_high, opening_range_low, close_strength)
 
-    return build_signal(
-        row=row,
-        has_signal=True,
-        reason="confirmed breakout above opening range",
-        last_price=last_price,
-        opening_range_high=opening_range_high,
-        opening_range_low=opening_range_low,
-        close_strength=close_strength,
-    )
+    if close_strength >= MIN_CLOSE_STRENGTH:
+        return build_signal(row, True, "confirmed breakout above opening range", "breakout", last_price, opening_range_high, opening_range_low, close_strength)
+
+    if has_retest:
+        return build_signal(row, True, "pullback/retest after breakout", "pullback_retest", last_price, opening_range_high, opening_range_low, close_strength)
+
+    return build_signal(row, False, f"weak candle close below {MIN_CLOSE_STRENGTH:.2f}", "none", last_price, opening_range_high, opening_range_low, close_strength)
 
 
 def mark_final_picks(signals: list[EntrySignal], max_positions: int = MAX_POSITIONS) -> list[EntrySignal]:
-    """Mark best trade candidates from valid entry signals.
-
-    Final picks are selected only from YES signals and remain sorted by
-    strategy-specific ranking score.
-    """
     selected_symbols = {
         signal.symbol
         for signal in sorted(
             [signal for signal in signals if signal.has_signal],
-            key=lambda signal: signal.ranking_score,
+            key=lambda signal: (signal.ranking_score, signal.breakout_pct, -signal.entry_risk_pct),
             reverse=True,
         )[:max_positions]
     }
@@ -226,6 +216,7 @@ def mark_final_picks(signals: list[EntrySignal], max_positions: int = MAX_POSITI
             has_signal=signal.has_signal,
             is_final_pick=signal.symbol in selected_symbols,
             reason=signal.reason,
+            setup_type=signal.setup_type,
             last_price=signal.last_price,
             opening_range_high=signal.opening_range_high,
             opening_range_low=signal.opening_range_low,
@@ -264,13 +255,14 @@ def print_final_picks(signals: list[EntrySignal]) -> None:
         print("No final picks. No valid YES signals passed the filters.")
         return
 
-    print("Pick | Symbol | Score | Last | Breakout % | CloseStr | Risk % | Mom % | Vol")
-    print("-------------------------------------------------------------------------")
+    print("Pick | Symbol | Setup | Score | Last | Breakout % | CloseStr | Risk % | Mom % | Vol")
+    print("--------------------------------------------------------------------------------")
 
     for i, signal in enumerate(final_picks, start=1):
         print(
             f"{i:>4} | "
             f"{signal.symbol:<6} | "
+            f"{signal.setup_type:<14} | "
             f"{signal.ranking_score:>5.2f} | "
             f"{signal.last_price:>8.2f} | "
             f"{signal.breakout_pct:>10.2f} | "
@@ -286,11 +278,11 @@ def main() -> None:
 
     print("\nEntry signals: Momentum Trailing Intraday\n")
     print(
-        "Rank | Symbol | Signal | Pick | Last | OR High | OR Low | "
+        "Rank | Symbol | Signal | Pick | Setup | Last | OR High | OR Low | "
         "Breakout % | CloseStr | Risk % | Mom % | Vol | Score | Reason"
     )
     print(
-        "-------------------------------------------------------------------------------------------------------"
+        "----------------------------------------------------------------------------------------------------------------"
     )
 
     for i, signal in enumerate(signals, start=1):
@@ -301,6 +293,7 @@ def main() -> None:
             f"{signal.symbol:<6} | "
             f"{signal_text:<6} | "
             f"{pick_text:<4} | "
+            f"{signal.setup_type:<14} | "
             f"{signal.last_price:>8.2f} | "
             f"{signal.opening_range_high:>7.2f} | "
             f"{signal.opening_range_low:>6.2f} | "
