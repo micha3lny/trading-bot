@@ -10,130 +10,107 @@ Repozytorium:
 https://github.com/micha3lny/trading-bot
 ```
 
-Cel projektu: bot tradingowy pod IBKR, który docelowo będzie obsługiwał:
-
-- bazę spółek,
-- dane historyczne,
-- ranking spółek per strategia,
-- backtesting,
-- paper trading,
-- live trading przez IBKR,
-- portfolio,
-- statystyki,
-- powiadomienia.
-
 ---
 
-## Co już zostało zrobione
+## 🚨 NOWY KIERUNEK (AKTUALNY)
 
-### 1. Dokumentacja główna
+### Strategia: Reversal Pullback (MTF)
 
-Utworzono i uzupełniono:
+Opis:
+- 15m: oversold + breakout attempt
+- 5m: pullback entry (mean reversion)
 
-```text
-README.md
-```
-
-### 2. Phase 1: Market Data Foundation
-
-```text
-docs/phase-1-market-data.md
-```
-
-### 3. IBKR setup
+To NIE jest już breakout strategy.
+To jest:
 
 ```text
-docs/ibkr-setup.md
-```
-
-### 4. Strategie
-
-```text
-docs/strategies.md
+reversal after failed breakout
 ```
 
 ---
 
-## Historia prac nad Momentum Trailing Intraday (90D intraday)
+## 🥇 BEST CONFIG (stan na teraz)
 
-### Pipeline
-- 1D + 15m intraday
-- 90 dni historii
-- parquet storage
-- ranking → entry → exit → portfolio sim
+### v12 (baseline)
 
----
+Parametry:
 
-## Eksperymenty
+- 15m:
+  - trend <= -5%
+  - breakout: 0.5% – 2.5%
+  - confirmation_cs: 0.4 – 0.95
 
-### 1. 30 spółek / 30 dni
-- winrate ~73%
-- return ~1.5%
-👉 Wniosek: overfitting
+- 5m entry:
+  - pullback: 0.3% – 2.5%
+  - close_strength <= 0.60
+  - max below OR: 0.75%
 
-### 2. 30 spółek / 90 dni
-- return ~ -0.30%
-👉 brak edge
+- Exit:
+  - stop: ~1.2%
+  - trailing
 
-### 3. Trailing tuning
-- brak wpływu
-👉 NIE jest bottleneck
+- Costs: included
 
-### 4. Universe 99 spółek
-- return ~ +0.65%
-- DD ~ -2.7%
-👉 poprawa, ale mała
+### Wynik (research, pseudo equity):
 
-### 5. OR range filter
-- return ~ -1%
-👉 NIE działa
+- Signals: ~49
+- Winrate: ~39%
+- Avg trade: ~0.15%
+- Total PnL: ~+7%
 
-### 6. Aggressive universe
-- return ~ -0.74%
-👉 NIE działa
-
-### 7. Luzowanie entry
-- więcej tradów
-- gorsza jakość
-👉 NIE działa
+- Equity:
+```text
+Initial: 10000
+Final:   ~10650
+Return:  ~6.5%
+DD:      ~-14%
+```
 
 ---
 
-## Najlepsza konfiguracja
+## 🔍 Kluczowe odkrycia
 
-- Universe: ~99 spółek
-- Selection: daily_trend + breakout
-- stop: 1%
-- trailing: 0.8 / 1.2
+1. Momentum NIE działa
+2. Follow-through NIE działa
+3. Pullback działa
+4. Najlepsze wejścia to:
 
-Wynik:
-- return ~0.6–1%
-- DD ~2–3%
+```text
+low close_strength (panic candles)
+```
+
+---
+
+## 🚧 Aktualne eksperymenty
+
+### v13
+
+Cel:
+- tylko panic entry (cs <= 0.35)
+- breakout >= 1.0
+- większy stop
+- time-based exit
 
 ---
 
 ## GŁÓWNY PROBLEM
 
-👉 brak follow-through po breakout
+```text
+wysoki drawdown (~14%)
+```
 
 ---
 
 ## NEXT STEP
 
-### Follow-through entry
-
-Zamiast:
-- wejście na breakout
-
-Zrobić:
-1. breakout
-2. kolejna świeca potwierdza
-3. entry
+- poprawa entry (panic only)
+- zmiana exit (time-based)
+- stabilizacja equity
 
 ---
 
-## START NEXT SESSION
+## START
 
 ```bash
-python -m src.strategies.momentum_trailing_intraday.backtest
+python -m src.strategies.momentum_trailing_intraday.backtest_reversal_pullback_v12_mtf_filtered
 ```
