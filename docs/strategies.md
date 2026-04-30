@@ -15,7 +15,26 @@ ranking → entry → exit
 Ranking jest liczony osobno dla każdej strategii.
 
 ---
+## 🔄 Reversal Pullback MTF (current main research direction)
 
+### Timeframes
+- 15m → setup (trend + breakout attempt)
+- 5m → pullback detection
+- 1m → entry timing (microstructure)
+
+### Strategy flow
+1. Identify oversold condition on 15m
+2. Detect breakout attempt
+3. Wait for controlled pullback on 5m
+4. Enter on 1m reversal signal
+
+### Notes
+- Strategy is **selective**, not universal
+- Works best on high-volatility symbols
+- Relies on few large winners
+
+### Status
+🚧 In active development (v12–v17 tested)
 ## 1. Momentum Trailing Intraday
 
 ### Cel
