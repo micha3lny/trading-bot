@@ -11,7 +11,22 @@ https://github.com/micha3lny/trading-bot
 ```
 
 ---
+## 📊 Data Layer Update (April 2026)
 
+### New datasets available
+- 1D candles
+- 15m candles
+- 5m candles
+- 1m candles (NEW)
+
+### Coverage
+- ~99 symbols
+- Full intraday coverage (90 days)
+
+### Impact
+- Enabled precise entry timing (v17+)
+- Allowed shift to MTF strategies
+- Significantly increased research depth
 ## 🚨 NOWY KIERUNEK (AKTUALNY)
 
 ### Strategia: Reversal Pullback (MTF)
