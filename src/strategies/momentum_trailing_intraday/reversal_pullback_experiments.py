@@ -6,11 +6,12 @@ It centralizes:
 - 5m pullback filters
 - 1m trigger filters
 - market/ADR filters
+- optional symbol and trend-regime filters
 - exit model
 
 Run examples:
 python -m src.strategies.momentum_trailing_intraday.reversal_pullback_experiments --config v22
-python -m src.strategies.momentum_trailing_intraday.reversal_pullback_experiments --config v25
+python -m src.strategies.momentum_trailing_intraday.reversal_pullback_experiments --config v26
 python -m src.strategies.momentum_trailing_intraday.reversal_pullback_experiments --list
 
 Research mode: all valid signals are included, no portfolio ranking.
@@ -20,7 +21,7 @@ No orders are placed.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 from src.strategies.momentum_trailing_intraday import backtest_reversal_pullback_v17_1m_entry as base
@@ -33,9 +34,11 @@ class ExperimentConfig:
 
     enable_market_regime_filter: bool = True
     min_avg_daily_range_pct: float = 5.0
+    excluded_symbols: frozenset[str] = field(default_factory=frozenset)
 
     min_daily_trend_pct: float = -999.0
     max_daily_trend_pct: float = -5.0
+    allowed_daily_trend_ranges: tuple[tuple[float, float], ...] | None = None
 
     min_breakout_pct: float = 1.0
     max_breakout_pct: float = 1.8
@@ -146,6 +149,28 @@ CONFIGS: dict[str, ExperimentConfig] = {
         min_1m_close_strength=0.80,
         max_1m_close_strength=0.90,
     ),
+    "v26": ExperimentConfig(
+        name="v26",
+        description="data-driven filters from segmentation: tight breakout/CS, trend pockets, symbol exclusions",
+        enable_market_regime_filter=False,
+        min_avg_daily_range_pct=4.5,
+        min_daily_trend_pct=-30.0,
+        max_daily_trend_pct=-3.0,
+        allowed_daily_trend_ranges=((-30.0, -20.0), (-5.0, -3.0)),
+        min_breakout_pct=1.00,
+        max_breakout_pct=1.50,
+        min_confirmation_close_strength=0.30,
+        max_confirmation_close_strength=1.00,
+        max_setup_entry_risk_pct=10.0,
+        min_pullback_from_confirmation_pct=0.20,
+        max_pullback_from_confirmation_pct=3.00,
+        max_5m_close_strength=0.75,
+        max_5m_entry_risk_pct=7.0,
+        min_1m_close_strength=0.80,
+        max_1m_close_strength=0.85,
+        max_1m_entry_risk_pct=7.0,
+        excluded_symbols=frozenset({"SMCI", "UUUU", "PINS", "SOUN", "RKLB", "TEAM", "SOXS"}),
+    ),
 }
 
 
@@ -180,7 +205,38 @@ def apply_config(config: ExperimentConfig) -> None:
     base.MAX_1M_CLOSE_BELOW_OR_HIGH_PCT = config.max_1m_close_below_or_high_pct
 
     patch_1m_upper_bound(config)
+    patch_trend_ranges(config)
+    patch_symbol_exclusions(config)
     patch_exit(config)
+
+
+def patch_trend_ranges(config: ExperimentConfig) -> None:
+    if config.allowed_daily_trend_ranges is None:
+        return
+
+    original_find_15m_setup: Callable = base.find_15m_setup
+
+    def find_15m_setup(session_15m, daily_trend_pct: float):
+        in_allowed_range = any(low <= daily_trend_pct <= high for low, high in config.allowed_daily_trend_ranges or ())
+        if not in_allowed_range:
+            return None
+        return original_find_15m_setup(session_15m, daily_trend_pct)
+
+    base.find_15m_setup = find_15m_setup
+
+
+def patch_symbol_exclusions(config: ExperimentConfig) -> None:
+    if not config.excluded_symbols:
+        return
+
+    original_backtest_symbol: Callable = base.backtest_symbol
+
+    def backtest_symbol(symbol, data_15m, data_5m, data_1m, daily, regimes):
+        if symbol in config.excluded_symbols:
+            return []
+        return original_backtest_symbol(symbol, data_15m, data_5m, data_1m, daily, regimes)
+
+    base.backtest_symbol = backtest_symbol
 
 
 def patch_1m_upper_bound(config: ExperimentConfig) -> None:
@@ -300,13 +356,18 @@ def print_config(config: ExperimentConfig) -> None:
     print("\nFilters:")
     print(f"- market_regime_filter={config.enable_market_regime_filter}")
     print(f"- ADR >= {config.min_avg_daily_range_pct:.2f}%")
+    print(f"- excluded_symbols={sorted(config.excluded_symbols)}")
     print(f"- daily_trend: {config.min_daily_trend_pct:.2f}% to {config.max_daily_trend_pct:.2f}%")
+    if config.allowed_daily_trend_ranges is not None:
+        print(f"- allowed_daily_trend_ranges={config.allowed_daily_trend_ranges}")
     print(f"- 15m breakout: {config.min_breakout_pct:.2f}% to {config.max_breakout_pct:.2f}%")
     print(f"- 15m confirmation CS: {config.min_confirmation_close_strength:.2f} to {config.max_confirmation_close_strength:.2f}")
     print(f"- 5m pullback: {config.min_pullback_from_confirmation_pct:.2f}% to {config.max_pullback_from_confirmation_pct:.2f}%")
     print(f"- 5m close_strength <= {config.max_5m_close_strength:.2f}")
+    print(f"- 5m entry_risk <= {config.max_5m_entry_risk_pct:.2f}%")
     upper_1m = "none" if config.max_1m_close_strength is None else f"{config.max_1m_close_strength:.2f}"
     print(f"- 1m close_strength: {config.min_1m_close_strength:.2f} to {upper_1m}")
+    print(f"- 1m entry_risk <= {config.max_1m_entry_risk_pct:.2f}%")
     print("\nExit:")
     print(f"- take_profit={config.take_profit_pct}")
     print(f"- stop_loss={config.stop_loss_pct:.2f}%")
