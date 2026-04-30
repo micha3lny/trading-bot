@@ -10,7 +10,7 @@ It centralizes:
 
 Run examples:
 python -m src.strategies.momentum_trailing_intraday.reversal_pullback_experiments --config v22
-python -m src.strategies.momentum_trailing_intraday.reversal_pullback_experiments --config scaled
+python -m src.strategies.momentum_trailing_intraday.reversal_pullback_experiments --config v25
 python -m src.strategies.momentum_trailing_intraday.reversal_pullback_experiments --list
 
 Research mode: all valid signals are included, no portfolio ranking.
@@ -113,6 +113,38 @@ CONFIGS: dict[str, ExperimentConfig] = {
         max_5m_close_strength=0.80,
         min_1m_close_strength=0.70,
         max_1m_close_strength=0.95,
+    ),
+    "v25": ExperimentConfig(
+        name="v25",
+        description="candidate compromise: enough entries without accepting the worst more_entries noise",
+        enable_market_regime_filter=False,
+        min_avg_daily_range_pct=4.5,
+        max_daily_trend_pct=-3.0,
+        min_breakout_pct=1.00,
+        max_breakout_pct=2.20,
+        min_confirmation_close_strength=0.30,
+        max_confirmation_close_strength=1.00,
+        min_pullback_from_confirmation_pct=0.20,
+        max_pullback_from_confirmation_pct=3.00,
+        max_5m_close_strength=0.75,
+        min_1m_close_strength=0.80,
+        max_1m_close_strength=0.90,
+    ),
+    "v25_quality": ExperimentConfig(
+        name="v25_quality",
+        description="quality-biased v25: stricter trend/ADR while keeping market regime disabled",
+        enable_market_regime_filter=False,
+        min_avg_daily_range_pct=5.0,
+        max_daily_trend_pct=-5.0,
+        min_breakout_pct=1.00,
+        max_breakout_pct=2.20,
+        min_confirmation_close_strength=0.35,
+        max_confirmation_close_strength=0.95,
+        min_pullback_from_confirmation_pct=0.25,
+        max_pullback_from_confirmation_pct=2.75,
+        max_5m_close_strength=0.70,
+        min_1m_close_strength=0.80,
+        max_1m_close_strength=0.90,
     ),
 }
 
