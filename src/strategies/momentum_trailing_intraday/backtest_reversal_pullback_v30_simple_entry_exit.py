@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from dataclasses import replace
 
 import pandas as pd
 
 from src.strategies.momentum_trailing_intraday import backtest as bt
+from src.strategies.momentum_trailing_intraday.analysis import analyze, export_trades
+from src.strategies.momentum_trailing_intraday.backtest_reversal_pullback_v17_1m_entry import summarize_research
 from src.strategies.momentum_trailing_intraday.costs import apply_costs_to_trades
 from src.strategies.momentum_trailing_intraday.reversal_pullback_entry_scan_v29_simple import (
     PRESETS,
@@ -37,16 +38,7 @@ TIME_EXIT_MIN_PNL_PCT = 0.50
 TRAILING_ACTIVATION_PROFIT_PCT = 1.50
 TRAILING_STOP_PCT = 1.00
 
-NOISY_SYMBOLS = {
-    "SOXL",
-    "SOXS",
-    "TQQQ",
-    "SQQQ",
-}
-
-
-class V30Trade(bt.BacktestTrade):
-    pass
+NOISY_SYMBOLS = {"SOXL", "SOXS", "TQQQ", "SQQQ"}
 
 
 def build_candidate_session_map(candidates: list[SimpleEntryCandidate]):
@@ -94,21 +86,7 @@ def simulate_v22_exit(symbol: str, session: pd.DataFrame, candidate: SimpleEntry
     daily_trend = candidate.daily_trend_pct
 
     if bars_after_entry.empty:
-        return bt.BacktestTrade(
-            symbol,
-            session_date,
-            entry_time,
-            entry_time,
-            entry_price,
-            entry_price,
-            0.0,
-            "v30 no bars after entry",
-            breakout_proxy,
-            close_strength,
-            entry_risk,
-            daily_trend,
-            setup_type,
-        )
+        return bt.BacktestTrade(symbol, session_date, entry_time, entry_time, entry_price, entry_price, 0.0, "v30 no bars after entry", breakout_proxy, close_strength, entry_risk, daily_trend, setup_type)
 
     last_bar = bars_after_entry.iloc[-1]
     for bars_held, (_, bar) in enumerate(bars_after_entry.iterrows(), start=1):
@@ -150,7 +128,7 @@ def run_backtest(preset: SimpleEntryPreset, exclude_noisy: bool):
     if exclude_noisy:
         candidates = [candidate for candidate in candidates if candidate.symbol not in NOISY_SYMBOLS]
 
-    data_15m, data_5m, data_1m, daily_data = load_all_data()
+    _data_15m, _data_5m, data_1m, _daily_data = load_all_data()
     candidates_by_symbol_day = build_candidate_session_map(candidates)
 
     trades = []
@@ -169,13 +147,14 @@ def run_backtest(preset: SimpleEntryPreset, exclude_noisy: bool):
     return counters, candidates, candidates_by_day, net_trades
 
 
-def summarize_inputs(counters: Counter, candidates: list[SimpleEntryCandidate], candidates_by_day, exclude_noisy: bool) -> None:
+def summarize_inputs(candidates: list[SimpleEntryCandidate], exclude_noisy: bool) -> None:
     print("\nEntry candidate pool")
     print(f"Candidates after symbol filter: {len(candidates)}")
-    print(f"Active days: {len(set(candidate.session_date for candidate in candidates))}")
-    if candidates:
+    active_days = len(set(candidate.session_date for candidate in candidates))
+    print(f"Active days: {active_days}")
+    if candidates and active_days:
         max_per_day = max(Counter(candidate.session_date for candidate in candidates).values())
-        avg_per_active_day = len(candidates) / len(set(candidate.session_date for candidate in candidates))
+        avg_per_active_day = len(candidates) / active_days
         print(f"Max candidates on one day: {max_per_day}")
         print(f"Avg candidates per active day: {avg_per_active_day:.2f}")
     print(f"Exclude noisy ETFs: {exclude_noisy}")
@@ -202,12 +181,12 @@ def main() -> None:
     print(f"- time_exit_bars={TIME_EXIT_BARS}, min_pnl={TIME_EXIT_MIN_PNL_PCT:.2f}%")
     print(f"- trailing_activation={TRAILING_ACTIVATION_PROFIT_PCT:.2f}%, trailing_stop={TRAILING_STOP_PCT:.2f}%")
 
-    counters, candidates, candidates_by_day, trades = run_backtest(preset, args.exclude_noisy)
-    summarize_inputs(counters, candidates, candidates_by_day, args.exclude_noisy)
+    _counters, candidates, _candidates_by_day, trades = run_backtest(preset, args.exclude_noisy)
+    summarize_inputs(candidates, args.exclude_noisy)
 
-    bt.summarize_research(trades)
-    df = bt.export_trades(trades)
-    bt.analyze(df)
+    summarize_research(trades)
+    df = export_trades(trades)
+    analyze(df)
 
 
 if __name__ == "__main__":
