@@ -16,19 +16,15 @@ python -m src.strategies.momentum_trailing_intraday.reversal_pullback_entry_opti
 from __future__ import annotations
 
 import argparse
-from collections import Counter
-from dataclasses import asdict
 from pathlib import Path
 
 import pandas as pd
 
-from src.strategies.momentum_trailing_intraday.analysis import export_trades
 from src.strategies.momentum_trailing_intraday.backtest_reversal_pullback_v30_simple_entry_exit import (
     NOISY_SYMBOLS,
     build_candidate_session_map,
     simulate_v22_exit,
 )
-from src.strategies.momentum_trailing_intraday.costs import apply_costs_to_trades
 from src.strategies.momentum_trailing_intraday.reversal_pullback_entry_audit import (
     find_entry_position,
     pre_entry_stats,
@@ -42,6 +38,10 @@ from src.strategies.momentum_trailing_intraday.reversal_pullback_entry_scan_v29_
 )
 
 MIN_SAMPLE_DEFAULT = 20
+
+
+def get_exit_reason(trade) -> str:
+    return str(getattr(trade, "exit_reason", getattr(trade, "reason", "unknown")))
 
 
 def simulate_all_candidates(candidates: list[SimpleEntryCandidate], data_1m: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -81,7 +81,7 @@ def simulate_all_candidates(candidates: list[SimpleEntryCandidate], data_1m: dic
                 "cs_1m": candidate.entry_close_strength_1m,
                 "entry_risk_pct": candidate.entry_risk_pct_1m,
                 "pnl_pct": trade.pnl_pct,
-                "exit_reason": trade.reason,
+                "exit_reason": get_exit_reason(trade),
             }
             for minutes in (5, 15, 30):
                 row.update(pre_entry_stats(session_1m, entry_idx, minutes))
@@ -101,6 +101,7 @@ def summarize_subset(df: pd.DataFrame, name: str) -> dict:
             "avg_per_active_day": 0.0,
             "win_rate": 0.0,
             "avg_pnl": 0.0,
+            "median_pnl": 0.0,
             "total_pnl": 0.0,
             "max_loss": 0.0,
             "max_win": 0.0,
