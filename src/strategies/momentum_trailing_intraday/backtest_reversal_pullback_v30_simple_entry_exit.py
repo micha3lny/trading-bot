@@ -1,4 +1,4 @@
-"""v30/v31/v32: simple entry scanner + v22 smart exit.
+"""v30/v31/v32/v33: simple entry scanner + v22 smart exit.
 
 v30:
 - use v29 simple 5m/1m entry algorithm
@@ -13,12 +13,18 @@ v32 context mode:
 - surgical refinement of v31 based on v31 segmentation
 - trend pocket -5% to -3%
 - pullback/breakout proxy >= 1.5%
+
+v33 context mode:
+- scaled version of v32 for larger sample size
+- trend pocket -6% to -3%
+- pullback/breakout proxy >= 1.2%
 - no artificial daily cap
 
 Run:
 python -m src.strategies.momentum_trailing_intraday.backtest_reversal_pullback_v30_simple_entry_exit --preset quality
 python -m src.strategies.momentum_trailing_intraday.backtest_reversal_pullback_v30_simple_entry_exit --preset quality --v31-context
 python -m src.strategies.momentum_trailing_intraday.backtest_reversal_pullback_v30_simple_entry_exit --preset quality --v32-context
+python -m src.strategies.momentum_trailing_intraday.backtest_reversal_pullback_v30_simple_entry_exit --preset quality --v33-context
 """
 
 from __future__ import annotations
@@ -61,6 +67,13 @@ V32_MAX_DAILY_TREND_PCT = -3.0
 V32_MIN_ENTRY_RISK_PCT = 4.0
 V32_MIN_1M_CLOSE_STRENGTH = 0.80
 V32_MIN_PULLBACK_PROXY_PCT = 1.50
+
+# v33 scaled context: wider than v32, still much cleaner than v30/v31.
+V33_MIN_DAILY_TREND_PCT = -6.0
+V33_MAX_DAILY_TREND_PCT = -3.0
+V33_MIN_ENTRY_RISK_PCT = 4.0
+V33_MIN_1M_CLOSE_STRENGTH = 0.80
+V33_MIN_PULLBACK_PROXY_PCT = 1.20
 
 
 def build_candidate_session_map(candidates: list[SimpleEntryCandidate]):
@@ -109,7 +122,23 @@ def passes_v32_context(candidate: SimpleEntryCandidate) -> bool:
     return True
 
 
-def candidate_setup_type(candidate: SimpleEntryCandidate, v32_context: bool, v31_context: bool) -> str:
+def passes_v33_context(candidate: SimpleEntryCandidate) -> bool:
+    if candidate.symbol in NOISY_SYMBOLS:
+        return False
+    if not (V33_MIN_DAILY_TREND_PCT <= candidate.daily_trend_pct <= V33_MAX_DAILY_TREND_PCT):
+        return False
+    if candidate.entry_risk_pct_1m < V33_MIN_ENTRY_RISK_PCT:
+        return False
+    if candidate.entry_close_strength_1m < V33_MIN_1M_CLOSE_STRENGTH:
+        return False
+    if candidate.pullback_from_recent_5m_high_pct < V33_MIN_PULLBACK_PROXY_PCT:
+        return False
+    return True
+
+
+def candidate_setup_type(candidate: SimpleEntryCandidate, v31_context: bool, v32_context: bool, v33_context: bool) -> str:
+    if v33_context and passes_v33_context(candidate):
+        return "v33_context_entry"
     if v32_context and passes_v32_context(candidate):
         return "v32_context_entry"
     if v31_context and passes_v31_context(candidate):
@@ -117,7 +146,7 @@ def candidate_setup_type(candidate: SimpleEntryCandidate, v32_context: bool, v31
     return "v30_simple_entry"
 
 
-def simulate_v22_exit(symbol: str, session: pd.DataFrame, candidate: SimpleEntryCandidate, v31_context: bool, v32_context: bool):
+def simulate_v22_exit(symbol: str, session: pd.DataFrame, candidate: SimpleEntryCandidate, v31_context: bool, v32_context: bool, v33_context: bool):
     entry_position = find_entry_position(session, candidate.entry_time)
     if entry_position is None:
         return None
@@ -135,7 +164,7 @@ def simulate_v22_exit(symbol: str, session: pd.DataFrame, candidate: SimpleEntry
     trailing_activated = False
     bars_after_entry = session.iloc[entry_position + 1 :]
 
-    setup_type = candidate_setup_type(candidate, v32_context, v31_context)
+    setup_type = candidate_setup_type(candidate, v31_context, v32_context, v33_context)
     breakout_proxy = candidate.pullback_from_recent_5m_high_pct
     close_strength = candidate.entry_close_strength_1m
     entry_risk = candidate.entry_risk_pct_1m
@@ -179,7 +208,7 @@ def simulate_v22_exit(symbol: str, session: pd.DataFrame, candidate: SimpleEntry
     return bt.BacktestTrade(symbol, session_date, entry_time, str(last_bar["date"]), entry_price, exit_price, pnl_pct, "v30 end of session", breakout_proxy, close_strength, entry_risk, daily_trend, setup_type)
 
 
-def run_backtest(preset: SimpleEntryPreset, exclude_noisy: bool, v31_context: bool, v32_context: bool):
+def run_backtest(preset: SimpleEntryPreset, exclude_noisy: bool, v31_context: bool, v32_context: bool, v33_context: bool):
     _counters, candidates, candidates_by_day = scan_entries(preset)
 
     if exclude_noisy:
@@ -188,6 +217,8 @@ def run_backtest(preset: SimpleEntryPreset, exclude_noisy: bool, v31_context: bo
         candidates = [candidate for candidate in candidates if passes_v31_context(candidate)]
     if v32_context:
         candidates = [candidate for candidate in candidates if passes_v32_context(candidate)]
+    if v33_context:
+        candidates = [candidate for candidate in candidates if passes_v33_context(candidate)]
 
     _data_15m, _data_5m, data_1m, _daily_data = load_all_data()
     candidates_by_symbol_day = build_candidate_session_map(candidates)
@@ -200,7 +231,7 @@ def run_backtest(preset: SimpleEntryPreset, exclude_noisy: bool, v31_context: bo
         if session_1m.empty:
             continue
         for candidate in day_candidates:
-            trade = simulate_v22_exit(symbol, session_1m, candidate, v31_context, v32_context)
+            trade = simulate_v22_exit(symbol, session_1m, candidate, v31_context, v32_context, v33_context)
             if trade is not None:
                 trades.append(trade)
 
@@ -208,7 +239,7 @@ def run_backtest(preset: SimpleEntryPreset, exclude_noisy: bool, v31_context: bo
     return candidates, candidates_by_day, net_trades
 
 
-def summarize_inputs(candidates: list[SimpleEntryCandidate], exclude_noisy: bool, v31_context: bool, v32_context: bool) -> None:
+def summarize_inputs(candidates: list[SimpleEntryCandidate], exclude_noisy: bool, v31_context: bool, v32_context: bool, v33_context: bool) -> None:
     print("\nEntry candidate pool")
     print(f"Candidates after filters: {len(candidates)}")
     active_days = len(set(candidate.session_date for candidate in candidates))
@@ -221,6 +252,7 @@ def summarize_inputs(candidates: list[SimpleEntryCandidate], exclude_noisy: bool
     print(f"Exclude noisy ETFs: {exclude_noisy}")
     print(f"v31 context filters: {v31_context}")
     print(f"v32 context filters: {v32_context}")
+    print(f"v33 context filters: {v33_context}")
     if v31_context:
         print(f"- v31 daily_trend: {V31_MIN_DAILY_TREND_PCT:.2f}% to {V31_MAX_DAILY_TREND_PCT:.2f}%")
         print(f"- v31 entry_risk >= {V31_MIN_ENTRY_RISK_PCT:.2f}%")
@@ -230,7 +262,12 @@ def summarize_inputs(candidates: list[SimpleEntryCandidate], exclude_noisy: bool
         print(f"- v32 entry_risk >= {V32_MIN_ENTRY_RISK_PCT:.2f}%")
         print(f"- v32 1m close_strength >= {V32_MIN_1M_CLOSE_STRENGTH:.2f}")
         print(f"- v32 pullback/breakout proxy >= {V32_MIN_PULLBACK_PROXY_PCT:.2f}%")
-    if v31_context or v32_context:
+    if v33_context:
+        print(f"- v33 daily_trend: {V33_MIN_DAILY_TREND_PCT:.2f}% to {V33_MAX_DAILY_TREND_PCT:.2f}%")
+        print(f"- v33 entry_risk >= {V33_MIN_ENTRY_RISK_PCT:.2f}%")
+        print(f"- v33 1m close_strength >= {V33_MIN_1M_CLOSE_STRENGTH:.2f}")
+        print(f"- v33 pullback/breakout proxy >= {V33_MIN_PULLBACK_PROXY_PCT:.2f}%")
+    if v31_context or v32_context or v33_context:
         print(f"- excluded symbols: {sorted(NOISY_SYMBOLS)}")
 
     by_symbol = Counter(candidate.symbol for candidate in candidates)
@@ -245,13 +282,15 @@ def main() -> None:
     parser.add_argument("--exclude-noisy", action="store_true", help="Exclude SOXL/SOXS/TQQQ/SQQQ/UVXY/SPXS/SPXL")
     parser.add_argument("--v31-context", action="store_true", help="Apply v31 context filters learned from v30 diagnostics")
     parser.add_argument("--v32-context", action="store_true", help="Apply v32 refined context filters from v31 segmentation")
+    parser.add_argument("--v33-context", action="store_true", help="Apply v33 scaled context filters for larger sample size")
     args = parser.parse_args()
 
-    if args.v31_context and args.v32_context:
-        raise SystemExit("Use only one context mode: --v31-context or --v32-context")
+    context_modes = sum([args.v31_context, args.v32_context, args.v33_context])
+    if context_modes > 1:
+        raise SystemExit("Use only one context mode: --v31-context, --v32-context, or --v33-context")
 
     preset = PRESETS[args.preset]
-    mode = "v32 context" if args.v32_context else "v31 context" if args.v31_context else "v30 simple"
+    mode = "v33 context" if args.v33_context else "v32 context" if args.v32_context else "v31 context" if args.v31_context else "v30 simple"
     print(f"\nExperiment: {mode} entry + v22 smart exit")
     print(f"Entry preset: {preset.name} - {preset.description}")
     print("Exit model:")
@@ -260,8 +299,14 @@ def main() -> None:
     print(f"- time_exit_bars={TIME_EXIT_BARS}, min_pnl={TIME_EXIT_MIN_PNL_PCT:.2f}%")
     print(f"- trailing_activation={TRAILING_ACTIVATION_PROFIT_PCT:.2f}%, trailing_stop={TRAILING_STOP_PCT:.2f}%")
 
-    candidates, _candidates_by_day, trades = run_backtest(preset, args.exclude_noisy, args.v31_context, args.v32_context)
-    summarize_inputs(candidates, args.exclude_noisy, args.v31_context, args.v32_context)
+    candidates, _candidates_by_day, trades = run_backtest(
+        preset,
+        args.exclude_noisy,
+        args.v31_context,
+        args.v32_context,
+        args.v33_context,
+    )
+    summarize_inputs(candidates, args.exclude_noisy, args.v31_context, args.v32_context, args.v33_context)
 
     summarize_research(trades)
     df = export_trades(trades)
