@@ -71,8 +71,6 @@ def run_backtest(preset_name: str):
         for candidate in day_candidates:
             trade = simulate_v22_exit(symbol, session_1m, candidate, False, False, False)
             if trade is not None:
-                # Keep the strategy label explicit in downstream exports/analysis.
-                trade.setup_type = "v34_context_entry"
                 trades.append(trade)
 
     net_trades = apply_costs_to_trades(trades)
