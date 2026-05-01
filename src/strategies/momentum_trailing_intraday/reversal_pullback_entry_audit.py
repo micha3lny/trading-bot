@@ -3,18 +3,16 @@
 This is NOT a strategy and does not optimize filters.
 It answers whether current entry candidates are early, late, or chasing the bounce.
 
-For each v29 simple entry candidate it reports:
+For each entry candidate it reports:
 - entry timestamp and price
 - 1m move before entry over 5/15/30 minutes
 - MFE/MAE after entry over 5/15/30/60 minutes
-- close-to-high-after-entry ratio: how much of the future move was already gone
 - whether the first 15/30 minutes after entry went favorable or adverse
 
 Run:
 python -m src.strategies.momentum_trailing_intraday.reversal_pullback_entry_audit --preset quality
-python -m src.strategies.momentum_trailing_intraday.reversal_pullback_entry_audit --preset balanced
-python -m src.strategies.momentum_trailing_intraday.reversal_pullback_entry_audit --preset quality --v33-context
 python -m src.strategies.momentum_trailing_intraday.reversal_pullback_entry_audit --preset quality --v35-context
+python -m src.strategies.momentum_trailing_intraday.reversal_pullback_entry_audit --preset quality --v36-context
 """
 
 from __future__ import annotations
@@ -30,6 +28,7 @@ from src.strategies.momentum_trailing_intraday.backtest_reversal_pullback_v30_si
     passes_v33_context,
 )
 from src.strategies.momentum_trailing_intraday.backtest_reversal_pullback_v35_context import passes_v35_context
+from src.strategies.momentum_trailing_intraday.backtest_reversal_pullback_v36_early_trigger import scan_v36_entries
 from src.strategies.momentum_trailing_intraday.reversal_pullback_entry_scan_v29_simple import (
     PRESETS,
     SimpleEntryCandidate,
@@ -117,8 +116,6 @@ def classify_timing(row: dict) -> str:
     mae_15 = row["mae_15m_pct"]
     mfe_60 = row["mfe_60m_pct"]
 
-    # Entry is likely late if price already bounced materially from recent low
-    # and future upside is smaller than the bounce already captured before entry.
     if pre_15 >= 1.0 and mfe_15 < pre_15 * 0.75:
         return "late_after_bounce"
     if mae_15 <= -1.0 and mfe_15 < 0.75:
@@ -128,22 +125,27 @@ def classify_timing(row: dict) -> str:
     return "weak_followthrough"
 
 
-def filter_candidates(candidates: list[SimpleEntryCandidate], mode: str) -> list[SimpleEntryCandidate]:
-    if mode == "all":
-        return candidates
+def load_candidates_for_mode(preset_name: str, mode: str):
+    if mode == "v36":
+        _counters, candidates, data_1m = scan_v36_entries(preset_name)
+        return candidates, data_1m
+
+    _counters, candidates, _by_day = scan_entries(PRESETS[preset_name])
     if mode == "exclude_noisy":
-        return [candidate for candidate in candidates if candidate.symbol not in NOISY_SYMBOLS]
-    if mode == "v33":
-        return [candidate for candidate in candidates if passes_v33_context(candidate)]
-    if mode == "v35":
-        return [candidate for candidate in candidates if passes_v35_context(candidate)]
-    raise ValueError(f"Unknown mode: {mode}")
+        candidates = [candidate for candidate in candidates if candidate.symbol not in NOISY_SYMBOLS]
+    elif mode == "v33":
+        candidates = [candidate for candidate in candidates if passes_v33_context(candidate)]
+    elif mode == "v35":
+        candidates = [candidate for candidate in candidates if passes_v35_context(candidate)]
+    elif mode != "all":
+        raise ValueError(f"Unknown mode: {mode}")
+
+    _data_15m, _data_5m, data_1m, _daily_data = load_all_data()
+    return candidates, data_1m
 
 
 def audit_candidates(preset_name: str, mode: str) -> pd.DataFrame:
-    _counters, candidates, _by_day = scan_entries(PRESETS[preset_name])
-    candidates = filter_candidates(candidates, mode)
-    _data_15m, _data_5m, data_1m, _daily_data = load_all_data()
+    candidates, data_1m = load_candidates_for_mode(preset_name, mode)
 
     rows = []
     for candidate in candidates:
@@ -245,10 +247,10 @@ def summarize_audit(df: pd.DataFrame) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--preset", default="quality", choices=sorted(PRESETS))
-    parser.add_argument("--mode", default="all", choices=["all", "exclude_noisy", "v33", "v35"])
-    # Backward-compatible convenience flags.
+    parser.add_argument("--mode", default="all", choices=["all", "exclude_noisy", "v33", "v35", "v36"])
     parser.add_argument("--v33-context", action="store_true")
     parser.add_argument("--v35-context", action="store_true")
+    parser.add_argument("--v36-context", action="store_true")
     args = parser.parse_args()
 
     mode = args.mode
@@ -256,6 +258,8 @@ def main() -> None:
         mode = "v33"
     if args.v35_context:
         mode = "v35"
+    if args.v36_context:
+        mode = "v36"
 
     print(f"\nEntry audit preset={args.preset} mode={mode}")
     df = audit_candidates(args.preset, mode)
