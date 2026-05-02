@@ -1,5 +1,30 @@
 # Project Status / Start Here
 
+## 🔥 Current Focus: Intraday Reversal Pullback (v29–v38)
+
+### Status
+Research paused – best candidate identified
+
+### Best result (v38 strict)
+- signals: 10
+- win rate: 90%
+- avg pnl: +0.78%
+- max DD: -1.20%
+
+### More robust profile (v38 sample20)
+- signals: 20
+- win rate: 70%
+- avg pnl: +0.23%
+
+### Key insight
+Edge exists only in narrow high-quality segment.
+Loosening filters introduces noise and stop-loss clusters.
+
+### Decision
+Strategy preserved as intraday module.
+Further validation required on:
+- larger dataset
+- more volatile markets
 ## Aktualny status
 
 Projekt: `trading-bot`
