@@ -1,5 +1,38 @@
 # Trading Strategies
 
+## Intraday: Reversal Pullback (v29–v38)
+
+### Idea
+Trade intraday reversal after controlled pullback on red day.
+
+### Entry (best segment)
+- daily trend: -7% to -3%
+- pullback: 1.2%–3%
+- 1m close strength: 0.80–0.90
+- entry risk: 4–8%
+- avoid extended bounce
+
+### Exit
+- SL: 1%
+- TP: 3%
+- trailing: 1% after 1.5%
+- time exit: 60 bars
+
+### What works
+- controlled selloff
+- strong reclaim
+- good timing (not early / not late)
+
+### What fails
+- weak follow-through
+- late entries
+- noisy tickers
+
+### Profiles
+- strict → high edge, small sample
+- sample20 → balanced (recommended reference)
+- scaled → too noisy
+- 
 ## Cel dokumentu
 
 Ten dokument opisuje strategie planowane w systemie. Każda strategia składa się z trzech części:
