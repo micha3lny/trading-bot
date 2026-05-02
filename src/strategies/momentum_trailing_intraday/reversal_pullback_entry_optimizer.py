@@ -1,21 +1,16 @@
 """Data-driven entry optimizer for reversal pullback research.
 
-This script stops guessing filters manually. It:
-1. Builds a broad candidate pool from the v29 simple scanner.
-2. Simulates the current v22/v30 exit on every candidate.
-3. Adds timing audit features: pre-entry bounce, future MFE/MAE.
-4. Runs a grid search over entry filters.
-5. Prints the best filter sets by average PnL, total PnL, win rate, and sample size.
+Fast mode is now the default. It avoids huge brute-force grids and finishes quickly.
 
 Run:
 python -m src.strategies.momentum_trailing_intraday.reversal_pullback_entry_optimizer --preset quality
-python -m src.strategies.momentum_trailing_intraday.reversal_pullback_entry_optimizer --preset balanced
-python -m src.strategies.momentum_trailing_intraday.reversal_pullback_entry_optimizer --preset loose
+python -m src.strategies.momentum_trailing_intraday.reversal_pullback_entry_optimizer --preset quality --min-sample 10
 """
 
 from __future__ import annotations
 
 import argparse
+from itertools import product
 from pathlib import Path
 
 import pandas as pd
@@ -125,15 +120,14 @@ def summarize_subset(df: pd.DataFrame, name: str) -> dict:
 
 
 def apply_filter(df: pd.DataFrame, params: dict) -> pd.DataFrame:
-    out = df.copy()
-
-    if params.get("exclude_noisy", False):
+    out = df
+    if params.get("exclude_noisy", True):
         out = out[~out["symbol"].isin(NOISY_SYMBOLS)]
     excluded_symbols = params.get("excluded_symbols") or set()
     if excluded_symbols:
         out = out[~out["symbol"].isin(excluded_symbols)]
 
-    out = out[
+    return out[
         (out["daily_trend_pct"] >= params["trend_min"])
         & (out["daily_trend_pct"] <= params["trend_max"])
         & (out["pullback_proxy_pct"] >= params["pullback_min"])
@@ -147,49 +141,64 @@ def apply_filter(df: pd.DataFrame, params: dict) -> pd.DataFrame:
         & (out["distance_below_or_high_pct"] <= params["below_or_max"])
         & (out["pre_15m_low_to_entry_pct"] <= params["pre15_bounce_max"])
     ]
-    return out
+
+
+def build_fast_grid():
+    return product(
+        [(-30, -3), (-15, -3), (-10, -3), (-7, -3), (-5, -3)],
+        [(0.8, 3.0), (1.0, 3.0), (1.2, 3.0), (1.5, 3.0), (2.0, 2.5)],
+        [(0.70, 0.90), (0.75, 0.90), (0.80, 0.90), (0.70, 0.85), (0.75, 0.85)],
+        [(0.0, 10.0), (2.0, 10.0), (4.0, 8.0), (5.0, 8.0), (6.0, 7.0)],
+        [0.8, 1.0, 1.2, 1.5, 2.0, 999.0],
+        [0.70, 0.75, 0.80, 1.00],
+        [(0.0, 5.0), (0.25, 3.5), (0.25, 2.5)],
+        [set(), {"UUUU"}, {"UUUU", "RIOT", "RXRX", "JOBY", "DNA"}],
+    )
 
 
 def grid_search(df: pd.DataFrame, min_sample: int) -> pd.DataFrame:
     results = []
+    total = 5 * 5 * 5 * 5 * 6 * 4 * 3 * 3
+    checked = 0
+    print(f"\nRunning fast grid search: {total} combinations")
 
-    base_excluded_sets = [
-        set(),
-        {"UUUU"},
-        {"UUUU", "RIOT", "RXRX", "JOBY", "DNA"},
-    ]
+    for (
+        (trend_min, trend_max),
+        (pullback_min, pullback_max),
+        (cs_min, cs_max),
+        (risk_min, risk_max),
+        pre15_bounce_max,
+        cs5_max,
+        (below_or_min, below_or_max),
+        excluded_symbols,
+    ) in build_fast_grid():
+        checked += 1
+        if checked % 5000 == 0:
+            print(f"Grid progress: {checked}/{total}, results={len(results)}")
 
-    for trend_min, trend_max in [(-30, -3), (-15, -3), (-10, -3), (-7, -3), (-6, -3), (-5, -3)]:
-        for pullback_min, pullback_max in [(0.8, 4.0), (1.0, 4.0), (1.2, 4.0), (1.5, 4.0), (2.0, 4.0), (1.5, 3.0), (2.0, 3.0)]:
-            for cs_min, cs_max in [(0.50, 0.90), (0.65, 0.90), (0.75, 0.90), (0.80, 0.90), (0.50, 0.80), (0.65, 0.80), (0.70, 0.85)]:
-                for risk_min, risk_max in [(0.0, 10.0), (2.0, 10.0), (4.0, 10.0), (5.0, 10.0), (4.0, 7.0), (5.0, 8.0)]:
-                    for pre15_bounce_max in [0.8, 1.0, 1.2, 1.5, 2.0, 999.0]:
-                        for cs5_max in [0.70, 0.75, 0.80, 1.00]:
-                            for below_or_min, below_or_max in [(0.0, 5.0), (0.25, 3.5), (0.25, 2.5), (0.5, 3.0)]:
-                                for excluded_symbols in base_excluded_sets:
-                                    params = {
-                                        "trend_min": trend_min,
-                                        "trend_max": trend_max,
-                                        "pullback_min": pullback_min,
-                                        "pullback_max": pullback_max,
-                                        "cs_min": cs_min,
-                                        "cs_max": cs_max,
-                                        "risk_min": risk_min,
-                                        "risk_max": risk_max,
-                                        "pre15_bounce_max": pre15_bounce_max,
-                                        "cs5_max": cs5_max,
-                                        "below_or_min": below_or_min,
-                                        "below_or_max": below_or_max,
-                                        "exclude_noisy": True,
-                                        "excluded_symbols": excluded_symbols,
-                                    }
-                                    subset = apply_filter(df, params)
-                                    if len(subset) < min_sample:
-                                        continue
-                                    summary = summarize_subset(subset, "grid")
-                                    summary.update({k: v for k, v in params.items() if k != "excluded_symbols"})
-                                    summary["excluded_symbols"] = ",".join(sorted(excluded_symbols))
-                                    results.append(summary)
+        params = {
+            "trend_min": trend_min,
+            "trend_max": trend_max,
+            "pullback_min": pullback_min,
+            "pullback_max": pullback_max,
+            "cs_min": cs_min,
+            "cs_max": cs_max,
+            "risk_min": risk_min,
+            "risk_max": risk_max,
+            "pre15_bounce_max": pre15_bounce_max,
+            "cs5_max": cs5_max,
+            "below_or_min": below_or_min,
+            "below_or_max": below_or_max,
+            "exclude_noisy": True,
+            "excluded_symbols": excluded_symbols,
+        }
+        subset = apply_filter(df, params)
+        if len(subset) < min_sample:
+            continue
+        summary = summarize_subset(subset, "grid")
+        summary.update({k: v for k, v in params.items() if k != "excluded_symbols"})
+        summary["excluded_symbols"] = ",".join(sorted(excluded_symbols))
+        results.append(summary)
 
     if not results:
         return pd.DataFrame()
@@ -199,6 +208,7 @@ def grid_search(df: pd.DataFrame, min_sample: int) -> pd.DataFrame:
         + results_df["win_rate"] * 0.05
         + results_df["total_pnl"] * 0.03
         - results_df["stop_rate"] * 0.03
+        + results_df["active_days"] * 0.02
     )
     return results_df.sort_values(["score", "avg_pnl", "total_pnl"], ascending=False)
 
@@ -288,7 +298,6 @@ def main() -> None:
     if not results_df.empty:
         best = results_df.iloc[0]
         print("\nBest candidate command idea:")
-        print("Create next strategy from these ranges:")
         for key in [
             "trend_min",
             "trend_max",
