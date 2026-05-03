@@ -1,206 +1,185 @@
 # Trading Strategies
 
-## Intraday: Reversal Pullback (v29–v38)
+## 🎯 Current strategy direction
+
+System is evolving into **two separate strategy families**:
+
+1. Reversal Pullback (intraday / controlled bounce)
+2. Big Momentum Continuation (new, main focus)
+
+These are fundamentally different and must not be mixed.
+
+---
+
+## 1. Reversal Pullback (v29–v39)
 
 ### Idea
-Trade intraday reversal after controlled pullback on red day.
 
-### Entry (best segment)
+Trade intraday reversal after controlled pullback on a red day.
+
+### Entry (best segment from optimizer)
+
 - daily trend: -7% to -3%
 - pullback: 1.2%–3%
 - 1m close strength: 0.80–0.90
-- entry risk: 4–8%
+- entry risk: 4%–8%
 - avoid extended bounce
 
-### Exit
-- SL: 1%
-- TP: 3%
-- trailing: 1% after 1.5%
-- time exit: 60 bars
+### Exit (typical baseline)
+
+- stop-loss: 1%–2%
+- take-profit: 2%–3%
+- trailing: ~1% after 1%–1.5% move
 
 ### What works
+
 - controlled selloff
-- strong reclaim
+- clean reclaim
 - good timing (not early / not late)
 
 ### What fails
+
 - weak follow-through
 - late entries
-- noisy tickers
+- noisy / low-quality tickers
 
 ### Profiles
-- strict → high edge, small sample
-- sample20 → balanced (recommended reference)
-- scaled → too noisy
-- 
-## Cel dokumentu
 
-Ten dokument opisuje strategie planowane w systemie. Każda strategia składa się z trzech części:
+- strict → high edge, very small sample
+- sample20 → balanced (reference)
+- scaled → too noisy
+
+### Status
+
+🟡 Preserved, not primary focus
+
+This strategy captures a **specific niche pattern** and works, but it does not capture the largest historical winners.
+
+---
+
+## 2. Reversal Pullback Overnight (v39)
+
+### Idea
+
+Same entry as intraday reversal, but allow holding overnight.
+
+### Key parameters tested
+
+- larger stop-loss (1.5%–2%)
+- delayed trailing activation
+- max hold: 2–5 days
+
+### Observations
+
+- no clear improvement vs intraday version yet
+- stop-loss clusters still dominate losses
+- holding overnight does not automatically increase edge
+
+### Status
+
+🟡 Experimental
+
+---
+
+## 3. 🚀 Big Momentum Continuation (NEW MAIN FOCUS)
+
+### Goal
+
+Learn how to capture **large daily winners (>=5% / >=10%)** that appear in historical data.
+
+### Key insight
+
+From audits and scans:
+
+- most 10%+ days are NOT reversal pullback days
+- they are:
+  - opening range breakouts
+  - momentum expansion days
+  - gap + continuation
+
+### Typical pattern (based on available data)
+
+- first 5–15 minutes already move several percent
+- first 30 minutes often reach ~10% move
+- pullbacks after +3% or +5% are shallow but tradable
+- holding to close captures much more than tight trailing
+
+### Candidate entry types
+
+1. OR5 breakout (first 5m high break)
+2. OR15 breakout
+3. early pullback after +3%
+4. pullback after +5%
+
+### Candidate exits
+
+- loose trailing (e.g. 15% activation / 10% trail)
+- time-based exit
+- hold-to-close
+
+### Why current system misses them
+
+- scanner looks for pullback on red days
+- does not consider momentum continuation
+- does not trigger on early breakout
+
+### Required data
+
+- 1m candles for full universe
+- especially for days with intraday high >= 10%
+
+### Status
+
+🔴 PRIMARY RESEARCH TRACK
+
+---
+
+## Strategy architecture (important)
+
+Each strategy must follow:
 
 ```text
 ranking → entry → exit
 ```
 
-- `ranking` wybiera najlepsze spółki do obserwacji,
-- `entry` decyduje, kiedy wejść w pozycję,
-- `exit` decyduje, kiedy wyjść z pozycji.
+But **ranking will differ between strategies**:
 
-Ranking jest liczony osobno dla każdej strategii.
+### Reversal Pullback ranking
 
----
-## 🔄 Reversal Pullback MTF (current main research direction)
+- oversold
+- controlled pullback
 
-### Timeframes
-- 15m → setup (trend + breakout attempt)
-- 5m → pullback detection
-- 1m → entry timing (microstructure)
+### Momentum Continuation ranking
 
-### Strategy flow
-1. Identify oversold condition on 15m
-2. Detect breakout attempt
-3. Wait for controlled pullback on 5m
-4. Enter on 1m reversal signal
-
-### Notes
-- Strategy is **selective**, not universal
-- Works best on high-volatility symbols
-- Relies on few large winners
-
-### Status
-🚧 In active development (v12–v17 tested)
-## 1. Momentum Trailing Intraday
-
-### Cel
-
-Strategia day tradingowa. Bot kupuje i sprzedaje tego samego dnia.
-
-Celem jest znalezienie spółek z silnym momentum, wejście w odpowiednim momencie i prowadzenie pozycji tak długo, jak cena rośnie.
-
-### Ranking
-
-Strategia ocenia spółki w skali `0–100` na podstawie między innymi:
-
-- momentum z ostatnich dni,
-- wolumenu względem średniej,
-- zmienności,
-- gapu na otwarciu,
-- trendu dziennego,
-- siły względem rynku,
-- płynności,
-- informacji giełdowych, np. earnings/news — etap późniejszy.
-
-Ranking służy do wyboru top X spółek, które bot będzie obserwował w danym dniu.
-
-### Entry
-
-Bot nie kupuje od razu po rankingu.
-
-Po wyborze top X spółek obserwuje bieżące świece i szuka sygnału wejścia, np.:
-
-- wybicie lokalnego high,
-- odbicie od VWAP / średniej,
-- rosnący wolumen,
-- świeca potwierdzająca momentum,
-- brak gwałtownego odwrócenia.
-
-Dokładna logika entry będzie doprecyzowana i testowana w backtestingu / paper tradingu.
-
-### Exit
-
-Strategia używa klasycznego stop-lossu oraz trailing stopu.
-
-Ustalona zasada:
-
-```text
-najpierw działa zwykły stop-loss
-trailing stop aktywuje się dopiero po osiągnięciu minimalnego zysku
-```
-
-Wstępne parametry:
-
-```text
-initial_stop_loss_pct = 1.2
-trailing_activation_profit_pct = 1.5
-trailing_stop_pct = 1.7
-force_exit_before_market_close = true
-```
-
-Interpretacja:
-
-- jeśli po kupnie cena spadnie o `1.2%`, bot sprzedaje,
-- jeśli cena wzrośnie minimum o `1.5%`, aktywuje się trailing stop,
-- po aktywacji trailing stop przesuwa się za najwyższą osiągniętą ceną,
-- bot sprzedaje, gdy cena spadnie o `1.7%` od maksimum po aktywacji trailing stopu,
-- jeśli pozycja nadal jest otwarta pod koniec sesji, bot zamyka ją przed końcem dnia.
-
-### Dodatkowe limity
-
-Planowane parametry bezpieczeństwa:
-
-- maksymalna liczba transakcji na spółkę dziennie,
-- cooldown po zamknięciu pozycji,
-- maksymalna strata dzienna na spółkę,
-- maksymalna strata dzienna całego bota,
-- maksymalna liczba jednocześnie otwartych pozycji.
+- gap
+- volume spike
+- early momentum
+- volatility
 
 ---
 
-## 2. Momentum Trailing Overnight
+## Next implementation target
 
-### Cel
-
-Strategia bliźniacza do Momentum Trailing Intraday, ale bez przymusu zamknięcia pozycji tego samego dnia.
-
-### Różnica względem strategii intraday
+New strategy module:
 
 ```text
-force_exit_before_market_close = false
+src/strategies/momentum_continuation/
+  backtest_big_momentum_continuation_v1.py
 ```
 
-Pozycja może przejść overnight.
+Based on:
 
-### Wstępne parametry
-
-```text
-initial_stop_loss_pct = 1.5
-trailing_activation_profit_pct = 2.0
-trailing_stop_pct = 2.5
-max_holding_days = 5
-```
-
-Parametry będą testowane na danych historycznych.
+- OR breakout logic
+- early momentum filters
+- separate exit logic (not v38 exit)
 
 ---
 
-## 3. Swing Trend Momentum
+## Important principle
 
-### Cel
+Do NOT try to force one strategy to do everything.
 
-Strategia swing tradingowa. Pozycje mogą być trzymane kilka dni lub tygodni.
+- Reversal Pullback = niche edge
+- Momentum Continuation = big winners
 
-Strategia ma szukać spółek w stabilnym trendzie wzrostowym.
-
-### Ranking
-
-Wstępne kryteria:
-
-- trend na danych dziennych,
-- momentum z kilku tygodni,
-- wolumen,
-- stabilność trendu,
-- siła względem rynku,
-- unikanie spółek o zbyt niskiej płynności.
-
-### Entry / Exit
-
-Do doprecyzowania po zbudowaniu fundamentu danych oraz pierwszej strategii intraday.
-
----
-
-## Kolejność implementacji
-
-1. Momentum Trailing Intraday
-2. Backtest Momentum Trailing Intraday
-3. Paper trading Momentum Trailing Intraday
-4. Momentum Trailing Overnight
-5. Swing Trend Momentum
+Both should coexist as independent systems.
