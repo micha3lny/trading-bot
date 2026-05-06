@@ -60,7 +60,6 @@ def day_features(symbol: str, day: pd.DataFrame, prev_close: float | None) -> di
     close_price = float(day.iloc[-1]["close"])
     high_price = float(day["high"].max())
     high_idx = day["high"].idxmax()
-    high_pos = day.index.get_loc(high_idx)
     start_time = pd.Timestamp(day.iloc[0]["datetime"])
     high_time = pd.Timestamp(day.loc[high_idx, "datetime"])
     first_5 = day.iloc[:5]
@@ -70,7 +69,8 @@ def day_features(symbol: str, day: pd.DataFrame, prev_close: float | None) -> di
         "session_date": str(day.iloc[0]["session_date"]),
         "symbol": symbol,
         "rows_1m": len(day),
-        "gap_pct": ((open_price / prev_close - 1.0) * 100.0) if prev_close and prev_close > 0 else None,
+        # Use NaN instead of None so pandas numeric filters like .abs() are safe.
+        "gap_pct": ((open_price / prev_close - 1.0) * 100.0) if prev_close and prev_close > 0 else float("nan"),
         "intraday_high_pct": (high_price / open_price - 1.0) * 100.0,
         "open_to_close_pct": (close_price / open_price - 1.0) * 100.0,
         "first_5m_high_pct": (float(first_5["high"].max()) / open_price - 1.0) * 100.0,
@@ -229,6 +229,9 @@ def run_backtest(args: argparse.Namespace, cfg: ExitConfig, label: str) -> pd.Da
             continue
         feats = day_features(symbol, day, prev_close)
         raw = pd.DataFrame([feats])
+        for col in ["gap_pct", "intraday_high_pct", "first_5m_high_pct", "first_15m_high_pct", "rows_1m"]:
+            if col in raw.columns:
+                raw[col] = pd.to_numeric(raw[col], errors="coerce")
         clean, _ = apply_quality_filter(
             raw,
             min_open_price=args.min_open_price,
