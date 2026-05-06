@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
@@ -105,15 +106,46 @@ def passes_v41_live_filter(symbol: str, day: pd.DataFrame, feats: dict[str, obje
     return not reasons, reasons, extra
 
 
-def run_backtest(args: argparse.Namespace, cfg: ExitConfig, label: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def make_variants(args: argparse.Namespace) -> dict[str, ExitConfig]:
+    return {
+        "close_exit": ExitConfig(args.stop_loss, None, None, None, args.max_hold_minutes, True, None, 0.0),
+        "trail_only": ExitConfig(args.stop_loss, None, args.trailing_activation, args.trailing_stop, args.max_hold_minutes, True, None, 0.0),
+        "tp_trail": ExitConfig(args.stop_loss, args.take_profit, args.trailing_activation, args.trailing_stop, args.max_hold_minutes, True, None, 0.0),
+        "staged": ExitConfig(args.stop_loss, args.take_profit, args.trailing_activation, args.trailing_stop, args.max_hold_minutes, True, args.staged_take_profit, args.staged_fraction),
+    }
+
+
+def add_reject(rejected: list[dict[str, object]], counter: Counter[str], payload: dict[str, object], reason: str) -> None:
+    counter[reason] += 1
+    if len(rejected) < 200_000:
+        rejected.append({**payload, "reject_reason": reason})
+
+
+def run_backtest_single_pass(args: argparse.Namespace, variants: dict[str, ExitConfig]) -> tuple[pd.DataFrame, pd.DataFrame, Counter[str], Counter[str]]:
     rows: list[dict[str, object]] = []
     rejected: list[dict[str, object]] = []
+    reject_counter: Counter[str] = Counter()
+    stats: Counter[str] = Counter()
 
     for symbol, day, prev_close in iter_days(Path(args.data_dir), args.recent_days):
+        stats["sessions_seen"] += 1
+        if stats["sessions_seen"] % args.progress_every == 0:
+            print(
+                "Progress: "
+                f"sessions={stats['sessions_seen']}, "
+                f"accepted_entries={stats['accepted_entries']}, "
+                f"rejects={sum(reject_counter.values())}, "
+                f"trades={len(rows)}",
+                flush=True,
+            )
+
         if len(day) < args.min_rows:
+            stats["sessions_short_rows"] += 1
             continue
 
         feats = day_features(symbol, day, prev_close)
+        base_payload = {"symbol": symbol, **feats}
+
         raw = pd.DataFrame([feats])
         for col in ["gap_pct", "intraday_high_pct", "first_5m_high_pct", "first_15m_high_pct", "rows_1m"]:
             if col in raw.columns:
@@ -131,36 +163,37 @@ def run_backtest(args: argparse.Namespace, cfg: ExitConfig, label: str) -> tuple
             excluded_symbols=set() if args.include_leveraged_etfs else DEFAULT_EXCLUDED_SYMBOLS,
         )
         if clean.empty:
-            rejected.append({**feats, "variant": label, "reject_reason": "base_clean_filter"})
+            add_reject(rejected, reject_counter, base_payload, "base_clean_filter")
             continue
 
         ok, reasons, extra = passes_v41_live_filter(symbol, day, feats, args)
         if not ok:
-            rejected.append({**feats, **extra, "variant": label, "reject_reason": ";".join(reasons)})
+            add_reject(rejected, reject_counter, {**base_payload, **extra}, ";".join(reasons))
             continue
 
         entry = find_or_breakout_entry(day, args.opening_range_minutes)
         if entry is None:
-            rejected.append({**feats, **extra, "variant": label, "reject_reason": "no_or_breakout"})
+            add_reject(rejected, reject_counter, {**base_payload, **extra}, "no_or_breakout")
             continue
 
         entry_pos, entry_price = entry
-        post_entry = day.iloc[entry_pos:].copy()
+        post_entry = day.iloc[entry_pos:]
         if post_entry.empty:
+            add_reject(rejected, reject_counter, {**base_payload, **extra}, "empty_post_entry")
             continue
 
-        pnl, reason, exit_time, max_pnl, min_pnl = simulate_exit(post_entry, entry_price, cfg)
-        result = TradeResult(
+        stats["accepted_entries"] += 1
+        common = TradeResult(
             symbol=symbol,
             session_date=str(feats["session_date"]),
             entry_time=str(pd.Timestamp(post_entry.iloc[0]["datetime"])),
             entry_price=entry_price,
-            exit_time=str(exit_time),
-            exit_price=entry_price * (1.0 + pnl / 100.0),
-            pnl_pct=pnl,
-            max_pnl_pct=max_pnl,
-            min_pnl_pct=min_pnl,
-            reason=reason,
+            exit_time="",
+            exit_price=entry_price,
+            pnl_pct=0.0,
+            max_pnl_pct=0.0,
+            min_pnl_pct=0.0,
+            reason="",
             intraday_high_pct=float(feats["intraday_high_pct"]),
             gap_pct=float(feats["gap_pct"]) if pd.notna(feats["gap_pct"]) else None,
             first_5m_high_pct=float(feats["first_5m_high_pct"]),
@@ -168,14 +201,29 @@ def run_backtest(args: argparse.Namespace, cfg: ExitConfig, label: str) -> tuple
             time_to_high_minutes=float(feats["time_to_high_minutes"]),
             opening_range_minutes=args.opening_range_minutes,
             open_to_close_pct=float(feats["open_to_close_pct"]),
-        )
-        rows.append({**result.__dict__, **extra, "variant": label})
+        ).__dict__
+
+        for label, cfg in variants.items():
+            pnl, reason, exit_time, max_pnl, min_pnl = simulate_exit(post_entry, entry_price, cfg)
+            rows.append(
+                {
+                    **common,
+                    **extra,
+                    "variant": label,
+                    "exit_time": str(exit_time),
+                    "exit_price": entry_price * (1.0 + pnl / 100.0),
+                    "pnl_pct": pnl,
+                    "max_pnl_pct": max_pnl,
+                    "min_pnl_pct": min_pnl,
+                    "reason": reason,
+                }
+            )
 
     trades = pd.DataFrame(rows)
     rejects = pd.DataFrame(rejected)
     if not trades.empty:
-        trades = trades.sort_values(["session_date", "symbol", "entry_time"]).reset_index(drop=True)
-    return trades, rejects
+        trades = trades.sort_values(["variant", "session_date", "symbol", "entry_time"]).reset_index(drop=True)
+    return trades, rejects, reject_counter, stats
 
 
 def main() -> int:
@@ -206,19 +254,16 @@ def main() -> int:
     parser.add_argument("--max-hold-minutes", type=int, default=None)
     parser.add_argument("--staged-take-profit", type=float, default=10.0)
     parser.add_argument("--staged-fraction", type=float, default=0.5)
+    parser.add_argument("--progress-every", type=int, default=10_000)
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    variants = {
-        "close_exit": ExitConfig(args.stop_loss, None, None, None, args.max_hold_minutes, True, None, 0.0),
-        "trail_only": ExitConfig(args.stop_loss, None, args.trailing_activation, args.trailing_stop, args.max_hold_minutes, True, None, 0.0),
-        "tp_trail": ExitConfig(args.stop_loss, args.take_profit, args.trailing_activation, args.trailing_stop, args.max_hold_minutes, True, None, 0.0),
-        "staged": ExitConfig(args.stop_loss, args.take_profit, args.trailing_activation, args.trailing_stop, args.max_hold_minutes, True, args.staged_take_profit, args.staged_fraction),
-    }
+    variants = make_variants(args)
 
     print("Experiment: v41 tradable momentum OR breakout")
+    print("Optimized single-pass version: filters once, simulates all exit variants after one accepted entry.")
     print("Live-like filters use only symbol/static/opening-range information before entry.")
     print(f"Data dir: {args.data_dir}")
     print(f"Recent days: {args.recent_days}")
@@ -235,18 +280,13 @@ def main() -> int:
     if args.research_min_intraday_high is not None:
         print(f"Research-only future filter: intraday_high >= {args.research_min_intraday_high:.2f}%")
 
-    all_trades: list[pd.DataFrame] = []
-    all_rejects: list[pd.DataFrame] = []
-    summaries: list[dict[str, object]] = []
-    for label, cfg in variants.items():
-        trades, rejects = run_backtest(args, cfg, label)
-        all_trades.append(trades)
-        all_rejects.append(rejects)
-        summaries.append(summarize(label, trades))
+    trades_df, rejects_df, reject_counter, stats = run_backtest_single_pass(args, variants)
 
+    summaries: list[dict[str, object]] = []
+    for label in variants:
+        subset = trades_df[trades_df["variant"] == label] if not trades_df.empty else pd.DataFrame()
+        summaries.append(summarize(label, subset))
     summary = pd.DataFrame(summaries)
-    trades_df = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
-    rejects_df = pd.concat(all_rejects, ignore_index=True) if all_rejects else pd.DataFrame()
 
     research = "research" if args.research_min_intraday_high is not None else "livelike"
     suffix = f"recent{args.recent_days}_or{args.opening_range_minutes}_{research}_minpx{args.min_entry_price:g}_minordv{int(args.min_or_dollar_volume)}"
@@ -260,6 +300,13 @@ def main() -> int:
     print(f"\nSaved trades CSV: {out_trades}")
     print(f"Saved summary CSV: {out_summary}")
     print(f"Saved rejected CSV: {out_rejects}")
+
+    print("\n=== Scan stats ===")
+    print(f"sessions_seen: {stats['sessions_seen']}")
+    print(f"sessions_short_rows: {stats['sessions_short_rows']}")
+    print(f"accepted_entries: {stats['accepted_entries']}")
+    print(f"trade_rows: {len(trades_df)}")
+    print(f"rejected_sessions: {sum(reject_counter.values())}")
 
     print("\n=== Variant comparison ===")
     if not summary.empty:
@@ -282,9 +329,10 @@ def main() -> int:
         cols = ["session_date", "symbol", "entry_time", "entry_price", "pnl_pct", "max_pnl_pct", "min_pnl_pct", "reason", "or_high_pct", "or_dollar_volume", "intraday_high_pct", "gap_pct"]
         print(best[cols].tail(40).to_string(index=False, float_format=lambda x: f"{x:.2f}"))
 
-    if not rejects_df.empty:
+    if reject_counter:
         print("\n=== Top rejection reasons ===")
-        print(rejects_df["reject_reason"].value_counts().head(20).to_string())
+        for reason, count in reject_counter.most_common(20):
+            print(f"{reason:90s} {count}")
 
     print("\nInterpretation hints:")
     print("- Run without --research-min-intraday-high for live-like behavior.")
