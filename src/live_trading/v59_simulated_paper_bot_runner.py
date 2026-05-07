@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -26,9 +26,6 @@ class SimPosition:
     reason: str = ""
     score: float = 0.0
 
-    def market_value(self, price: float) -> float:
-        return self.quantity * price
-
     def unrealized_pnl(self, price: float) -> float:
         return self.quantity * (price - self.entry_price)
 
@@ -44,12 +41,6 @@ def read_csv_if_exists(path: str) -> pd.DataFrame:
     return pd.read_csv(p)
 
 
-def append_csv(path: Path, df: pd.DataFrame) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.exists()
-    df.to_csv(path, mode="a", index=False, header=not exists)
-
-
 def prepare_intents(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -59,7 +50,7 @@ def prepare_intents(df: pd.DataFrame) -> pd.DataFrame:
     out["reference_price"] = pd.to_numeric(out.get("reference_price"), errors="coerce")
     out["quantity"] = pd.to_numeric(out.get("quantity"), errors="coerce").fillna(0).astype(int)
     out["position_usd"] = pd.to_numeric(out.get("position_usd"), errors="coerce").fillna(0.0)
-    out = out.dropna(subset=["timestamp_utc", "reference_price"])
+    out = out.dropna(subset=["timestamp_utc", "symbol", "reference_price"])
     return out.sort_values(["timestamp_utc", "score"], ascending=[True, False]).reset_index(drop=True)
 
 
@@ -72,7 +63,7 @@ def prepare_snapshots(df: pd.DataFrame) -> pd.DataFrame:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
     out = out.dropna(subset=["timestamp_utc", "symbol"])
-    return out.sort_values("timestamp_utc").reset_index(drop=True)
+    return out.sort_values(["timestamp_utc", "symbol"]).reset_index(drop=True)
 
 
 def current_price_from_snapshot(row: pd.Series) -> float | None:
@@ -86,13 +77,78 @@ def current_price_from_snapshot(row: pd.Series) -> float | None:
     return None
 
 
+def enter_position(
+    *,
+    ts: pd.Timestamp,
+    symbol: str,
+    price: float,
+    intent: dict[str, object],
+    args: argparse.Namespace,
+    cash: float,
+    open_positions: dict[str, SimPosition],
+    trade_events: list[dict[str, object]],
+) -> tuple[float, bool]:
+    if symbol in open_positions:
+        return cash, False
+    if len(open_positions) >= args.max_positions:
+        return cash, False
+
+    entry_price = price * (1.0 + args.simulated_entry_slippage_bps / 10_000.0)
+    quantity = int(intent.get("quantity") or 0)
+    if quantity <= 0:
+        quantity = int(float(intent.get("position_usd") or args.base_position_usd) // entry_price)
+    if quantity <= 0:
+        return cash, False
+
+    notional = quantity * entry_price
+    if notional > args.max_position_usd:
+        quantity = int(args.max_position_usd // entry_price)
+        notional = quantity * entry_price
+    if quantity <= 0 or notional < args.min_position_usd:
+        return cash, False
+
+    open_exposure = sum(p.quantity * p.entry_price for p in open_positions.values())
+    if open_exposure + notional > args.max_gross_exposure:
+        return cash, False
+    if cash < notional:
+        return cash, False
+
+    cash -= notional
+    score = float(intent.get("score") or 0.0)
+    stop_price = entry_price * (1.0 - args.stop_loss_pct / 100.0)
+    open_positions[symbol] = SimPosition(
+        symbol=symbol,
+        entry_time=ts,
+        entry_price=entry_price,
+        quantity=quantity,
+        position_usd=notional,
+        stop_price=stop_price,
+        max_price=entry_price,
+        reason=str(intent.get("reason") or "BUY_INTENT"),
+        score=score,
+    )
+    trade_events.append({
+        "timestamp_utc": ts.isoformat(),
+        "event": "ENTRY",
+        "symbol": symbol,
+        "quantity": quantity,
+        "entry_price": entry_price,
+        "exit_price": None,
+        "pnl_usd": None,
+        "pnl_pct": None,
+        "reason": str(intent.get("reason") or "BUY_INTENT"),
+        "cash_after": cash,
+        "score": score,
+    })
+    return cash, True
+
+
 def simulate(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     intents = prepare_intents(read_csv_if_exists(args.intents_csv))
     snapshots = prepare_snapshots(read_csv_if_exists(args.snapshots_csv))
 
     if snapshots.empty:
-        raise RuntimeError("No snapshots found. Run v58_live_signal_engine first.")
-
+        raise RuntimeError("No snapshots found. Run v58_live_signal_engine or v59_fake_intent_generator first.")
     if intents.empty:
         print("No order intents found. Runner will only produce empty summary.")
 
@@ -102,10 +158,10 @@ def simulate(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     trade_events: list[dict[str, object]] = []
     equity_rows: list[dict[str, object]] = []
 
-    intents_by_time = intents.groupby("timestamp_utc") if not intents.empty else None
-    intent_idx = 0
+    last_prices: dict[str, tuple[pd.Timestamp, float]] = {}
+    pending_intents: list[dict[str, object]] = []
     intents_sorted = intents.to_dict("records") if not intents.empty else []
-
+    intent_idx = 0
     daily_loss_triggered = False
 
     for _, snap in snapshots.iterrows():
@@ -114,29 +170,31 @@ def simulate(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
         price = current_price_from_snapshot(snap)
         if price is None:
             continue
+        last_prices[symbol] = (ts, price)
 
-        # Manage exits for this symbol.
+        # Add all intents that are now known to the pending queue.
+        while intent_idx < len(intents_sorted) and intents_sorted[intent_idx]["timestamp_utc"] <= ts:
+            pending_intents.append(intents_sorted[intent_idx])
+            intent_idx += 1
+
+        # Manage exits for the current symbol.
         if symbol in open_positions:
             pos = open_positions[symbol]
             pos.max_price = max(pos.max_price, price)
             max_gain_pct = (pos.max_price / pos.entry_price - 1.0) * 100.0
-
             if max_gain_pct >= args.trailing_activation_pct:
                 trail_price = pos.max_price * (1.0 - args.trailing_stop_pct / 100.0)
                 pos.trailing_stop_price = max(pos.trailing_stop_price or 0.0, trail_price)
 
             exit_reason = None
-            exit_price = None
             if price <= pos.stop_price:
                 exit_reason = "stop_loss"
-                exit_price = price
             elif pos.trailing_stop_price is not None and price <= pos.trailing_stop_price:
                 exit_reason = "trailing_stop"
-                exit_price = price
 
             if exit_reason is not None:
-                pnl = pos.quantity * (exit_price - pos.entry_price)
-                cash += pos.quantity * exit_price
+                pnl = pos.quantity * (price - pos.entry_price)
+                cash += pos.quantity * price
                 realized_pnl += pnl
                 trade_events.append({
                     "timestamp_utc": ts.isoformat(),
@@ -144,83 +202,43 @@ def simulate(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
                     "symbol": symbol,
                     "quantity": pos.quantity,
                     "entry_price": pos.entry_price,
-                    "exit_price": exit_price,
+                    "exit_price": price,
                     "pnl_usd": pnl,
-                    "pnl_pct": (exit_price / pos.entry_price - 1.0) * 100.0,
+                    "pnl_pct": (price / pos.entry_price - 1.0) * 100.0,
                     "reason": exit_reason,
                     "cash_after": cash,
                     "score": pos.score,
                 })
                 del open_positions[symbol]
 
-        # Process intents up to current timestamp.
-        while intent_idx < len(intents_sorted) and intents_sorted[intent_idx]["timestamp_utc"] <= ts:
-            intent = intents_sorted[intent_idx]
-            intent_idx += 1
-            i_symbol = str(intent.get("symbol"))
-            if i_symbol != symbol:
-                # Only fill intent when we have a current snapshot for that symbol.
-                continue
+        # Execute only pending intents for this exact symbol; keep other intents pending.
+        still_pending: list[dict[str, object]] = []
+        symbol_intents = [i for i in pending_intents if str(i.get("symbol")) == symbol]
+        other_intents = [i for i in pending_intents if str(i.get("symbol")) != symbol]
+        symbol_intents = sorted(symbol_intents, key=lambda i: float(i.get("score") or 0.0), reverse=True)
+
+        for intent in symbol_intents:
             if daily_loss_triggered:
+                still_pending.append(intent)
                 continue
-            if i_symbol in open_positions:
-                continue
-            if len(open_positions) >= args.max_positions:
-                continue
-
-            ref_price = float(intent.get("reference_price") or price)
-            entry_price = price * (1.0 + args.simulated_entry_slippage_bps / 10_000.0)
-            quantity = int(intent.get("quantity") or 0)
-            if quantity <= 0:
-                quantity = int(float(intent.get("position_usd") or args.base_position_usd) // entry_price)
-            if quantity <= 0:
-                continue
-
-            notional = quantity * entry_price
-            open_exposure = sum(p.quantity * p.entry_price for p in open_positions.values())
-            if notional > args.max_position_usd:
-                quantity = int(args.max_position_usd // entry_price)
-                notional = quantity * entry_price
-            if notional < args.min_position_usd or quantity <= 0:
-                continue
-            if open_exposure + notional > args.max_gross_exposure:
-                continue
-            if cash < notional:
-                continue
-
-            cash -= notional
-            stop_price = entry_price * (1.0 - args.stop_loss_pct / 100.0)
-            score = float(intent.get("score") or 0.0)
-            open_positions[i_symbol] = SimPosition(
-                symbol=i_symbol,
-                entry_time=ts,
-                entry_price=entry_price,
-                quantity=quantity,
-                position_usd=notional,
-                stop_price=stop_price,
-                max_price=entry_price,
-                reason=str(intent.get("reason") or ""),
-                score=score,
+            cash, accepted = enter_position(
+                ts=ts,
+                symbol=symbol,
+                price=price,
+                intent=intent,
+                args=args,
+                cash=cash,
+                open_positions=open_positions,
+                trade_events=trade_events,
             )
-            trade_events.append({
-                "timestamp_utc": ts.isoformat(),
-                "event": "ENTRY",
-                "symbol": i_symbol,
-                "quantity": quantity,
-                "entry_price": entry_price,
-                "exit_price": None,
-                "pnl_usd": None,
-                "pnl_pct": None,
-                "reason": str(intent.get("reason") or "BUY_INTENT"),
-                "cash_after": cash,
-                "score": score,
-            })
+            if not accepted:
+                still_pending.append(intent)
+        pending_intents = other_intents + still_pending
 
         open_value = 0.0
         open_unrealized = 0.0
-        # Approximate equity using last seen price only for current symbol; entry price for others.
         for p_symbol, pos in open_positions.items():
-            p_price = price if p_symbol == symbol else pos.entry_price
+            p_price = last_prices.get(p_symbol, (ts, pos.entry_price))[1]
             open_value += pos.quantity * p_price
             open_unrealized += pos.unrealized_pnl(p_price)
 
@@ -238,15 +256,10 @@ def simulate(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
             "realized_pnl_usd": realized_pnl,
             "equity_usd": equity,
             "daily_loss_triggered": daily_loss_triggered,
+            "pending_intents": len(pending_intents),
         })
 
-    # End-of-run flatten using last available price per symbol.
-    last_prices = {}
-    for _, row in snapshots.iterrows():
-        price = current_price_from_snapshot(row)
-        if price is not None:
-            last_prices[str(row["symbol"])] = (row["timestamp_utc"], price)
-
+    # End-of-run flatten.
     for symbol, pos in list(open_positions.items()):
         ts, price = last_prices.get(symbol, (snapshots.iloc[-1]["timestamp_utc"], pos.entry_price))
         exit_price = price * (1.0 - args.simulated_exit_slippage_bps / 10_000.0)
@@ -281,6 +294,7 @@ def simulate(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
             "return_pct": 0.0,
             "max_drawdown_usd": 0.0,
             "max_open_positions": 0,
+            "pending_intents_left": len(pending_intents),
         }])
     else:
         exits = events_df[events_df["event"] == "EXIT"].copy()
@@ -304,6 +318,7 @@ def simulate(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
             "avg_trade_pnl_usd": float(pnl.mean()) if not pnl.empty else 0.0,
             "max_drawdown_usd": max_dd,
             "max_open_positions": max_open,
+            "pending_intents_left": len(pending_intents),
         }])
 
     return events_df, equity_df, summary
