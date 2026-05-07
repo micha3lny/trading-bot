@@ -17,6 +17,7 @@ DEFAULT_CLIENT_ID = 61
 DEFAULT_SYMBOLS = ["QQQ", "SPY", "IWM", "NVDA", "TSLA", "META", "RKLB", "SOUN", "PLTR", "NBIS"]
 DEFAULT_OUTPUT = "data/live/order_intents.csv"
 DEFAULT_SNAPSHOT_OUTPUT = "data/live/live_signal_snapshots.csv"
+DEFAULT_FLOW_SIGNALS = "data/live/v61_flow_signals.csv"
 
 
 @dataclass
@@ -40,6 +41,35 @@ def safe_float(value) -> float | None:
         return value
     except Exception:
         return None
+
+
+def load_latest_flow_scores(path: str) -> dict[str, dict[str, object]]:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        df = pd.read_csv(p)
+    except Exception:
+        return {}
+    if df.empty or "symbol" not in df.columns:
+        return {}
+    if "timestamp_utc" in df.columns:
+        df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], errors="coerce", utc=True)
+        df = df.sort_values("timestamp_utc")
+    latest = df.groupby("symbol", as_index=False).tail(1)
+    out: dict[str, dict[str, object]] = {}
+    for _, row in latest.iterrows():
+        symbol = str(row.get("symbol", "")).upper()
+        if not symbol:
+            continue
+        out[symbol] = {
+            "flow_score": safe_float(row.get("flow_score")) or 0.0,
+            "relative_volume": safe_float(row.get("relative_volume")),
+            "relative_strength_6": safe_float(row.get("relative_strength_6")),
+            "momentum_acceleration": safe_float(row.get("momentum_acceleration")),
+            "flow_reasons": row.get("flow_reasons", ""),
+        }
+    return out
 
 
 def market_snapshot(symbol: str, ticker) -> dict[str, object]:
@@ -104,6 +134,24 @@ def update_bar_state(state: SymbolState, snap: dict[str, object], max_bars: int 
         state.bars = state.bars[-max_bars:]
 
 
+def apply_flow_boost(features: dict[str, object], flow: dict[str, object] | None, args: argparse.Namespace) -> dict[str, object]:
+    base_score = float(features.get("score", 0.0) or 0.0)
+    flow_score = float((flow or {}).get("flow_score", 0.0) or 0.0)
+    flow_boost = min(args.max_flow_score_boost, flow_score * args.flow_score_multiplier)
+
+    # Flow is additive, but it cannot override required market structure filters.
+    final_score = base_score + flow_boost
+    features["base_score"] = base_score
+    features["flow_score"] = flow_score
+    features["flow_boost"] = flow_boost
+    features["score"] = final_score
+    features["relative_volume"] = (flow or {}).get("relative_volume")
+    features["relative_strength_6"] = (flow or {}).get("relative_strength_6")
+    features["momentum_acceleration"] = (flow or {}).get("momentum_acceleration")
+    features["flow_reasons"] = (flow or {}).get("flow_reasons", "")
+    return features
+
+
 def compute_features(state: SymbolState, snap: dict[str, object], args: argparse.Namespace) -> dict[str, object]:
     bars = state.bars
     price = safe_float(snap.get("reference_price"))
@@ -112,6 +160,10 @@ def compute_features(state: SymbolState, snap: dict[str, object], args: argparse
         return {
             "ready": False,
             "reason": "no_price_history",
+            "score": 0.0,
+            "base_score": 0.0,
+            "flow_score": 0.0,
+            "flow_boost": 0.0,
         }
 
     prices = pd.Series([b["price"] for b in bars], dtype="float64")
@@ -154,7 +206,6 @@ def compute_features(state: SymbolState, snap: dict[str, object], args: argparse
     if intraday_from_first_pct >= 2.0:
         score += 1.0
 
-    ready = bool(or_ready and breakout and momentum_ok and spread_ok and price_ok and or_range_ok and score >= args.min_signal_score)
     reasons = []
     if not or_ready:
         reasons.append("opening_range_not_ready")
@@ -172,9 +223,13 @@ def compute_features(state: SymbolState, snap: dict[str, object], args: argparse
         reasons.append("score_too_low")
 
     return {
-        "ready": ready,
+        "ready": False,  # final readiness is computed after flow boost
+        "structure_ready": bool(or_ready and breakout and momentum_ok and spread_ok and price_ok and or_range_ok),
         "reason": ";".join(reasons) if reasons else "signal_ready",
         "score": score,
+        "base_score": score,
+        "flow_score": 0.0,
+        "flow_boost": 0.0,
         "last_price": last_price,
         "first_price": first_price,
         "or_high": or_high,
@@ -188,9 +243,24 @@ def compute_features(state: SymbolState, snap: dict[str, object], args: argparse
     }
 
 
+def finalize_ready(features: dict[str, object], args: argparse.Namespace) -> dict[str, object]:
+    structure_ready = bool(features.get("structure_ready"))
+    score = float(features.get("score", 0.0) or 0.0)
+    ready = bool(structure_ready and score >= args.min_signal_score)
+    reasons = [r for r in str(features.get("reason", "")).split(";") if r]
+    if score >= args.min_signal_score:
+        reasons = [r for r in reasons if r != "score_too_low"]
+    elif "score_too_low" not in reasons:
+        reasons.append("score_too_low")
+    features["ready"] = ready
+    features["reason"] = ";".join(reasons) if reasons else "signal_ready"
+    return features
+
+
 def calc_position_usd(features: dict[str, object], args: argparse.Namespace) -> float:
     score = float(features.get("score", 0.0) or 0.0)
-    if score >= 10:
+    flow_score = float(features.get("flow_score", 0.0) or 0.0)
+    if score >= 10 and flow_score >= args.min_flow_score_for_max_size:
         return args.max_position_usd
     if score >= 8:
         return min(args.max_position_usd, args.base_position_usd * 1.5)
@@ -216,6 +286,13 @@ def create_intent(symbol: str, snap: dict[str, object], features: dict[str, obje
         "limit_price": limit_price,
         "order_type": "MARKETABLE_LIMIT_INTENT",
         "score": features.get("score"),
+        "base_score": features.get("base_score"),
+        "flow_score": features.get("flow_score"),
+        "flow_boost": features.get("flow_boost"),
+        "flow_reasons": features.get("flow_reasons"),
+        "relative_volume": features.get("relative_volume"),
+        "relative_strength_6": features.get("relative_strength_6"),
+        "momentum_acceleration": features.get("momentum_acceleration"),
         "reason": features.get("reason"),
         "or_high": features.get("or_high"),
         "or_low": features.get("or_low"),
@@ -242,6 +319,8 @@ def main() -> int:
     parser.add_argument("--market-data-type", type=int, default=3, help="1=live, 3=delayed")
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
     parser.add_argument("--snapshot-output", default=DEFAULT_SNAPSHOT_OUTPUT)
+    parser.add_argument("--flow-signals", default=DEFAULT_FLOW_SIGNALS)
+    parser.add_argument("--enable-flow-boost", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--opening-range-samples", type=int, default=6, help="6 samples at 5s interval = 30 seconds test OR")
     parser.add_argument("--min-breakout-pct", type=float, default=0.10)
@@ -250,6 +329,9 @@ def main() -> int:
     parser.add_argument("--min-price", type=float, default=5.0)
     parser.add_argument("--max-or-range-pct", type=float, default=3.0)
     parser.add_argument("--min-signal-score", type=float, default=7.0)
+    parser.add_argument("--flow-score-multiplier", type=float, default=1.0)
+    parser.add_argument("--max-flow-score-boost", type=float, default=3.0)
+    parser.add_argument("--min-flow-score-for-max-size", type=float, default=3.0)
 
     parser.add_argument("--base-position-usd", type=float, default=100.0)
     parser.add_argument("--max-position-usd", type=float, default=250.0)
@@ -262,6 +344,7 @@ def main() -> int:
     print(f"Symbols: {', '.join(args.symbols)}")
     print(f"Market data type: {args.market_data_type}")
     print(f"Output intents: {args.output}")
+    print(f"Flow boost: {args.enable_flow_boost} file={args.flow_signals}")
 
     ib = IB()
     try:
@@ -291,18 +374,22 @@ def main() -> int:
 
         intent_fields = [
             "timestamp_utc", "intent_type", "symbol", "side", "quantity", "position_usd", "reference_price",
-            "limit_price", "order_type", "score", "reason", "or_high", "or_low", "or_breakout_pct",
-            "momentum_5_pct", "intraday_from_first_pct", "spread_bps", "bid", "ask", "last", "mid", "status",
+            "limit_price", "order_type", "score", "base_score", "flow_score", "flow_boost", "flow_reasons",
+            "relative_volume", "relative_strength_6", "momentum_acceleration", "reason", "or_high", "or_low",
+            "or_breakout_pct", "momentum_5_pct", "intraday_from_first_pct", "spread_bps", "bid", "ask", "last",
+            "mid", "status",
         ]
         snapshot_fields = [
             "timestamp_utc", "symbol", "bid", "ask", "mid", "last", "close", "volume", "bid_size",
-            "ask_size", "spread", "spread_bps", "reference_price", "ready", "reason", "score",
-            "or_high", "or_low", "or_breakout_pct", "momentum_5_pct", "samples",
+            "ask_size", "spread", "spread_bps", "reference_price", "ready", "structure_ready", "reason", "score",
+            "base_score", "flow_score", "flow_boost", "flow_reasons", "relative_volume", "relative_strength_6",
+            "momentum_acceleration", "or_high", "or_low", "or_breakout_pct", "momentum_5_pct", "samples",
         ]
 
         start = time.time()
         while time.time() - start < args.duration_seconds:
             ib.sleep(args.interval_seconds)
+            flow_scores = load_latest_flow_scores(args.flow_signals) if args.enable_flow_boost else {}
             snapshot_rows = []
             intent_rows = []
 
@@ -311,6 +398,9 @@ def main() -> int:
                 state = states[symbol]
                 update_bar_state(state, snap)
                 features = compute_features(state, snap, args)
+                if args.enable_flow_boost:
+                    features = apply_flow_boost(features, flow_scores.get(symbol), args)
+                features = finalize_ready(features, args)
 
                 snapshot_rows.append({**snap, **features})
 
@@ -327,17 +417,24 @@ def main() -> int:
                     print(
                         f"BUY_INTENT {intent['symbol']} qty={intent['quantity']} "
                         f"limit={intent['limit_price']} score={float(intent['score']):.1f} "
+                        f"base={float(intent.get('base_score') or 0.0):.1f} flow={float(intent.get('flow_score') or 0.0):.1f} "
                         f"spread={intent['spread_bps']}bps"
                     )
 
-            # Compact status line.
             status_parts = []
             for row in snapshot_rows:
                 score = row.get("score")
+                base_score = row.get("base_score")
+                flow_score = row.get("flow_score")
                 score_txt = "NA" if score is None else f"{float(score):.1f}"
+                base_txt = "NA" if base_score is None else f"{float(base_score):.1f}"
+                flow_txt = "NA" if flow_score is None else f"{float(flow_score):.1f}"
                 spread = row.get("spread_bps")
                 spread_txt = "NA" if spread is None else f"{float(spread):.1f}"
-                status_parts.append(f"{row['symbol']} score={score_txt} spread={spread_txt} reason={row.get('reason')}")
+                status_parts.append(
+                    f"{row['symbol']} score={score_txt} base={base_txt} flow={flow_txt} "
+                    f"spread={spread_txt} reason={row.get('reason')}"
+                )
             print(" | ".join(status_parts), flush=True)
 
     finally:
