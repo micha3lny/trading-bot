@@ -55,6 +55,7 @@ class FetchConfig:
     min_rows_per_day: int
     skip_existing_any: bool
     failed_cache: set[str]
+    max_empty_chunks_per_symbol: int
 
 
 def ensure_dir(path: Path) -> None:
@@ -191,6 +192,16 @@ def append_failed_symbol(output_dir: Path, symbol: str, error: str) -> None:
         writer.writerow({"symbol": symbol, "error": error})
 
 
+def append_no_data_symbol(output_dir: Path, symbol: str, reason: str) -> None:
+    no_data_path = output_dir / "fetch_1m_no_data_symbols.csv"
+    exists = no_data_path.exists()
+    with no_data_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["symbol", "reason"])
+        if not exists:
+            writer.writeheader()
+        writer.writerow({"symbol": symbol, "reason": reason})
+
+
 def should_skip_existing(path: Path, days: int, min_rows_per_day: int, force: bool, skip_existing_any: bool) -> bool:
     if force:
         return False
@@ -252,6 +263,7 @@ def fetch_symbol_1m(ib: IB, symbol: str, cfg: FetchConfig) -> pd.DataFrame:
     contract = qualified[0]
 
     all_chunks: list[pd.DataFrame] = []
+    empty_chunks = 0
     end = datetime.now(timezone.utc)
     start_limit = end - timedelta(days=cfg.days)
 
@@ -276,6 +288,16 @@ def fetch_symbol_1m(ib: IB, symbol: str, cfg: FetchConfig) -> pd.DataFrame:
         chunk_df = ib_to_dataframe(symbol, bars)
         if not chunk_df.empty:
             all_chunks.append(chunk_df)
+            empty_chunks = 0
+        else:
+            empty_chunks += 1
+            if cfg.max_empty_chunks_per_symbol > 0 and empty_chunks >= cfg.max_empty_chunks_per_symbol and not all_chunks:
+                print(
+                    f"  no data after {empty_chunks} empty chunks; stop symbol early",
+                    flush=True,
+                )
+                append_no_data_symbol(cfg.output_dir, symbol, f"{empty_chunks}_empty_chunks")
+                break
 
         end = chunk_start + timedelta(minutes=1)
         time.sleep(cfg.sleep_seconds)
@@ -355,6 +377,12 @@ def main() -> int:
         default=True,
         help="Skip symbols already listed in data/1m/fetch_1m_failed_symbols.csv.",
     )
+    parser.add_argument(
+        "--max-empty-chunks-per-symbol",
+        type=int,
+        default=2,
+        help="If a symbol returns this many empty chunks before any data, stop trying it early. Use 0 to disable.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -384,6 +412,7 @@ def main() -> int:
         min_rows_per_day=args.min_rows_per_day,
         skip_existing_any=args.skip_existing_any,
         failed_cache=failed_cache,
+        max_empty_chunks_per_symbol=args.max_empty_chunks_per_symbol,
     )
 
     print("IBKR 1m backfill")
@@ -393,6 +422,7 @@ def main() -> int:
     print(f"IBKR: {cfg.host}:{cfg.port}, client_id={cfg.client_id}")
     print(f"Chunk days: {cfg.chunk_days}, useRTH={cfg.use_rth}, whatToShow={cfg.what_to_show}")
     print(f"skip_existing_any={cfg.skip_existing_any}, failed_cache_symbols={len(cfg.failed_cache)}")
+    print(f"max_empty_chunks_per_symbol={cfg.max_empty_chunks_per_symbol}")
 
     ib = IB()
     ib.connect(cfg.host, cfg.port, clientId=cfg.client_id, timeout=cfg.timeout)
@@ -420,7 +450,10 @@ def main() -> int:
                 df = fetch_symbol_1m(ib, symbol, cfg)
                 rows = merge_and_save(symbol, output_dir, df)
                 ok += 1
-                print(f"  saved {symbol}: {rows} total rows -> {path}", flush=True)
+                if rows == 0:
+                    print(f"  saved {symbol}: 0 rows/no data", flush=True)
+                else:
+                    print(f"  saved {symbol}: {rows} total rows -> {path}", flush=True)
             except Exception as exc:
                 error = str(exc)
                 failed.append((symbol, error))
