@@ -53,6 +53,8 @@ class FetchConfig:
     use_rth: bool
     force: bool
     min_rows_per_day: int
+    skip_existing_any: bool
+    failed_cache: set[str]
 
 
 def ensure_dir(path: Path) -> None:
@@ -166,11 +168,37 @@ def existing_row_count(path: Path) -> int:
         return 0
 
 
-def should_skip_existing(path: Path, days: int, min_rows_per_day: int, force: bool) -> bool:
+def load_failed_cache(output_dir: Path) -> set[str]:
+    failed_path = output_dir / "fetch_1m_failed_symbols.csv"
+    if not failed_path.exists():
+        return set()
+    try:
+        df = pd.read_csv(failed_path)
+    except Exception:
+        return set()
+    if "symbol" not in df.columns:
+        return set()
+    return set(df["symbol"].dropna().astype(str).str.upper())
+
+
+def append_failed_symbol(output_dir: Path, symbol: str, error: str) -> None:
+    failed_path = output_dir / "fetch_1m_failed_symbols.csv"
+    exists = failed_path.exists()
+    with failed_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["symbol", "error"])
+        if not exists:
+            writer.writeheader()
+        writer.writerow({"symbol": symbol, "error": error})
+
+
+def should_skip_existing(path: Path, days: int, min_rows_per_day: int, force: bool, skip_existing_any: bool) -> bool:
     if force:
         return False
+    rows = existing_row_count(path)
+    if skip_existing_any and rows > 0:
+        return True
     expected_min_rows = max(1, days * min_rows_per_day)
-    return existing_row_count(path) >= expected_min_rows
+    return rows >= expected_min_rows
 
 
 def ib_to_dataframe(symbol: str, bars) -> pd.DataFrame:
@@ -316,6 +344,17 @@ def main() -> int:
         default=250,
         help="Resume heuristic: skip existing files with at least days * this many rows",
     )
+    parser.add_argument(
+        "--skip-existing-any",
+        action="store_true",
+        help="Raw data-lake resume mode: skip any symbol that already has a non-empty CSV, even if partial.",
+    )
+    parser.add_argument(
+        "--skip-failed-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip symbols already listed in data/1m/fetch_1m_failed_symbols.csv.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -325,6 +364,8 @@ def main() -> int:
     if not symbols:
         print("No symbols provided. Use --universe, --symbols, or --symbols-file.", file=sys.stderr)
         return 2
+
+    failed_cache = load_failed_cache(output_dir) if args.skip_failed_cache else set()
 
     cfg = FetchConfig(
         host=args.host,
@@ -341,6 +382,8 @@ def main() -> int:
         use_rth=args.use_rth,
         force=args.force,
         min_rows_per_day=args.min_rows_per_day,
+        skip_existing_any=args.skip_existing_any,
+        failed_cache=failed_cache,
     )
 
     print("IBKR 1m backfill")
@@ -349,18 +392,25 @@ def main() -> int:
     print(f"Output: {cfg.output_dir}")
     print(f"IBKR: {cfg.host}:{cfg.port}, client_id={cfg.client_id}")
     print(f"Chunk days: {cfg.chunk_days}, useRTH={cfg.use_rth}, whatToShow={cfg.what_to_show}")
+    print(f"skip_existing_any={cfg.skip_existing_any}, failed_cache_symbols={len(cfg.failed_cache)}")
 
     ib = IB()
     ib.connect(cfg.host, cfg.port, clientId=cfg.client_id, timeout=cfg.timeout)
 
     ok = 0
     skipped = 0
+    skipped_failed = 0
     failed: list[tuple[str, str]] = []
 
     try:
         for idx, symbol in enumerate(symbols, start=1):
+            if symbol.upper() in cfg.failed_cache and not cfg.force:
+                skipped_failed += 1
+                print(f"[{idx}/{len(symbols)}] SKIP_FAILED {symbol} -> in failed cache")
+                continue
+
             path = output_path(output_dir, symbol)
-            if should_skip_existing(path, cfg.days, cfg.min_rows_per_day, cfg.force):
+            if should_skip_existing(path, cfg.days, cfg.min_rows_per_day, cfg.force, cfg.skip_existing_any):
                 skipped += 1
                 print(f"[{idx}/{len(symbols)}] SKIP {symbol} -> {path} already has {existing_row_count(path)} rows")
                 continue
@@ -372,21 +422,24 @@ def main() -> int:
                 ok += 1
                 print(f"  saved {symbol}: {rows} total rows -> {path}", flush=True)
             except Exception as exc:
-                failed.append((symbol, str(exc)))
+                error = str(exc)
+                failed.append((symbol, error))
+                append_failed_symbol(output_dir, symbol, error)
                 print(f"  [FAIL] {symbol}: {exc}", flush=True)
                 time.sleep(max(cfg.sleep_seconds, 2.0))
     finally:
         ib.disconnect()
 
     if failed:
-        failed_path = output_dir / "fetch_1m_failed_symbols.csv"
+        failed_path = output_dir / "fetch_1m_failed_symbols_last_run.csv"
         pd.DataFrame(failed, columns=["symbol", "error"]).to_csv(failed_path, index=False)
-        print(f"Failed symbols saved: {failed_path}")
+        print(f"Failed symbols from this run saved: {failed_path}")
 
     print("\nDone")
     print(f"Fetched/updated: {ok}")
     print(f"Skipped existing: {skipped}")
-    print(f"Failed: {len(failed)}")
+    print(f"Skipped failed cache: {skipped_failed}")
+    print(f"Failed this run: {len(failed)}")
     return 0 if not failed else 1
 
 
