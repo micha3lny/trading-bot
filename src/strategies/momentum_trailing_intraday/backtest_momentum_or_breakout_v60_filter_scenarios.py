@@ -16,12 +16,36 @@ from src.strategies.momentum_trailing_intraday.backtest_momentum_or_breakout_v57
 DEFAULT_TRADES = "data/backtests/v53_portfolio_accepted_cash20000_exposure20000_pos8.csv"
 
 
+def not_bad_regime(out: pd.DataFrame) -> pd.Series:
+    if "market_regime" not in out.columns:
+        return pd.Series(True, index=out.index)
+    return out["market_regime"].astype(str).str.lower().ne("bad")
+
+
+def not_c_quality(out: pd.DataFrame) -> pd.Series:
+    if "setup_quality" not in out.columns:
+        return pd.Series(True, index=out.index)
+    return out["setup_quality"].astype(str).str.upper().ne("C")
+
+
+def live_safe_core(out: pd.DataFrame) -> pd.Series:
+    return (
+        (out["entry_price"] >= 50.0)
+        & (out["first_5m_high_pct"] >= 4.0)
+        & (out["first_15m_high_pct"] >= 6.5)
+        & (out["or_range_pct"] >= 5.0)
+        & not_bad_regime(out)
+        & not_c_quality(out)
+    )
+
+
 def apply_trade_filters(df: pd.DataFrame, scenario: str) -> pd.DataFrame:
     out = df.copy()
 
     if scenario == "baseline":
         return out
 
+    # Research-only hindsight archetype filters.
     if scenario == "continuation_only":
         return out[
             (out["first_15m_high_pct"] >= 5.0)
@@ -57,6 +81,38 @@ def apply_trade_filters(df: pd.DataFrame, scenario: str) -> pd.DataFrame:
             & (out["entry_price"] <= 250.0)
             & (out["first_15m_high_pct"] >= 5.0)
             & (out["time_to_high_minutes"] >= 30.0)
+        ].copy()
+
+    # Live-safe filters: only use information known early in session / at entry.
+    if scenario == "live_safe_expansion":
+        return out[
+            (out["first_5m_high_pct"] >= 4.0)
+            & (out["first_15m_high_pct"] >= 6.5)
+            & (out["or_range_pct"] >= 5.0)
+        ].copy()
+
+    if scenario == "live_safe_expansion_price_ge_50":
+        return out[
+            (out["entry_price"] >= 50.0)
+            & (out["first_5m_high_pct"] >= 4.0)
+            & (out["first_15m_high_pct"] >= 6.5)
+            & (out["or_range_pct"] >= 5.0)
+        ].copy()
+
+    if scenario == "live_safe_full":
+        return out[live_safe_core(out)].copy()
+
+    if scenario == "live_safe_full_price_50_250":
+        return out[
+            live_safe_core(out)
+            & (out["entry_price"] <= 250.0)
+        ].copy()
+
+    if scenario == "live_safe_full_price_100_250":
+        return out[
+            live_safe_core(out)
+            & (out["entry_price"] >= 100.0)
+            & (out["entry_price"] <= 250.0)
         ].copy()
 
     raise ValueError(f"Unknown scenario: {scenario}")
@@ -163,7 +219,9 @@ def main() -> int:
     trades = load_trades(args.trades_csv)
     numeric_cols = [
         "entry_price",
+        "first_5m_high_pct",
         "first_15m_high_pct",
+        "or_range_pct",
         "time_to_high_minutes",
         "pnl_pct",
     ]
@@ -179,6 +237,11 @@ def main() -> int:
         "price_100_250",
         "price_50_250_continuation",
         "price_100_250_continuation",
+        "live_safe_expansion",
+        "live_safe_expansion_price_ge_50",
+        "live_safe_full",
+        "live_safe_full_price_50_250",
+        "live_safe_full_price_100_250",
     ]
 
     output_dir = Path(args.output_dir)
@@ -203,8 +266,8 @@ def main() -> int:
 
     print("\nInterpretation hints:")
     print("- price_100_250 tests the profitable price bucket discovered in v60 expectancy diagnostics.")
-    print("- continuation_only tests whether strong early expansion plus slow time-to-high improves all buckets.")
-    print("- continuation filters use hindsight time_to_high_minutes, so treat them as research/proxy, not direct live rules yet.")
+    print("- continuation_only uses hindsight time_to_high_minutes, so treat it as research/proxy, not a live rule.")
+    print("- live_safe_* scenarios use only price, first 5m/15m expansion, OR range, regime, and setup quality.")
     return 0
 
 
