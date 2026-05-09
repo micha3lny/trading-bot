@@ -16,6 +16,8 @@ from src.strategies.momentum_trailing_intraday.backtest_momentum_or_breakout_v57
 DEFAULT_TRADES = "data/backtests/v53_portfolio_accepted_cash20000_exposure20000_pos8.csv"
 DEFAULT_WIDE = "data/universe/v62_symbols_wide.txt"
 DEFAULT_LIQUID = "data/universe/v62_symbols_liquid.txt"
+DEFAULT_V64_FOCUS = "data/universe/v64_symbols_focus.txt"
+DEFAULT_V64_TRADEABLE = "data/universe/v64_symbols_tradeable.txt"
 
 
 def read_symbols(path: str) -> set[str]:
@@ -78,8 +80,14 @@ def run_universe(label: str, trades: pd.DataFrame, symbols: set[str], args: argp
     if accepted_df.empty:
         summary = pd.DataFrame([{
             "strategy": label,
+            "universe_symbols": len(symbols),
+            "candidate_trades_after_universe_filter": len(filtered),
+            "rejected_by_portfolio": len(rejected_df),
             "trades": 0,
+            "active_days": 0,
             "symbols": 0,
+            "gross_profit_usd": 0.0,
+            "execution_cost_usd": 0.0,
             "net_profit_usd": 0.0,
             "net_return_on_starting_cash_pct": 0.0,
         }])
@@ -94,10 +102,12 @@ def run_universe(label: str, trades: pd.DataFrame, symbols: set[str], args: argp
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="v58 universe comparison: wide vs liquid")
+    parser = argparse.ArgumentParser(description="v58 universe comparison: wide/liquid/v64 alpha")
     parser.add_argument("--trades-csv", default=DEFAULT_TRADES)
     parser.add_argument("--wide-symbols", default=DEFAULT_WIDE)
     parser.add_argument("--liquid-symbols", default=DEFAULT_LIQUID)
+    parser.add_argument("--v64-focus-symbols", default=DEFAULT_V64_FOCUS)
+    parser.add_argument("--v64-tradeable-symbols", default=DEFAULT_V64_TRADEABLE)
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
 
     parser.add_argument("--starting-cash", type=float, default=25_000.0)
@@ -129,12 +139,11 @@ def main() -> int:
     trades = load_trades(args.trades_csv)
     trades["symbol"] = trades["symbol"].astype(str).str.upper()
 
-    wide = read_symbols(args.wide_symbols)
-    liquid = read_symbols(args.liquid_symbols)
-
     scenarios = [
-        ("v58_wide_universe", wide),
-        ("v58_liquid_universe", liquid),
+        ("v58_wide_universe", read_symbols(args.wide_symbols)),
+        ("v58_liquid_universe", read_symbols(args.liquid_symbols)),
+        ("v64_focus_universe", read_symbols(args.v64_focus_symbols)),
+        ("v64_tradeable_universe", read_symbols(args.v64_tradeable_symbols)),
     ]
 
     summaries = []
@@ -169,7 +178,8 @@ def main() -> int:
 
     print("\nInterpretation hints:")
     print("- Wide universe should capture more movers but may carry more execution/noise risk.")
-    print("- Liquid universe should reduce execution risk but may miss smaller momentum names.")
+    print("- Liquid universe reduces execution risk but may miss smaller momentum names.")
+    print("- v64 focus/tradeable test whether alpha-style universe selection improves expectancy.")
     print("- Compare net profit, drawdown, trade count, and avg net profit per trade before deleting data.")
     return 0
 
