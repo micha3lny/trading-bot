@@ -49,20 +49,10 @@ def quality_float(row: pd.Series, col: str, default: float = 0.0) -> float:
 
 
 def score_trade_candidate(row: pd.Series, alpha_scores: dict[str, float], args: argparse.Namespace) -> float:
-    """Daily ranking proxy for choosing active watchlist candidates.
-
-    This is intentionally based on information available in the candidate trade table plus a static
-    symbol quality prior. It is not the final live scanner, but it tests the core idea:
-    broad universe -> daily ranked top N -> strategy execution.
-    """
     symbol = str(row.get("symbol", "")).upper()
     score = 0.0
-
-    # Static symbol prior from v64 universe quality. Small weight only: it should help tie-break,
-    # not dominate day-specific setups.
     score += args.alpha_weight * alpha_scores.get(symbol, 0.0)
 
-    # Candidate/setup quality fields from historical accepted setup table.
     quality = str(row.get("setup_quality", "")).upper()
     if quality == "A+":
         score += 35.0
@@ -79,7 +69,6 @@ def score_trade_candidate(row: pd.Series, alpha_scores: dict[str, float], args: 
     elif regime == "bad":
         score -= 20.0
 
-    # Flexible feature boosts: only applied if columns exist.
     for col, weight in [
         ("score", 3.0),
         ("quality_score", 2.0),
@@ -88,12 +77,11 @@ def score_trade_candidate(row: pd.Series, alpha_scores: dict[str, float], args: 
         ("relative_volume", 4.0),
         ("rvol", 4.0),
         ("or_breakout_pct", 5.0),
-        ("pnl_pct", 0.0),  # intentionally ignored; do not leak outcome into ranking.
+        ("pnl_pct", 0.0),
     ]:
         if col in row.index and weight:
             score += weight * quality_float(row, col)
 
-    # Prefer cleaner execution candidates if these columns exist.
     for spread_col in ["spread_bps", "entry_spread_bps"]:
         if spread_col in row.index:
             spread = quality_float(row, spread_col, default=999.0)
@@ -153,6 +141,24 @@ def build_daily_top_universe(trades: pd.DataFrame, alpha_rank: pd.DataFrame, wid
     return selected_trades, daily_universe
 
 
+def apply_live_safe_expansion(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    out = df.copy()
+    mask = (
+        (out["first_5m_high_pct"] >= args.min_first_5m_high_pct)
+        & (out["first_15m_high_pct"] >= args.min_first_15m_high_pct)
+        & (out["or_range_pct"] >= args.min_or_range_pct)
+    )
+    if args.min_entry_price is not None:
+        mask &= out["entry_price"] >= args.min_entry_price
+    if args.max_entry_price is not None:
+        mask &= out["entry_price"] <= args.max_entry_price
+    if args.exclude_bad_regime and "market_regime" in out.columns:
+        mask &= out["market_regime"].astype(str).str.lower().ne("bad")
+    if args.exclude_c_quality and "setup_quality" in out.columns:
+        mask &= out["setup_quality"].astype(str).str.upper().ne("C")
+    return out[mask].copy()
+
+
 def simulate_portfolio(trades: pd.DataFrame, args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
     trades = trades.sort_values("entry_dt").reset_index(drop=True)
     accepted = []
@@ -176,18 +182,15 @@ def simulate_portfolio(trades: pd.DataFrame, args: argparse.Namespace) -> tuple[
 
         row = row.copy()
         row["position_usd"] = dynamic_position_size(row, args)
-
         pnl_pct = float(row.get("pnl_pct", 0.0))
         row["profit_usd"] = row["position_usd"] * pnl_pct / 100.0
 
         if len(open_positions) >= args.max_positions:
             rejected.append({**row.to_dict(), "reason": "max_positions"})
             continue
-
         if open_exposure + row["position_usd"] > args.max_gross_exposure:
             rejected.append({**row.to_dict(), "reason": "max_exposure"})
             continue
-
         if cash < row["position_usd"]:
             rejected.append({**row.to_dict(), "reason": "insufficient_cash"})
             continue
@@ -218,6 +221,14 @@ def run_case(label: str, trades: pd.DataFrame, args: argparse.Namespace) -> tupl
     return summary, costed, rejected_df
 
 
+def add_selection_metadata(summary: pd.DataFrame, top_n: int, trades: pd.DataFrame) -> pd.DataFrame:
+    out = summary.copy()
+    out.insert(1, "daily_top_n", top_n)
+    out.insert(2, "candidate_trades_after_daily_filter", len(trades))
+    out.insert(3, "unique_symbols_in_daily_universe", trades["symbol"].nunique() if "symbol" in trades.columns and not trades.empty else 0)
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="v59 daily top-N universe simulation")
     parser.add_argument("--trades-csv", default=DEFAULT_TRADES)
@@ -226,6 +237,14 @@ def main() -> int:
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--top-n", type=int, default=100)
     parser.add_argument("--alpha-weight", type=float, default=0.25)
+    parser.add_argument("--apply-live-safe-expansion", action="store_true")
+    parser.add_argument("--min-first-5m-high-pct", type=float, default=4.0)
+    parser.add_argument("--min-first-15m-high-pct", type=float, default=6.5)
+    parser.add_argument("--min-or-range-pct", type=float, default=5.0)
+    parser.add_argument("--min-entry-price", type=float, default=None)
+    parser.add_argument("--max-entry-price", type=float, default=None)
+    parser.add_argument("--exclude-bad-regime", action="store_true")
+    parser.add_argument("--exclude-c-quality", action="store_true")
 
     parser.add_argument("--starting-cash", type=float, default=25_000.0)
     parser.add_argument("--max-gross-exposure", type=float, default=25_000.0)
@@ -252,40 +271,45 @@ def main() -> int:
     print(f"Trades CSV: {args.trades_csv}")
     print(f"Alpha rank: {args.alpha_rank_csv}")
     print(f"Top N/day: {args.top_n}")
+    print(f"Live-safe expansion: {args.apply_live_safe_expansion}")
     print(f"Position range: ${args.min_position_usd:.0f}-${args.max_position_usd:.0f}")
 
     trades = load_trades(args.trades_csv)
     trades["symbol"] = trades["symbol"].astype(str).str.upper()
+    for col in ["entry_price", "first_5m_high_pct", "first_15m_high_pct", "or_range_pct", "pnl_pct"]:
+        if col in trades.columns:
+            trades[col] = pd.to_numeric(trades[col], errors="coerce")
     alpha = load_alpha_rank(args.alpha_rank_csv)
     wide = read_symbols(args.wide_symbols)
 
     wide_trades = trades[trades["symbol"].isin(wide)].copy()
     selected_trades, daily_universe = build_daily_top_universe(trades, alpha, wide, args)
 
+    if args.apply_live_safe_expansion:
+        wide_trades = apply_live_safe_expansion(wide_trades, args)
+        selected_trades = apply_live_safe_expansion(selected_trades, args)
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    baseline_summary, baseline_costed, baseline_rejected = run_case("v59_baseline_wide_all_candidates", wide_trades, args)
-    top_summary, top_costed, top_rejected = run_case(f"v59_daily_top_{args.top_n}", selected_trades, args)
+    suffix = f"top_{args.top_n}"
+    if args.apply_live_safe_expansion:
+        suffix += "_live_safe_expansion"
 
-    # Add selection metadata.
-    baseline_summary.insert(1, "daily_top_n", 0)
-    baseline_summary.insert(2, "candidate_trades_after_daily_filter", len(wide_trades))
-    baseline_summary.insert(3, "unique_symbols_in_daily_universe", wide_trades["symbol"].nunique())
+    baseline_summary, baseline_costed, baseline_rejected = run_case("v59_baseline_wide_all_candidates" + ("_live_safe_expansion" if args.apply_live_safe_expansion else ""), wide_trades, args)
+    top_summary, top_costed, top_rejected = run_case(f"v59_daily_top_{args.top_n}" + ("_live_safe_expansion" if args.apply_live_safe_expansion else ""), selected_trades, args)
 
-    top_summary.insert(1, "daily_top_n", args.top_n)
-    top_summary.insert(2, "candidate_trades_after_daily_filter", len(selected_trades))
-    top_summary.insert(3, "unique_symbols_in_daily_universe", selected_trades["symbol"].nunique())
-
+    baseline_summary = add_selection_metadata(baseline_summary, 0, wide_trades)
+    top_summary = add_selection_metadata(top_summary, args.top_n, selected_trades)
     combined = pd.concat([baseline_summary, top_summary], ignore_index=True)
 
-    daily_universe.to_csv(output_dir / f"v59_daily_top_{args.top_n}_universe_by_day.csv", index=False)
-    selected_trades.to_csv(output_dir / f"v59_daily_top_{args.top_n}_selected_candidate_trades.csv", index=False)
-    baseline_costed.to_csv(output_dir / "v59_baseline_wide_all_candidates_costed.csv", index=False)
-    top_costed.to_csv(output_dir / f"v59_daily_top_{args.top_n}_costed.csv", index=False)
-    baseline_rejected.to_csv(output_dir / "v59_baseline_wide_all_candidates_rejected.csv", index=False)
-    top_rejected.to_csv(output_dir / f"v59_daily_top_{args.top_n}_rejected.csv", index=False)
-    combined.to_csv(output_dir / f"v59_daily_top_{args.top_n}_comparison_summary.csv", index=False)
+    daily_universe.to_csv(output_dir / f"v59_daily_{suffix}_universe_by_day.csv", index=False)
+    selected_trades.to_csv(output_dir / f"v59_daily_{suffix}_selected_candidate_trades.csv", index=False)
+    baseline_costed.to_csv(output_dir / f"v59_baseline_wide_all_candidates_{suffix}_costed.csv", index=False)
+    top_costed.to_csv(output_dir / f"v59_daily_{suffix}_costed.csv", index=False)
+    baseline_rejected.to_csv(output_dir / f"v59_baseline_wide_all_candidates_{suffix}_rejected.csv", index=False)
+    top_rejected.to_csv(output_dir / f"v59_daily_{suffix}_rejected.csv", index=False)
+    combined.to_csv(output_dir / f"v59_daily_{suffix}_comparison_summary.csv", index=False)
 
     print("\n=== v59 daily top-N comparison ===")
     print(combined.to_string(index=False, float_format=lambda x: f"{x:.2f}"))
@@ -295,11 +319,11 @@ def main() -> int:
         counts = daily_universe.groupby("date")["symbol"].nunique()
         print(counts.describe().to_string(float_format=lambda x: f"{x:.2f}"))
 
-    print(f"\nSaved summary: {output_dir / f'v59_daily_top_{args.top_n}_comparison_summary.csv'}")
+    print(f"\nSaved summary: {output_dir / f'v59_daily_{suffix}_comparison_summary.csv'}")
     print("\nInterpretation hints:")
-    print("- This is the correct architecture test: broad universe -> ranked daily top N -> trade simulation.")
-    print("- If daily top N improves avg net trade or reduces drawdown, we use it for live watchlist selection.")
-    print("- If it worsens PnL, the daily ranking proxy needs better features or lower alpha weighting.")
+    print("- This is the live architecture test: broad universe -> daily top N -> optional live-safe expansion -> portfolio simulation.")
+    print("- live-safe expansion uses first_5m_high_pct, first_15m_high_pct, or_range_pct, and optional price/regime/quality filters.")
+    print("- It does not use time_to_high_minutes, so it avoids the earlier hindsight bias.")
     return 0
 
 
