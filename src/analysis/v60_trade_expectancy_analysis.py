@@ -27,6 +27,28 @@ def safe_numeric(df: pd.DataFrame, cols: list[str]) -> None:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
 
+def normalize_profit_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    net_col = pick_column(out, ["net_profit_usd", "profit_after_costs_usd", "net_pnl_usd"])
+    gross_col = pick_column(out, ["gross_profit_usd", "profit_usd", "gross_pnl_usd"])
+
+    if net_col is None:
+        raise ValueError("input csv must contain one of: net_profit_usd, profit_after_costs_usd, net_pnl_usd")
+    if gross_col is None:
+        raise ValueError("input csv must contain one of: gross_profit_usd, profit_usd, gross_pnl_usd")
+
+    out["net_profit_usd"] = pd.to_numeric(out[net_col], errors="coerce")
+    out["gross_profit_usd"] = pd.to_numeric(out[gross_col], errors="coerce")
+
+    if "execution_cost_usd" not in out.columns:
+        out["execution_cost_usd"] = out["gross_profit_usd"] - out["net_profit_usd"]
+    else:
+        out["execution_cost_usd"] = pd.to_numeric(out["execution_cost_usd"], errors="coerce")
+
+    return out
+
+
 def summarize_subset(name: str, subset: pd.DataFrame) -> dict:
     if subset.empty:
         return {"segment": name, "trades": 0}
@@ -36,10 +58,12 @@ def summarize_subset(name: str, subset: pd.DataFrame) -> dict:
         "trades": len(subset),
         "symbols": subset["symbol"].nunique() if "symbol" in subset.columns else 0,
         "net_profit_usd": subset["net_profit_usd"].sum(),
-        "gross_profit_usd": subset["gross_profit_usd"].sum() if "gross_profit_usd" in subset.columns else np.nan,
-        "execution_cost_usd": subset["execution_cost_usd"].sum() if "execution_cost_usd" in subset.columns else np.nan,
+        "gross_profit_usd": subset["gross_profit_usd"].sum(),
+        "execution_cost_usd": subset["execution_cost_usd"].sum(),
         "avg_net_trade_usd": subset["net_profit_usd"].mean(),
         "median_net_trade_usd": subset["net_profit_usd"].median(),
+        "avg_gross_trade_usd": subset["gross_profit_usd"].mean(),
+        "avg_cost_trade_usd": subset["execution_cost_usd"].mean(),
         "win_rate_pct": (subset["net_profit_usd"] > 0).mean() * 100.0,
     }
 
@@ -75,10 +99,13 @@ def bucket_analysis(df: pd.DataFrame, value_col: str, bucket_edges: list[float],
             "trades": len(group),
             "symbols": group["symbol"].nunique() if "symbol" in group.columns else 0,
             "net_profit_usd": group["net_profit_usd"].sum(),
+            "gross_profit_usd": group["gross_profit_usd"].sum(),
+            "execution_cost_usd": group["execution_cost_usd"].sum(),
             "avg_net_trade_usd": group["net_profit_usd"].mean(),
+            "avg_gross_trade_usd": group["gross_profit_usd"].mean(),
             "median_net_trade_usd": group["net_profit_usd"].median(),
             "win_rate_pct": (group["net_profit_usd"] > 0).mean() * 100.0,
-            "avg_execution_cost_usd": group["execution_cost_usd"].mean() if "execution_cost_usd" in group.columns else np.nan,
+            "avg_execution_cost_usd": group["execution_cost_usd"].mean(),
         })
 
     out = pd.DataFrame(rows)
@@ -102,6 +129,7 @@ def main() -> int:
     outdir.mkdir(parents=True, exist_ok=True)
 
     df = pd.read_csv(path)
+    df = normalize_profit_columns(df)
 
     safe_numeric(df, [
         "net_profit_usd",
@@ -112,31 +140,41 @@ def main() -> int:
         "last_price",
         "median_dollar_volume",
         "avg_dollar_volume",
+        "session_dollar_volume",
+        "or_dollar_volume",
+        "first_15m_dollar_volume",
         "relative_volume",
         "rvol",
+        "entry_minutes_from_open",
+        "or_range_pct",
+        "gap_pct",
+        "first_5m_high_pct",
+        "first_15m_high_pct",
+        "time_to_high_minutes",
+        "shares_est",
+        "pnl_pct",
+        "pnl_after_costs_pct",
     ])
 
-    if "net_profit_usd" not in df.columns:
-        raise ValueError("input csv must contain net_profit_usd")
-
     price_col = pick_column(df, ["entry_price", "price", "last_price"])
-    liquidity_col = pick_column(df, ["median_dollar_volume", "avg_dollar_volume"])
+    liquidity_col = pick_column(df, ["median_dollar_volume", "avg_dollar_volume", "session_dollar_volume", "or_dollar_volume", "first_15m_dollar_volume"])
 
     print("=== v60 expectancy diagnostics ===")
     print(f"Input: {path}")
     print(f"Trades: {len(df)}")
+    print(f"Price column: {price_col}")
+    print(f"Liquidity column: {liquidity_col}")
 
-    # Winners vs losers
     sorted_df = df.sort_values("net_profit_usd")
     q = max(1, int(len(sorted_df) * args.top_bottom_quantile))
 
     losers = sorted_df.head(q).copy()
     winners = sorted_df.tail(q).copy()
 
-    winner_summary = summarize_subset("top_winners", winners)
-    loser_summary = summarize_subset("top_losers", losers)
-
-    summary_df = pd.DataFrame([winner_summary, loser_summary])
+    summary_df = pd.DataFrame([
+        summarize_subset("top_winners", winners),
+        summarize_subset("top_losers", losers),
+    ])
 
     compare_cols = [
         c for c in [
@@ -145,8 +183,13 @@ def main() -> int:
             "execution_cost_usd",
             "relative_volume",
             "rvol",
-            "shares",
-            "holding_minutes",
+            "shares_est",
+            "entry_minutes_from_open",
+            "or_range_pct",
+            "gap_pct",
+            "first_5m_high_pct",
+            "first_15m_high_pct",
+            "time_to_high_minutes",
             "gross_profit_usd",
             "net_profit_usd",
         ]
@@ -162,20 +205,9 @@ def main() -> int:
         compare_rows.append(row)
 
     compare_df = pd.DataFrame(compare_rows)
+    price_df = bucket_analysis(df, price_col, PRICE_BUCKETS, "price_bucket") if price_col else pd.DataFrame()
+    liquidity_df = bucket_analysis(df, liquidity_col, LIQUIDITY_BUCKETS, "liquidity_bucket") if liquidity_col else pd.DataFrame()
 
-    # Price bucket analysis
-    if price_col:
-        price_df = bucket_analysis(df, price_col, PRICE_BUCKETS, "price_bucket")
-    else:
-        price_df = pd.DataFrame()
-
-    # Liquidity bucket analysis
-    if liquidity_col:
-        liquidity_df = bucket_analysis(df, liquidity_col, LIQUIDITY_BUCKETS, "liquidity_bucket")
-    else:
-        liquidity_df = pd.DataFrame()
-
-    # Save outputs
     summary_df.to_csv(outdir / "v60_winner_loser_summary.csv", index=False)
     compare_df.to_csv(outdir / "v60_winner_loser_feature_compare.csv", index=False)
     price_df.to_csv(outdir / "v60_price_bucket_analysis.csv", index=False)
