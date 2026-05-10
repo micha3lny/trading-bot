@@ -1,0 +1,16 @@
+[Unit]
+Description=IBKR Gateway via IBC
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/ibc
+Environment=DISPLAY=:1
+ExecStart=/usr/bin/xvfb-run -a /home/pi/ibc/scripts/run-ibgateway.sh
+Restart=always
+RestartSec=20
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
