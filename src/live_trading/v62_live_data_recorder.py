@@ -78,6 +78,28 @@ class LiveCandle1m:
 
 
 @dataclass
+class ExtendedHoursCandle1m:
+    symbol: str
+    bar_time: str
+    session_type: str  # premarket or afterhours
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
+    close: float | None = None
+    volume: float | None = None
+    wap: float | None = None
+    trade_count: int | None = None
+    bid: float | None = None
+    ask: float | None = None
+    mid_price: float | None = None
+    spread_bps: float | None = None
+    relative_volume: float | None = None
+    market_regime: str = ""
+    source: str = "ibkr"
+    recorded_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
 class MarketDataSnapshot:
     symbol: str
     price: float | None = None
@@ -91,6 +113,92 @@ class MarketDataSnapshot:
     close: float | None = None
     spread_bps: float | None = None
     source: str = "ibkr"
+    recorded_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
+class SpreadSnapshot:
+    symbol: str
+    timestamp: str
+    bid: float | None = None
+    ask: float | None = None
+    spread: float | None = None
+    spread_bps: float | None = None
+    mid_price: float | None = None
+    spread_regime: str = ""
+    liquidity_regime: str = ""
+    session_type: str = ""
+    source: str = "ibkr"
+    recorded_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
+class PremarketSummary:
+    symbol: str
+    session_date: str
+    premarket_open: float | None = None
+    premarket_close: float | None = None
+    premarket_high: float | None = None
+    premarket_low: float | None = None
+    premarket_range_pct: float | None = None
+    premarket_volume: float | None = None
+    premarket_dollar_volume: float | None = None
+    premarket_vwap: float | None = None
+    premarket_trend_pct: float | None = None
+    premarket_close_vs_high_pct: float | None = None
+    premarket_close_vs_low_pct: float | None = None
+    premarket_high_time: str = ""
+    premarket_low_time: str = ""
+    premarket_relative_volume: float | None = None
+    premarket_gap_pct: float | None = None
+    premarket_spread_avg_bps: float | None = None
+    premarket_spread_max_bps: float | None = None
+    premarket_breakout_distance_pct: float | None = None
+    news_flag: bool | None = None
+    earnings_flag: bool | None = None
+    features_json: str = ""
+    recorded_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
+class AfterhoursSummary:
+    symbol: str
+    session_date: str
+    afterhours_open: float | None = None
+    afterhours_close: float | None = None
+    afterhours_high: float | None = None
+    afterhours_low: float | None = None
+    afterhours_range_pct: float | None = None
+    afterhours_volume: float | None = None
+    afterhours_dollar_volume: float | None = None
+    afterhours_vwap: float | None = None
+    afterhours_trend_pct: float | None = None
+    afterhours_relative_volume: float | None = None
+    afterhours_close_vs_high_pct: float | None = None
+    afterhours_close_vs_low_pct: float | None = None
+    afterhours_spread_avg_bps: float | None = None
+    afterhours_spread_max_bps: float | None = None
+    news_flag: bool | None = None
+    earnings_flag: bool | None = None
+    features_json: str = ""
+    recorded_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
+class OvernightMarketContext:
+    session_date: str
+    spy_overnight_pct: float | None = None
+    qqq_overnight_pct: float | None = None
+    iwm_overnight_pct: float | None = None
+    vix_change_pct: float | None = None
+    spy_premarket_high_pct: float | None = None
+    spy_premarket_low_pct: float | None = None
+    qqq_premarket_high_pct: float | None = None
+    qqq_premarket_low_pct: float | None = None
+    futures_trend: str = ""
+    market_gap_regime: str = ""
+    market_volatility_regime: str = ""
+    context_json: str = ""
     recorded_at: str = field(default_factory=utc_now_iso)
 
 
@@ -188,12 +296,17 @@ class LiveDataRecorder:
     """Append-only CSV recorder for paper/live trading experiments.
 
     This class intentionally has no IBKR dependency. The live engine should call these methods
-    whenever it receives candles, market data, selection decisions, signals, orders, fills,
-    portfolio snapshots, or errors.
+    whenever it receives candles, market data, extended-hours data, selection decisions,
+    signals, orders, fills, portfolio snapshots, or errors.
     """
 
     candle_fields = list(LiveCandle1m.__dataclass_fields__.keys())
+    extended_candle_fields = list(ExtendedHoursCandle1m.__dataclass_fields__.keys())
     market_fields = list(MarketDataSnapshot.__dataclass_fields__.keys())
+    spread_fields = list(SpreadSnapshot.__dataclass_fields__.keys())
+    premarket_summary_fields = list(PremarketSummary.__dataclass_fields__.keys())
+    afterhours_summary_fields = list(AfterhoursSummary.__dataclass_fields__.keys())
+    overnight_context_fields = list(OvernightMarketContext.__dataclass_fields__.keys())
     selection_fields = list(SelectionEvent.__dataclass_fields__.keys())
     signal_fields = list(SignalSnapshot.__dataclass_fields__.keys())
     order_fields = list(OrderIntent.__dataclass_fields__.keys())
@@ -218,9 +331,54 @@ class LiveDataRecorder:
         rows = [asdict(c) if isinstance(c, LiveCandle1m) else dict(c) for c in candles]
         return append_csv_rows(self.path("candles_1m.csv"), rows, self.candle_fields)
 
+    def record_extended_hours_candle_1m(self, candle: ExtendedHoursCandle1m | dict[str, Any]) -> None:
+        row = asdict(candle) if isinstance(candle, ExtendedHoursCandle1m) else dict(candle)
+        session_type = str(row.get("session_type", "")).lower()
+        filename = "premarket_1m.csv" if session_type == "premarket" else "afterhours_1m.csv"
+        append_csv_row(self.path(filename), row, self.extended_candle_fields)
+
+    def record_extended_hours_candles_1m(self, candles: Iterable[ExtendedHoursCandle1m | dict[str, Any]]) -> int:
+        count = 0
+        for candle in candles:
+            self.record_extended_hours_candle_1m(candle)
+            count += 1
+        return count
+
+    def record_premarket_candle_1m(self, candle: ExtendedHoursCandle1m | dict[str, Any]) -> None:
+        row = asdict(candle) if isinstance(candle, ExtendedHoursCandle1m) else dict(candle)
+        row["session_type"] = "premarket"
+        append_csv_row(self.path("premarket_1m.csv"), row, self.extended_candle_fields)
+
+    def record_afterhours_candle_1m(self, candle: ExtendedHoursCandle1m | dict[str, Any]) -> None:
+        row = asdict(candle) if isinstance(candle, ExtendedHoursCandle1m) else dict(candle)
+        row["session_type"] = "afterhours"
+        append_csv_row(self.path("afterhours_1m.csv"), row, self.extended_candle_fields)
+
     def record_market_snapshot(self, snapshot: MarketDataSnapshot | dict[str, Any]) -> None:
         row = asdict(snapshot) if isinstance(snapshot, MarketDataSnapshot) else dict(snapshot)
         append_csv_row(self.path("market_snapshots.csv"), row, self.market_fields)
+
+    def record_spread_snapshot(self, snapshot: SpreadSnapshot | dict[str, Any]) -> None:
+        row = asdict(snapshot) if isinstance(snapshot, SpreadSnapshot) else dict(snapshot)
+        append_csv_row(self.path("spread_snapshots.csv"), row, self.spread_fields)
+
+    def record_premarket_summary(self, summary: PremarketSummary | dict[str, Any]) -> None:
+        row = asdict(summary) if isinstance(summary, PremarketSummary) else dict(summary)
+        if row.get("features_json") and not isinstance(row.get("features_json"), str):
+            row["features_json"] = safe_json(row["features_json"])
+        append_csv_row(self.path("premarket_summary.csv"), row, self.premarket_summary_fields)
+
+    def record_afterhours_summary(self, summary: AfterhoursSummary | dict[str, Any]) -> None:
+        row = asdict(summary) if isinstance(summary, AfterhoursSummary) else dict(summary)
+        if row.get("features_json") and not isinstance(row.get("features_json"), str):
+            row["features_json"] = safe_json(row["features_json"])
+        append_csv_row(self.path("afterhours_summary.csv"), row, self.afterhours_summary_fields)
+
+    def record_overnight_market_context(self, context: OvernightMarketContext | dict[str, Any]) -> None:
+        row = asdict(context) if isinstance(context, OvernightMarketContext) else dict(context)
+        if row.get("context_json") and not isinstance(row.get("context_json"), str):
+            row["context_json"] = safe_json(row["context_json"])
+        append_csv_row(self.path("overnight_market_context.csv"), row, self.overnight_context_fields)
 
     def record_selection(self, event: SelectionEvent | dict[str, Any]) -> None:
         row = asdict(event) if isinstance(event, SelectionEvent) else dict(event)
@@ -273,6 +431,12 @@ class LiveDataRecorder:
             "created_at": utc_now_iso(),
             "files": [
                 "candles_1m.csv",
+                "premarket_1m.csv",
+                "afterhours_1m.csv",
+                "premarket_summary.csv",
+                "afterhours_summary.csv",
+                "overnight_market_context.csv",
+                "spread_snapshots.csv",
                 "market_snapshots.csv",
                 "selection_events.csv",
                 "signal_snapshots.csv",
@@ -292,10 +456,17 @@ def demo_records(recorder: LiveDataRecorder) -> None:
     recorder.record_run_metadata({
         "mode": "demo",
         "strategy": "v59_top100_live_safe_expansion",
+        "extended_hours_enabled": True,
         "pid": os.getpid(),
     })
     recorder.record_candle_1m(LiveCandle1m(symbol="AAPL", bar_time=utc_now_iso(), open=100, high=101, low=99.5, close=100.5, volume=12345))
+    recorder.record_premarket_candle_1m(ExtendedHoursCandle1m(symbol="AAPL", bar_time=utc_now_iso(), session_type="premarket", open=99.0, high=101.0, low=98.8, close=100.6, volume=25_000, wap=100.1, bid=100.55, ask=100.65, mid_price=100.60, spread_bps=9.94, relative_volume=3.2, market_regime="neutral"))
+    recorder.record_afterhours_candle_1m(ExtendedHoursCandle1m(symbol="AAPL", bar_time=utc_now_iso(), session_type="afterhours", open=100.5, high=101.2, low=100.1, close=100.9, volume=18_000, wap=100.7, bid=100.85, ask=100.95, mid_price=100.90, spread_bps=9.91, relative_volume=2.1, market_regime="neutral"))
     recorder.record_market_snapshot(MarketDataSnapshot(symbol="AAPL", price=100.5, bid=100.49, ask=100.51, spread_bps=2.0))
+    recorder.record_spread_snapshot(SpreadSnapshot(symbol="AAPL", timestamp=utc_now_iso(), bid=100.49, ask=100.51, spread=0.02, spread_bps=2.0, mid_price=100.50, spread_regime="tight", liquidity_regime="good", session_type="regular"))
+    recorder.record_premarket_summary(PremarketSummary(symbol="AAPL", session_date=recorder.session_date, premarket_open=99.0, premarket_close=100.6, premarket_high=101.0, premarket_low=98.8, premarket_range_pct=2.22, premarket_volume=25_000, premarket_dollar_volume=2_500_000, premarket_vwap=100.1, premarket_trend_pct=1.62, premarket_close_vs_high_pct=-0.40, premarket_close_vs_low_pct=1.82, premarket_relative_volume=3.2, premarket_gap_pct=1.1, premarket_spread_avg_bps=10.0, premarket_spread_max_bps=18.0, news_flag=False, earnings_flag=False, features_json={"demo": True}))
+    recorder.record_afterhours_summary(AfterhoursSummary(symbol="AAPL", session_date=recorder.session_date, afterhours_open=100.5, afterhours_close=100.9, afterhours_high=101.2, afterhours_low=100.1, afterhours_range_pct=1.09, afterhours_volume=18_000, afterhours_dollar_volume=1_814_000, afterhours_vwap=100.7, afterhours_trend_pct=0.40, afterhours_relative_volume=2.1, afterhours_close_vs_high_pct=-0.30, afterhours_spread_avg_bps=10.0, afterhours_spread_max_bps=20.0, news_flag=False, earnings_flag=False, features_json={"demo": True}))
+    recorder.record_overnight_market_context(OvernightMarketContext(session_date=recorder.session_date, spy_overnight_pct=0.15, qqq_overnight_pct=0.22, iwm_overnight_pct=-0.05, vix_change_pct=-1.2, spy_premarket_high_pct=0.35, spy_premarket_low_pct=-0.10, qqq_premarket_high_pct=0.42, qqq_premarket_low_pct=-0.08, futures_trend="up", market_gap_regime="mild_gap_up", market_volatility_regime="normal", context_json={"demo": True}))
     recorder.record_selection(SelectionEvent(symbol="AAPL", stage="live_safe_expansion", decision="accepted", score=87.5, reason="first_5m_high_pct>=4;first_15m_high_pct>=6.5;or_range_pct>=5", features_json={"first_5m_high_pct": 4.8}))
     recorder.record_signal(SignalSnapshot(symbol="AAPL", signal_name="momentum_or_breakout", action="BUY", score=87.5, threshold=80, reasons="live_safe_expansion"))
     recorder.record_order_intent(OrderIntent(symbol="AAPL", action="BUY", quantity=10, notional_usd=1005, order_type="MKT", strategy="v59_top100_live_safe_expansion", reason="paper demo"))
@@ -325,6 +496,12 @@ def main() -> int:
     print("Files:")
     for name in [
         "candles_1m.csv",
+        "premarket_1m.csv",
+        "afterhours_1m.csv",
+        "premarket_summary.csv",
+        "afterhours_summary.csv",
+        "overnight_market_context.csv",
+        "spread_snapshots.csv",
         "market_snapshots.csv",
         "selection_events.csv",
         "signal_snapshots.csv",
@@ -338,8 +515,9 @@ def main() -> int:
         print(f"- {recorder.path(name)}")
 
     print("\nUsage from live engine:")
-    print("from src.live_trading.v62_live_data_recorder import LiveDataRecorder, SelectionEvent")
+    print("from src.live_trading.v62_live_data_recorder import LiveDataRecorder, SelectionEvent, ExtendedHoursCandle1m")
     print("rec = LiveDataRecorder(); rec.record_selection(SelectionEvent(symbol='AAPL', stage='top100', decision='accepted'))")
+    print("rec.record_premarket_candle_1m(ExtendedHoursCandle1m(symbol='AAPL', bar_time='...', session_type='premarket'))")
     return 0
 
 
