@@ -1,0 +1,17 @@
+[Unit]
+Description=Trading Bot
+After=network.target ibgateway.service
+Requires=ibgateway.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/trading-bot
+ExecStartPre=/home/pi/trading-bot/.venv/bin/python -m src.live_trading.v64_wait_for_ibkr_api --host 127.0.0.1 --port 4002
+ExecStart=/home/pi/trading-bot/.venv/bin/python -m src.live_trading.run_live_bot
+Restart=always
+RestartSec=15
+TimeoutStartSec=360
+
+[Install]
+WantedBy=multi-user.target
