@@ -1,0 +1,15 @@
+[Unit]
+Description=Trading Portfolio Monitor
+After=trading-bot.service
+Requires=trading-bot.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/trading-bot
+ExecStart=/home/pi/trading-bot/.venv/bin/python -m src.live_trading.v63_live_portfolio_monitor --refresh 5
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
