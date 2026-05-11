@@ -13,15 +13,10 @@ from typing import Any
 import pandas as pd
 from ib_insync import IB, Stock, MarketOrder
 
-from src.live_trading.v62_live_data_recorder import (
-    ExtendedHoursCandle1m,
-    LiveCandle1m,
-    LiveDataRecorder,
-    MarketDataSnapshot,
-    OrderIntent,
-    SelectionEvent,
-    SignalSnapshot,
-    SpreadSnapshot,
+from src.live_trading.v62_live_data_recorder import LiveDataRecorder
+from src.live_trading.v66_ibkr_account_recorder import (
+    record_account_snapshot,
+    record_recent_fills,
 )
 
 DEFAULT_HOST = "127.0.0.1"
@@ -184,16 +179,12 @@ def compute_live_safe_features(state: SymbolState, snap: dict[str, Any], args: a
 
     if first_5m_high_pct is None or first_5m_high_pct < args.min_first_5m_high_pct:
         reasons.append("first_5m_high_too_low")
-
     if first_15m_high_pct is None or first_15m_high_pct < args.min_first_15m_high_pct:
         reasons.append("first_15m_high_too_low")
-
     if or_range_pct is None or or_range_pct < args.min_or_range_pct:
         reasons.append("or_range_too_low")
-
     if price is None or price < args.min_price:
         reasons.append("price_too_low")
-
     if spread_bps is not None and spread_bps > args.max_spread_bps:
         reasons.append("spread_too_wide")
 
@@ -219,6 +210,7 @@ def main() -> int:
     parser.add_argument("--recorder-dir", default=DEFAULT_RECORDER_DIR)
     parser.add_argument("--duration-seconds", type=int, default=28800)
     parser.add_argument("--interval-seconds", type=float, default=5.0)
+    parser.add_argument("--portfolio-interval-seconds", type=float, default=10.0)
     parser.add_argument("--market-data-type", type=int, default=1)
     parser.add_argument("--opening-range-seconds", type=int, default=15 * 60)
     parser.add_argument("--min-first-5m-high-pct", type=float, default=4.0)
@@ -236,6 +228,7 @@ def main() -> int:
     print("=== v67 live top100 expansion paper trader ===")
     print(f"Symbols loaded: {len(symbols)}")
     print(f"Recorder dir: {recorder.session_dir}")
+    print(f"Portfolio/fills recorder: integrated every {args.portfolio_interval_seconds}s")
 
     ib = IB()
     ib.connect(args.host, args.port, clientId=args.client_id, timeout=15)
@@ -244,6 +237,8 @@ def main() -> int:
     tickers = {}
     states = {symbol: SymbolState(symbol=symbol) for symbol in symbols}
     contracts = []
+    seen_fills: set[str] = set()
+    last_portfolio_record = 0.0
 
     try:
         for symbol in symbols:
@@ -261,7 +256,8 @@ def main() -> int:
 
         while time.time() - start < args.duration_seconds:
             ib.sleep(args.interval_seconds)
-            elapsed = time.time() - start
+            loop_now = time.time()
+            elapsed = loop_now - start
 
             ready_count = 0
             data_count = 0
@@ -314,6 +310,15 @@ def main() -> int:
 
                     state.signal_sent = True
 
+            new_fills = None
+            if loop_now - last_portfolio_record >= args.portfolio_interval_seconds:
+                try:
+                    record_account_snapshot(ib, recorder)
+                    new_fills = record_recent_fills(ib, recorder, seen_fills)
+                    last_portfolio_record = loop_now
+                except Exception as exc:
+                    print(f"{now_utc()} portfolio_recorder_error={exc!r}", flush=True)
+
             ranked = sorted(ranked, key=lambda x: x[1], reverse=True)
             top5 = ranked[:5]
 
@@ -325,6 +330,10 @@ def main() -> int:
                 f"{k}={v}" for k, v in rejection_counter.most_common(5)
             ])
 
+            portfolio_part = ""
+            if new_fills is not None:
+                portfolio_part = f" portfolio_recorded=1 new_fills={new_fills}"
+
             print(
                 f"{now_utc()} heartbeat "
                 f"scanned={len(contracts)} "
@@ -332,7 +341,8 @@ def main() -> int:
                 f"ready_new={ready_count} "
                 f"best={best_symbol}:{best_score:.2f} "
                 f"top5=[{top5_str}] "
-                f"rejects=[{rejection_summary}]",
+                f"rejects=[{rejection_summary}]"
+                f"{portfolio_part}",
                 flush=True,
             )
 
