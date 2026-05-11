@@ -67,15 +67,16 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     return out.fillna("")
 
 
-def print_table(title: str, df: pd.DataFrame, cols: list[str], limit: int = 10) -> None:
+def print_table(title: str, df: pd.DataFrame, cols: list[str], limit: int | None = 10) -> None:
     print(f"\n=== {title} ===")
     if df.empty:
         print("empty")
         return
-    show = clean_df(df.tail(limit).copy())
+    show = df.copy() if limit is None else df.tail(limit).copy()
+    show = clean_df(show)
     existing = [c for c in cols if c in show.columns]
     if not existing:
-        print(show.tail(limit).to_string(index=False))
+        print(show.to_string(index=False))
         return
     print(show[existing].to_string(index=False))
 
@@ -179,11 +180,12 @@ def render_strategy_section(session: Path, table_limit: int, assumed_roundtrip_c
         for c in ["entry", "price", "peak", "market_value", "cost_basis", "unrealized_pnl", "current_pct", "unrealized_pct"]:
             if c in show.columns:
                 show[c] = pd.to_numeric(show[c], errors="coerce")
+        show = show.sort_values("unrealized_pnl", ascending=True) if "unrealized_pnl" in show.columns else show
         print_table(
-            "Bot open positions",
-            show.sort_values("unrealized_pnl", ascending=True) if "unrealized_pnl" in show.columns else show,
+            "Bot open positions — ALL",
+            show,
             ["symbol", "qty", "cost_basis", "market_value", "entry", "price", "peak", "current_pct", "unrealized_pnl"],
-            limit=table_limit,
+            limit=None,
         )
 
     if not closed.empty:
