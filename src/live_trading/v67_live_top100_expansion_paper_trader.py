@@ -6,7 +6,7 @@ import math
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,18 @@ class SymbolState:
     latest_volume: float | None = None
     signal_sent: bool = False
     bars: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class ManagedPosition:
+    symbol: str
+    contract: Any
+    quantity: int
+    entry_price: float
+    entry_time: str
+    peak_price: float
+    active: bool = True
+    exit_sent: bool = False
 
 
 def now_utc() -> str:
@@ -200,6 +212,66 @@ def compute_live_safe_features(state: SymbolState, snap: dict[str, Any], args: a
     }
 
 
+def is_eod_flatten_time(flatten_utc: str) -> bool:
+    try:
+        hh, mm = [int(x) for x in flatten_utc.split(":", 1)]
+        return datetime.now(timezone.utc).time() >= dtime(hour=hh, minute=mm, tzinfo=timezone.utc)
+    except Exception:
+        return False
+
+
+def send_exit_order(ib: IB, pos: ManagedPosition, reason: str, price: float | None) -> None:
+    if not pos.active or pos.exit_sent or pos.quantity <= 0:
+        return
+    order = MarketOrder("SELL", pos.quantity)
+    order.tif = "DAY"
+    order.outsideRth = False
+    trade = ib.placeOrder(pos.contract, order)
+    pos.exit_sent = True
+    pos.active = False
+    pnl_pct = ((price / pos.entry_price - 1.0) * 100.0) if price and pos.entry_price > 0 else None
+    pnl_txt = f" pnl_pct={pnl_pct:.2f}" if pnl_pct is not None else ""
+    print(
+        f"PAPER SELL SENT symbol={pos.symbol} qty={pos.quantity} "
+        f"reason={reason} entry={pos.entry_price:.2f} price={price if price else 0:.2f}" 
+        f"{pnl_txt} orderId={trade.order.orderId} tif={order.tif} outsideRth={order.outsideRth}",
+        flush=True,
+    )
+
+
+def manage_exits(ib: IB, managed_positions: dict[str, ManagedPosition], latest_snapshots: dict[str, dict[str, Any]], args: argparse.Namespace) -> int:
+    exits = 0
+    eod = args.enable_eod_flatten and is_eod_flatten_time(args.eod_flatten_utc)
+
+    for symbol, pos in list(managed_positions.items()):
+        if not pos.active or pos.exit_sent:
+            continue
+        snap = latest_snapshots.get(symbol) or {}
+        price = safe_float(snap.get("price"))
+        if price is None or price <= 0:
+            continue
+
+        pos.peak_price = max(pos.peak_price, price)
+        stop_price = pos.entry_price * (1.0 - args.exit_stop_loss_pct / 100.0)
+        peak_pnl_pct = (pos.peak_price / pos.entry_price - 1.0) * 100.0
+
+        reason = None
+        if price <= stop_price:
+            reason = "v46_wide_trail_stop_loss"
+        elif peak_pnl_pct >= args.exit_trailing_activation_pct:
+            trail_price = pos.peak_price * (1.0 - args.exit_trailing_stop_pct / 100.0)
+            if price <= trail_price:
+                reason = "v46_wide_trail_trailing_stop"
+        if reason is None and eod:
+            reason = "v46_wide_trail_close_exit_eod"
+
+        if reason:
+            send_exit_order(ib, pos, reason, price)
+            exits += 1
+
+    return exits
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="v67 live top100 expansion paper trader")
     parser.add_argument("--host", default=DEFAULT_HOST)
@@ -219,6 +291,11 @@ def main() -> int:
     parser.add_argument("--min-price", type=float, default=5.0)
     parser.add_argument("--max-spread-bps", type=float, default=50.0)
     parser.add_argument("--position-usd", type=float, default=1000.0)
+    parser.add_argument("--exit-stop-loss-pct", type=float, default=8.0)
+    parser.add_argument("--exit-trailing-activation-pct", type=float, default=3.0)
+    parser.add_argument("--exit-trailing-stop-pct", type=float, default=3.0)
+    parser.add_argument("--enable-eod-flatten", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--eod-flatten-utc", default="19:55")
     args = parser.parse_args()
 
     symbols = load_top_symbols(args.alpha_rank_csv, args.top_n, min_price=args.min_price)
@@ -229,6 +306,13 @@ def main() -> int:
     print(f"Symbols loaded: {len(symbols)}")
     print(f"Recorder dir: {recorder.session_dir}")
     print(f"Portfolio/fills recorder: integrated every {args.portfolio_interval_seconds}s")
+    print(
+        "Exit: v46 wide_trail "
+        f"stop_loss={args.exit_stop_loss_pct}% "
+        f"trail_activation={args.exit_trailing_activation_pct}% "
+        f"trail_stop={args.exit_trailing_stop_pct}% "
+        f"eod_flatten={args.enable_eod_flatten} at {args.eod_flatten_utc} UTC"
+    )
 
     ib = IB()
     ib.connect(args.host, args.port, clientId=args.client_id, timeout=15)
@@ -238,6 +322,8 @@ def main() -> int:
     states = {symbol: SymbolState(symbol=symbol) for symbol in symbols}
     contracts = []
     seen_fills: set[str] = set()
+    managed_positions: dict[str, ManagedPosition] = {}
+    latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
 
     try:
@@ -260,6 +346,7 @@ def main() -> int:
             elapsed = loop_now - start
 
             ready_count = 0
+            exit_count = 0
             data_count = 0
             best_symbol = None
             best_score = -999999.0
@@ -272,6 +359,7 @@ def main() -> int:
                 if snap.get("price") is None:
                     continue
 
+                latest_snapshots[symbol] = snap
                 data_count += 1
 
                 state = states[symbol]
@@ -302,6 +390,16 @@ def main() -> int:
                     order.outsideRth = False
                     trade = ib.placeOrder(q, order)
 
+                    if qty > 0 and price and price > 0:
+                        managed_positions[symbol] = ManagedPosition(
+                            symbol=symbol,
+                            contract=q,
+                            quantity=qty,
+                            entry_price=float(price),
+                            entry_time=now_utc(),
+                            peak_price=float(price),
+                        )
+
                     print(
                         f"PAPER BUY SENT symbol={symbol} qty={qty} "
                         f"price={price:.2f} score={features['score']:.2f} "
@@ -309,6 +407,8 @@ def main() -> int:
                     )
 
                     state.signal_sent = True
+
+            exit_count = manage_exits(ib, managed_positions, latest_snapshots, args)
 
             new_fills = None
             if loop_now - last_portfolio_record >= args.portfolio_interval_seconds:
@@ -334,11 +434,14 @@ def main() -> int:
             if new_fills is not None:
                 portfolio_part = f" portfolio_recorded=1 new_fills={new_fills}"
 
+            active_managed = sum(1 for p in managed_positions.values() if p.active)
             print(
                 f"{now_utc()} heartbeat "
                 f"scanned={len(contracts)} "
                 f"with_data={data_count} "
                 f"ready_new={ready_count} "
+                f"exits_sent={exit_count} "
+                f"managed_open={active_managed} "
                 f"best={best_symbol}:{best_score:.2f} "
                 f"top5=[{top5_str}] "
                 f"rejects=[{rejection_summary}]"
