@@ -6,7 +6,7 @@ import json
 import math
 import time
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, time as dtime, timezone
 from pathlib import Path
 from typing import Any
@@ -85,18 +85,147 @@ def append_dict_csv(path: Path, row: dict[str, Any], fieldnames: list[str]) -> N
         writer.writerow({k: row.get(k, "") for k in fieldnames})
 
 
+def load_top_symbols(alpha_rank_csv: str, top_n: int, min_price: float | None = None) -> list[str]:
+    p = Path(alpha_rank_csv)
+    if not p.exists():
+        raise FileNotFoundError(f"Missing alpha rank file: {alpha_rank_csv}")
+    df = pd.read_csv(p)
+    if "symbol" not in df.columns:
+        raise ValueError("alpha rank csv must contain symbol column")
+    df["symbol"] = df["symbol"].astype(str).str.upper()
+    if "alpha_score" in df.columns:
+        df["alpha_score"] = pd.to_numeric(df["alpha_score"], errors="coerce").fillna(0.0)
+        df = df.sort_values("alpha_score", ascending=False)
+    if min_price is not None and "last_close" in df.columns:
+        df["last_close"] = pd.to_numeric(df["last_close"], errors="coerce")
+        df = df[df["last_close"] >= min_price]
+    return df["symbol"].dropna().drop_duplicates().head(top_n).tolist()
+
+
+def snapshot_from_ticker(symbol: str, ticker: Any) -> dict[str, Any]:
+    bid = safe_float(getattr(ticker, "bid", None))
+    ask = safe_float(getattr(ticker, "ask", None))
+    last = safe_float(getattr(ticker, "last", None))
+    close = safe_float(getattr(ticker, "close", None))
+    volume = safe_float(getattr(ticker, "volume", None))
+    bid_size = safe_float(getattr(ticker, "bidSize", None))
+    ask_size = safe_float(getattr(ticker, "askSize", None))
+
+    mid = None
+    spread = None
+    spread_bps = None
+    if bid is not None and ask is not None and ask >= bid and bid > 0:
+        mid = (bid + ask) / 2.0
+        spread = ask - bid
+        spread_bps = spread / mid * 10_000.0 if mid else None
+
+    price = last or mid or close or bid or ask
+    return {
+        "symbol": symbol,
+        "price": price,
+        "bid": bid,
+        "ask": ask,
+        "last": last,
+        "close": close,
+        "volume": volume,
+        "bid_size": bid_size,
+        "ask_size": ask_size,
+        "mid_price": mid,
+        "spread": spread,
+        "spread_bps": spread_bps,
+    }
+
+
+def update_state(state: SymbolState, snap: dict[str, Any], elapsed: float, opening_range_seconds: int) -> None:
+    price = safe_float(snap.get("price"))
+    if price is None or price <= 0:
+        return
+    now_ts = time.time()
+    if state.first_seen_ts is None:
+        state.first_seen_ts = now_ts
+        state.first_price = price
+        state.open_price = price
+        state.high = price
+        state.low = price
+    state.last_price = price
+    state.high = max(state.high or price, price)
+    state.low = min(state.low or price, price)
+    state.latest_volume = safe_float(snap.get("volume"))
+    if elapsed <= 5 * 60:
+        state.first_5m_high = max(state.first_5m_high or price, price)
+    if elapsed <= 15 * 60:
+        state.first_15m_high = max(state.first_15m_high or price, price)
+    if elapsed <= opening_range_seconds:
+        state.or_high = max(state.or_high or price, price)
+        state.or_low = min(state.or_low or price, price)
+
+
+def pct_from(base: float | None, value: float | None) -> float | None:
+    if base is None or value is None or base <= 0:
+        return None
+    return (value / base - 1.0) * 100.0
+
+
+def compute_live_safe_features(state: SymbolState, snap: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    first = state.first_price or state.open_price
+    last = state.last_price or safe_float(snap.get("price"))
+    first_5m_high_pct = pct_from(first, state.first_5m_high)
+    first_15m_high_pct = pct_from(first, state.first_15m_high)
+    or_range_pct = None
+    if state.or_low is not None and state.or_high is not None and state.or_low > 0:
+        or_range_pct = (state.or_high / state.or_low - 1.0) * 100.0
+
+    price = last
+    spread_bps = safe_float(snap.get("spread_bps"))
+    ready = (
+        first_5m_high_pct is not None
+        and first_15m_high_pct is not None
+        and or_range_pct is not None
+        and first_5m_high_pct >= args.min_first_5m_high_pct
+        and first_15m_high_pct >= args.min_first_15m_high_pct
+        and or_range_pct >= args.min_or_range_pct
+        and price is not None
+        and price >= args.min_price
+        and (spread_bps is None or spread_bps <= args.max_spread_bps)
+    )
+
+    score = 0.0
+    for value, weight in [(first_5m_high_pct, 2.0), (first_15m_high_pct, 2.0), (or_range_pct, 1.0)]:
+        if value is not None:
+            score += value * weight
+    if spread_bps is not None and args.max_spread_bps > 0:
+        score += max(0.0, args.max_spread_bps - spread_bps) / args.max_spread_bps * 5.0
+
+    reasons: list[str] = []
+    if first_5m_high_pct is None or first_5m_high_pct < args.min_first_5m_high_pct:
+        reasons.append("first_5m_high_too_low")
+    if first_15m_high_pct is None or first_15m_high_pct < args.min_first_15m_high_pct:
+        reasons.append("first_15m_high_too_low")
+    if or_range_pct is None or or_range_pct < args.min_or_range_pct:
+        reasons.append("or_range_too_low")
+    if price is None or price < args.min_price:
+        reasons.append("price_too_low")
+    if spread_bps is not None and spread_bps > args.max_spread_bps:
+        reasons.append("spread_too_wide")
+
+    return {
+        "ready": ready,
+        "score": round(score, 4),
+        "reason": ";".join(reasons) if reasons else "live_safe_expansion_ready",
+        "first_5m_high_pct": first_5m_high_pct,
+        "first_15m_high_pct": first_15m_high_pct,
+        "or_range_pct": or_range_pct,
+        "entry_price": price,
+        "spread_bps": spread_bps,
+    }
+
+
 def record_lifecycle(recorder: LiveDataRecorder, event: str, symbol: str, **kwargs: Any) -> None:
     fields = [
         "recorded_at", "strategy", "event", "symbol", "action", "quantity", "price", "order_id",
         "execution_id", "reason", "entry_price", "peak_price", "pnl_pct", "raw_json",
     ]
-    row = {
-        "recorded_at": now_utc(),
-        "strategy": STRATEGY_NAME,
-        "event": event,
-        "symbol": symbol,
-        **kwargs,
-    }
+    row = {"recorded_at": now_utc(), "strategy": STRATEGY_NAME, "event": event, "symbol": symbol, **kwargs}
     raw = row.get("raw_json")
     if raw and not isinstance(raw, str):
         row["raw_json"] = json.dumps(raw, ensure_ascii=False, default=str)
@@ -120,20 +249,23 @@ def load_existing_fill_keys(recorder: LiveDataRecorder) -> set[str]:
 
 
 def managed_position_payload(pos: ManagedPosition) -> dict[str, Any]:
-    out = asdict(pos)
-    out.pop("contract", None)
-    return out
+    return {
+        "symbol": pos.symbol,
+        "quantity": pos.quantity,
+        "entry_price": pos.entry_price,
+        "entry_time": pos.entry_time,
+        "peak_price": pos.peak_price,
+        "active": pos.active,
+        "exit_sent": pos.exit_sent,
+        "source": pos.source,
+    }
 
 
 def persist_managed_positions(recorder: LiveDataRecorder, positions: dict[str, ManagedPosition]) -> None:
     payload = {
         "recorded_at": now_utc(),
         "strategy": STRATEGY_NAME,
-        "positions": {
-            symbol: managed_position_payload(pos)
-            for symbol, pos in positions.items()
-            if pos.active and not pos.exit_sent
-        },
+        "positions": {symbol: managed_position_payload(pos) for symbol, pos in positions.items() if pos.active and not pos.exit_sent},
     }
     recorder.path("managed_positions.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
@@ -275,23 +407,6 @@ def backfill_recent_1m(ib: IB, recorder: LiveDataRecorder, contracts: list[tuple
     return total
 
 
-def load_top_symbols(alpha_rank_csv: str, top_n: int, min_price: float | None = None) -> list[str]:
-    p = Path(alpha_rank_csv)
-    if not p.exists():
-        raise FileNotFoundError(f"Missing alpha rank file: {alpha_rank_csv}")
-    df = pd.read_csv(p)
-    if "symbol" not in df.columns:
-        raise ValueError("alpha rank csv must contain symbol column")
-    df["symbol"] = df["symbol"].astype(str).str.upper()
-    if "alpha_score" in df.columns:
-        df["alpha_score"] = pd.to_numeric(df["alpha_score"], errors="coerce").fillna(0.0)
-        df = df.sort_values("alpha_score", ascending=False)
-    if min_price is not None and "last_close" in df.columns:
-        df["last_close"] = pd.to_numeric(df["last_close"], errors="coerce")
-        df = df[df["last_close"] >= min_price]
-    return df["symbol"].dropna().drop_duplicates().head(top_n).tolist()
-
-
 def is_eod_flatten_time(flatten_utc: str) -> bool:
     try:
         hh, mm = [int(x) for x in flatten_utc.split(":", 1)]
@@ -374,11 +489,7 @@ def adopt_existing_long_positions(
             peak_price=peak_price,
             reason="restart_recovery_from_ibkr_portfolio",
         )
-        print(
-            f"ADOPTED EXISTING POSITION symbol={symbol} qty={int(quantity)} "
-            f"entry={entry_price:.2f} peak={peak_price:.2f}",
-            flush=True,
-        )
+        print(f"ADOPTED EXISTING POSITION symbol={symbol} qty={int(quantity)} entry={entry_price:.2f} peak={peak_price:.2f}", flush=True)
         adopted += 1
     return adopted
 
@@ -386,7 +497,6 @@ def adopt_existing_long_positions(
 def manage_exits(ib: IB, recorder: LiveDataRecorder, managed_positions: dict[str, ManagedPosition], latest_snapshots: dict[str, dict[str, Any]], args: argparse.Namespace) -> int:
     exits = 0
     eod = args.enable_eod_flatten and is_eod_flatten_time(args.eod_flatten_utc)
-
     for symbol, pos in list(managed_positions.items()):
         if not pos.active or pos.exit_sent:
             continue
@@ -402,7 +512,6 @@ def manage_exits(ib: IB, recorder: LiveDataRecorder, managed_positions: dict[str
 
         stop_price = pos.entry_price * (1.0 - args.exit_stop_loss_pct / 100.0)
         peak_pnl_pct = (pos.peak_price / pos.entry_price - 1.0) * 100.0
-
         reason = None
         if price <= stop_price:
             reason = "v46_wide_trail_stop_loss"
@@ -412,11 +521,9 @@ def manage_exits(ib: IB, recorder: LiveDataRecorder, managed_positions: dict[str
                 reason = "v46_wide_trail_trailing_stop"
         if reason is None and eod:
             reason = "v46_wide_trail_close_exit_eod"
-
         if reason:
             send_exit_order(ib, recorder, pos, reason, price)
             exits += 1
-
     return exits
 
 
@@ -454,27 +561,26 @@ def main() -> int:
     symbols = load_top_symbols(args.alpha_rank_csv, args.top_n, min_price=args.min_price)
     recorder = LiveDataRecorder(args.recorder_dir)
 
-    print("=== v67 live top100 expansion paper trader ===")
-    print(f"Symbols loaded: {len(symbols)}")
-    print(f"Recorder dir: {recorder.session_dir}")
-    print(f"Portfolio/fills recorder: integrated every {args.portfolio_interval_seconds}s")
+    print("=== v67 live top100 expansion paper trader ===", flush=True)
+    print(f"Symbols loaded: {len(symbols)}", flush=True)
+    print(f"Recorder dir: {recorder.session_dir}", flush=True)
+    print(f"Portfolio/fills recorder: integrated every {args.portfolio_interval_seconds}s", flush=True)
     print(
         "Exit: v46 wide_trail "
-        f"stop_loss={args.exit_stop_loss_pct}% "
-        f"trail_activation={args.exit_trailing_activation_pct}% "
-        f"trail_stop={args.exit_trailing_stop_pct}% "
-        f"adopt_existing={args.adopt_existing_positions} "
-        f"eod_flatten={args.enable_eod_flatten} at {args.eod_flatten_utc} UTC"
+        f"stop_loss={args.exit_stop_loss_pct}% trail_activation={args.exit_trailing_activation_pct}% "
+        f"trail_stop={args.exit_trailing_stop_pct}% adopt_existing={args.adopt_existing_positions} "
+        f"eod_flatten={args.enable_eod_flatten} at {args.eod_flatten_utc} UTC",
+        flush=True,
     )
-    print(f"Backfill 1m: {args.backfill_1m_on_start} duration={args.backfill_duration} top_n={args.backfill_top_n}")
+    print(f"Backfill 1m: {args.backfill_1m_on_start} duration={args.backfill_duration} top_n={args.backfill_top_n}", flush=True)
 
     ib = IB()
     ib.connect(args.host, args.port, clientId=args.client_id, timeout=15)
     ib.reqMarketDataType(args.market_data_type)
 
-    tickers = {}
+    tickers: dict[str, Any] = {}
     states = {symbol: SymbolState(symbol=symbol) for symbol in symbols}
-    contracts = []
+    contracts: list[tuple[str, Any]] = []
     contract_by_symbol: dict[str, Any] = {}
     seen_fills: set[str] = load_existing_fill_keys(recorder)
     managed_positions: dict[str, ManagedPosition] = {}
@@ -492,12 +598,13 @@ def main() -> int:
             contracts.append((symbol, q))
             contract_by_symbol[symbol] = q
             tickers[symbol] = ib.reqMktData(q, "", False, False)
-            print(f"Subscribed {symbol} conId={q.conId}")
+            print(f"Subscribed {symbol} conId={q.conId}", flush=True)
 
         restored = restore_managed_positions(recorder, contract_by_symbol)
         if restored:
             managed_positions.update(restored)
             for symbol, pos in restored.items():
+                states.get(symbol, SymbolState(symbol)).signal_sent = True
                 record_lifecycle(recorder, "RESTORED_MANAGED_POSITION", symbol, quantity=pos.quantity, entry_price=pos.entry_price, peak_price=pos.peak_price, reason="managed_positions_json")
             print(f"{now_utc()} restored_managed_positions={len(restored)}", flush=True)
 
@@ -517,9 +624,7 @@ def main() -> int:
             ib.sleep(args.interval_seconds)
             loop_now = time.time()
             elapsed = loop_now - start
-
             ready_count = 0
-            exit_count = 0
             data_count = 0
             best_symbol = None
             best_score = -999999.0
@@ -532,12 +637,10 @@ def main() -> int:
                     continue
                 latest_snapshots[symbol] = snap
                 data_count += 1
-
                 state = states[symbol]
                 update_state(state, snap, elapsed, args.opening_range_seconds)
                 features = compute_live_safe_features(state, snap, args)
                 ranked.append((symbol, features["score"], features))
-
                 if features["score"] > best_score:
                     best_score = features["score"]
                     best_symbol = symbol
@@ -545,7 +648,8 @@ def main() -> int:
                     for reason in features["reason"].split(";"):
                         rejection_counter[reason] += 1
 
-                if features["ready"] and not state.signal_sent:
+                has_active_position = symbol in managed_positions and managed_positions[symbol].active and not managed_positions[symbol].exit_sent
+                if features["ready"] and not state.signal_sent and not has_active_position:
                     ready_count += 1
                     price = features.get("entry_price")
                     qty = max(1, int(args.position_usd // price)) if price and price > 0 else 0
@@ -554,27 +658,19 @@ def main() -> int:
                     order.tif = "DAY"
                     order.outsideRth = False
                     trade = ib.placeOrder(q, order)
-
                     if qty > 0 and price and price > 0:
-                        managed_positions[symbol] = ManagedPosition(
-                            symbol=symbol,
-                            contract=q,
-                            quantity=qty,
-                            entry_price=float(price),
-                            entry_time=now_utc(),
-                            peak_price=float(price),
-                        )
+                        managed_positions[symbol] = ManagedPosition(symbol=symbol, contract=q, quantity=qty, entry_price=float(price), entry_time=now_utc(), peak_price=float(price))
                         persist_managed_positions(recorder, managed_positions)
                     record_lifecycle(recorder, "BUY_ORDER_SENT", symbol, action="BUY", quantity=qty, price=price, order_id=trade.order.orderId, entry_price=price, peak_price=price)
-                    print(
-                        f"PAPER BUY SENT symbol={symbol} qty={qty} price={price:.2f} score={features['score']:.2f} "
-                        f"orderId={trade.order.orderId} tif={order.tif} outsideRth={order.outsideRth}"
-                    )
+                    print(f"PAPER BUY SENT symbol={symbol} qty={qty} price={price:.2f} score={features['score']:.2f} orderId={trade.order.orderId} tif={order.tif} outsideRth={order.outsideRth}", flush=True)
                     state.signal_sent = True
 
             adopted_count = 0
             if args.adopt_existing_positions and not adopted_once and data_count > 0:
                 adopted_count = adopt_existing_long_positions(ib, recorder, contract_by_symbol, latest_snapshots, managed_positions)
+                for symbol in managed_positions:
+                    if symbol in states:
+                        states[symbol].signal_sent = True
                 adopted_once = True
                 if adopted_count:
                     persist_managed_positions(recorder, managed_positions)
@@ -615,7 +711,7 @@ def main() -> int:
             except Exception:
                 pass
         ib.disconnect()
-        print("Disconnected")
+        print("Disconnected", flush=True)
     return 0
 
 
