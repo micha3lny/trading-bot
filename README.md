@@ -4,6 +4,97 @@ Automated trading bot for IBKR with strategy ranking, backtesting, paper trading
 
 ---
 
+## ✅ Aktualny status — 2026-05-11
+
+Projekt przeszedł z etapu backtestów do pierwszego realnego uruchomienia na Raspberry Pi z IBKR Gateway i paper account.
+
+### Uruchomione i potwierdzone
+
+- Raspberry Pi działa jako execution node.
+- IB Gateway działa przez GUI/VNC i udostępnia API na porcie `4002`.
+- Repo działa na Macu i Raspberry przez GitHub.
+- Universe został rozszerzony do `2184` symboli w `data/universe/v62_symbols_wide.txt`.
+- Na Raspberry trzymamy tylko pliki potrzebne do live execution, a pełną historię świec trzymamy na Macu.
+- Działa live recorder zapisujący dane do `data/live/recorder/<YYYY-MM-DD>/`.
+- Działa monitor tekstowy portfolio: `src.live_trading.v63_live_portfolio_monitor`.
+- Działa account recorder: `src.live_trading.v66_ibkr_account_recorder`.
+- Działa paper trader: `src.live_trading.v67_live_top100_expansion_paper_trader`.
+
+### Najlepszy aktualny setup strategiczny
+
+Najlepszy potwierdzony setup z ostatnich backtestów:
+
+```bash
+python -m src.strategies.momentum_trailing_intraday.backtest_momentum_or_breakout_v59_daily_top_universe \
+  --top-n 100 \
+  --apply-live-safe-expansion
+```
+
+Wynik testowy dla tego wariantu:
+
+- około `+614.72 USD` netto,
+- `26` transakcji,
+- `76.92%` win rate,
+- testowany jako live-safe TOP100 + expansion.
+
+### Aktualny live/paper stack
+
+```text
+IB Gateway / Paper Account
+    ↓
+v67 live top100 expansion paper trader
+    ↓
+TOP100 z alpha rankingu
+    ↓
+live snapshots: bid / ask / last / spread / volume
+    ↓
+feature engine: first 5m, first 15m, OR range, spread, price
+    ↓
+signal / order intent / paper execution
+    ↓
+recorder CSV
+    ↓
+portfolio monitor
+```
+
+### Obecny tryb działania v67
+
+`v67_live_top100_expansion_paper_trader.py`:
+
+- subskrybuje TOP100 spółek z `data/universe/v64_universe_alpha_ranked.csv`,
+- liczy live-safe expansion,
+- zapisuje `market_snapshots.csv`, `spread_snapshots.csv`, `selection_events.csv`, `signal_snapshots.csv`, `order_intents.csv`,
+- po spełnieniu warunków wysyła paper BUY przez IBKR `MarketOrder`,
+- działa z poziomu `tmux`,
+- logowany jest do `data/live/recorder/<date>/v67_trader.log`.
+
+Uruchomienie na Raspberry:
+
+```bash
+cd ~/trading-bot
+source venv/bin/activate
+
+python -m src.live_trading.v67_live_top100_expansion_paper_trader \
+  --host 127.0.0.1 \
+  --port 4002 \
+  --client-id 67 \
+  --top-n 100 \
+  --duration-seconds 28800 \
+  2>&1 | tee -a data/live/recorder/$(date -u +%F)/v67_trader.log
+```
+
+### Ważne ograniczenia / TODO
+
+- Domyślne logi v67 są jeszcze zbyt ubogie; potrzebujemy logować `best_score`, `best_symbol`, TOP kandydatów i powody odrzuceń.
+- Trzeba dodać live agregację świec 1m do `candles_1m.csv`.
+- Trzeba potwierdzić pełną ścieżkę: sygnał → order intent → paper fill → portfolio snapshot.
+- Trzeba dopiąć exit management i zweryfikować SELL w paper tradingu.
+- Trzeba dodać autostart po reboot: Gateway → wait for API → bot → portfolio recorder.
+- Trzeba dodać backfill po restarcie, żeby uzupełniać brakujące świece.
+- Trzeba dodać automatyczny sync danych live z Raspberry na Maca.
+
+---
+
 ## 🎯 Cel projektu
 
 System do automatycznego i półautomatycznego handlu akcjami przez IBKR, który:
