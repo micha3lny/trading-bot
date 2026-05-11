@@ -302,11 +302,14 @@ def main() -> int:
                         qty = max(1, int(args.position_usd // price))
 
                     order = MarketOrder("BUY", qty)
-                    ib.placeOrder(q, order)
+                    order.tif = "DAY"
+                    order.outsideRth = False
+                    trade = ib.placeOrder(q, order)
 
                     print(
                         f"PAPER BUY SENT symbol={symbol} qty={qty} "
-                        f"price={price:.2f} score={features['score']:.2f}"
+                        f"price={price:.2f} score={features['score']:.2f} "
+                        f"orderId={trade.order.orderId} tif={order.tif} outsideRth={order.outsideRth}"
                     )
 
                     state.signal_sent = True
