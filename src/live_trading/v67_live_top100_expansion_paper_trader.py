@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +23,6 @@ from src.live_trading.v62_live_data_recorder import (
     SignalSnapshot,
     SpreadSnapshot,
 )
-
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4001
@@ -136,9 +136,6 @@ def update_state(state: SymbolState, snap: dict[str, Any], elapsed: float, openi
     if elapsed <= opening_range_seconds:
         state.or_high = max(state.or_high or price, price)
         state.or_low = min(state.or_low or price, price)
-    state.bars.append({"recorded_at": now_utc(), "price": price, "volume": state.latest_volume})
-    if len(state.bars) > 500:
-        state.bars = state.bars[-500:]
 
 
 def pct_from(base: float | None, value: float | None) -> float | None:
@@ -155,8 +152,10 @@ def compute_live_safe_features(state: SymbolState, snap: dict[str, Any], args: a
     or_range_pct = None
     if state.or_low is not None and state.or_high is not None and state.or_low > 0:
         or_range_pct = (state.or_high / state.or_low - 1.0) * 100.0
+
     price = last
     spread_bps = safe_float(snap.get("spread_bps"))
+
     ready = (
         first_5m_high_pct is not None
         and first_15m_high_pct is not None
@@ -168,6 +167,7 @@ def compute_live_safe_features(state: SymbolState, snap: dict[str, Any], args: a
         and price >= args.min_price
         and (spread_bps is None or spread_bps <= args.max_spread_bps)
     )
+
     score = 0.0
     for value, weight in [
         (first_5m_high_pct, 2.0),
@@ -176,19 +176,27 @@ def compute_live_safe_features(state: SymbolState, snap: dict[str, Any], args: a
     ]:
         if value is not None:
             score += value * weight
+
     if spread_bps is not None:
         score += max(0.0, args.max_spread_bps - spread_bps) / args.max_spread_bps * 5.0
+
     reasons = []
+
     if first_5m_high_pct is None or first_5m_high_pct < args.min_first_5m_high_pct:
         reasons.append("first_5m_high_too_low")
+
     if first_15m_high_pct is None or first_15m_high_pct < args.min_first_15m_high_pct:
         reasons.append("first_15m_high_too_low")
+
     if or_range_pct is None or or_range_pct < args.min_or_range_pct:
         reasons.append("or_range_too_low")
+
     if price is None or price < args.min_price:
         reasons.append("price_too_low")
+
     if spread_bps is not None and spread_bps > args.max_spread_bps:
         reasons.append("spread_too_wide")
+
     return {
         "ready": ready,
         "score": round(score, 4),
@@ -198,50 +206,20 @@ def compute_live_safe_features(state: SymbolState, snap: dict[str, Any], args: a
         "or_range_pct": or_range_pct,
         "entry_price": price,
         "spread_bps": spread_bps,
-        "open_price": first,
-        "or_high": state.or_high,
-        "or_low": state.or_low,
     }
 
 
-def record_snapshot(recorder: LiveDataRecorder, snap: dict[str, Any], session_type: str) -> None:
-    recorder.record_market_snapshot(MarketDataSnapshot(
-        symbol=snap["symbol"],
-        price=snap.get("price"),
-        bid=snap.get("bid"),
-        ask=snap.get("ask"),
-        last=snap.get("last"),
-        bid_size=snap.get("bid_size"),
-        ask_size=snap.get("ask_size"),
-        volume=snap.get("volume"),
-        close=snap.get("close"),
-        spread_bps=snap.get("spread_bps"),
-    ))
-    if snap.get("spread_bps") is not None:
-        recorder.record_spread_snapshot(SpreadSnapshot(
-            symbol=snap["symbol"],
-            timestamp=now_utc(),
-            bid=snap.get("bid"),
-            ask=snap.get("ask"),
-            spread=snap.get("spread"),
-            spread_bps=snap.get("spread_bps"),
-            mid_price=snap.get("mid_price"),
-            session_type=session_type,
-        ))
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser(description="v65 observe-only live top100 + live-safe expansion bot")
+    parser = argparse.ArgumentParser(description="v67 live top100 expansion paper trader")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--client-id", type=int, default=DEFAULT_CLIENT_ID)
     parser.add_argument("--alpha-rank-csv", default=DEFAULT_ALPHA_RANK)
     parser.add_argument("--top-n", type=int, default=100)
     parser.add_argument("--recorder-dir", default=DEFAULT_RECORDER_DIR)
-    parser.add_argument("--duration-seconds", type=int, default=3600)
+    parser.add_argument("--duration-seconds", type=int, default=28800)
     parser.add_argument("--interval-seconds", type=float, default=5.0)
-    parser.add_argument("--market-data-type", type=int, default=1, help="1=live, 3=delayed")
-    parser.add_argument("--session-type", default="regular", choices=["regular", "premarket", "afterhours"])
+    parser.add_argument("--market-data-type", type=int, default=1)
     parser.add_argument("--opening-range-seconds", type=int, default=15 * 60)
     parser.add_argument("--min-first-5m-high-pct", type=float, default=4.0)
     parser.add_argument("--min-first-15m-high-pct", type=float, default=6.5)
@@ -249,30 +227,15 @@ def main() -> int:
     parser.add_argument("--min-price", type=float, default=5.0)
     parser.add_argument("--max-spread-bps", type=float, default=50.0)
     parser.add_argument("--position-usd", type=float, default=1000.0)
-    parser.add_argument("--observe-only", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     symbols = load_top_symbols(args.alpha_rank_csv, args.top_n, min_price=args.min_price)
-    if not symbols:
-        raise SystemExit("No symbols loaded for live observer")
 
     recorder = LiveDataRecorder(args.recorder_dir)
-    recorder.record_run_metadata({
-        "module": "v65_live_top100_expansion_observer",
-        "strategy": "v59_top100_live_safe_expansion_observe_only",
-        "top_n": args.top_n,
-        "symbols": symbols,
-        "host": args.host,
-        "port": args.port,
-        "market_data_type": args.market_data_type,
-        "session_type": args.session_type,
-        "observe_only": args.observe_only,
-    })
 
-    print("=== v65 live top100 expansion observer ===")
-    print("Mode: observe-only. No broker orders are sent.")
-    print(f"Symbols: {len(symbols)} top ranked from {args.alpha_rank_csv}")
-    print(f"Recorder: {recorder.session_dir}")
+    print("=== v67 live top100 expansion paper trader ===")
+    print(f"Symbols loaded: {len(symbols)}")
+    print(f"Recorder dir: {recorder.session_dir}")
 
     ib = IB()
     ib.connect(args.host, args.port, clientId=args.client_id, timeout=15)
@@ -281,86 +244,94 @@ def main() -> int:
     tickers = {}
     states = {symbol: SymbolState(symbol=symbol) for symbol in symbols}
     contracts = []
+
     try:
         for symbol in symbols:
             contract = Stock(symbol, "SMART", "USD")
             qualified = ib.qualifyContracts(contract)
             if not qualified:
-                recorder.record_selection(SelectionEvent(symbol=symbol, stage="contract_qualification", decision="rejected", reason="could_not_qualify"))
                 continue
+
             q = qualified[0]
             contracts.append((symbol, q))
             tickers[symbol] = ib.reqMktData(q, "", False, False)
-            recorder.record_selection(SelectionEvent(symbol=symbol, stage="top100", decision="accepted", reason="alpha_rank_top_n"))
             print(f"Subscribed {symbol} conId={q.conId}")
 
         start = time.time()
+
         while time.time() - start < args.duration_seconds:
             ib.sleep(args.interval_seconds)
             elapsed = time.time() - start
+
             ready_count = 0
-            for symbol, _ in contracts:
+            data_count = 0
+            best_symbol = None
+            best_score = -999999.0
+            rejection_counter = Counter()
+            ranked = []
+
+            for symbol, q in contracts:
                 snap = snapshot_from_ticker(symbol, tickers[symbol])
+
                 if snap.get("price") is None:
                     continue
-                record_snapshot(recorder, snap, args.session_type)
+
+                data_count += 1
+
                 state = states[symbol]
                 update_state(state, snap, elapsed, args.opening_range_seconds)
                 features = compute_live_safe_features(state, snap, args)
 
-                recorder.record_selection(SelectionEvent(
-                    symbol=symbol,
-                    stage="live_safe_expansion",
-                    decision="accepted" if features["ready"] else "rejected",
-                    score=features["score"],
-                    reason=features["reason"],
-                    first_5m_high_pct=features.get("first_5m_high_pct"),
-                    first_15m_high_pct=features.get("first_15m_high_pct"),
-                    or_range_pct=features.get("or_range_pct"),
-                    entry_price=features.get("entry_price"),
-                    features_json=json.dumps(features, default=str),
-                ))
+                ranked.append((symbol, features["score"], features))
+
+                if features["score"] > best_score:
+                    best_score = features["score"]
+                    best_symbol = symbol
+
+                if not features["ready"]:
+                    for reason in features["reason"].split(";"):
+                        rejection_counter[reason] += 1
 
                 if features["ready"] and not state.signal_sent:
                     ready_count += 1
-                    recorder.record_signal(SignalSnapshot(
-                        symbol=symbol,
-                        signal_name="v59_top100_live_safe_expansion",
-                        action="BUY_INTENT",
-                        score=features["score"],
-                        threshold=0.0,
-                        reasons=features["reason"],
-                        features_json=json.dumps(features, default=str),
-                    ))
+
                     price = features.get("entry_price")
                     qty = 0
+
                     if price and price > 0:
                         qty = max(1, int(args.position_usd // price))
 
-                    recorder.record_order_intent(OrderIntent(
-                        symbol=symbol,
-                        action="BUY",
-                        quantity=qty,
-                        notional_usd=args.position_usd,
-                        order_type="IBKR_MARKET_ORDER",
-                        strategy="v59_top100_live_safe_expansion",
-                        reason=features["reason"],
-                        signal_score=features["score"],
-                        features_json=json.dumps(features, default=str),
-                    ))
+                    order = MarketOrder("BUY", qty)
+                    ib.placeOrder(q, order)
 
-                    if qty > 0:
-                        order = MarketOrder("BUY", qty)
-                        trade = ib.placeOrder(q, order)
-                        print(
-                            f"PAPER BUY SENT {symbol} qty={qty} "
-                            f"price~{price:.2f} score={features['score']}"
-                        )
-                    else:
-                        print(f"BUY_SKIPPED {symbol} invalid price={price}")
+                    print(
+                        f"PAPER BUY SENT symbol={symbol} qty={qty} "
+                        f"price={price:.2f} score={features['score']:.2f}"
+                    )
 
                     state.signal_sent = True
-            print(f"{now_utc()} scanned={len(contracts)} ready_new={ready_count}", flush=True)
+
+            ranked = sorted(ranked, key=lambda x: x[1], reverse=True)
+            top5 = ranked[:5]
+
+            top5_str = " | ".join([
+                f"{s}:{score:.1f}" for s, score, _ in top5
+            ])
+
+            rejection_summary = ", ".join([
+                f"{k}={v}" for k, v in rejection_counter.most_common(5)
+            ])
+
+            print(
+                f"{now_utc()} heartbeat "
+                f"scanned={len(contracts)} "
+                f"with_data={data_count} "
+                f"ready_new={ready_count} "
+                f"best={best_symbol}:{best_score:.2f} "
+                f"top5=[{top5_str}] "
+                f"rejects=[{rejection_summary}]",
+                flush=True,
+            )
 
     finally:
         for ticker in tickers.values():
@@ -368,6 +339,7 @@ def main() -> int:
                 ib.cancelMktData(ticker.contract)
             except Exception:
                 pass
+
         ib.disconnect()
         print("Disconnected")
 
