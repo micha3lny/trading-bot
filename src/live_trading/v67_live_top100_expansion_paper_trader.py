@@ -233,10 +233,48 @@ def send_exit_order(ib: IB, pos: ManagedPosition, reason: str, price: float | No
     pnl_txt = f" pnl_pct={pnl_pct:.2f}" if pnl_pct is not None else ""
     print(
         f"PAPER SELL SENT symbol={pos.symbol} qty={pos.quantity} "
-        f"reason={reason} entry={pos.entry_price:.2f} price={price if price else 0:.2f}" 
+        f"reason={reason} entry={pos.entry_price:.2f} price={price if price else 0:.2f}"
         f"{pnl_txt} orderId={trade.order.orderId} tif={order.tif} outsideRth={order.outsideRth}",
         flush=True,
     )
+
+
+def adopt_existing_long_positions(
+    ib: IB,
+    contract_by_symbol: dict[str, Any],
+    latest_snapshots: dict[str, dict[str, Any]],
+    managed_positions: dict[str, ManagedPosition],
+) -> int:
+    adopted = 0
+    for item in ib.portfolio():
+        symbol = str(getattr(item.contract, "symbol", "")).upper()
+        if symbol not in contract_by_symbol or symbol in managed_positions:
+            continue
+        quantity = safe_float(getattr(item, "position", None))
+        avg_cost = safe_float(getattr(item, "averageCost", None))
+        market_price = safe_float(getattr(item, "marketPrice", None))
+        if quantity is None or quantity <= 0:
+            continue
+        entry_price = avg_cost or market_price
+        if entry_price is None or entry_price <= 0:
+            continue
+        snap_price = safe_float((latest_snapshots.get(symbol) or {}).get("price"))
+        peak_price = max(entry_price, snap_price or market_price or entry_price)
+        managed_positions[symbol] = ManagedPosition(
+            symbol=symbol,
+            contract=contract_by_symbol[symbol],
+            quantity=int(quantity),
+            entry_price=float(entry_price),
+            entry_time=f"adopted_on_restart:{now_utc()}",
+            peak_price=float(peak_price),
+        )
+        print(
+            f"ADOPTED EXISTING POSITION symbol={symbol} qty={int(quantity)} "
+            f"entry={entry_price:.2f} peak={peak_price:.2f}",
+            flush=True,
+        )
+        adopted += 1
+    return adopted
 
 
 def manage_exits(ib: IB, managed_positions: dict[str, ManagedPosition], latest_snapshots: dict[str, dict[str, Any]], args: argparse.Namespace) -> int:
@@ -294,6 +332,7 @@ def main() -> int:
     parser.add_argument("--exit-stop-loss-pct", type=float, default=8.0)
     parser.add_argument("--exit-trailing-activation-pct", type=float, default=3.0)
     parser.add_argument("--exit-trailing-stop-pct", type=float, default=3.0)
+    parser.add_argument("--adopt-existing-positions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--enable-eod-flatten", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--eod-flatten-utc", default="19:55")
     args = parser.parse_args()
@@ -311,6 +350,7 @@ def main() -> int:
         f"stop_loss={args.exit_stop_loss_pct}% "
         f"trail_activation={args.exit_trailing_activation_pct}% "
         f"trail_stop={args.exit_trailing_stop_pct}% "
+        f"adopt_existing={args.adopt_existing_positions} "
         f"eod_flatten={args.enable_eod_flatten} at {args.eod_flatten_utc} UTC"
     )
 
@@ -321,10 +361,12 @@ def main() -> int:
     tickers = {}
     states = {symbol: SymbolState(symbol=symbol) for symbol in symbols}
     contracts = []
+    contract_by_symbol: dict[str, Any] = {}
     seen_fills: set[str] = set()
     managed_positions: dict[str, ManagedPosition] = {}
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
+    adopted_once = False
 
     try:
         for symbol in symbols:
@@ -335,6 +377,7 @@ def main() -> int:
 
             q = qualified[0]
             contracts.append((symbol, q))
+            contract_by_symbol[symbol] = q
             tickers[symbol] = ib.reqMktData(q, "", False, False)
             print(f"Subscribed {symbol} conId={q.conId}")
 
@@ -408,6 +451,11 @@ def main() -> int:
 
                     state.signal_sent = True
 
+            adopted_count = 0
+            if args.adopt_existing_positions and not adopted_once and data_count > 0:
+                adopted_count = adopt_existing_long_positions(ib, contract_by_symbol, latest_snapshots, managed_positions)
+                adopted_once = True
+
             exit_count = manage_exits(ib, managed_positions, latest_snapshots, args)
 
             new_fills = None
@@ -440,6 +488,7 @@ def main() -> int:
                 f"scanned={len(contracts)} "
                 f"with_data={data_count} "
                 f"ready_new={ready_count} "
+                f"adopted={adopted_count} "
                 f"exits_sent={exit_count} "
                 f"managed_open={active_managed} "
                 f"best={best_symbol}:{best_score:.2f} "
