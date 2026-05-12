@@ -587,6 +587,76 @@ def is_after_utc(value):
     return utc_minutes_now() >= parse_utc_hhmm(value)
 
 
+def enrich_lifecycle_with_fills(recorder: LiveDataRecorder) -> int:
+    lifecycle_path = recorder.path("trade_lifecycle.csv")
+    fills_path = recorder.path("fills.csv")
+    if not lifecycle_path.exists() or not fills_path.exists():
+        return 0
+
+    try:
+        with lifecycle_path.open("r", newline="", encoding="utf-8") as f:
+            lifecycle_rows = list(csv.DictReader(f))
+            lifecycle_fields = list(f.reader.fieldnames or [])
+        with fills_path.open("r", newline="", encoding="utf-8") as f:
+            fills_rows = list(csv.DictReader(f))
+    except Exception:
+        return 0
+
+    if not lifecycle_rows or not fills_rows:
+        return 0
+
+    needed = ["fill_price", "fill_latency_ms"]
+    for field in needed:
+        if field not in lifecycle_fields:
+            lifecycle_fields.append(field)
+
+    fills_by_order = {}
+    for fill in fills_rows:
+        oid = str(fill.get("order_id", "")).strip()
+        if oid:
+            fills_by_order[oid] = fill
+
+    updated = 0
+    for row in lifecycle_rows:
+        event = str(row.get("event", ""))
+        if event not in {"BUY_ORDER_SENT", "SELL_ORDER_SENT"}:
+            continue
+        if str(row.get("fill_price", "")).strip():
+            continue
+
+        oid = str(row.get("order_id", "")).strip()
+        fill = fills_by_order.get(oid)
+        if not fill:
+            continue
+
+        fill_price = (
+            fill.get("price")
+            or fill.get("avg_price")
+            or fill.get("avgPrice")
+            or fill.get("fill_price")
+        )
+        if fill_price:
+            row["fill_price"] = fill_price
+
+        try:
+            order_ts = datetime.fromisoformat(str(row.get("recorded_at")).replace("Z", "+00:00"))
+            fill_ts_raw = fill.get("recorded_at") or fill.get("time") or fill.get("execution_time")
+            fill_ts = datetime.fromisoformat(str(fill_ts_raw).replace("Z", "+00:00"))
+            row["fill_latency_ms"] = int((fill_ts - order_ts).total_seconds() * 1000)
+        except Exception:
+            row["fill_latency_ms"] = ""
+
+        updated += 1
+
+    if updated:
+        with lifecycle_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=lifecycle_fields)
+            writer.writeheader()
+            writer.writerows(lifecycle_rows)
+
+    return updated
+
+
 def connect_ibkr_with_retry(ib: IB, args: argparse.Namespace) -> None:
     attempts = 0
     while True:
@@ -811,6 +881,9 @@ def main() -> int:
                 try:
                     record_account_snapshot(ib, recorder)
                     new_fills = record_recent_fills(ib, recorder, seen_fills)
+                    lifecycle_fills_updated = enrich_lifecycle_with_fills(recorder)
+                    if lifecycle_fills_updated:
+                        print(f"{now_utc()} lifecycle_fills_updated={lifecycle_fills_updated}", flush=True)
                     record_strategy_equity(recorder, managed_positions, latest_snapshots)
                     persist_managed_positions(recorder, managed_positions)
                     last_portfolio_record = loop_now
