@@ -428,6 +428,103 @@ def backfill_recent_1m(ib: IB, recorder: LiveDataRecorder, contracts: list[tuple
     return total
 
 
+def current_session_candle_count(recorder: LiveDataRecorder, args: argparse.Namespace) -> int:
+    path = recorder.path("candles_1m.csv")
+    if not path.exists() or path.stat().st_size == 0:
+        return 0
+    try:
+        hh, mm = [int(x) for x in str(args.market_open_utc).split(":", 1)]
+        today = datetime.now(timezone.utc).date()
+        market_open = datetime(today.year, today.month, today.day, hh, mm, tzinfo=timezone.utc)
+    except Exception:
+        return 0
+    count = 0
+    try:
+        with path.open("r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                ts = _parse_bar_time_utc(row.get("bar_time", ""))
+                if ts is not None and ts >= market_open:
+                    count += 1
+    except Exception:
+        return 0
+    return count
+
+
+def backfill_current_session_1m(
+    ib: IB,
+    recorder: LiveDataRecorder,
+    contracts: list[tuple[str, Any]],
+    args: argparse.Namespace,
+) -> int:
+    if not getattr(args, "backfill_current_session_on_rebuild_miss", True):
+        return 0
+
+    try:
+        hh, mm = [int(x) for x in str(args.market_open_utc).split(":", 1)]
+        now = datetime.now(timezone.utc)
+        market_open = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    except Exception as exc:
+        print(f"{now_utc()} current_session_backfill_skipped reason=bad_market_open error={exc!r}", flush=True)
+        return 0
+
+    if now < market_open:
+        print(f"{now_utc()} current_session_backfill_skipped reason=before_market_open", flush=True)
+        return 0
+
+    duration_seconds = max(60, int((now - market_open).total_seconds()) + 300)
+    duration = f"{duration_seconds} S"
+    keys = existing_candle_keys(recorder)
+    total = 0
+    subset = contracts[: max(0, int(getattr(args, "backfill_top_n", len(contracts))))]
+    print(f"{now_utc()} current_session_backfill_start symbols={len(subset)} duration={duration}", flush=True)
+
+    for symbol, contract in subset:
+        try:
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr=duration,
+                barSizeSetting="1 min",
+                whatToShow="TRADES",
+                useRTH=False,
+                formatDate=1,
+                keepUpToDate=False,
+            )
+        except Exception as exc:
+            print(f"{now_utc()} current_session_backfill_error symbol={symbol} error={exc!r}", flush=True)
+            continue
+
+        rows = []
+        for bar in bars:
+            bar_time = str(getattr(bar, "date", ""))
+            ts = _parse_bar_time_utc(bar_time)
+            if ts is None or ts < market_open:
+                continue
+            key = (symbol, bar_time)
+            if key in keys:
+                continue
+            keys.add(key)
+            rows.append({
+                "symbol": symbol,
+                "bar_time": bar_time,
+                "open": safe_float(getattr(bar, "open", None)),
+                "high": safe_float(getattr(bar, "high", None)),
+                "low": safe_float(getattr(bar, "low", None)),
+                "close": safe_float(getattr(bar, "close", None)),
+                "volume": safe_float(getattr(bar, "volume", None)),
+                "wap": safe_float(getattr(bar, "average", None)),
+                "trade_count": safe_float(getattr(bar, "barCount", None)),
+                "source": "ibkr_current_session_backfill_1m",
+                "recorded_at": now_utc(),
+            })
+        if rows:
+            total += recorder.record_candles_1m(rows)
+        ib.sleep(float(getattr(args, "backfill_pause_seconds", 0.15)))
+
+    print(f"{now_utc()} current_session_backfill_done symbols={len(subset)} rows={total}", flush=True)
+    return total
+
+
 def is_eod_flatten_time(flatten_utc: str) -> bool:
     try:
         hh, mm = [int(x) for x in flatten_utc.split(":", 1)]
@@ -682,6 +779,143 @@ def enrich_lifecycle_with_fills(recorder: LiveDataRecorder) -> int:
     return updated
 
 
+def load_traded_symbols_today(recorder: LiveDataRecorder) -> set[str]:
+    path = recorder.path("trade_lifecycle.csv")
+    symbols: set[str] = set()
+    if not path.exists() or path.stat().st_size == 0:
+        return symbols
+    try:
+        with path.open("r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if str(row.get("event", "")).strip() in {"BUY_ORDER_SENT", "SIGNAL_READY"}:
+                    sym = str(row.get("symbol", "")).upper().strip()
+                    if sym:
+                        symbols.add(sym)
+    except Exception:
+        return symbols
+    return symbols
+
+
+def _parse_bar_time_utc(value: str):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    raw = raw.replace("US/Eastern", "").replace("America/New_York", "").strip()
+
+    for fmt in (
+        "%Y%m%d  %H:%M:%S",
+        "%Y%m%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%z",
+    ):
+        try:
+            dt = datetime.strptime(raw, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def rebuild_symbol_states_from_1m_candles(
+    recorder: LiveDataRecorder,
+    states: dict[str, SymbolState],
+    args: argparse.Namespace,
+) -> int:
+    path = recorder.path("candles_1m.csv")
+    if not path.exists() or path.stat().st_size == 0:
+        print(f"{now_utc()} state_rebuild_skipped reason=no_candles_1m", flush=True)
+        return 0
+
+    try:
+        hh, mm = [int(x) for x in str(args.market_open_utc).split(":", 1)]
+        now = datetime.now(timezone.utc)
+        market_open = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    except Exception as exc:
+        print(f"{now_utc()} state_rebuild_skipped reason=bad_market_open error={exc!r}", flush=True)
+        return 0
+
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    try:
+        with path.open("r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                symbol = str(row.get("symbol", "")).upper().strip()
+                if symbol not in states:
+                    continue
+                ts = _parse_bar_time_utc(row.get("bar_time", ""))
+                if ts is None or ts < market_open:
+                    continue
+                by_symbol.setdefault(symbol, []).append(row)
+    except Exception as exc:
+        print(f"{now_utc()} state_rebuild_error error={exc!r}", flush=True)
+        return 0
+
+    rebuilt = 0
+    for symbol, rows in by_symbol.items():
+        rows.sort(key=lambda r: str(r.get("bar_time", "")))
+        if not rows:
+            continue
+
+        first = safe_float(rows[0].get("open")) or safe_float(rows[0].get("close"))
+        if first is None or first <= 0:
+            continue
+
+        st = states[symbol]
+        st.first_seen_ts = time.time()
+        st.first_price = first
+        st.open_price = first
+        st.high = first
+        st.low = first
+        st.first_5m_high = None
+        st.first_15m_high = None
+        st.or_high = None
+        st.or_low = None
+
+        for row in rows:
+            ts = _parse_bar_time_utc(row.get("bar_time", ""))
+            if ts is None:
+                continue
+
+            high = safe_float(row.get("high"))
+            low = safe_float(row.get("low"))
+            close = safe_float(row.get("close"))
+            vol = safe_float(row.get("volume"))
+
+            if high is None or low is None:
+                continue
+
+            minutes = (ts - market_open).total_seconds() / 60.0
+
+            st.high = max(st.high or high, high)
+            st.low = min(st.low or low, low)
+            st.last_price = close or st.last_price
+            st.latest_volume = vol or st.latest_volume
+
+            if 0 <= minutes < 5:
+                st.first_5m_high = max(st.first_5m_high or high, high)
+            if 0 <= minutes < 15:
+                st.first_15m_high = max(st.first_15m_high or high, high)
+            if 0 <= minutes < (args.opening_range_seconds / 60.0):
+                st.or_high = max(st.or_high or high, high)
+                st.or_low = min(st.or_low or low, low)
+
+        rebuilt += 1
+
+    print(f"{now_utc()} state_rebuild_done symbols={rebuilt} source=candles_1m market_open_utc={args.market_open_utc}", flush=True)
+    return rebuilt
+
+
 def connect_ibkr_with_retry(ib: IB, args: argparse.Namespace) -> None:
     attempts = 0
     while True:
@@ -732,6 +966,7 @@ def main() -> int:
     parser.add_argument("--min-or-range-pct", type=float, default=5.0)
     parser.add_argument("--min-price", type=float, default=5.0)
     parser.add_argument("--max-spread-bps", type=float, default=50.0)
+    parser.add_argument("--max-one-trade-per-symbol-per-day", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--position-usd", type=float, default=1000.0)
     parser.add_argument("--exit-stop-loss-pct", type=float, default=8.0)
     parser.add_argument("--exit-trailing-activation-pct", type=float, default=3.0)
@@ -740,12 +975,14 @@ def main() -> int:
     parser.add_argument("--enable-eod-flatten", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--eod-flatten-utc", default="19:55")
     parser.add_argument("--no-new-entries-after-utc", default="19:30")
+    parser.add_argument("--market-open-utc", default="13:30")
     parser.add_argument("--new-entries-start-utc", default="13:35")
     parser.add_argument("--manage-exits-start-utc", default="13:30")
     parser.add_argument("--backfill-1m-on-start", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--backfill-duration", default="1 D")
     parser.add_argument("--backfill-top-n", type=int, default=100)
     parser.add_argument("--backfill-pause-seconds", type=float, default=0.15)
+    parser.add_argument("--backfill-current-session-on-rebuild-miss", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reconnect-wait-seconds", type=float, default=15.0)
     parser.add_argument("--reconnect-max-attempts", type=int, default=999999)
     args = parser.parse_args()
@@ -800,6 +1037,19 @@ def main() -> int:
             print(f"{now_utc()} restored_managed_positions={len(restored)}", flush=True)
 
         backfilled_rows = backfill_recent_1m(ib, recorder, contracts, args)
+        state_rebuild_count = rebuild_symbol_states_from_1m_candles(recorder, states, args)
+        current_session_backfilled_rows = 0
+        if state_rebuild_count == 0 and current_session_candle_count(recorder, args) == 0:
+            current_session_backfilled_rows = backfill_current_session_1m(ib, recorder, contracts, args)
+            if current_session_backfilled_rows:
+                state_rebuild_count = rebuild_symbol_states_from_1m_candles(recorder, states, args)
+        traded_symbols_today = load_traded_symbols_today(recorder)
+        if traded_symbols_today:
+            for symbol in traded_symbols_today:
+                if symbol in states and args.max_one_trade_per_symbol_per_day:
+                    states[symbol].signal_sent = True
+            print(f"{now_utc()} traded_symbols_today_loaded={len(traded_symbols_today)} max_one_trade_per_symbol_per_day={args.max_one_trade_per_symbol_per_day}", flush=True)
+
         recorder.record_run_metadata({
             "module": "v67_live_top100_expansion_paper_trader",
             "strategy": STRATEGY_NAME,
@@ -808,6 +1058,8 @@ def main() -> int:
             "seen_fills_loaded": len(seen_fills),
             "restored_positions": len(restored),
             "backfilled_1m_rows": backfilled_rows,
+            "state_rebuild_count": state_rebuild_count,
+            "current_session_backfilled_1m_rows": current_session_backfilled_rows,
         })
 
         start = time.time()
