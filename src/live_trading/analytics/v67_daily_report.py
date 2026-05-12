@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+MARKET_OPEN_UTC = "13:30"
 
 
 def f(x, default=0.0):
@@ -14,6 +17,53 @@ def f(x, default=0.0):
         return float(x)
     except Exception:
         return default
+
+
+def parse_dt(value: str | None):
+    try:
+        if not value:
+            return None
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def utc_hhmm(value: str | None) -> str:
+    dt = parse_dt(value)
+    return dt.strftime("%H:%M") if dt else ""
+
+
+def minutes_from_market_open(value: str | None, market_open_utc: str = MARKET_OPEN_UTC) -> int | None:
+    dt = parse_dt(value)
+    if dt is None:
+        return None
+    try:
+        hh, mm = [int(x) for x in market_open_utc.split(":", 1)]
+        open_dt = dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return int((dt - open_dt).total_seconds() // 60)
+    except Exception:
+        return None
+
+
+def buy_time_bucket(value: str | None) -> str:
+    mins = minutes_from_market_open(value)
+    if mins is None:
+        return "unknown"
+    if mins < 0:
+        return "pre-open"
+    if mins < 30:
+        return "13:30-14:00"
+    if mins < 90:
+        return "14:00-15:00"
+    if mins < 150:
+        return "15:00-16:00"
+    if mins < 210:
+        return "16:00-17:00"
+    if mins < 270:
+        return "17:00-18:00"
+    if mins < 330:
+        return "18:00-19:00"
+    return "19:00+"
 
 
 def load_latest_portfolio(session: Path):
@@ -71,6 +121,7 @@ def main():
                     buy_px = f(b.get("price") or b.get("entry_price"))
                     sell_px = f(r.get("price"))
                     peak = f(r.get("peak_price"), sell_px)
+                    buy_time = b.get("recorded_at")
 
                     gross = (sell_px - buy_px) * qty
                     net = gross - args.commission_per_roundtrip
@@ -81,7 +132,10 @@ def main():
                     closed.append({
                         "symbol": sym,
                         "qty": qty,
-                        "buy_time": b.get("recorded_at"),
+                        "buy_time": buy_time,
+                        "buy_utc": utc_hhmm(buy_time),
+                        "buy_bucket": buy_time_bucket(buy_time),
+                        "minutes_from_open": minutes_from_market_open(buy_time),
                         "sell_time": r.get("recorded_at"),
                         "buy": buy_px,
                         "sell": sell_px,
@@ -99,6 +153,7 @@ def main():
         for b in rows:
             qty = f(b.get("quantity"))
             buy_px = f(b.get("price") or b.get("entry_price"))
+            buy_time = b.get("recorded_at")
             pf = latest_portfolio.get(sym, {})
             current = f(pf.get("marketPrice"), 0)
             market_value = f(pf.get("marketValue"), current * qty)
@@ -114,7 +169,10 @@ def main():
             open_positions.append({
                 "symbol": sym,
                 "qty": qty,
-                "buy_time": b.get("recorded_at"),
+                "buy_time": buy_time,
+                "buy_utc": utc_hhmm(buy_time),
+                "buy_bucket": buy_time_bucket(buy_time),
+                "minutes_from_open": minutes_from_market_open(buy_time),
                 "buy": buy_px,
                 "current": current,
                 "peak": peak,
@@ -151,13 +209,54 @@ def main():
     print(f"Expectancy:           ${expectancy:.2f}/trade")
     print()
 
+    print("=== PnL by buy time bucket ===")
+    bucket_stats = defaultdict(lambda: {"closed": 0, "open": 0, "wins": 0, "closed_gross": 0.0, "closed_net": 0.0, "open_upnl": 0.0})
+    for x in closed:
+        b = x.get("buy_bucket") or "unknown"
+        bucket_stats[b]["closed"] += 1
+        bucket_stats[b]["closed_gross"] += x["gross"]
+        bucket_stats[b]["closed_net"] += x["net"]
+        if x["gross"] > 0:
+            bucket_stats[b]["wins"] += 1
+    for x in open_positions:
+        b = x.get("buy_bucket") or "unknown"
+        bucket_stats[b]["open"] += 1
+        bucket_stats[b]["open_upnl"] += x["unrealized"]
+
+    preferred_order = ["pre-open", "13:30-14:00", "14:00-15:00", "15:00-16:00", "16:00-17:00", "17:00-18:00", "18:00-19:00", "19:00+", "unknown"]
+    print(f"{'BUCKET':<13} {'CLOSED':>7} {'OPEN':>5} {'WIN%':>7} {'GROSS':>10} {'NET':>10} {'OPEN_UPNL':>11} {'TOTAL_EST':>11}")
+    print("-" * 86)
+    for bucket in preferred_order:
+        s = bucket_stats.get(bucket)
+        if not s:
+            continue
+        closed_n = s["closed"]
+        win_pct = (s["wins"] / closed_n * 100) if closed_n else 0.0
+        total = s["closed_net"] + s["open_upnl"]
+        print(
+            f"{bucket:<13} "
+            f"{closed_n:>7} "
+            f"{s['open']:>5} "
+            f"{win_pct:>6.1f}% "
+            f"{s['closed_gross']:>10.2f} "
+            f"{s['closed_net']:>10.2f} "
+            f"{s['open_upnl']:>11.2f} "
+            f"{total:>11.2f}"
+        )
+    print()
+
     print("=== Closed trades ===")
-    print(f"{'SYM':<7} {'QTY':>5} {'BUY':>10} {'SELL':>10} {'PEAK':>10} {'GROSS':>10} {'NET':>10} {'PNL%':>8} {'PEAK%':>8} {'DROP':>8}  REASON")
-    print("-" * 125)
+    print(f"{'SYM':<7} {'UTC':>5} {'MIN':>5} {'BUCKET':<13} {'QTY':>5} {'BUY':>10} {'SELL':>10} {'PEAK':>10} {'GROSS':>10} {'NET':>10} {'PNL%':>8} {'PEAK%':>8} {'DROP':>8}  REASON")
+    print("-" * 150)
 
     for x in sorted(closed, key=lambda r: r["gross"]):
+        mins = x.get("minutes_from_open")
+        mins_txt = "" if mins is None else str(mins)
         print(
             f"{x['symbol']:<7} "
+            f"{x.get('buy_utc',''):>5} "
+            f"{mins_txt:>5} "
+            f"{x.get('buy_bucket',''):<13} "
             f"{x['qty']:>5.0f} "
             f"{x['buy']:>10.4f} "
             f"{x['sell']:>10.4f} "
@@ -172,12 +271,17 @@ def main():
 
     print()
     print("=== Open trades from today ===")
-    print(f"{'SYM':<7} {'QTY':>5} {'BUY':>10} {'NOW':>10} {'PEAK':>10} {'UPNL':>10} {'NOW%':>8} {'PEAK%':>8} {'FROM_PK':>9}  BUY_TIME")
-    print("-" * 120)
+    print(f"{'SYM':<7} {'UTC':>5} {'MIN':>5} {'BUCKET':<13} {'QTY':>5} {'BUY':>10} {'NOW':>10} {'PEAK':>10} {'UPNL':>10} {'NOW%':>8} {'PEAK%':>8} {'FROM_PK':>9}  BUY_TIME")
+    print("-" * 145)
 
     for x in sorted(open_positions, key=lambda r: r["unrealized"]):
+        mins = x.get("minutes_from_open")
+        mins_txt = "" if mins is None else str(mins)
         print(
             f"{x['symbol']:<7} "
+            f"{x.get('buy_utc',''):>5} "
+            f"{mins_txt:>5} "
+            f"{x.get('buy_bucket',''):<13} "
             f"{x['qty']:>5.0f} "
             f"{x['buy']:>10.4f} "
             f"{x['current']:>10.4f} "
