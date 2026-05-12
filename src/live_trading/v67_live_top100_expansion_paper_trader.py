@@ -248,6 +248,23 @@ def load_existing_fill_keys(recorder: LiveDataRecorder) -> set[str]:
     return seen
 
 
+def load_exit_sent_symbols(recorder: LiveDataRecorder) -> set[str]:
+    path = recorder.path("trade_lifecycle.csv")
+    symbols: set[str] = set()
+    if not path.exists() or path.stat().st_size == 0:
+        return symbols
+    try:
+        with path.open("r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if str(row.get("event", "")).strip() == "SELL_ORDER_SENT":
+                    sym = str(row.get("symbol", "")).upper().strip()
+                    if sym and sym != "__ALL__":
+                        symbols.add(sym)
+    except Exception:
+        return symbols
+    return symbols
+
+
 def managed_position_payload(pos: ManagedPosition) -> dict[str, Any]:
     return {
         "symbol": pos.symbol,
@@ -455,9 +472,20 @@ def adopt_existing_long_positions(
     managed_positions: dict[str, ManagedPosition],
 ) -> int:
     adopted = 0
+    exit_sent_symbols = load_exit_sent_symbols(recorder)
     for item in ib.portfolio():
         symbol = str(getattr(item.contract, "symbol", "")).upper()
         if symbol not in contract_by_symbol or symbol in managed_positions:
+            continue
+        if symbol in exit_sent_symbols:
+            record_lifecycle(
+                recorder,
+                "SKIP_ADOPT_EXIT_SENT",
+                symbol,
+                action="SKIP_ADOPT",
+                reason="sell_order_already_sent_in_lifecycle",
+            )
+            print(f"SKIP ADOPT symbol={symbol} reason=sell_order_already_sent_in_lifecycle", flush=True)
             continue
         quantity = safe_float(getattr(item, "position", None))
         avg_cost = safe_float(getattr(item, "averageCost", None))
@@ -497,11 +525,19 @@ def adopt_existing_long_positions(
 def manage_exits(ib: IB, recorder: LiveDataRecorder, managed_positions: dict[str, ManagedPosition], latest_snapshots: dict[str, dict[str, Any]], args: argparse.Namespace) -> int:
     exits = 0
     eod = args.enable_eod_flatten and is_eod_flatten_time(args.eod_flatten_utc)
+    if not eod and not is_after_utc(getattr(args, "manage_exits_start_utc", "13:30")):
+        return 0
     for symbol, pos in list(managed_positions.items()):
         if not pos.active or pos.exit_sent:
             continue
         snap = latest_snapshots.get(symbol) or {}
         price = safe_float(snap.get("price"))
+
+        if eod:
+            send_exit_order(ib, recorder, pos, "v46_wide_trail_close_exit_eod", price)
+            exits += 1
+            continue
+
         if price is None or price <= 0:
             continue
 
@@ -570,6 +606,8 @@ def main() -> int:
     parser.add_argument("--enable-eod-flatten", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--eod-flatten-utc", default="19:55")
     parser.add_argument("--no-new-entries-after-utc", default="19:30")
+    parser.add_argument("--new-entries-start-utc", default="13:35")
+    parser.add_argument("--manage-exits-start-utc", default="13:30")
     parser.add_argument("--backfill-1m-on-start", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--backfill-duration", default="1 D")
     parser.add_argument("--backfill-top-n", type=int, default=100)
@@ -648,6 +686,12 @@ def main() -> int:
             best_score = -999999.0
             rejection_counter = Counter()
             ranked = []
+            entries_blocked = (
+                not is_after_utc(args.new_entries_start_utc)
+                or is_after_utc(args.no_new_entries_after_utc)
+                or is_after_utc(args.eod_flatten_utc)
+            )
+            eod_active = args.enable_eod_flatten and is_after_utc(args.eod_flatten_utc)
 
             for symbol, q in contracts:
                 snap = snapshot_from_ticker(symbol, tickers[symbol])
@@ -713,7 +757,11 @@ def main() -> int:
             rejection_summary = ", ".join([f"{k}={v}" for k, v in rejection_counter.most_common(5)])
             portfolio_part = f" portfolio_recorded=1 new_fills={new_fills}" if new_fills is not None else ""
             active_managed = sum(1 for p in managed_positions.values() if p.active)
-            entries_blocked = is_after_utc(args.no_new_entries_after_utc) or is_after_utc(args.eod_flatten_utc)
+            entries_blocked = (
+                not is_after_utc(args.new_entries_start_utc)
+                or is_after_utc(args.no_new_entries_after_utc)
+                or is_after_utc(args.eod_flatten_utc)
+            )
             eod_active = args.enable_eod_flatten and is_after_utc(args.eod_flatten_utc)
             print(
                 f"{now_utc()} heartbeat scanned={len(contracts)} with_data={data_count} ready_new={ready_count} "
