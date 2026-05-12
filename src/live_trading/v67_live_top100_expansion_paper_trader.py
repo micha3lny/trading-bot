@@ -552,6 +552,7 @@ def main() -> int:
     parser.add_argument("--adopt-existing-positions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--enable-eod-flatten", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--eod-flatten-utc", default="19:55")
+    parser.add_argument("--no-new-entries-after-utc", default="19:30")
     parser.add_argument("--backfill-1m-on-start", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--backfill-duration", default="1 D")
     parser.add_argument("--backfill-top-n", type=int, default=100)
@@ -649,7 +650,7 @@ def main() -> int:
                         rejection_counter[reason] += 1
 
                 has_active_position = symbol in managed_positions and managed_positions[symbol].active and not managed_positions[symbol].exit_sent
-                if features["ready"] and not state.signal_sent and not has_active_position:
+                if features["ready"] and not state.signal_sent and not has_active_position and not entries_blocked:
                     ready_count += 1
                     price = features.get("entry_price")
                     qty = max(1, int(args.position_usd // price)) if price and price > 0 else 0
@@ -695,9 +696,11 @@ def main() -> int:
             rejection_summary = ", ".join([f"{k}={v}" for k, v in rejection_counter.most_common(5)])
             portfolio_part = f" portfolio_recorded=1 new_fills={new_fills}" if new_fills is not None else ""
             active_managed = sum(1 for p in managed_positions.values() if p.active)
+            entries_blocked = is_after_utc(args.no_new_entries_after_utc) or is_after_utc(args.eod_flatten_utc)
+            eod_active = args.enable_eod_flatten and is_after_utc(args.eod_flatten_utc)
             print(
                 f"{now_utc()} heartbeat scanned={len(contracts)} with_data={data_count} ready_new={ready_count} "
-                f"adopted={adopted_count} exits_sent={exit_count} managed_open={active_managed} "
+                f"adopted={adopted_count} exits_sent={exit_count} managed_open={active_managed} entries_blocked={int(entries_blocked)} eod_active={int(eod_active)} "
                 f"best={best_symbol}:{best_score:.2f} top5=[{top5_str}] rejects=[{rejection_summary}]"
                 f"{portfolio_part}",
                 flush=True,
