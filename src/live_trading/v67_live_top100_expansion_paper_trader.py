@@ -580,6 +580,38 @@ def is_after_utc(value):
     return utc_minutes_now() >= parse_utc_hhmm(value)
 
 
+def connect_ibkr_with_retry(ib: IB, args: argparse.Namespace) -> None:
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            if ib.isConnected():
+                return
+            print(f"{now_utc()} RECONNECT_START attempt={attempts}", flush=True)
+            ib.connect(args.host, args.port, clientId=args.client_id, timeout=15)
+            ib.reqMarketDataType(args.market_data_type)
+            print(f"{now_utc()} RECONNECT_DONE attempt={attempts}", flush=True)
+            return
+        except Exception as exc:
+            print(f"{now_utc()} RECONNECT_FAILED attempt={attempts} error={exc!r}", flush=True)
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+            if attempts >= getattr(args, "reconnect_max_attempts", 999999):
+                raise
+            time.sleep(getattr(args, "reconnect_wait_seconds", 15.0))
+
+
+def resubscribe_market_data(ib: IB, contracts: list[tuple[str, Any]]) -> dict[str, Any]:
+    tickers: dict[str, Any] = {}
+    for symbol, contract in contracts:
+        tickers[symbol] = ib.reqMktData(contract, "", False, False)
+        print(f"RESUBSCRIBED {symbol} conId={getattr(contract, 'conId', '')}", flush=True)
+    print(f"{now_utc()} RESUBSCRIBE_DONE symbols={len(tickers)}", flush=True)
+    return tickers
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="v67 live top100 expansion paper trader")
     parser.add_argument("--host", default=DEFAULT_HOST)
@@ -612,6 +644,8 @@ def main() -> int:
     parser.add_argument("--backfill-duration", default="1 D")
     parser.add_argument("--backfill-top-n", type=int, default=100)
     parser.add_argument("--backfill-pause-seconds", type=float, default=0.15)
+    parser.add_argument("--reconnect-wait-seconds", type=float, default=15.0)
+    parser.add_argument("--reconnect-max-attempts", type=int, default=999999)
     args = parser.parse_args()
 
     symbols = load_top_symbols(args.alpha_rank_csv, args.top_n, min_price=args.min_price)
@@ -631,8 +665,7 @@ def main() -> int:
     print(f"Backfill 1m: {args.backfill_1m_on_start} duration={args.backfill_duration} top_n={args.backfill_top_n}", flush=True)
 
     ib = IB()
-    ib.connect(args.host, args.port, clientId=args.client_id, timeout=15)
-    ib.reqMarketDataType(args.market_data_type)
+    connect_ibkr_with_retry(ib, args)
 
     tickers: dict[str, Any] = {}
     states = {symbol: SymbolState(symbol=symbol) for symbol in symbols}
@@ -677,7 +710,17 @@ def main() -> int:
 
         start = time.time()
         while time.time() - start < args.duration_seconds:
-            ib.sleep(args.interval_seconds)
+            try:
+                ib.sleep(args.interval_seconds)
+            except Exception as exc:
+                print(f"{now_utc()} IBKR_DISCONNECTED during=sleep error={exc!r}", flush=True)
+                try:
+                    ib.disconnect()
+                except Exception:
+                    pass
+                connect_ibkr_with_retry(ib, args)
+                tickers = resubscribe_market_data(ib, contracts)
+                continue
             loop_now = time.time()
             elapsed = loop_now - start
             ready_count = 0
@@ -751,6 +794,14 @@ def main() -> int:
                     last_portfolio_record = loop_now
                 except Exception as exc:
                     print(f"{now_utc()} portfolio_recorder_error={exc!r}", flush=True)
+                    if "disconnect" in repr(exc).lower() or "connection" in repr(exc).lower() or "socket" in repr(exc).lower():
+                        print(f"{now_utc()} IBKR_DISCONNECTED during=portfolio_recorder error={exc!r}", flush=True)
+                        try:
+                            ib.disconnect()
+                        except Exception:
+                            pass
+                        connect_ibkr_with_retry(ib, args)
+                        tickers = resubscribe_market_data(ib, contracts)
 
             ranked = sorted(ranked, key=lambda x: x[1], reverse=True)
             top5_str = " | ".join([f"{s}:{score:.1f}" for s, score, _ in ranked[:5]])
