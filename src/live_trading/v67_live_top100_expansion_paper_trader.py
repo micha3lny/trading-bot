@@ -223,7 +223,9 @@ def compute_live_safe_features(state: SymbolState, snap: dict[str, Any], args: a
 def record_lifecycle(recorder: LiveDataRecorder, event: str, symbol: str, **kwargs: Any) -> None:
     fields = [
         "recorded_at", "strategy", "event", "symbol", "action", "quantity", "price", "order_id",
-        "execution_id", "reason", "entry_price", "peak_price", "pnl_pct", "raw_json",
+        "execution_id", "reason", "entry_price", "peak_price", "pnl_pct",
+        "decision_bid", "decision_ask", "decision_mid", "decision_last",
+        "spread_pct", "fill_price", "fill_latency_ms", "raw_json",
     ]
     row = {"recorded_at": now_utc(), "strategy": STRATEGY_NAME, "event": event, "symbol": symbol, **kwargs}
     raw = row.get("raw_json")
@@ -452,6 +454,11 @@ def send_exit_order(ib: IB, recorder: LiveDataRecorder, pos: ManagedPosition, re
         entry_price=pos.entry_price,
         peak_price=pos.peak_price,
         pnl_pct=pnl_pct,
+        decision_bid=None,
+        decision_ask=None,
+        decision_mid=None,
+        decision_last=price,
+        spread_pct=None,
     )
     pos.exit_sent = True
     pos.active = False
@@ -766,7 +773,22 @@ def main() -> int:
                     if qty > 0 and price and price > 0:
                         managed_positions[symbol] = ManagedPosition(symbol=symbol, contract=q, quantity=qty, entry_price=float(price), entry_time=now_utc(), peak_price=float(price))
                         persist_managed_positions(recorder, managed_positions)
-                    record_lifecycle(recorder, "BUY_ORDER_SENT", symbol, action="BUY", quantity=qty, price=price, order_id=trade.order.orderId, entry_price=price, peak_price=price)
+                    record_lifecycle(
+                        recorder,
+                        "BUY_ORDER_SENT",
+                        symbol,
+                        action="BUY",
+                        quantity=qty,
+                        price=price,
+                        order_id=trade.order.orderId,
+                        entry_price=price,
+                        peak_price=price,
+                        decision_bid=snap.get("bid"),
+                        decision_ask=snap.get("ask"),
+                        decision_mid=snap.get("mid_price"),
+                        decision_last=snap.get("last"),
+                        spread_pct=((snap.get("spread") / snap.get("mid_price") * 100.0) if snap.get("spread") and snap.get("mid_price") else None),
+                    )
                     print(f"PAPER BUY SENT symbol={symbol} qty={qty} price={price:.2f} score={features['score']:.2f} orderId={trade.order.orderId} tif={order.tif} outsideRth={order.outsideRth}", flush=True)
                     state.signal_sent = True
 
