@@ -527,6 +527,23 @@ def manage_exits(ib: IB, recorder: LiveDataRecorder, managed_positions: dict[str
     return exits
 
 
+def utc_minutes_now():
+    from datetime import datetime, timezone
+    t = datetime.now(timezone.utc).time()
+    return t.hour * 60 + t.minute
+
+
+def parse_utc_hhmm(value):
+    hh, mm = [int(x) for x in str(value).strip().split(":", 1)]
+    if not 0 <= hh <= 23 or not 0 <= mm <= 59:
+        raise ValueError(f"Invalid UTC time HH:MM: {value}")
+    return hh * 60 + mm
+
+
+def is_after_utc(value):
+    return utc_minutes_now() >= parse_utc_hhmm(value)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="v67 live top100 expansion paper trader")
     parser.add_argument("--host", default=DEFAULT_HOST)
