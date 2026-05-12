@@ -225,7 +225,9 @@ def record_lifecycle(recorder: LiveDataRecorder, event: str, symbol: str, **kwar
         "recorded_at", "strategy", "event", "symbol", "action", "quantity", "price", "order_id",
         "execution_id", "reason", "entry_price", "peak_price", "pnl_pct",
         "decision_bid", "decision_ask", "decision_mid", "decision_last",
-        "spread_pct", "fill_price", "fill_latency_ms", "raw_json",
+        "spread_pct", "fill_price", "fill_latency_ms",
+        "estimated_commission", "realized_slippage_bps",
+        "raw_json",
     ]
     row = {"recorded_at": now_utc(), "strategy": STRATEGY_NAME, "event": event, "symbol": symbol, **kwargs}
     raw = row.get("raw_json")
@@ -637,6 +639,29 @@ def enrich_lifecycle_with_fills(recorder: LiveDataRecorder) -> int:
         )
         if fill_price:
             row["fill_price"] = fill_price
+
+            try:
+                fill_px = float(fill_price)
+                qty = abs(float(row.get("quantity") or 0))
+                decision_mid = row.get("decision_mid")
+
+                # IBKR-style rough estimate
+                est_commission = max(0.35, qty * 0.0035)
+                row["estimated_commission"] = round(est_commission, 4)
+
+                if decision_mid not in (None, "", "None"):
+                    decision_mid = float(decision_mid)
+                    if decision_mid > 0:
+                        side = str(row.get("action") or "").upper()
+
+                        if side == "BUY":
+                            slippage_bps = ((fill_px - decision_mid) / decision_mid) * 10000.0
+                        else:
+                            slippage_bps = ((decision_mid - fill_px) / decision_mid) * 10000.0
+
+                        row["realized_slippage_bps"] = round(slippage_bps, 2)
+            except Exception:
+                pass
 
         try:
             order_ts = datetime.fromisoformat(str(row.get("recorded_at")).replace("Z", "+00:00"))
