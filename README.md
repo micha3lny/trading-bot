@@ -1,429 +1,350 @@
 # 📊 Trading Bot
 
-Automated trading bot for IBKR with strategy ranking, backtesting, paper trading, live execution, portfolio tracking, and notifications.
+Automated trading bot for IBKR with strategy ranking, backtesting, paper trading, live execution, portfolio tracking, analytics, and operational controls.
 
 ---
 
-## ✅ Aktualny status — 2026-05-11
+## ✅ Aktualny status — 2026-05-13
 
-Projekt przeszedł z etapu backtestów do pierwszego realnego uruchomienia na Raspberry Pi z IBKR Gateway i paper account.
+Projekt przeszedł z etapu prostego paper tradingu do etapu:
 
-### Uruchomione i potwierdzone
+```text
+production-style paper trading infrastructure
+```
+
+System działa już jako:
+- live execution node na Raspberry Pi,
+- z pełnym IBKR Gateway,
+- reconnect watchdogiem,
+- recorderem,
+- analytics,
+- telemetry,
+- emergency control API.
+
+---
+
+## 🚀 Co działa i zostało potwierdzone
+
+### Infrastructure
 
 - Raspberry Pi działa jako execution node.
-- IB Gateway działa przez GUI/VNC i udostępnia API na porcie `4002`.
-- Repo działa na Macu i Raspberry przez GitHub.
-- Universe został rozszerzony do `2184` symboli w `data/universe/v62_symbols_wide.txt`.
-- Na Raspberry trzymamy tylko pliki potrzebne do live execution, a pełną historię świec trzymamy na Macu.
-- Działa live recorder zapisujący dane do `data/live/recorder/<YYYY-MM-DD>/`.
-- Działa monitor tekstowy portfolio: `src.live_trading.v63_live_portfolio_monitor`.
-- Działa account recorder: `src.live_trading.v66_ibkr_account_recorder`.
-- Działa paper trader: `src.live_trading.v67_live_top100_expansion_paper_trader`.
+- IBKR Gateway działa przez GUI/VNC.
+- API działa na porcie `4002`.
+- Repo synchronizowane przez GitHub.
+- System działa w `systemd`.
+- Autorestart bota działa.
+- Reconnect watchdog działa.
+- Backfill po reconnect działa.
 
-### Najlepszy aktualny setup strategiczny
+---
 
-Najlepszy potwierdzony setup z ostatnich backtestów:
+### Universe / Market Data
+
+- Universe rozszerzony do ~2184 symboli.
+- TOP100 wybierane dynamicznie.
+- Działa live recorder.
+- Działa agregacja świec 1m.
+- Działa current-session backfill.
+- Działa universe-wide 1m backfill.
+- Zapisywane są candles dla pełnego universe.
+
+Recorder zapisuje:
+
+- `candles_1m.csv`
+- `trade_lifecycle.csv`
+- `fills.csv`
+- `strategy_equity.csv`
+- `portfolio_snapshots.csv`
+- `run_metadata.csv`
+
+---
+
+### Strategy / Trading
+
+Działa:
+
+- `v67_live_top100_expansion_paper_trader`
+- momentum expansion ranking
+- breakout entries
+- trailing exits
+- EOD flatten support
+- restart recovery
+- managed positions restore
+- multiple entries per symbol/day
+
+---
+
+### Strict setup tracking
+
+Najlepszy historyczny setup (~600 USD netto) został zachowany jako osobny tag telemetryczny.
+
+Strict thresholds:
+
+- 5m >= 4.0%
+- 15m >= 6.5%
+- OR >= 5.0%
+- spread <= 50bps
+
+Każdy trade posiada:
+
+- `strict_setup=True`
+- `strict_setup=False`
+
+Pozwala to:
+
+- eksperymentować z poluzowanymi parametrami,
+- ale nadal mierzyć performance oryginalnego setupu.
+
+---
+
+### Analytics
+
+Działa:
+
+- daily report
+- strict setup analytics
+- peak / giveback analytics
+- pnl bucket analytics
+- missed runners report
+- runner telemetry
+- MFE tracking
+- entry timing analytics
+- open/unrealized pnl
+
+Raporty:
 
 ```bash
-python -m src.strategies.momentum_trailing_intraday.backtest_momentum_or_breakout_v59_daily_top_universe \
-  --top-n 100 \
-  --apply-live-safe-expansion
+python -m src.live_trading.analytics.v67_daily_report --date YYYY-MM-DD
 ```
-
-Wynik testowy dla tego wariantu:
-
-- około `+614.72 USD` netto,
-- `26` transakcji,
-- `76.92%` win rate,
-- testowany jako live-safe TOP100 + expansion.
-
-### Aktualny live/paper stack
-
-```text
-IB Gateway / Paper Account
-    ↓
-v67 live top100 expansion paper trader
-    ↓
-TOP100 z alpha rankingu
-    ↓
-live snapshots: bid / ask / last / spread / volume
-    ↓
-feature engine: first 5m, first 15m, OR range, spread, price
-    ↓
-signal / order intent / paper execution
-    ↓
-recorder CSV
-    ↓
-portfolio monitor
-```
-
-### Obecny tryb działania v67
-
-`v67_live_top100_expansion_paper_trader.py`:
-
-- subskrybuje TOP100 spółek z `data/universe/v64_universe_alpha_ranked.csv`,
-- liczy live-safe expansion,
-- zapisuje `market_snapshots.csv`, `spread_snapshots.csv`, `selection_events.csv`, `signal_snapshots.csv`, `order_intents.csv`,
-- po spełnieniu warunków wysyła paper BUY przez IBKR `MarketOrder`,
-- działa z poziomu `tmux`,
-- logowany jest do `data/live/recorder/<date>/v67_trader.log`.
-
-Uruchomienie na Raspberry:
 
 ```bash
-cd ~/trading-bot
-source venv/bin/activate
-
-python -m src.live_trading.v67_live_top100_expansion_paper_trader \
-  --host 127.0.0.1 \
-  --port 4002 \
-  --client-id 67 \
-  --top-n 100 \
-  --duration-seconds 28800 \
-  2>&1 | tee -a data/live/recorder/$(date -u +%F)/v67_trader.log
+python -m src.live_trading.analytics.v67_missed_runners_report --date YYYY-MM-DD
 ```
 
-### Ważne ograniczenia / TODO
-
-- Domyślne logi v67 są jeszcze zbyt ubogie; potrzebujemy logować `best_score`, `best_symbol`, TOP kandydatów i powody odrzuceń.
-- Trzeba dodać live agregację świec 1m do `candles_1m.csv`.
-- Trzeba potwierdzić pełną ścieżkę: sygnał → order intent → paper fill → portfolio snapshot.
-- Trzeba dopiąć exit management i zweryfikować SELL w paper tradingu.
-- Trzeba dodać autostart po reboot: Gateway → wait for API → bot → portfolio recorder.
-- Trzeba dodać backfill po restarcie, żeby uzupełniać brakujące świece.
-- Trzeba dodać automatyczny sync danych live z Raspberry na Maca.
-
 ---
 
-## 🎯 Cel projektu
+### Missed runners analytics
 
-System do automatycznego i półautomatycznego handlu akcjami przez IBKR, który:
-
-- analizuje rynek, początkowo NASDAQ, później również inne giełdy,
-- buduje ranking spółek osobno dla każdej strategii,
-- wybiera najlepsze kandydaty do tradingu,
-- podejmuje decyzje o kupnie i sprzedaży,
-- działa w trybie manualnym albo automatycznym,
-- przechodzi przez etapy: backtest → paper trading → live trading.
-
----
-
-## 🧱 Architektura logiczna
+System analizuje wszystkie spółki, które zrobiły:
 
 ```text
-Market Data
-↓
-Universe / baza spółek
-↓
-Strategie
-↓
-Ranking 0–100 per strategia
-↓
-Tryb manual / auto
-↓
-Entry / Exit
-↓
-Risk Management
-↓
-Order Manager
-↓
-Broker API / IBKR
-↓
-Portfolio
-↓
-Statystyki + Powiadomienia
++10% intraday move
 ```
 
----
+Dla każdej spółki raport pokazuje:
 
-## 📊 Baza spółek / Universe
+- open price
+- high price
+- high timestamp
+- whether bought
+- buy timestamp
+- buy price
+- sell price
+- pnl
+- first 5m expansion
+- first 15m expansion
+- OR expansion
+- rejection reason
 
-Baza spółek będzie zawierać między innymi:
+To pozwala analizować:
 
-- ticker,
-- giełdę,
-- walutę,
-- sektor,
-- market cap,
-- średni wolumen,
-- status aktywności,
-- informację, czy spółka jest dopuszczona do tradingu.
-
-Na start zakładamy NASDAQ, ale system ma być rozszerzalny o inne giełdy.
-
----
-
-## 📈 Dane historyczne
-
-System będzie przechowywał dane historyczne potrzebne do analizy, rankingu i backtestów.
-
-Wstępne założenia:
-
-- `1D` — minimum 3 lata,
-- `1H` — 1–2 lata,
-- `15m / 5m` — kilka miesięcy,
-- `1m` — dla day tradingu.
-
-Dane mają być:
-
-- zasilone początkowo,
-- aktualizowane codziennie,
-- wykorzystywane zarówno do rankingu, jak i do backtestów.
+- dlaczego runner został pominięty,
+- czy kupujemy za późno,
+- czy kupujemy near peak.
 
 ---
 
-## 🧠 Strategie
+### Control API (NEW)
 
-System ma obsługiwać wiele strategii w jednym frameworku.
+Bot posiada lokalne operational API.
 
-Na start planowane są dwie strategie:
+Endpoints:
 
-1. Day Trading Strategy,
-2. Swing Trading Strategy.
+```bash
+curl http://127.0.0.1:8767/health
+```
 
-Każda strategia zawiera:
+```bash
+curl -X POST http://127.0.0.1:8767/flatten_all_positions
+```
 
-- ranking kandydatów,
-- logikę wejścia — kiedy kupić,
-- logikę wyjścia — kiedy sprzedać,
-- parametry strategii,
-- zasady zarządzania pozycją.
+```bash
+curl -X POST "http://127.0.0.1:8767/flatten_symbol?symbol=QUBT"
+```
+
+```bash
+curl -X POST http://127.0.0.1:8767/pause_entries
+```
+
+```bash
+curl -X POST http://127.0.0.1:8767/resume_entries
+```
+
+Cel:
+
+- emergency flatten
+- lifecycle consistency
+- operational safety
+- avoiding ghost positions
+- safer restart handling
 
 ---
 
-## 🏆 Ranking
+## ⚠️ Aktualne problemy / TODO
 
-Ranking jest liczony osobno dla każdej strategii.
+### HIGH PRIORITY
 
-Przykład:
+#### 1. Trade reconciliation engine
+
+Potrzebny jest:
+
+- IBKR executions reconciliation
+- portfolio reconciliation
+- ghost trade cleanup
+- restart reconciliation
+
+Status:
 
 ```text
-Day Trading Strategy:
-AAPL → 91
-NVDA → 88
-TSLA → 82
-
-Swing Trading Strategy:
-MSFT → 89
-AMD  → 84
-META → 81
+NOT DONE
 ```
 
-Założenia:
-
-- skala od 0 do 100,
-- ranking jest częścią strategii,
-- ranking korzysta z danych historycznych i wskaźników,
-- po rankingu wybierane jest top X spółek do obserwacji albo tradingu.
-
 ---
 
-## 🎮 Tryby działania
+#### 2. Reliable EOD flatten
 
-### AUTO
+Potrzebne:
 
-Bot:
+- retry logic
+- verification pass
+- stuck order handling
+- guaranteed flatten before close
 
-- generuje ranking,
-- wybiera top X spółek,
-- obserwuje rynek,
-- sam podejmuje decyzje o wejściu,
-- sam zarządza wyjściem według strategii.
-
-### MANUAL
-
-Bot:
-
-- generuje ranking,
-- pokazuje propozycję spółek,
-- czeka na zatwierdzenie użytkownika,
-- po zatwierdzeniu handluje tylko zatwierdzonymi spółkami.
-
-Manual oznacza zgodę na handel wybranymi spółkami, a nie ręczne klikanie każdej transakcji.
-
----
-
-## ⚡ Day Trading
-
-Założenia:
-
-- codzienny ranking,
-- wybór top X spółek,
-- bot może otworzyć pozycję na tej samej spółce kilka razy w ciągu dnia, jeśli warunki strategii są spełnione,
-- bot decyduje, kiedy wejść w pozycję,
-- sprzedaż odbywa się według algorytmu strategii.
-
-Przykładowe limity:
-
-- maksymalna liczba transakcji na spółkę dziennie,
-- cooldown po zamknięciu pozycji,
-- maksymalna strata dzienna na spółkę,
-- maksymalna strata dzienna całego bota.
-
----
-
-## 📉 Swing Trading
-
-Założenia:
-
-- pozycje mogą być trzymane kilka dni albo tygodni,
-- strategia będzie oparta głównie o dane dzienne,
-- liczba transakcji będzie mniejsza niż w day tradingu,
-- strategia ma służyć jako stabilniejszy i wolniejszy model handlu.
-
----
-
-## 🧪 Backtesting
-
-Backtesting sprawdza strategię na danych historycznych.
-
-Ma odpowiadać na pytania:
-
-- czy strategia zarabiała w przeszłości,
-- jaki był zysk lub strata,
-- jaki był winrate,
-- jaki był maksymalny drawdown,
-- ile było transakcji,
-- jakie były najlepsze i najgorsze okresy.
-
-Backtesting jest wymagany przed paper tradingiem i live tradingiem.
-
----
-
-## 🧾 Paper Trading
-
-Paper trading to test strategii na aktualnym rynku bez użycia prawdziwych pieniędzy.
-
-Bot:
-
-- działa na realnych danych,
-- generuje realne sygnały,
-- symuluje kupno i sprzedaż,
-- prowadzi wirtualny portfel,
-- liczy wyniki strategii.
-
-Paper trading jest etapem po backteście i przed live tradingiem.
-
----
-
-## 💰 Live Trading / IBKR
-
-Po przejściu backtestu i paper tradingu strategia może zostać aktywowana na realnym rachunku IBKR.
-
-System ma korzystać z API Interactive Brokers.
-
----
-
-## ⚠️ Risk Management
-
-Risk Management jest nadrzędnym modułem bezpieczeństwa.
-
-Przykładowe zasady:
-
-- maksymalna kwota na jedną pozycję,
-- maksymalna liczba otwartych pozycji,
-- stop-loss,
-- take-profit,
-- trailing stop,
-- maksymalna strata dzienna,
-- blokada handlu po serii strat,
-- limit ekspozycji na jedną spółkę.
-
-Strategia nie powinna móc ominąć risk managera.
-
----
-
-## 📦 Portfolio Manager
-
-Portfolio Manager śledzi:
-
-- otwarte pozycje,
-- średnią cenę zakupu,
-- ilość akcji,
-- P/L,
-- dostępną gotówkę,
-- historię transakcji,
-- wynik per strategia.
-
----
-
-## 📬 Powiadomienia
-
-Na start planowane są powiadomienia email.
-
-Docelowo możliwe kanały:
-
-- Telegram,
-- Slack,
-- panel webowy.
-
-Powiadomienia mają obejmować:
-
-- wygenerowany ranking,
-- prośbę o zatwierdzenie w trybie manualnym,
-- kupno,
-- sprzedaż,
-- wynik transakcji,
-- błędy,
-- alerty bezpieczeństwa.
-
----
-
-## 📊 Statystyki
-
-System ma raportować:
-
-- liczbę transakcji,
-- transakcje zyskowne i stratne,
-- winrate,
-- zysk/stratę,
-- wynik per strategia,
-- wynik per spółka,
-- maksymalny drawdown,
-- najlepsze i najgorsze transakcje.
-
----
-
-## 🔁 Dzienny workflow
+Status:
 
 ```text
-1. Aktualizacja danych
-2. Generowanie rankingu per strategia
-3. Wybór top X spółek
-4. Tryb AUTO albo MANUAL
-5. Obserwacja rynku
-6. Wejście w pozycję, gdy warunki są spełnione
-7. Zarządzanie wyjściem według strategii
-8. Aktualizacja portfolio
-9. Zapis statystyk
-10. Wysłanie powiadomień
+PARTIALLY DONE
 ```
 
 ---
 
-## 🚀 Roadmap
+#### 3. Lifecycle recorder migration
 
-1. Dokumentacja i założenia projektu,
-2. baza spółek,
-3. moduł danych historycznych,
-4. pierwsza strategia day tradingowa,
-5. backtesting,
-6. paper trading,
-7. powiadomienia,
-8. integracja z IBKR,
-9. live trading,
-10. strategia swing tradingowa,
-11. panel webowy / Telegram / Slack.
+Obecnie:
+
+```text
+trade_lifecycle.csv
+```
+
+Problem:
+
+embedded JSON potrafi uszkodzić CSV parsing.
+
+Planned:
+
+```text
+JSONL structured recorder
+```
 
 ---
 
-## 📌 Kluczowe decyzje projektowe
+#### 4. Restart safety
 
-- Jeden system obsługujący wiele strategii.
-- Ranking osobny dla każdej strategii.
-- Tryb manual/auto po wygenerowaniu rankingu.
-- Day trading i swing trading w tym samym frameworku.
-- Bot decyduje o wejściu w pozycję.
-- Wyjście z pozycji jest zarządzane przez algorytm strategii.
-- Możliwość wielu wejść w tę samą spółkę jednego dnia.
-- Risk manager jest obowiązkowy i nadrzędny wobec strategii.
+Potrzebne:
+
+- restart cooldown
+- stale order cleanup
+- duplicate entry prevention
+- stronger adoption logic
+
+---
+
+## 🎯 Aktualny cel projektu
+
+Przejście z:
+
+```text
+paper trading prototype
+```
+
+na:
+
+```text
+production-grade live trading infrastructure
+```
+
+przed przejściem na:
+
+```text
+real IBKR account
+```
+
+---
+
+## 📌 Najważniejsze wnioski po pierwszych live sesjach
+
+### Strategicznie
+
+- strict setup wygląda bardzo obiecująco,
+- część relaxed entries wygląda jak buying near peak,
+- peak/giveback analytics okazały się bardzo wartościowe,
+- missed runner telemetry daje dużo insightów.
+
+---
+
+### Technicznie
+
+Największe ryzyka nie są już strategiczne.
+
+Największe ryzyka:
+
+- restart consistency
+- lifecycle consistency
+- reconciliation
+- IBKR gateway edge cases
+- EOD reliability
+
+---
+
+## 🧠 Architektura logiczna
+
+```text
+Universe (2184 symbols)
+    ↓
+1m candles
+    ↓
+TOP100 ranking
+    ↓
+Feature engine
+    ↓
+Expansion filters
+    ↓
+Entry signals
+    ↓
+IBKR paper execution
+    ↓
+Managed positions
+    ↓
+Trailing exits
+    ↓
+Recorder / analytics
+    ↓
+Daily reports
+```
+
+---
+
+## 🚀 Long-term roadmap
+
+Planned:
+
+- reconciliation engine
+- JSONL recorder
+- web dashboard
+- Discord / Telegram alerts
+- Prometheus/Grafana monitoring
+- dynamic position sizing
+- volatility regime filters
+- ML ranking layer
+- multi-strategy framework
+- live account rollout
