@@ -121,8 +121,15 @@ def infer_reject_reasons(metrics: dict, args: argparse.Namespace) -> list[str]:
         reasons.append("or_range_too_low")
     if metrics.get("open_price") is None or metrics["open_price"] < args.min_price:
         reasons.append("price_too_low_at_open")
-    # spread requires live quotes; candle-only report cannot reconstruct it.
     return reasons
+
+
+def first_price(row: dict, *names: str) -> float | None:
+    for name in names:
+        value = f(row.get(name), None)
+        if value is not None and value > 0:
+            return value
+    return None
 
 
 def main():
@@ -189,16 +196,25 @@ def main():
 
         bought = sym in buys and len(buys[sym]) > 0
         first_buy = buys[sym][0] if bought else {}
+        first_sell = sells[sym][0] if sells.get(sym) else {}
         buy_time = first_buy.get("recorded_at")
-        buy_px = f(first_buy.get("fill_price") or first_buy.get("price") or first_buy.get("entry_price"), None)
+        sell_time = first_sell.get("recorded_at")
+        buy_px = first_price(first_buy, "fill_price", "price", "entry_price")
+        sell_px = first_price(first_sell, "fill_price", "price")
         buy_ts = parse_ts(buy_time)
+        sell_ts = parse_ts(sell_time)
+        buy_from_open_pct = pct(open_price, buy_px)
+        pnl_pct = pct(buy_px, sell_px)
         before_buy_high_pct = None
-        after_buy_high_pct = None
+        run_after_buy_pct = None
+        giveback_from_high_pct = None
         if buy_ts and buy_px:
             before = [b["high"] for b in bars if b["ts"] <= buy_ts]
             after = [b["high"] for b in bars if b["ts"] >= buy_ts]
             before_buy_high_pct = pct(open_price, max(before, default=None))
-            after_buy_high_pct = pct(buy_px, max(after, default=None))
+            run_after_buy_pct = pct(buy_px, max(after, default=None))
+            if sell_px and after:
+                giveback_from_high_pct = pct(max(after), sell_px)
 
         metrics = {
             "open_price": open_price,
@@ -230,9 +246,14 @@ def main():
             "or_range_pct": or_range_pct,
             "bought": bought,
             "buy_time_utc": buy_ts.strftime("%H:%M") if buy_ts else "",
+            "sell_time_utc": sell_ts.strftime("%H:%M") if sell_ts else "",
             "buy_price": buy_px,
+            "sell_price": sell_px,
+            "buy_from_open_pct": buy_from_open_pct,
+            "pnl_pct": pnl_pct,
             "before_buy_high_pct": before_buy_high_pct,
-            "after_buy_high_from_buy_pct": after_buy_high_pct,
+            "run_after_buy_pct": run_after_buy_pct,
+            "giveback_from_high_pct": giveback_from_high_pct,
             "buy_count": len(buys.get(sym, [])),
             "sell_count": len(sells.get(sym, [])),
             "had_signal_ready": had_signal_ready,
@@ -260,14 +281,20 @@ def main():
     print()
 
     print("=== Runners detail ===")
-    print(f"{'SYM':<7} {'RUN%':>7} {'HIGH':>8} {'H_TIME':>6} {'BGT':>4} {'BUY':>5} {'BUY_PX':>9} {'5M%':>7} {'15M%':>7} {'OR%':>7} {'WHY'}")
-    print("-" * 132)
+    print(
+        f"{'SYM':<7} {'OPEN':>8} {'RUN%':>7} {'HIGH':>8} {'H_TIME':>6} "
+        f"{'BGT':>4} {'BUY':>5} {'BUY_PX':>9} {'BUY_OPEN%':>9} "
+        f"{'SELL':>5} {'SELL_PX':>9} {'PNL%':>8} {'RUN_AFTER%':>10} {'DROP%':>8} "
+        f"{'5M%':>7} {'15M%':>7} {'OR%':>7} {'WHY'}"
+    )
+    print("-" * 190)
     for r in rows:
         def fmt(v):
             return "" if v is None else f"{v:.2f}"
         print(
-            f"{r['symbol']:<7} {r['session_high_pct']:>6.2f}% {r['session_high']:>8.2f} {r['high_time_utc']:>6} "
-            f"{str(r['bought']):>4} {r['buy_time_utc']:>5} {fmt(r['buy_price']):>9} "
+            f"{r['symbol']:<7} {r['open']:>8.2f} {r['session_high_pct']:>6.2f}% {r['session_high']:>8.2f} {r['high_time_utc']:>6} "
+            f"{str(r['bought']):>4} {r['buy_time_utc']:>5} {fmt(r['buy_price']):>9} {fmt(r['buy_from_open_pct']):>9} "
+            f"{r['sell_time_utc']:>5} {fmt(r['sell_price']):>9} {fmt(r['pnl_pct']):>8} {fmt(r['run_after_buy_pct']):>10} {fmt(r['giveback_from_high_pct']):>8} "
             f"{fmt(r['first_5m_high_pct']):>7} {fmt(r['first_15m_high_pct']):>7} {fmt(r['or_range_pct']):>7} "
             f"{r['why_not_bought_or_status']}"
         )
