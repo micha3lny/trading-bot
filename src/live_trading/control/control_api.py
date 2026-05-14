@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import threading
+import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
@@ -24,14 +24,6 @@ class ControlApiContext:
     runtime_state: dict[str, Any]
     record_lifecycle_fn: RecordLifecycleFn
     persist_managed_positions_fn: PersistManagedPositionsFn | None = None
-
-
-def _ensure_thread_event_loop() -> None:
-    """Ensure ib_insync has an asyncio loop in HTTP request worker threads."""
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: JsonDict) -> None:
@@ -109,9 +101,15 @@ def _make_contract(pos: Any, symbol: str) -> Any:
     return Stock(symbol, "SMART", "USD")
 
 
-def _flatten_position(ctx: ControlApiContext, symbol: str, dry_run: bool) -> JsonDict:
-    _ensure_thread_event_loop()
+def _ensure_queue(ctx: ControlApiContext) -> list[JsonDict]:
+    queue = ctx.runtime_state.setdefault("control_api_commands", [])
+    if not isinstance(queue, list):
+        queue = []
+        ctx.runtime_state["control_api_commands"] = queue
+    return queue
 
+
+def _flatten_request(ctx: ControlApiContext, symbol: str, dry_run: bool) -> JsonDict:
     pos = _resolve_position(ctx, symbol)
     if pos is None:
         return {"ok": False, "symbol": symbol, "status": "not_found_or_inactive"}
@@ -131,7 +129,7 @@ def _flatten_position(ctx: ControlApiContext, symbol: str, dry_run: bool) -> Jso
     payload: JsonDict = {
         "ok": True,
         "symbol": symbol,
-        "status": "dry_run" if dry_run else "order_sent",
+        "status": "dry_run" if dry_run else "queued",
         "action": action,
         "quantity": qty,
         "position": _position_payload(symbol, pos),
@@ -152,47 +150,117 @@ def _flatten_position(ctx: ControlApiContext, symbol: str, dry_run: bool) -> Jso
         )
         return payload
 
-    contract = _make_contract(pos, symbol)
-    try:
-        qualified = ctx.ib.qualifyContracts(contract)
-        if qualified:
-            contract = qualified[0]
-    except Exception as exc:
-        return {"ok": False, "symbol": symbol, "status": "qualify_failed", "error": repr(exc)}
-
-    order = MarketOrder(action, qty)
-    order.tif = "DAY"
-    order.outsideRth = False
-
-    try:
-        trade = ctx.ib.placeOrder(contract, order)
-    except Exception as exc:
-        return {"ok": False, "symbol": symbol, "status": "place_order_failed", "error": repr(exc)}
-
-    order_id = getattr(getattr(trade, "order", None), "orderId", None)
-    setattr(pos, "exit_sent", True)
-    setattr(pos, "active", False)
-
-    payload["order_id"] = order_id
+    command_id = uuid.uuid4().hex
+    command = {
+        "id": command_id,
+        "type": "flatten_symbol",
+        "symbol": symbol,
+        "action": action,
+        "quantity": qty,
+    }
+    _ensure_queue(ctx).append(command)
     ctx.record_lifecycle_fn(
         ctx.recorder,
-        "MANUAL_FLATTEN_SENT",
+        "MANUAL_FLATTEN_QUEUED",
         symbol,
         action=action,
         quantity=qty,
-        order_id=order_id,
         price=None,
-        reason="control_api_flatten_symbol",
+        reason="control_api_flatten_symbol_queued",
         entry_price=getattr(pos, "entry_price", None),
         peak_price=getattr(pos, "peak_price", None),
-        raw_json=payload,
+        raw_json={**payload, "command_id": command_id},
     )
-    if ctx.persist_managed_positions_fn is not None:
-        try:
-            ctx.persist_managed_positions_fn(ctx.recorder, ctx.managed_positions)
-        except Exception:
-            pass
+    payload["command_id"] = command_id
     return payload
+
+
+def process_control_api_commands(
+    *,
+    ib: Any,
+    recorder: Any,
+    managed_positions: dict[str, Any],
+    runtime_state: dict[str, Any],
+    record_lifecycle_fn: RecordLifecycleFn,
+    persist_managed_positions_fn: PersistManagedPositionsFn | None = None,
+    max_commands: int = 20,
+) -> int:
+    """Execute queued control API commands from the trader's main thread.
+
+    HTTP request threads only enqueue commands. This function must be called from
+    the main trader loop where ib_insync already has a working event loop.
+    """
+    queue = runtime_state.setdefault("control_api_commands", [])
+    if not queue:
+        return 0
+
+    processed = 0
+    while queue and processed < max_commands:
+        cmd = queue.pop(0)
+        processed += 1
+        symbol = str(cmd.get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        pos = managed_positions.get(symbol)
+        if pos is None or not bool(getattr(pos, "active", False)):
+            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_SKIPPED", symbol, reason="not_found_or_inactive", raw_json=cmd)
+            continue
+        if bool(getattr(pos, "exit_sent", False)):
+            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_SKIPPED", symbol, reason="already_exit_sent", raw_json=cmd)
+            continue
+
+        qty_raw = getattr(pos, "quantity", cmd.get("quantity", 0))
+        try:
+            qty = int(abs(float(qty_raw)))
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_SKIPPED", symbol, reason="bad_quantity", raw_json=cmd)
+            continue
+
+        action = "SELL" if float(qty_raw) > 0 else "BUY"
+        contract = _make_contract(pos, symbol)
+        try:
+            qualified = ib.qualifyContracts(contract)
+            if qualified:
+                contract = qualified[0]
+        except Exception as exc:
+            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_FAILED", symbol, action=action, quantity=qty, reason=f"qualify_failed:{exc!r}", raw_json=cmd)
+            continue
+
+        order = MarketOrder(action, qty)
+        order.tif = "DAY"
+        order.outsideRth = False
+
+        try:
+            trade = ib.placeOrder(contract, order)
+        except Exception as exc:
+            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_FAILED", symbol, action=action, quantity=qty, reason=f"place_order_failed:{exc!r}", raw_json=cmd)
+            continue
+
+        order_id = getattr(getattr(trade, "order", None), "orderId", None)
+        setattr(pos, "exit_sent", True)
+        setattr(pos, "active", False)
+        record_lifecycle_fn(
+            recorder,
+            "MANUAL_FLATTEN_SENT",
+            symbol,
+            action=action,
+            quantity=qty,
+            order_id=order_id,
+            price=None,
+            reason="control_api_queue_main_loop",
+            entry_price=getattr(pos, "entry_price", None),
+            peak_price=getattr(pos, "peak_price", None),
+            raw_json={**cmd, "order_id": order_id},
+        )
+        if persist_managed_positions_fn is not None:
+            try:
+                persist_managed_positions_fn(recorder, managed_positions)
+            except Exception:
+                pass
+
+    return processed
 
 
 class _ControlHandler(BaseHTTPRequestHandler):
@@ -205,12 +273,12 @@ class _ControlHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
             active = [s for s, p in self.ctx.managed_positions.items() if bool(getattr(p, "active", False)) and not bool(getattr(p, "exit_sent", False))]
-            _json_response(self, 200, {"ok": True, "active_positions": len(active), "entries_blocked": bool(self.ctx.runtime_state.get("entries_blocked", False))})
+            pending = len(self.ctx.runtime_state.get("control_api_commands", []) or [])
+            _json_response(self, 200, {"ok": True, "active_positions": len(active), "entries_blocked": bool(self.ctx.runtime_state.get("entries_blocked", False)), "pending_commands": pending})
             return
         _json_response(self, 404, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        _ensure_thread_event_loop()
         parsed = urlparse(self.path)
         body = _read_json_body(self)
 
@@ -229,14 +297,14 @@ class _ControlHandler(BaseHTTPRequestHandler):
             if not symbol:
                 _json_response(self, 400, {"ok": False, "error": "missing_symbol"})
                 return
-            payload = _flatten_position(self.ctx, symbol, _extract_dry_run(parsed, body))
+            payload = _flatten_request(self.ctx, symbol, _extract_dry_run(parsed, body))
             _json_response(self, 200 if payload.get("ok") else 400, payload)
             return
 
         if parsed.path == "/flatten_all_positions":
             dry_run = _extract_dry_run(parsed, body)
             symbols = [s for s, p in self.ctx.managed_positions.items() if bool(getattr(p, "active", False)) and not bool(getattr(p, "exit_sent", False))]
-            results = [_flatten_position(self.ctx, s, dry_run) for s in symbols]
+            results = [_flatten_request(self.ctx, s, dry_run) for s in symbols]
             _json_response(self, 200, {"ok": True, "dry_run": dry_run, "count": len(results), "results": results})
             return
 
@@ -254,6 +322,7 @@ def start_control_api(
     host: str = "127.0.0.1",
     port: int = 8767,
 ) -> ThreadingHTTPServer:
+    runtime_state.setdefault("control_api_commands", [])
     ctx = ControlApiContext(
         ib=ib,
         recorder=recorder,
