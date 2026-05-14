@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from dataclasses import dataclass
@@ -23,6 +24,14 @@ class ControlApiContext:
     runtime_state: dict[str, Any]
     record_lifecycle_fn: RecordLifecycleFn
     persist_managed_positions_fn: PersistManagedPositionsFn | None = None
+
+
+def _ensure_thread_event_loop() -> None:
+    """Ensure ib_insync has an asyncio loop in HTTP request worker threads."""
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: JsonDict) -> None:
@@ -101,6 +110,8 @@ def _make_contract(pos: Any, symbol: str) -> Any:
 
 
 def _flatten_position(ctx: ControlApiContext, symbol: str, dry_run: bool) -> JsonDict:
+    _ensure_thread_event_loop()
+
     pos = _resolve_position(ctx, symbol)
     if pos is None:
         return {"ok": False, "symbol": symbol, "status": "not_found_or_inactive"}
@@ -199,6 +210,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
         _json_response(self, 404, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        _ensure_thread_event_loop()
         parsed = urlparse(self.path)
         body = _read_json_body(self)
 
