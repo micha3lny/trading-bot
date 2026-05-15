@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -215,7 +216,10 @@ def expected_min_rows(session_type: str) -> int:
 def write_parquet(path: Path, df: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp.parquet")
-    df.to_parquet(tmp, index=False)
+    try:
+        df.to_parquet(tmp, index=False)
+    except ImportError as exc:
+        raise RuntimeError("Missing parquet engine. Install pyarrow in venv: pip install pyarrow") from exc
     tmp.replace(path)
 
 
@@ -289,9 +293,9 @@ def main() -> int:
     parser.add_argument("--batch-sleep-seconds", type=float, default=10.0)
     parser.add_argument("--allow-outside-window", action="store_true")
     parser.add_argument("--postmarket-start-utc", default="20:15")
-    parser.add_argument("--postmarket-end-utc", default="23:00")
-    parser.add_argument("--premarket-start-utc", default="11:00")
-    parser.add_argument("--premarket-end-utc", default="13:00")
+    parser.add_argument("--postmarket-end-utc", default="15:00")
+    parser.add_argument("--premarket-start-utc", default="20:15")
+    parser.add_argument("--premarket-end-utc", default="15:00")
     parser.add_argument("--retry-failed", action="store_true")
     args = parser.parse_args()
 
@@ -342,7 +346,8 @@ def main() -> int:
 
     print(
         f"{now_iso()} HISTORY_COLLECTOR_START symbols={len(symbols)} tasks={len(tasks)} "
-        f"pending={len(pending)} start={start} end={end} session={args.session_type}",
+        f"pending={len(pending)} start={start} end={end} session={args.session_type} "
+        f"output_dir={output_dir}",
         flush=True,
     )
 
@@ -357,7 +362,17 @@ def main() -> int:
     completed = partial = failed = no_data = 0
     try:
         for idx, task in enumerate(pending, 1):
-            state, rows, error = collect_one(ib, task, output_dir, float(args.request_sleep_seconds))
+            try:
+                state, rows, error = collect_one(ib, task, output_dir, float(args.request_sleep_seconds))
+            except Exception as exc:
+                state, rows, error = "failed", 0, f"unexpected: {exc!r}"
+                tb = traceback.format_exc(limit=3).replace("\n", " | ")
+                print(
+                    f"{now_iso()} HISTORY_SYMBOL_EXCEPTION {task.symbol} {task.session_date} "
+                    f"error={exc!r} traceback={tb}",
+                    flush=True,
+                )
+
             if state == "complete":
                 completed += 1
                 failures.pop(task_key(task), None)
@@ -384,7 +399,11 @@ def main() -> int:
             if idx % 10 == 0:
                 write_json_atomic(status_path, status)
                 write_json_atomic(failures_path, failures)
-                print(f"{now_iso()} HISTORY_PROGRESS_SAVED idx={idx} pending={len(pending)}", flush=True)
+                print(
+                    f"{now_iso()} HISTORY_PROGRESS_SAVED idx={idx} pending={len(pending)} "
+                    f"complete={completed} partial={partial} no_data={no_data} failed={failed}",
+                    flush=True,
+                )
 
             if args.batch_size and idx % int(args.batch_size) == 0:
                 print(f"{now_iso()} HISTORY_BATCH_SLEEP idx={idx} sleep={args.batch_sleep_seconds}", flush=True)
@@ -397,7 +416,7 @@ def main() -> int:
 
     print(
         f"{now_iso()} HISTORY_COLLECTOR_DONE complete={completed} partial={partial} "
-        f"no_data={no_data} failed={failed}",
+        f"no_data={no_data} failed={failed} output_dir={output_dir}",
         flush=True,
     )
     return 0
