@@ -25,6 +25,10 @@ def f(x, default=0.0):
         return default
 
 
+def b(x) -> bool:
+    return str(x).strip().lower() in {"1", "true", "yes", "y"}
+
+
 def raw_json_dict(row: dict) -> dict:
     try:
         raw = row.get("raw_json") or "{}"
@@ -33,25 +37,6 @@ def raw_json_dict(row: dict) -> dict:
         return json.loads(raw)
     except Exception:
         return {}
-
-
-def is_strict_setup_payload(payload: dict, entry_price: float = 0.0, spread_bps: float | None = None) -> bool:
-    first_5m = f(payload.get("first_5m_high_pct"), None)
-    first_15m = f(payload.get("first_15m_high_pct"), None)
-    or_range = f(payload.get("or_range_pct"), None)
-    payload_spread = f(payload.get("spread_bps"), None)
-    px = f(payload.get("entry_price"), entry_price)
-    effective_spread = payload_spread if payload_spread is not None else spread_bps
-    return (
-        first_5m is not None
-        and first_15m is not None
-        and or_range is not None
-        and first_5m >= STRICT_MIN_FIRST_5M_HIGH_PCT
-        and first_15m >= STRICT_MIN_FIRST_15M_HIGH_PCT
-        and or_range >= STRICT_MIN_OR_RANGE_PCT
-        and px >= STRICT_MIN_PRICE
-        and (effective_spread is None or effective_spread <= STRICT_MAX_SPREAD_BPS)
-    )
 
 
 def parse_dt(value: str | None):
@@ -101,11 +86,38 @@ def buy_time_bucket(value: str | None) -> str:
     return "19:00+"
 
 
+def is_strict_payload(payload: dict, row: dict | None = None) -> bool:
+    row = row or {}
+    if b(row.get("strict_setup_ready")) or b(payload.get("strict_setup_ready")):
+        return True
+    first_5m = f(row.get("first_5m_high_pct"), None)
+    first_15m = f(row.get("first_15m_high_pct"), None)
+    or_range = f(row.get("or_range_pct"), None)
+    spread_pct = f(row.get("spread_pct"), None)
+    spread_bps = spread_pct * 100.0 if spread_pct is not None else None
+    if first_5m is None:
+        first_5m = f(payload.get("first_5m_high_pct"), None)
+    if first_15m is None:
+        first_15m = f(payload.get("first_15m_high_pct"), None)
+    if or_range is None:
+        or_range = f(payload.get("or_range_pct"), None)
+    if spread_bps is None:
+        spread_bps = f(payload.get("spread_bps"), None)
+    price = f(payload.get("entry_price"), f(row.get("price"), 0.0))
+    return (
+        first_5m is not None and first_5m >= STRICT_MIN_FIRST_5M_HIGH_PCT
+        and first_15m is not None and first_15m >= STRICT_MIN_FIRST_15M_HIGH_PCT
+        and or_range is not None and or_range >= STRICT_MIN_OR_RANGE_PCT
+        and price >= STRICT_MIN_PRICE
+        and (spread_bps is None or spread_bps <= STRICT_MAX_SPREAD_BPS)
+    )
+
+
 def load_latest_portfolio(session: Path):
     p = session / "portfolio_snapshots.csv"
     if not p.exists():
         return {}
-    with p.open() as fh:
+    with p.open(errors="replace") as fh:
         rows = list(csv.DictReader(fh))
     if not rows:
         return {}
@@ -125,14 +137,21 @@ def load_signal_features(session: Path) -> dict[str, list[dict]]:
     by_symbol: dict[str, list[dict]] = defaultdict(list)
     if not lifecycle.exists():
         return by_symbol
-    with lifecycle.open() as fh:
+    with lifecycle.open(errors="replace") as fh:
         for row in csv.DictReader(fh):
             if row.get("event") != "SIGNAL_READY":
                 continue
             sym = str(row.get("symbol", "")).upper()
             payload = raw_json_dict(row)
-            if sym and payload:
-                payload["recorded_at"] = row.get("recorded_at")
+            payload.update({
+                "recorded_at": row.get("recorded_at"),
+                "strict_setup_ready": row.get("strict_setup_ready") or payload.get("strict_setup_ready"),
+                "first_5m_high_pct": row.get("first_5m_high_pct") or payload.get("first_5m_high_pct"),
+                "first_15m_high_pct": row.get("first_15m_high_pct") or payload.get("first_15m_high_pct"),
+                "or_range_pct": row.get("or_range_pct") or payload.get("or_range_pct"),
+                "score": row.get("score") or payload.get("score"),
+            })
+            if sym:
                 by_symbol[sym].append(payload)
     return by_symbol
 
@@ -157,6 +176,12 @@ def best_signal_payload_for_buy(signal_features: dict[str, list[dict]], symbol: 
     return best or signals[-1]
 
 
+def avg(items, key):
+    vals = [key(x) for x in items]
+    vals = [v for v in vals if v is not None]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=datetime.now(timezone.utc).strftime("%F"))
@@ -166,90 +191,66 @@ def main():
 
     session = Path(args.recorder_dir) / args.date
     lifecycle = session / "trade_lifecycle.csv"
-
     if not lifecycle.exists():
         raise SystemExit(f"Missing {lifecycle}")
 
     latest_portfolio = load_latest_portfolio(session)
     signal_features = load_signal_features(session)
-
-    buys = {}
+    buys: dict[str, list[dict]] = {}
     closed = []
 
-    with lifecycle.open() as fh:
+    with lifecycle.open(errors="replace") as fh:
         for r in csv.DictReader(fh):
             event = r.get("event")
             sym = str(r.get("symbol", "")).upper()
             if not sym:
                 continue
-
             if event == "BUY_ORDER_SENT":
                 buys.setdefault(sym, []).append(r)
-
-            elif event == "SELL_ORDER_SENT":
-                if buys.get(sym):
-                    b = buys[sym].pop(0)
-
-                    qty = f(r.get("quantity"))
-                    buy_px = f(b.get("price") or b.get("entry_price"))
-                    sell_px = f(r.get("price"))
-                    peak = f(r.get("peak_price"), sell_px)
-                    buy_time = b.get("recorded_at")
-                    buy_payload = raw_json_dict(b)
-                    signal_payload = buy_payload or best_signal_payload_for_buy(signal_features, sym, buy_time)
-                    decision_spread = f(b.get("spread_pct"), None)
-                    decision_spread_bps = decision_spread * 100.0 if decision_spread is not None else None
-                    strict_ready = is_strict_setup_payload(signal_payload, buy_px, decision_spread_bps)
-
-                    gross = (sell_px - buy_px) * qty
-                    net = gross - args.commission_per_roundtrip
-                    pnl_pct = ((sell_px / buy_px) - 1) * 100 if buy_px else 0
-                    peak_pct = ((peak / buy_px) - 1) * 100 if buy_px else 0
-                    giveback_pct = ((sell_px / peak) - 1) * 100 if peak else 0
-
-                    closed.append({
-                        "symbol": sym,
-                        "qty": qty,
-                        "buy_time": buy_time,
-                        "buy_utc": utc_hhmm(buy_time),
-                        "buy_bucket": buy_time_bucket(buy_time),
-                        "minutes_from_open": minutes_from_market_open(buy_time),
-                        "strict_setup_ready": strict_ready,
-                        "strict_setup_name": STRICT_SETUP_NAME if strict_ready else "",
-                        "sell_time": r.get("recorded_at"),
-                        "buy": buy_px,
-                        "sell": sell_px,
-                        "peak": peak,
-                        "gross": gross,
-                        "net": net,
-                        "pnl_pct": pnl_pct,
-                        "peak_pct": peak_pct,
-                        "giveback_pct": giveback_pct,
-                        "reason": r.get("reason"),
-                    })
+            elif event == "SELL_ORDER_SENT" and buys.get(sym):
+                b_row = buys[sym].pop(0)
+                buy_px = f(b_row.get("fill_price") or b_row.get("price") or b_row.get("entry_price"))
+                sell_px = f(r.get("fill_price") or r.get("price"))
+                qty = f(r.get("quantity"))
+                buy_time = b_row.get("recorded_at")
+                payload = raw_json_dict(b_row) or best_signal_payload_for_buy(signal_features, sym, buy_time)
+                strict = is_strict_payload(payload, b_row)
+                peak = f(r.get("peak_price"), max(buy_px, sell_px))
+                peak_gain_pct = f(r.get("peak_gain_pct"), ((peak / buy_px - 1) * 100 if buy_px else 0))
+                giveback_pct = f(r.get("giveback_pct"), ((sell_px / peak - 1) * 100 if peak else 0))
+                gross = (sell_px - buy_px) * qty
+                net = gross - args.commission_per_roundtrip
+                closed.append({
+                    "symbol": sym,
+                    "qty": qty,
+                    "buy_time": buy_time,
+                    "buy_utc": utc_hhmm(buy_time),
+                    "buy_bucket": buy_time_bucket(buy_time),
+                    "minutes_from_open": minutes_from_market_open(buy_time),
+                    "strict_setup_ready": strict,
+                    "buy": buy_px,
+                    "sell": sell_px,
+                    "peak": peak,
+                    "gross": gross,
+                    "net": net,
+                    "pnl_pct": ((sell_px / buy_px - 1) * 100 if buy_px else 0),
+                    "peak_gain_pct": peak_gain_pct,
+                    "giveback_pct": giveback_pct,
+                    "reason": r.get("reason"),
+                })
 
     open_positions = []
     for sym, rows in buys.items():
-        for b in rows:
-            qty = f(b.get("quantity"))
-            buy_px = f(b.get("price") or b.get("entry_price"))
-            buy_time = b.get("recorded_at")
-            buy_payload = raw_json_dict(b)
-            signal_payload = buy_payload or best_signal_payload_for_buy(signal_features, sym, buy_time)
-            decision_spread = f(b.get("spread_pct"), None)
-            decision_spread_bps = decision_spread * 100.0 if decision_spread is not None else None
-            strict_ready = is_strict_setup_payload(signal_payload, buy_px, decision_spread_bps)
+        for row in rows:
+            buy_px = f(row.get("fill_price") or row.get("price") or row.get("entry_price"))
+            qty = f(row.get("quantity"))
+            buy_time = row.get("recorded_at")
+            payload = raw_json_dict(row) or best_signal_payload_for_buy(signal_features, sym, buy_time)
+            strict = is_strict_payload(payload, row)
             pf = latest_portfolio.get(sym, {})
             current = f(pf.get("marketPrice"), 0)
-            market_value = f(pf.get("marketValue"), current * qty)
             unrealized = f(pf.get("unrealizedPNL"), (current - buy_px) * qty if current else 0)
-            current_pct = ((current / buy_px) - 1) * 100 if buy_px and current else 0
-
-            peak = f(b.get("peak_price"), buy_px)
-            peak = max(peak, buy_px, current)
-            peak_pct = ((peak / buy_px) - 1) * 100 if buy_px else 0
-            from_peak_pct = ((current / peak) - 1) * 100 if peak and current else 0
-
+            peak = max(f(row.get("peak_price"), buy_px), buy_px, current)
             open_positions.append({
                 "symbol": sym,
                 "qty": qty,
@@ -257,127 +258,104 @@ def main():
                 "buy_utc": utc_hhmm(buy_time),
                 "buy_bucket": buy_time_bucket(buy_time),
                 "minutes_from_open": minutes_from_market_open(buy_time),
-                "strict_setup_ready": strict_ready,
-                "strict_setup_name": STRICT_SETUP_NAME if strict_ready else "",
+                "strict_setup_ready": strict,
                 "buy": buy_px,
                 "current": current,
                 "peak": peak,
-                "market_value": market_value,
                 "unrealized": unrealized,
-                "current_pct": current_pct,
-                "peak_pct": peak_pct,
-                "from_peak_pct": from_peak_pct,
+                "current_pct": ((current / buy_px - 1) * 100 if buy_px and current else 0),
+                "peak_gain_pct": ((peak / buy_px - 1) * 100 if buy_px else 0),
+                "from_peak_pct": ((current / peak - 1) * 100 if peak and current else 0),
             })
 
     wins = [x for x in closed if x["gross"] > 0]
     losses = [x for x in closed if x["gross"] <= 0]
-
     gross_total = sum(x["gross"] for x in closed)
     net_total = sum(x["net"] for x in closed)
-    open_unrealized = sum(x["unrealized"] for x in open_positions)
-    total_est = net_total + open_unrealized
-
-    win_rate = len(wins) / len(closed) * 100 if closed else 0
-    avg_win = sum(x["gross"] for x in wins) / len(wins) if wins else 0
-    avg_loss = sum(x["gross"] for x in losses) / len(losses) if losses else 0
-    expectancy = gross_total / len(closed) if closed else 0
-
-    strict_closed = [x for x in closed if x.get("strict_setup_ready")]
-    strict_open = [x for x in open_positions if x.get("strict_setup_ready")]
-    strict_wins = [x for x in strict_closed if x["gross"] > 0]
-    strict_gross = sum(x["gross"] for x in strict_closed)
-    strict_net = sum(x["net"] for x in strict_closed)
-    strict_upnl = sum(x["unrealized"] for x in strict_open)
-    strict_win_rate = len(strict_wins) / len(strict_closed) * 100 if strict_closed else 0
+    open_upnl = sum(x["unrealized"] for x in open_positions)
+    strict_closed = [x for x in closed if x["strict_setup_ready"]]
+    strict_open = [x for x in open_positions if x["strict_setup_ready"]]
 
     print(f"=== v67 Daily Report {args.date} ===")
     print(f"Closed trades:        {len(closed)}")
     print(f"Open trades:          {len(open_positions)}")
-    print(f"Win rate:             {win_rate:.1f}%")
+    print(f"Win rate:             {(len(wins) / len(closed) * 100 if closed else 0):.1f}%")
     print(f"Gross closed PnL:     ${gross_total:.2f}")
     print(f"Net closed est PnL:   ${net_total:.2f}")
-    print(f"Open unrealized PnL:  ${open_unrealized:.2f}")
-    print(f"Total est PnL:        ${total_est:.2f}")
-    print(f"Avg win:              ${avg_win:.2f}")
-    print(f"Avg loss:             ${avg_loss:.2f}")
-    print(f"Expectancy:           ${expectancy:.2f}/trade")
+    print(f"Open unrealized PnL:  ${open_upnl:.2f}")
+    print(f"Total est PnL:        ${net_total + open_upnl:.2f}")
+    print(f"Avg win:              ${(sum(x['gross'] for x in wins) / len(wins) if wins else 0):.2f}")
+    print(f"Avg loss:             ${(sum(x['gross'] for x in losses) / len(losses) if losses else 0):.2f}")
+    print(f"Expectancy:           ${(gross_total / len(closed) if closed else 0):.2f}/trade")
     print()
 
     print("=== Strict/original setup subset ===")
+    strict_wins = [x for x in strict_closed if x["gross"] > 0]
     print(f"Name:                 {STRICT_SETUP_NAME}")
     print(f"Thresholds:           5m>={STRICT_MIN_FIRST_5M_HIGH_PCT}%, 15m>={STRICT_MIN_FIRST_15M_HIGH_PCT}%, OR>={STRICT_MIN_OR_RANGE_PCT}%, spread<={STRICT_MAX_SPREAD_BPS}bps")
     print(f"Strict closed trades: {len(strict_closed)}")
     print(f"Strict open trades:   {len(strict_open)}")
-    print(f"Strict win rate:      {strict_win_rate:.1f}%")
-    print(f"Strict gross closed:  ${strict_gross:.2f}")
-    print(f"Strict net closed:    ${strict_net:.2f}")
-    print(f"Strict open UPNL:     ${strict_upnl:.2f}")
-    print(f"Strict total est:     ${strict_net + strict_upnl:.2f}")
+    print(f"Strict win rate:      {(len(strict_wins) / len(strict_closed) * 100 if strict_closed else 0):.1f}%")
+    print(f"Strict gross closed:  ${sum(x['gross'] for x in strict_closed):.2f}")
+    print(f"Strict net closed:    ${sum(x['net'] for x in strict_closed):.2f}")
+    print(f"Strict open UPNL:     ${sum(x['unrealized'] for x in strict_open):.2f}")
+    print(f"Strict total est:     ${sum(x['net'] for x in strict_closed) + sum(x['unrealized'] for x in strict_open):.2f}")
+    print()
+
+    print("=== Peak / giveback analytics ===")
+    groups = [("ALL", closed), ("STRICT", strict_closed), ("NONSTRICT", [x for x in closed if not x["strict_setup_ready"]])]
+    print(f"{'GROUP':<10} {'TRADES':>7} {'AVG_MFE%':>10} {'AVG_EXIT%':>10} {'AVG_DROP%':>10} {'GROSS':>10} {'NET':>10}")
+    print("-" * 76)
+    for name, rows in groups:
+        print(
+            f"{name:<10} {len(rows):>7} "
+            f"{avg(rows, lambda x: x['peak_gain_pct']):>10.2f} "
+            f"{avg(rows, lambda x: x['pnl_pct']):>10.2f} "
+            f"{avg(rows, lambda x: x['giveback_pct']):>10.2f} "
+            f"{sum(x['gross'] for x in rows):>10.2f} "
+            f"{sum(x['net'] for x in rows):>10.2f}"
+        )
     print()
 
     print("=== PnL by buy time bucket ===")
-    bucket_stats = defaultdict(lambda: {"closed": 0, "open": 0, "wins": 0, "closed_gross": 0.0, "closed_net": 0.0, "open_upnl": 0.0, "strict_closed": 0, "strict_open": 0})
+    bucket_stats = defaultdict(lambda: {"closed": 0, "open": 0, "wins": 0, "gross": 0.0, "net": 0.0, "open_upnl": 0.0, "strict": 0})
     for x in closed:
-        b = x.get("buy_bucket") or "unknown"
-        bucket_stats[b]["closed"] += 1
-        bucket_stats[b]["closed_gross"] += x["gross"]
-        bucket_stats[b]["closed_net"] += x["net"]
-        if x["gross"] > 0:
-            bucket_stats[b]["wins"] += 1
-        if x.get("strict_setup_ready"):
-            bucket_stats[b]["strict_closed"] += 1
+        s = bucket_stats[x["buy_bucket"]]
+        s["closed"] += 1
+        s["gross"] += x["gross"]
+        s["net"] += x["net"]
+        s["wins"] += 1 if x["gross"] > 0 else 0
+        s["strict"] += 1 if x["strict_setup_ready"] else 0
     for x in open_positions:
-        b = x.get("buy_bucket") or "unknown"
-        bucket_stats[b]["open"] += 1
-        bucket_stats[b]["open_upnl"] += x["unrealized"]
-        if x.get("strict_setup_ready"):
-            bucket_stats[b]["strict_open"] += 1
-
-    preferred_order = ["pre-open", "13:30-14:00", "14:00-15:00", "15:00-16:00", "16:00-17:00", "17:00-18:00", "18:00-19:00", "19:00+", "unknown"]
+        s = bucket_stats[x["buy_bucket"]]
+        s["open"] += 1
+        s["open_upnl"] += x["unrealized"]
+        s["strict"] += 1 if x["strict_setup_ready"] else 0
+    order = ["pre-open", "13:30-14:00", "14:00-15:00", "15:00-16:00", "16:00-17:00", "17:00-18:00", "18:00-19:00", "19:00+", "unknown"]
     print(f"{'BUCKET':<13} {'CLOSED':>7} {'OPEN':>5} {'STRICT':>7} {'WIN%':>7} {'GROSS':>10} {'NET':>10} {'OPEN_UPNL':>11} {'TOTAL_EST':>11}")
     print("-" * 96)
-    for bucket in preferred_order:
+    for bucket in order:
         s = bucket_stats.get(bucket)
         if not s:
             continue
-        closed_n = s["closed"]
-        win_pct = (s["wins"] / closed_n * 100) if closed_n else 0.0
-        total = s["closed_net"] + s["open_upnl"]
-        strict_count = s["strict_closed"] + s["strict_open"]
-        print(
-            f"{bucket:<13} {closed_n:>7} {s['open']:>5} {strict_count:>7} {win_pct:>6.1f}% "
-            f"{s['closed_gross']:>10.2f} {s['closed_net']:>10.2f} {s['open_upnl']:>11.2f} {total:>11.2f}"
-        )
+        win_pct = s["wins"] / s["closed"] * 100 if s["closed"] else 0
+        print(f"{bucket:<13} {s['closed']:>7} {s['open']:>5} {s['strict']:>7} {win_pct:>6.1f}% {s['gross']:>10.2f} {s['net']:>10.2f} {s['open_upnl']:>11.2f} {s['net'] + s['open_upnl']:>11.2f}")
     print()
 
     print("=== Closed trades ===")
-    print(f"{'SYM':<7} {'UTC':>5} {'MIN':>5} {'BUCKET':<13} {'STRICT':>6} {'QTY':>5} {'BUY':>10} {'SELL':>10} {'PEAK':>10} {'GROSS':>10} {'NET':>10} {'PNL%':>8} {'PEAK%':>8} {'DROP':>8}  REASON")
-    print("-" * 160)
-
+    print(f"{'SYM':<7} {'UTC':>5} {'MIN':>5} {'BUCKET':<13} {'STRICT':>6} {'QTY':>5} {'BUY':>10} {'SELL':>10} {'PEAK':>10} {'GROSS':>10} {'NET':>10} {'PNL%':>8} {'MFE%':>8} {'DROP':>8}  REASON")
+    print("-" * 165)
     for x in sorted(closed, key=lambda r: r["gross"]):
         mins = x.get("minutes_from_open")
-        mins_txt = "" if mins is None else str(mins)
-        print(
-            f"{x['symbol']:<7} {x.get('buy_utc',''):>5} {mins_txt:>5} {x.get('buy_bucket',''):<13} "
-            f"{str(bool(x.get('strict_setup_ready'))):>6} {x['qty']:>5.0f} {x['buy']:>10.4f} {x['sell']:>10.4f} "
-            f"{x['peak']:>10.4f} {x['gross']:>10.2f} {x['net']:>10.2f} {x['pnl_pct']:>7.2f}% "
-            f"{x['peak_pct']:>7.2f}% {x['giveback_pct']:>7.2f}%  {x['reason']}"
-        )
+        print(f"{x['symbol']:<7} {x['buy_utc']:>5} {str(mins if mins is not None else ''):>5} {x['buy_bucket']:<13} {str(x['strict_setup_ready']):>6} {x['qty']:>5.0f} {x['buy']:>10.4f} {x['sell']:>10.4f} {x['peak']:>10.4f} {x['gross']:>10.2f} {x['net']:>10.2f} {x['pnl_pct']:>7.2f}% {x['peak_gain_pct']:>7.2f}% {x['giveback_pct']:>7.2f}%  {x['reason']}")
 
     print()
     print("=== Open trades from today ===")
-    print(f"{'SYM':<7} {'UTC':>5} {'MIN':>5} {'BUCKET':<13} {'STRICT':>6} {'QTY':>5} {'BUY':>10} {'NOW':>10} {'PEAK':>10} {'UPNL':>10} {'NOW%':>8} {'PEAK%':>8} {'FROM_PK':>9}  BUY_TIME")
-    print("-" * 155)
-
+    print(f"{'SYM':<7} {'UTC':>5} {'MIN':>5} {'BUCKET':<13} {'STRICT':>6} {'QTY':>5} {'BUY':>10} {'NOW':>10} {'PEAK':>10} {'UPNL':>10} {'NOW%':>8} {'MFE%':>8} {'FROM_PK':>9}  BUY_TIME")
+    print("-" * 158)
     for x in sorted(open_positions, key=lambda r: r["unrealized"]):
         mins = x.get("minutes_from_open")
-        mins_txt = "" if mins is None else str(mins)
-        print(
-            f"{x['symbol']:<7} {x.get('buy_utc',''):>5} {mins_txt:>5} {x.get('buy_bucket',''):<13} "
-            f"{str(bool(x.get('strict_setup_ready'))):>6} {x['qty']:>5.0f} {x['buy']:>10.4f} {x['current']:>10.4f} "
-            f"{x['peak']:>10.4f} {x['unrealized']:>10.2f} {x['current_pct']:>7.2f}% {x['peak_pct']:>7.2f}% "
-            f"{x['from_peak_pct']:>8.2f}%  {x['buy_time']}"
-        )
+        print(f"{x['symbol']:<7} {x['buy_utc']:>5} {str(mins if mins is not None else ''):>5} {x['buy_bucket']:<13} {str(x['strict_setup_ready']):>6} {x['qty']:>5.0f} {x['buy']:>10.4f} {x['current']:>10.4f} {x['peak']:>10.4f} {x['unrealized']:>10.2f} {x['current_pct']:>7.2f}% {x['peak_gain_pct']:>7.2f}% {x['from_peak_pct']:>8.2f}%  {x['buy_time']}")
 
 
 if __name__ == "__main__":
