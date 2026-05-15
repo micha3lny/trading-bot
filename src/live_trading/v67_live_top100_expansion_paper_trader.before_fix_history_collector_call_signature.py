@@ -1088,7 +1088,9 @@ def main() -> int:
                 )
 
                 process_history_collector_commands(
+                    ib=ib,
                     runtime_state=runtime_state,
+                    recorder=recorder,
                 )
 
                 ib.sleep(args.interval_seconds)

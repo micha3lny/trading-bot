@@ -15,7 +15,7 @@ import pandas as pd
 from ib_insync import IB, Stock, MarketOrder
 
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
-from src.live_trading.control.control_api import process_control_api_commands, process_history_collector_commands, start_control_api
+from src.live_trading.control.control_api import process_control_api_commands, start_control_api
 from src.live_trading.v66_ibkr_account_recorder import (
     record_account_snapshot,
     record_recent_fills,
@@ -1013,7 +1013,7 @@ def main() -> int:
     contract_by_symbol: dict[str, Any] = {}
     seen_fills: set[str] = load_existing_fill_keys(recorder)
     managed_positions: dict[str, ManagedPosition] = {}
-    runtime_state = {"entries_blocked": False, "control_api_commands": [], "history_collector_start_utc": "20:15", "history_collector_end_utc": "15:00", "market_open_utc": "15:00", "market_close_utc": "20:00"}
+    runtime_state = {"entries_blocked": False, "control_api_commands": []}
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
     adopted_once = False
@@ -1086,11 +1086,6 @@ def main() -> int:
                     record_lifecycle_fn=record_lifecycle,
                     persist_managed_positions_fn=persist_managed_positions,
                 )
-
-                process_history_collector_commands(
-                    runtime_state=runtime_state,
-                )
-
                 ib.sleep(args.interval_seconds)
             except Exception as exc:
                 print(f"{now_utc()} IBKR_DISCONNECTED during=sleep error={exc!r}", flush=True)

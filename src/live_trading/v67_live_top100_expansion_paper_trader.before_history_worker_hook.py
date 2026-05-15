@@ -15,7 +15,7 @@ import pandas as pd
 from ib_insync import IB, Stock, MarketOrder
 
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
-from src.live_trading.control.control_api import process_control_api_commands, process_history_collector_commands, start_control_api
+from src.live_trading.control.control_api import process_control_api_commands, start_control_api
 from src.live_trading.v66_ibkr_account_recorder import (
     record_account_snapshot,
     record_recent_fills,
@@ -1088,7 +1088,9 @@ def main() -> int:
                 )
 
                 process_history_collector_commands(
+                    ib=ib,
                     runtime_state=runtime_state,
+                    recorder=recorder,
                 )
 
                 ib.sleep(args.interval_seconds)
