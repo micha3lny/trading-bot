@@ -27,7 +27,7 @@ from src.live_trading.v62_live_data_recorder import (
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4001
 DEFAULT_CLIENT_ID = 65
-DEFAULT_ALPHA_RANK = "data/universe/v64_universe_alpha_ranked.csv"
+DEFAULT_ALPHA_RANK = "data/universe/v68_final_daytrading_universe.csv"
 DEFAULT_RECORDER_DIR = "data/live/recorder"
 
 

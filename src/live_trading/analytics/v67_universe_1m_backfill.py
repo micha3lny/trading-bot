@@ -13,7 +13,7 @@ from ib_insync import IB, Stock
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4002
 DEFAULT_CLIENT_ID = 766
-DEFAULT_UNIVERSE = "data/universe/v64_universe_alpha_ranked.csv"
+DEFAULT_UNIVERSE = "data/universe/v68_final_daytrading_universe.csv"
 DEFAULT_OUTPUT_DIR = "data/live/universe_candles_1m"
 
 

@@ -14,7 +14,7 @@ from src.strategies.momentum_trailing_intraday.backtest_momentum_or_breakout_v57
 
 
 DEFAULT_TRADES = "data/backtests/v53_portfolio_accepted_cash20000_exposure20000_pos8.csv"
-DEFAULT_ALPHA_RANK = "data/universe/v64_universe_alpha_ranked.csv"
+DEFAULT_ALPHA_RANK = "data/universe/v68_final_daytrading_universe.csv"
 DEFAULT_WIDE = "data/universe/v62_symbols_wide.txt"
 
 

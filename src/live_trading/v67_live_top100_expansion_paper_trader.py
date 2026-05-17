@@ -24,7 +24,7 @@ from src.live_trading.v66_ibkr_account_recorder import (
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4001
 DEFAULT_CLIENT_ID = 65
-DEFAULT_ALPHA_RANK = "data/universe/v64_universe_alpha_ranked.csv"
+DEFAULT_ALPHA_RANK = "data/universe/v68_final_daytrading_universe.csv"
 DEFAULT_RECORDER_DIR = "data/live/recorder"
 STRATEGY_NAME = "v67_top100_live_safe_expansion_v46_wide_trail"
 
@@ -1013,7 +1013,7 @@ def main() -> int:
     contract_by_symbol: dict[str, Any] = {}
     seen_fills: set[str] = load_existing_fill_keys(recorder)
     managed_positions: dict[str, ManagedPosition] = {}
-    runtime_state = {"entries_blocked": False, "control_api_commands": [], "history_collector_start_utc": "20:15", "history_collector_end_utc": "15:00", "market_open_utc": "15:00", "market_close_utc": "20:00"}
+    runtime_state = {"entries_blocked": True, "control_api_commands": [], "history_collector_start_utc": "20:15", "history_collector_end_utc": "15:00", "market_open_utc": "15:00", "market_close_utc": "20:00"}
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
     adopted_once = False
@@ -1109,11 +1109,13 @@ def main() -> int:
             best_score = -999999.0
             rejection_counter = Counter()
             ranked = []
-            entries_blocked = (
+            time_entries_blocked = (
                 not is_after_utc(args.new_entries_start_utc)
                 or is_after_utc(args.no_new_entries_after_utc)
                 or is_after_utc(args.eod_flatten_utc)
             )
+            manual_entries_blocked = bool(runtime_state.get("entries_blocked", False))
+            entries_blocked = time_entries_blocked or manual_entries_blocked
             eod_active = args.enable_eod_flatten and is_after_utc(args.eod_flatten_utc)
 
             for symbol, q in contracts:
@@ -1134,6 +1136,16 @@ def main() -> int:
                         rejection_counter[reason] += 1
 
                 has_active_position = symbol in managed_positions and managed_positions[symbol].active and not managed_positions[symbol].exit_sent
+                if features["ready"] and not state.signal_sent and not has_active_position and entries_blocked:
+                    record_lifecycle(
+                        recorder,
+                        "BUY_BLOCKED",
+                        symbol,
+                        action="BUY",
+                        price=features.get("entry_price"),
+                        reason="entries_blocked_manual_or_time_window",
+                        raw_json={**features, "manual_entries_blocked": bool(runtime_state.get("entries_blocked", False))},
+                    )
                 if features["ready"] and not state.signal_sent and not has_active_position and not entries_blocked:
                     ready_count += 1
                     price = features.get("entry_price")
@@ -1206,11 +1218,13 @@ def main() -> int:
             rejection_summary = ", ".join([f"{k}={v}" for k, v in rejection_counter.most_common(5)])
             portfolio_part = f" portfolio_recorded=1 new_fills={new_fills}" if new_fills is not None else ""
             active_managed = sum(1 for p in managed_positions.values() if p.active)
-            entries_blocked = (
+            time_entries_blocked = (
                 not is_after_utc(args.new_entries_start_utc)
                 or is_after_utc(args.no_new_entries_after_utc)
                 or is_after_utc(args.eod_flatten_utc)
             )
+            manual_entries_blocked = bool(runtime_state.get("entries_blocked", False))
+            entries_blocked = time_entries_blocked or manual_entries_blocked
             eod_active = args.enable_eod_flatten and is_after_utc(args.eod_flatten_utc)
             print(
                 f"{now_utc()} heartbeat scanned={len(contracts)} with_data={data_count} ready_new={ready_count} "
