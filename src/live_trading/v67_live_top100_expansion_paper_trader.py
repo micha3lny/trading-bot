@@ -20,6 +20,15 @@ from src.live_trading.v66_ibkr_account_recorder import (
     record_account_snapshot,
     record_recent_fills,
 )
+from src.live_trading.order_lifecycle.models import (
+    ExecutionRecord,
+    LifecycleEvent,
+    LifecycleEventType,
+    OrderSide,
+    OrderState,
+    PositionState,
+)
+from src.live_trading.order_lifecycle.store import JsonlLifecycleStore
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4002
@@ -238,6 +247,108 @@ def record_lifecycle(recorder: LiveDataRecorder, event: str, symbol: str, **kwar
     if raw and not isinstance(raw, str):
         row["raw_json"] = json.dumps(raw, ensure_ascii=False, default=str)
     append_dict_csv(recorder.path("trade_lifecycle.csv"), row, fields)
+
+
+def formal_event_type_for_legacy_event(event: str) -> LifecycleEventType | None:
+    mapping = {
+        "SIGNAL_READY": LifecycleEventType.ENTRY_SIGNAL,
+        "BUY_ORDER_SENT": LifecycleEventType.ENTRY_ORDER_SUBMITTED,
+        "SELL_ORDER_SENT": LifecycleEventType.EXIT_ORDER_SUBMITTED,
+        "MANUAL_FLATTEN_SENT": LifecycleEventType.EXIT_ORDER_SUBMITTED,
+        "MANUAL_FLATTEN_QUEUED": LifecycleEventType.EXIT_ORDER_PREPARED,
+        "MANUAL_FLATTEN_DRY_RUN": LifecycleEventType.EXIT_ORDER_PREPARED,
+        "ADOPTED_POSITION": LifecycleEventType.POSITION_ADOPTED,
+        "RESTORED_MANAGED_POSITION": LifecycleEventType.POSITION_ADOPTED,
+        "POSITION_VERIFIED_CLOSED": LifecycleEventType.POSITION_CLOSED,
+        "POSITION_QUANTITY_DRIFT": LifecycleEventType.POSITION_DRIFT_DETECTED,
+        "POSITION_MISSING_IN_IBKR": LifecycleEventType.POSITION_DRIFT_DETECTED,
+    }
+    return mapping.get(event)
+
+
+def record_formal_lifecycle(
+    recorder: LiveDataRecorder,
+    event_type: LifecycleEventType,
+    symbol: str,
+    *,
+    strategy: str = STRATEGY_NAME,
+    order_state: OrderState | None = None,
+    position_state: PositionState | None = None,
+    state_before: PositionState | None = None,
+    state_after: PositionState | None = None,
+    client_order_id: str = "",
+    order_id: Any = "",
+    execution_id: str = "",
+    quantity: Any = None,
+    price: Any = None,
+    reason: str = "",
+    raw_json: dict[str, Any] | None = None,
+) -> None:
+    try:
+        store = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl"))
+        store.append_event(
+            LifecycleEvent(
+                event_type=event_type,
+                symbol=symbol,
+                strategy=strategy,
+                state_before=state_before,
+                state_after=state_after,
+                client_order_id=client_order_id,
+                ib_order_id=str(order_id or ""),
+                execution_id=execution_id,
+                order_state=order_state,
+                position_state=position_state,
+                quantity=safe_float(quantity),
+                price=safe_float(price),
+                reason=reason,
+                raw_json=raw_json or {},
+            )
+        )
+    except Exception as exc:
+        print(f"{now_utc()} formal_lifecycle_record_error event={event_type} symbol={symbol} error={exc!r}", flush=True)
+
+
+def record_lifecycle_with_formal(recorder: LiveDataRecorder, event: str, symbol: str, **kwargs: Any) -> None:
+    record_lifecycle(recorder, event, symbol, **kwargs)
+    event_type = formal_event_type_for_legacy_event(event)
+    if event_type is None:
+        return
+    order_state = None
+    position_state = None
+    state_before = None
+    state_after = None
+    if event_type == LifecycleEventType.ENTRY_SIGNAL:
+        position_state = PositionState.NONE
+    elif event_type == LifecycleEventType.ENTRY_ORDER_SUBMITTED:
+        order_state = OrderState.SUBMITTED
+        state_before = PositionState.NONE
+        state_after = PositionState.ENTRY_PENDING
+        position_state = PositionState.ENTRY_PENDING
+    elif event_type == LifecycleEventType.EXIT_ORDER_SUBMITTED:
+        order_state = OrderState.SUBMITTED
+        state_before = PositionState.OPEN
+        state_after = PositionState.EXIT_PENDING
+        position_state = PositionState.EXIT_PENDING
+    elif event_type in {LifecycleEventType.POSITION_ADOPTED, LifecycleEventType.POSITION_DRIFT_DETECTED}:
+        position_state = PositionState.RECONCILING if event_type == LifecycleEventType.POSITION_DRIFT_DETECTED else PositionState.OPEN
+    elif event_type == LifecycleEventType.POSITION_CLOSED:
+        state_after = PositionState.CLOSED
+        position_state = PositionState.CLOSED
+    record_formal_lifecycle(
+        recorder,
+        event_type,
+        symbol,
+        order_state=order_state,
+        position_state=position_state,
+        state_before=state_before,
+        state_after=state_after,
+        order_id=kwargs.get("order_id", ""),
+        execution_id=str(kwargs.get("execution_id", "") or ""),
+        quantity=kwargs.get("quantity"),
+        price=kwargs.get("price"),
+        reason=str(kwargs.get("reason", "") or ""),
+        raw_json=kwargs.get("raw_json") if isinstance(kwargs.get("raw_json"), dict) else {"legacy_event": event},
+    )
 
 
 def load_existing_fill_keys(recorder: LiveDataRecorder) -> set[str]:
@@ -552,7 +663,7 @@ def send_exit_order(ib: IB, recorder: LiveDataRecorder, pos: ManagedPosition, re
     trade = ib.placeOrder(pos.contract, order)
     order_id = trade.order.orderId
     pnl_pct = ((price / pos.entry_price - 1.0) * 100.0) if price and pos.entry_price > 0 else None
-    record_lifecycle(
+    record_lifecycle_with_formal(
         recorder,
         "SELL_ORDER_SENT",
         pos.symbol,
@@ -614,7 +725,7 @@ def verify_managed_positions_against_ibkr(
         if abs(ib_qty) <= 0:
             if not pos.exit_sent:
                 drift_symbols.append(symbol)
-                record_lifecycle(
+                record_lifecycle_with_formal(
                     recorder,
                     "POSITION_MISSING_IN_IBKR",
                     symbol,
@@ -626,7 +737,7 @@ def verify_managed_positions_against_ibkr(
                 continue
             pos.active = False
             closed_symbols.append(symbol)
-            record_lifecycle(
+            record_lifecycle_with_formal(
                 recorder,
                 "POSITION_VERIFIED_CLOSED",
                 symbol,
@@ -640,7 +751,7 @@ def verify_managed_positions_against_ibkr(
         open_symbols.append(symbol)
         if int(abs(ib_qty)) != int(abs(pos.quantity)):
             drift_symbols.append(symbol)
-            record_lifecycle(
+            record_lifecycle_with_formal(
                 recorder,
                 "POSITION_QUANTITY_DRIFT",
                 symbol,
@@ -675,7 +786,7 @@ def adopt_existing_long_positions(
         if not symbol or symbol in managed_positions:
             continue
         if symbol in exit_sent_symbols:
-            record_lifecycle(
+            record_lifecycle_with_formal(
                 recorder,
                 "ADOPT_DESPITE_EXIT_SENT",
                 symbol,
@@ -706,7 +817,7 @@ def adopt_existing_long_positions(
             peak_price=float(peak_price),
             source="adopted_from_ibkr_portfolio_top100" if in_runtime_universe else "adopted_from_ibkr_portfolio_external",
         )
-        record_lifecycle(
+        record_lifecycle_with_formal(
             recorder,
             "ADOPTED_POSITION",
             symbol,
@@ -879,6 +990,54 @@ def enrich_lifecycle_with_fills(recorder: LiveDataRecorder) -> int:
         )
         if fill_price:
             row["fill_price"] = fill_price
+            side = str(row.get("action") or "").upper()
+            event_type = LifecycleEventType.ENTRY_ORDER_FILLED if side == "BUY" else LifecycleEventType.EXIT_ORDER_FILLED
+            position_state = PositionState.OPEN if side == "BUY" else PositionState.CLOSED
+            try:
+                execution_id = str(fill.get("execution_id") or fill.get("execId") or f"{oid}-{row.get('symbol','')}-{fill_price}")
+                execution = ExecutionRecord(
+                    execution_id=execution_id,
+                    client_order_id="",
+                    symbol=str(row.get("symbol") or ""),
+                    side=OrderSide.BUY if side == "BUY" else OrderSide.SELL,
+                    quantity=abs(float(row.get("quantity") or fill.get("quantity") or 0)),
+                    price=float(fill_price),
+                    ib_order_id=oid,
+                    commission=safe_float(fill.get("commission")),
+                    raw_json={"source": "enrich_lifecycle_with_fills"},
+                )
+                store = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl"))
+                store.append_execution_once(
+                    execution,
+                    LifecycleEvent(
+                        event_type=event_type,
+                        symbol=execution.symbol,
+                        strategy=STRATEGY_NAME,
+                        state_after=position_state,
+                        ib_order_id=oid,
+                        execution_id=execution.execution_id,
+                        order_state=OrderState.FILLED,
+                        position_state=position_state,
+                        quantity=execution.quantity,
+                        price=execution.price,
+                        reason="ibkr_execution_recorded",
+                        raw_json={"legacy_order_event": event},
+                    ),
+                )
+                record_formal_lifecycle(
+                    recorder,
+                    LifecycleEventType.POSITION_OPENED if side == "BUY" else LifecycleEventType.POSITION_CLOSED,
+                    execution.symbol,
+                    position_state=position_state,
+                    state_after=position_state,
+                    order_id=oid,
+                    execution_id=execution.execution_id,
+                    quantity=execution.quantity,
+                    price=execution.price,
+                    reason="fill_enriched_lifecycle",
+                )
+            except Exception as exc:
+                print(f"{now_utc()} formal_fill_record_error order_id={oid} error={exc!r}", flush=True)
 
             try:
                 fill_px = float(fill_price)
@@ -1191,7 +1350,7 @@ def main() -> int:
             managed_positions.update(restored)
             for symbol, pos in restored.items():
                 states.get(symbol, SymbolState(symbol)).signal_sent = True
-                record_lifecycle(recorder, "RESTORED_MANAGED_POSITION", symbol, quantity=pos.quantity, entry_price=pos.entry_price, peak_price=pos.peak_price, reason="managed_positions_json")
+                record_lifecycle_with_formal(recorder, "RESTORED_MANAGED_POSITION", symbol, quantity=pos.quantity, entry_price=pos.entry_price, peak_price=pos.peak_price, reason="managed_positions_json")
             print(f"{now_utc()} restored_managed_positions={len(restored)}", flush=True)
 
         backfilled_rows = backfill_recent_1m(ib, recorder, contracts, args)
@@ -1213,7 +1372,7 @@ def main() -> int:
             recorder=recorder,
             managed_positions=managed_positions,
             runtime_state=runtime_state,
-            record_lifecycle_fn=record_lifecycle,
+            record_lifecycle_fn=record_lifecycle_with_formal,
             persist_managed_positions_fn=persist_managed_positions,
             host="127.0.0.1",
             port=8767,
@@ -1239,7 +1398,7 @@ def main() -> int:
                     recorder=recorder,
                     managed_positions=managed_positions,
                     runtime_state=runtime_state,
-                    record_lifecycle_fn=record_lifecycle,
+                    record_lifecycle_fn=record_lifecycle_with_formal,
                     persist_managed_positions_fn=persist_managed_positions,
                 )
 
@@ -1296,7 +1455,7 @@ def main() -> int:
 
                 has_active_position = symbol in managed_positions and managed_positions[symbol].active and not managed_positions[symbol].exit_sent
                 if features["ready"] and not state.signal_sent and not has_active_position and entries_blocked:
-                    record_lifecycle(
+                    record_lifecycle_with_formal(
                         recorder,
                         "BUY_BLOCKED",
                         symbol,
@@ -1309,7 +1468,7 @@ def main() -> int:
                     ready_count += 1
                     price = features.get("entry_price")
                     qty = max(1, int(args.position_usd // price)) if price and price > 0 else 0
-                    record_lifecycle(recorder, "SIGNAL_READY", symbol, action="BUY", quantity=qty, price=price, reason=features["reason"], raw_json=features)
+                    record_lifecycle_with_formal(recorder, "SIGNAL_READY", symbol, action="BUY", quantity=qty, price=price, reason=features["reason"], raw_json=features)
                     order = MarketOrder("BUY", qty)
                     order.tif = "DAY"
                     order.outsideRth = False
@@ -1317,7 +1476,7 @@ def main() -> int:
                     if qty > 0 and price and price > 0:
                         managed_positions[symbol] = ManagedPosition(symbol=symbol, contract=q, quantity=qty, entry_price=float(price), entry_time=now_utc(), peak_price=float(price))
                         persist_managed_positions(recorder, managed_positions)
-                    record_lifecycle(
+                    record_lifecycle_with_formal(
                         recorder,
                         "BUY_ORDER_SENT",
                         symbol,
