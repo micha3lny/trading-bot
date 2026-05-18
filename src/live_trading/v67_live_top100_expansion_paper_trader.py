@@ -22,7 +22,7 @@ from src.live_trading.v66_ibkr_account_recorder import (
 )
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 4001
+DEFAULT_PORT = 4002
 DEFAULT_CLIENT_ID = 65
 DEFAULT_ALPHA_RANK = "data/universe/v68_final_daytrading_universe.csv"
 DEFAULT_RECORDER_DIR = "data/live/recorder"
@@ -58,6 +58,9 @@ class ManagedPosition:
     active: bool = True
     exit_sent: bool = False
     source: str = "live_buy"
+    exit_order_id: int | None = None
+    last_exit_order_ts: float | None = None
+    eod_retry_count: int = 0
 
 
 def now_utc() -> str:
@@ -280,6 +283,9 @@ def managed_position_payload(pos: ManagedPosition) -> dict[str, Any]:
         "active": pos.active,
         "exit_sent": pos.exit_sent,
         "source": pos.source,
+        "exit_order_id": pos.exit_order_id,
+        "last_exit_order_ts": pos.last_exit_order_ts,
+        "eod_retry_count": pos.eod_retry_count,
     }
 
 
@@ -318,6 +324,9 @@ def restore_managed_positions(recorder: LiveDataRecorder, contract_by_symbol: di
                 active=bool(row.get("active", True)),
                 exit_sent=bool(row.get("exit_sent", False)),
                 source=str(row.get("source") or "restored"),
+                exit_order_id=int(float(row["exit_order_id"])) if row.get("exit_order_id") not in (None, "", "None") else None,
+                last_exit_order_ts=safe_float(row.get("last_exit_order_ts")),
+                eod_retry_count=int(float(row.get("eod_retry_count") or 0)),
             )
     except Exception as exc:
         print(f"{now_utc()} managed_positions_restore_error={exc!r}", flush=True)
@@ -534,13 +543,14 @@ def is_eod_flatten_time(flatten_utc: str) -> bool:
         return False
 
 
-def send_exit_order(ib: IB, recorder: LiveDataRecorder, pos: ManagedPosition, reason: str, price: float | None) -> None:
-    if not pos.active or pos.exit_sent or pos.quantity <= 0:
-        return
+def send_exit_order(ib: IB, recorder: LiveDataRecorder, pos: ManagedPosition, reason: str, price: float | None) -> bool:
+    if not pos.active or pos.quantity <= 0:
+        return False
     order = MarketOrder("SELL", pos.quantity)
     order.tif = "DAY"
     order.outsideRth = False
     trade = ib.placeOrder(pos.contract, order)
+    order_id = trade.order.orderId
     pnl_pct = ((price / pos.entry_price - 1.0) * 100.0) if price and pos.entry_price > 0 else None
     record_lifecycle(
         recorder,
@@ -549,7 +559,7 @@ def send_exit_order(ib: IB, recorder: LiveDataRecorder, pos: ManagedPosition, re
         action="SELL",
         quantity=pos.quantity,
         price=price,
-        order_id=trade.order.orderId,
+        order_id=order_id,
         reason=reason,
         entry_price=pos.entry_price,
         peak_price=pos.peak_price,
@@ -561,14 +571,94 @@ def send_exit_order(ib: IB, recorder: LiveDataRecorder, pos: ManagedPosition, re
         spread_pct=None,
     )
     pos.exit_sent = True
-    pos.active = False
+    pos.exit_order_id = order_id
+    pos.last_exit_order_ts = time.time()
     pnl_txt = f" pnl_pct={pnl_pct:.2f}" if pnl_pct is not None else ""
     print(
         f"PAPER SELL SENT symbol={pos.symbol} qty={pos.quantity} "
         f"reason={reason} entry={pos.entry_price:.2f} price={price if price else 0:.2f}"
-        f"{pnl_txt} orderId={trade.order.orderId} tif={order.tif} outsideRth={order.outsideRth}",
+        f"{pnl_txt} orderId={order_id} tif={order.tif} outsideRth={order.outsideRth}",
         flush=True,
     )
+    return True
+
+
+def ibkr_position_quantities(ib: IB) -> dict[str, float]:
+    quantities: dict[str, float] = {}
+    for item in ib.portfolio():
+        symbol = str(getattr(item.contract, "symbol", "")).upper().strip()
+        if not symbol:
+            continue
+        qty = safe_float(getattr(item, "position", None)) or 0.0
+        if abs(qty) > 0:
+            quantities[symbol] = quantities.get(symbol, 0.0) + qty
+    return quantities
+
+
+def verify_managed_positions_against_ibkr(
+    ib: IB,
+    recorder: LiveDataRecorder,
+    managed_positions: dict[str, ManagedPosition],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    quantities = ibkr_position_quantities(ib)
+    open_symbols: list[str] = []
+    closed_symbols: list[str] = []
+    drift_symbols: list[str] = []
+
+    for symbol, pos in managed_positions.items():
+        if not pos.active:
+            continue
+        ib_qty = quantities.get(symbol, 0.0)
+        if abs(ib_qty) <= 0:
+            if not pos.exit_sent:
+                drift_symbols.append(symbol)
+                record_lifecycle(
+                    recorder,
+                    "POSITION_MISSING_IN_IBKR",
+                    symbol,
+                    action="VERIFY",
+                    quantity=pos.quantity,
+                    reason=reason,
+                    raw_json={"managed_quantity": pos.quantity, "ibkr_quantity": ib_qty},
+                )
+                continue
+            pos.active = False
+            closed_symbols.append(symbol)
+            record_lifecycle(
+                recorder,
+                "POSITION_VERIFIED_CLOSED",
+                symbol,
+                action="VERIFY",
+                quantity=pos.quantity,
+                reason=reason,
+                entry_price=pos.entry_price,
+                peak_price=pos.peak_price,
+            )
+            continue
+        open_symbols.append(symbol)
+        if int(abs(ib_qty)) != int(abs(pos.quantity)):
+            drift_symbols.append(symbol)
+            record_lifecycle(
+                recorder,
+                "POSITION_QUANTITY_DRIFT",
+                symbol,
+                action="VERIFY",
+                quantity=pos.quantity,
+                reason=reason,
+                raw_json={"managed_quantity": pos.quantity, "ibkr_quantity": ib_qty},
+            )
+
+    result = {
+        "recorded_at": now_utc(),
+        "reason": reason,
+        "ibkr_open_symbols": sorted(quantities.keys()),
+        "managed_open_symbols": sorted(open_symbols),
+        "closed_symbols": sorted(closed_symbols),
+        "drift_symbols": sorted(drift_symbols),
+    }
+    return result
 
 
 def adopt_existing_long_positions(
@@ -629,20 +719,53 @@ def adopt_existing_long_positions(
     return adopted
 
 
-def manage_exits(ib: IB, recorder: LiveDataRecorder, managed_positions: dict[str, ManagedPosition], latest_snapshots: dict[str, dict[str, Any]], args: argparse.Namespace) -> int:
+def manage_exits(
+    ib: IB,
+    recorder: LiveDataRecorder,
+    managed_positions: dict[str, ManagedPosition],
+    latest_snapshots: dict[str, dict[str, Any]],
+    args: argparse.Namespace,
+    runtime_state: dict[str, Any],
+) -> int:
     exits = 0
-    eod = args.enable_eod_flatten and is_eod_flatten_time(args.eod_flatten_utc)
+    manual_eod = bool(runtime_state.get("manual_eod_flatten_requested", False))
+    manual_eod_force = bool(runtime_state.get("manual_eod_flatten_force", False))
+    eod = args.enable_eod_flatten and (manual_eod or is_eod_flatten_time(args.eod_flatten_utc))
     if not eod and not is_after_utc(getattr(args, "manage_exits_start_utc", "13:30")):
         return 0
+
+    ibkr_quantities: dict[str, float] = {}
+    if eod:
+        runtime_state["entries_blocked"] = True
+        try:
+            ibkr_quantities = ibkr_position_quantities(ib)
+        except Exception as exc:
+            print(f"{now_utc()} eod_portfolio_verify_error={exc!r}", flush=True)
+
     for symbol, pos in list(managed_positions.items()):
         if not pos.active or pos.exit_sent:
-            continue
+            if not eod:
+                continue
         snap = latest_snapshots.get(symbol) or {}
         price = safe_float(snap.get("price"))
 
         if eod:
-            send_exit_order(ib, recorder, pos, "v46_wide_trail_close_exit_eod", price)
-            exits += 1
+            ibkr_qty = ibkr_quantities.get(symbol)
+            if ibkr_qty is not None and abs(ibkr_qty) <= 0:
+                pos.active = False
+                continue
+            retry_due = (
+                pos.exit_sent
+                and pos.last_exit_order_ts is not None
+                and (time.time() - pos.last_exit_order_ts) >= args.eod_retry_seconds
+                and pos.eod_retry_count < args.eod_max_retries
+            )
+            should_send = not pos.exit_sent or retry_due or manual_eod_force
+            if should_send:
+                if retry_due or pos.exit_sent:
+                    pos.eod_retry_count += 1
+                if send_exit_order(ib, recorder, pos, "v46_wide_trail_close_exit_eod", price):
+                    exits += 1
             continue
 
         if price is None or price <= 0:
@@ -665,8 +788,24 @@ def manage_exits(ib: IB, recorder: LiveDataRecorder, managed_positions: dict[str
         if reason is None and eod:
             reason = "v46_wide_trail_close_exit_eod"
         if reason:
-            send_exit_order(ib, recorder, pos, reason, price)
-            exits += 1
+            if not pos.exit_sent and send_exit_order(ib, recorder, pos, reason, price):
+                exits += 1
+
+    if eod:
+        runtime_state["manual_eod_flatten_force"] = False
+        try:
+            verification = verify_managed_positions_against_ibkr(
+                ib,
+                recorder,
+                managed_positions,
+                reason="eod_flatten_verification_pass",
+            )
+            runtime_state["eod_last_verification"] = verification
+            if not verification["managed_open_symbols"]:
+                runtime_state["manual_eod_flatten_requested"] = False
+                runtime_state["manual_eod_flatten_force"] = False
+        except Exception as exc:
+            print(f"{now_utc()} eod_verification_error={exc!r}", flush=True)
     return exits
 
 
@@ -974,11 +1113,14 @@ def main() -> int:
     parser.add_argument("--exit-trailing-stop-pct", type=float, default=3.0)
     parser.add_argument("--adopt-existing-positions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--enable-eod-flatten", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--eod-flatten-utc", default="19:55")
+    parser.add_argument("--eod-flatten-utc", default="19:45")
+    parser.add_argument("--eod-retry-seconds", type=float, default=60.0)
+    parser.add_argument("--eod-max-retries", type=int, default=5)
     parser.add_argument("--no-new-entries-after-utc", default="19:30")
     parser.add_argument("--market-open-utc", default="13:30")
     parser.add_argument("--new-entries-start-utc", default="13:35")
     parser.add_argument("--manage-exits-start-utc", default="13:30")
+    parser.add_argument("--restart-cooldown-seconds", type=float, default=300.0)
     parser.add_argument("--backfill-1m-on-start", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--backfill-duration", default="1 D")
     parser.add_argument("--backfill-top-n", type=int, default=100)
@@ -1013,7 +1155,18 @@ def main() -> int:
     contract_by_symbol: dict[str, Any] = {}
     seen_fills: set[str] = load_existing_fill_keys(recorder)
     managed_positions: dict[str, ManagedPosition] = {}
-    runtime_state = {"entries_blocked": True, "control_api_commands": [], "history_collector_start_utc": "20:15", "history_collector_end_utc": "15:00", "market_open_utc": "15:00", "market_close_utc": "20:00"}
+    runtime_state = {
+        "entries_blocked": False,
+        "entries_blocked_until": time.time() + max(0.0, args.restart_cooldown_seconds),
+        "entries_blocked_reason": "restart_cooldown" if args.restart_cooldown_seconds > 0 else "",
+        "control_api_commands": [],
+        "history_collector_start_utc": "20:15",
+        "history_collector_end_utc": "15:00",
+        "market_open_utc": "15:00",
+        "market_close_utc": "20:00",
+        "manual_eod_flatten_requested": False,
+        "manual_eod_flatten_force": False,
+    }
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
     adopted_once = False
@@ -1114,9 +1267,12 @@ def main() -> int:
                 or is_after_utc(args.no_new_entries_after_utc)
                 or is_after_utc(args.eod_flatten_utc)
             )
+            restart_entries_blocked = loop_now < float(runtime_state.get("entries_blocked_until") or 0.0)
+            if not restart_entries_blocked and runtime_state.get("entries_blocked_reason") == "restart_cooldown":
+                runtime_state["entries_blocked_reason"] = ""
             manual_entries_blocked = bool(runtime_state.get("entries_blocked", False))
-            entries_blocked = time_entries_blocked or manual_entries_blocked
-            eod_active = args.enable_eod_flatten and is_after_utc(args.eod_flatten_utc)
+            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked
+            eod_active = args.enable_eod_flatten and (is_after_utc(args.eod_flatten_utc) or bool(runtime_state.get("manual_eod_flatten_requested", False)))
 
             for symbol, q in contracts:
                 snap = snapshot_from_ticker(symbol, tickers[symbol])
@@ -1144,7 +1300,7 @@ def main() -> int:
                         action="BUY",
                         price=features.get("entry_price"),
                         reason="entries_blocked_manual_or_time_window",
-                        raw_json={**features, "manual_entries_blocked": bool(runtime_state.get("entries_blocked", False))},
+                        raw_json={**features, "manual_entries_blocked": manual_entries_blocked, "time_entries_blocked": time_entries_blocked, "restart_entries_blocked": restart_entries_blocked},
                     )
                 if features["ready"] and not state.signal_sent and not has_active_position and not entries_blocked:
                     ready_count += 1
@@ -1187,7 +1343,7 @@ def main() -> int:
                 if adopted_count:
                     persist_managed_positions(recorder, managed_positions)
 
-            exit_count = manage_exits(ib, recorder, managed_positions, latest_snapshots, args)
+            exit_count = manage_exits(ib, recorder, managed_positions, latest_snapshots, args, runtime_state)
             if exit_count:
                 persist_managed_positions(recorder, managed_positions)
 
@@ -1199,6 +1355,13 @@ def main() -> int:
                     lifecycle_fills_updated = enrich_lifecycle_with_fills(recorder)
                     if lifecycle_fills_updated:
                         print(f"{now_utc()} lifecycle_fills_updated={lifecycle_fills_updated}", flush=True)
+                    verification = verify_managed_positions_against_ibkr(
+                        ib,
+                        recorder,
+                        managed_positions,
+                        reason="portfolio_recorder_verification",
+                    )
+                    runtime_state["portfolio_last_verification"] = verification
                     record_strategy_equity(recorder, managed_positions, latest_snapshots)
                     persist_managed_positions(recorder, managed_positions)
                     last_portfolio_record = loop_now
@@ -1223,12 +1386,14 @@ def main() -> int:
                 or is_after_utc(args.no_new_entries_after_utc)
                 or is_after_utc(args.eod_flatten_utc)
             )
+            restart_entries_blocked = loop_now < float(runtime_state.get("entries_blocked_until") or 0.0)
             manual_entries_blocked = bool(runtime_state.get("entries_blocked", False))
-            entries_blocked = time_entries_blocked or manual_entries_blocked
-            eod_active = args.enable_eod_flatten and is_after_utc(args.eod_flatten_utc)
+            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked
+            eod_active = args.enable_eod_flatten and (is_after_utc(args.eod_flatten_utc) or bool(runtime_state.get("manual_eod_flatten_requested", False)))
             print(
                 f"{now_utc()} heartbeat scanned={len(contracts)} with_data={data_count} ready_new={ready_count} "
-                f"adopted={adopted_count} exits_sent={exit_count} managed_open={active_managed} entries_blocked={int(entries_blocked)} eod_active={int(eod_active)} "
+                f"adopted={adopted_count} exits_sent={exit_count} managed_open={active_managed} entries_blocked={int(entries_blocked)} "
+                f"manual_block={int(manual_entries_blocked)} restart_block={int(restart_entries_blocked)} eod_active={int(eod_active)} "
                 f"best={best_symbol}:{best_score:.2f} top5=[{top5_str}] rejects=[{rejection_summary}]"
                 f"{portfolio_part}",
                 flush=True,

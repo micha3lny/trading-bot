@@ -83,6 +83,14 @@ def _extract_dry_run(parsed: Any, body: JsonDict) -> bool:
     return _bool_value(value, False)
 
 
+def _extract_force(parsed: Any, body: JsonDict) -> bool:
+    qs = parse_qs(parsed.query or "")
+    value = body.get("force")
+    if value is None and "force" in qs:
+        value = qs.get("force", [None])[0]
+    return _bool_value(value, False)
+
+
 def _position_payload(symbol: str, pos: Any) -> JsonDict:
     return {
         "symbol": symbol,
@@ -118,8 +126,8 @@ def _utc_minutes(value: str) -> int:
     return hh * 60 + mm
 
 
-def _in_utc_window(start_hhmm: str, end_hhmm: str) -> bool:
-    now = datetime.now(timezone.utc)
+def _in_utc_window(start_hhmm: str, end_hhmm: str, now: datetime | None = None) -> bool:
+    now = now or datetime.now(timezone.utc)
     now_min = now.hour * 60 + now.minute
     start = _utc_minutes(start_hhmm)
     end = _utc_minutes(end_hhmm)
@@ -128,14 +136,16 @@ def _in_utc_window(start_hhmm: str, end_hhmm: str) -> bool:
     return start <= now_min < end
 
 
-def _collector_allowed(runtime_state: dict[str, Any]) -> tuple[bool, str]:
+def _collector_allowed(runtime_state: dict[str, Any], *, force: bool = False, now: datetime | None = None) -> tuple[bool, str]:
+    if force:
+        return True, "forced"
     market_open = str(runtime_state.get("market_open_utc", "15:00"))
     market_close = str(runtime_state.get("market_close_utc", "20:00"))
-    if _in_utc_window(market_open, market_close):
+    if _in_utc_window(market_open, market_close, now):
         return False, "market_session_active"
     start = str(runtime_state.get("history_collector_start_utc", "20:15"))
     end = str(runtime_state.get("history_collector_end_utc", "15:00"))
-    if not _in_utc_window(start, end):
+    if not _in_utc_window(start, end, now):
         return False, "outside_collector_window"
     return True, "allowed"
 
@@ -199,8 +209,59 @@ def _flatten_request(ctx: ControlApiContext, symbol: str, dry_run: bool) -> Json
     return payload
 
 
-def _queue_history_collector(ctx: ControlApiContext, body: JsonDict) -> JsonDict:
-    allowed, reason = _collector_allowed(ctx.runtime_state)
+def _history_collector_status(runtime_state: dict[str, Any]) -> JsonDict:
+    queue = runtime_state.setdefault("history_collector_commands", [])
+    proc = runtime_state.get("history_collector_process")
+    running = bool(proc is not None and proc.poll() is None)
+    running_command = runtime_state.get("history_collector_running_command")
+    return {
+        "ok": True,
+        "running": running,
+        "pid": getattr(proc, "pid", None) if running else None,
+        "running_command": running_command,
+        "pending_commands": len(queue) if isinstance(queue, list) else 0,
+        "last_run_key": runtime_state.get("history_collector_last_run_key"),
+        "last_cancelled_at": runtime_state.get("history_collector_last_cancelled_at"),
+        "last_returncode": runtime_state.get("history_collector_last_returncode"),
+    }
+
+
+def _cancel_history_collector(ctx: ControlApiContext, *, force: bool = False) -> JsonDict:
+    queue = _ensure_history_queue(ctx)
+    cancelled_pending = len(queue)
+    queue.clear()
+
+    proc = ctx.runtime_state.get("history_collector_process")
+    running_command = ctx.runtime_state.get("history_collector_running_command")
+    killed = False
+    if proc is not None and proc.poll() is None:
+        if force:
+            proc.kill()
+            killed = True
+        else:
+            proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            if not force:
+                proc.kill()
+                killed = True
+    ctx.runtime_state["history_collector_process"] = None
+    ctx.runtime_state["history_collector_running_command"] = None
+    ctx.runtime_state["history_collector_last_cancelled_at"] = _now_utc()
+    _log("HISTORY_COLLECTOR_CANCELLED", pending=cancelled_pending, force=force, killed=killed)
+    return {
+        "ok": True,
+        "status": "cancelled",
+        "cancelled_pending_commands": cancelled_pending,
+        "running_command": running_command,
+        "force": force,
+        "killed": killed,
+    }
+
+
+def _queue_history_collector(ctx: ControlApiContext, body: JsonDict, *, force: bool = False) -> JsonDict:
+    allowed, reason = _collector_allowed(ctx.runtime_state, force=force)
     if not allowed:
         _log("HISTORY_COLLECTOR_REJECTED", reason=reason)
         return {"ok": False, "status": "rejected", "reason": reason}
@@ -220,6 +281,7 @@ def _queue_history_collector(ctx: ControlApiContext, body: JsonDict) -> JsonDict
         "max_tasks": int(body.get("max_tasks") or ctx.runtime_state.get("history_collector_max_tasks") or 300),
         "limit_symbols": int(body.get("limit_symbols") or ctx.runtime_state.get("history_collector_limit_symbols") or 0),
         "client_id": int(body.get("client_id") or ctx.runtime_state.get("history_collector_client_id") or 168),
+        "force": bool(force),
     }
     queue = _ensure_history_queue(ctx)
     queue.append(cmd)
@@ -255,6 +317,7 @@ def process_history_collector_commands(*, runtime_state: dict[str, Any], max_com
         _log("HISTORY_COLLECTOR_DONE", command_id=cmd.get("id"), returncode=rc)
         runtime_state["history_collector_process"] = None
         runtime_state["history_collector_running_command"] = None
+        runtime_state["history_collector_last_returncode"] = rc
         if rc == 0:
             runtime_state["history_collector_last_run_key"] = f"{cmd.get('end_date')}_{cmd.get('session_type')}"
 
@@ -262,7 +325,7 @@ def process_history_collector_commands(*, runtime_state: dict[str, Any], max_com
     if not queue:
         return 0
 
-    allowed, reason = _collector_allowed(runtime_state)
+    allowed, reason = _collector_allowed(runtime_state, force=bool((queue[0] or {}).get("force")) if queue else False)
     if not allowed:
         _log("HISTORY_COLLECTOR_DEFERRED", reason=reason, pending=len(queue))
         return 0
@@ -381,6 +444,12 @@ class _ControlHandler(BaseHTTPRequestHandler):
             history_running = bool(running_proc is not None and running_proc.poll() is None)
             _json_response(self, 200, {"ok": True, "active_positions": len(active), "entries_blocked": bool(self.ctx.runtime_state.get("entries_blocked", False)), "pending_commands": pending, "pending_history_collector_commands": pending_history, "history_collector_running": history_running})
             return
+        if parsed.path == "/history_collector/status":
+            _json_response(self, 200, _history_collector_status(self.ctx.runtime_state))
+            return
+        if parsed.path == "/eod/status":
+            _json_response(self, 200, {"ok": True, "eod_flatten_requested": bool(self.ctx.runtime_state.get("manual_eod_flatten_requested", False)), "eod_flatten_requested_at": self.ctx.runtime_state.get("manual_eod_flatten_requested_at"), "eod_flatten_force": bool(self.ctx.runtime_state.get("manual_eod_flatten_force", False)), "eod_last_verification": self.ctx.runtime_state.get("eod_last_verification")})
+            return
         _json_response(self, 404, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -418,8 +487,28 @@ class _ControlHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/run_history_collector":
-            payload = _queue_history_collector(self.ctx, body)
+            payload = _queue_history_collector(self.ctx, body, force=_extract_force(parsed, body))
             _json_response(self, 200 if payload.get("ok") else 400, payload)
+            return
+
+        if parsed.path == "/history_collector/cancel":
+            payload = _cancel_history_collector(self.ctx, force=_extract_force(parsed, body))
+            _json_response(self, 200, payload)
+            return
+
+        if parsed.path in {"/eod_flatten", "/eod/flatten"}:
+            dry_run = _extract_dry_run(parsed, body)
+            force = _extract_force(parsed, body)
+            active = [s for s, p in self.ctx.managed_positions.items() if bool(getattr(p, "active", False)) and not bool(getattr(p, "exit_sent", False))]
+            if dry_run:
+                _json_response(self, 200, {"ok": True, "status": "dry_run", "active_positions": active, "count": len(active), "force": force})
+                return
+            self.ctx.runtime_state["entries_blocked"] = True
+            self.ctx.runtime_state["manual_eod_flatten_requested"] = True
+            self.ctx.runtime_state["manual_eod_flatten_requested_at"] = _now_utc()
+            self.ctx.runtime_state["manual_eod_flatten_force"] = force
+            _log("EOD_FLATTEN_REQUESTED", force=force, active_positions=len(active))
+            _json_response(self, 200, {"ok": True, "status": "queued", "force": force, "active_positions": active, "count": len(active)})
             return
 
         _json_response(self, 404, {"ok": False, "error": "not_found"})

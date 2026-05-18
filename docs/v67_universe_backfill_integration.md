@@ -93,6 +93,12 @@ Runtime control server:
 127.0.0.1:8767
 ```
 
+Full endpoint reference:
+
+```text
+docs/control-api.md
+```
+
 Implemented endpoints:
 
 ### Flatten single symbol
@@ -120,6 +126,24 @@ curl -X POST http://127.0.0.1:8767/run_history_collector \
     "session_type":"RTH",
     "max_tasks":300
   }'
+```
+
+Status:
+
+```bash
+curl http://127.0.0.1:8767/history_collector/status
+```
+
+Cancel:
+
+```bash
+curl -X POST http://127.0.0.1:8767/history_collector/cancel
+```
+
+Manual EOD flatten test trigger:
+
+```bash
+curl -X POST http://127.0.0.1:8767/eod/flatten
 ```
 
 ---

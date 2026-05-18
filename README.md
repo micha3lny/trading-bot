@@ -25,6 +25,26 @@ System działa już jako:
 
 ## 🚀 Co działa i zostało potwierdzone
 
+## Public repo bootstrap
+
+Production market data and universe files are intentionally not committed under `data/`.
+
+The active v67 runtime expects:
+
+```text
+data/universe/v68_final_daytrading_universe.csv
+```
+
+For local smoke tests on a fresh clone, use:
+
+```bash
+mkdir -p data/universe
+cp docs/examples/sample_daytrading_universe.csv data/universe/v68_final_daytrading_universe.csv
+python -m src.live_trading.v67_live_top100_expansion_paper_trader --help
+```
+
+On the Raspberry Pi production node, keep using the generated production universe file.
+
 ### Infrastructure
 
 - Raspberry Pi działa jako execution node.
