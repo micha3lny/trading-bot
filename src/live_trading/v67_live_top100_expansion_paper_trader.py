@@ -671,19 +671,17 @@ def adopt_existing_long_positions(
     adopted = 0
     exit_sent_symbols = load_exit_sent_symbols(recorder)
     for item in ib.portfolio():
-        symbol = str(getattr(item.contract, "symbol", "")).upper()
-        if symbol not in contract_by_symbol or symbol in managed_positions:
+        symbol = str(getattr(item.contract, "symbol", "")).upper().strip()
+        if not symbol or symbol in managed_positions:
             continue
         if symbol in exit_sent_symbols:
             record_lifecycle(
                 recorder,
-                "SKIP_ADOPT_EXIT_SENT",
+                "ADOPT_DESPITE_EXIT_SENT",
                 symbol,
-                action="SKIP_ADOPT",
-                reason="sell_order_already_sent_in_lifecycle",
+                action="ADOPT",
+                reason="ibkr_portfolio_still_has_position_after_lifecycle_sell_order",
             )
-            print(f"SKIP ADOPT symbol={symbol} reason=sell_order_already_sent_in_lifecycle", flush=True)
-            continue
         quantity = safe_float(getattr(item, "position", None))
         avg_cost = safe_float(getattr(item, "averageCost", None))
         market_price = safe_float(getattr(item, "marketPrice", None))
@@ -692,16 +690,21 @@ def adopt_existing_long_positions(
         entry_price = avg_cost or market_price
         if entry_price is None or entry_price <= 0:
             continue
+        in_runtime_universe = symbol in contract_by_symbol
+        contract = contract_by_symbol.get(symbol) or item.contract
+        if contract is None:
+            contract = Stock(symbol, "SMART", "USD")
+        contract_by_symbol.setdefault(symbol, contract)
         snap_price = safe_float((latest_snapshots.get(symbol) or {}).get("price"))
         peak_price = max(entry_price, snap_price or market_price or entry_price)
         managed_positions[symbol] = ManagedPosition(
             symbol=symbol,
-            contract=contract_by_symbol[symbol],
+            contract=contract,
             quantity=int(quantity),
             entry_price=float(entry_price),
             entry_time=f"adopted_on_restart:{now_utc()}",
             peak_price=float(peak_price),
-            source="adopted_from_ibkr_portfolio",
+            source="adopted_from_ibkr_portfolio_top100" if in_runtime_universe else "adopted_from_ibkr_portfolio_external",
         )
         record_lifecycle(
             recorder,

@@ -442,7 +442,25 @@ class _ControlHandler(BaseHTTPRequestHandler):
             pending_history = len(self.ctx.runtime_state.get("history_collector_commands", []) or [])
             running_proc = self.ctx.runtime_state.get("history_collector_process")
             history_running = bool(running_proc is not None and running_proc.poll() is None)
-            _json_response(self, 200, {"ok": True, "active_positions": len(active), "entries_blocked": bool(self.ctx.runtime_state.get("entries_blocked", False)), "pending_commands": pending, "pending_history_collector_commands": pending_history, "history_collector_running": history_running})
+            verification = self.ctx.runtime_state.get("portfolio_last_verification") or self.ctx.runtime_state.get("eod_last_verification") or {}
+            ibkr_open_symbols = verification.get("ibkr_open_symbols", []) if isinstance(verification, dict) else []
+            drift_symbols = verification.get("drift_symbols", []) if isinstance(verification, dict) else []
+            _json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "active_positions": len(active),
+                    "active_symbols": active,
+                    "ibkr_open_positions": len(ibkr_open_symbols),
+                    "ibkr_open_symbols": ibkr_open_symbols,
+                    "drift_symbols": drift_symbols,
+                    "entries_blocked": bool(self.ctx.runtime_state.get("entries_blocked", False)),
+                    "pending_commands": pending,
+                    "pending_history_collector_commands": pending_history,
+                    "history_collector_running": history_running,
+                },
+            )
             return
         if parsed.path == "/history_collector/status":
             _json_response(self, 200, _history_collector_status(self.ctx.runtime_state))
