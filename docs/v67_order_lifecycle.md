@@ -172,6 +172,59 @@ When they disagree, bot must prefer safety:
 
 ## Stage 2 Direction
 
+### Etap 2A: Dry-Run Reconciliation Report
+
+Etap 2A is still non-invasive. It does not:
+
+- block entries,
+- change order types,
+- change `ManagedPosition` mechanics,
+- cancel orders,
+- flatten positions.
+
+It only compares:
+
+```text
+managed_positions
+IBKR portfolio
+IBKR openTrades/openOrders
+order_lifecycle.jsonl
+```
+
+Runtime emits log lines:
+
+```text
+RECONCILIATION_START
+RECONCILIATION_CLEAN
+RECONCILIATION_DRIFT
+RECONCILIATION_ORPHAN_IBKR_POSITION
+RECONCILIATION_LOCAL_POSITION_MISSING_IN_IBKR
+RECONCILIATION_PENDING_ORDER_FOUND
+RECONCILIATION_DONE
+```
+
+CLI dry-run:
+
+```bash
+python -m src.live_trading.order_lifecycle.reconciliation --dry-run
+```
+
+Optional JSON output:
+
+```bash
+python -m src.live_trading.order_lifecycle.reconciliation --dry-run --json
+```
+
+The default CLI command is local lifecycle-only unless a specific JSONL path is provided:
+
+```bash
+python -m src.live_trading.order_lifecycle.reconciliation \
+  --dry-run \
+  --lifecycle-jsonl data/live/recorder/YYYY-MM-DD/order_lifecycle.jsonl
+```
+
+## Future Stage 2B Direction
+
 The next stage should not switch to marketable limits yet. Recommended order:
 
 1. Expand formal event emission for all order statuses.

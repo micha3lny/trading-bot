@@ -26,9 +26,11 @@ from src.live_trading.order_lifecycle.models import (
     LifecycleEventType,
     OrderSide,
     OrderState,
+    PositionRecord,
     PositionState,
 )
 from src.live_trading.order_lifecycle.store import JsonlLifecycleStore
+from src.live_trading.order_lifecycle.reconciliation import build_reconciliation_report, log_reconciliation_report
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4002
@@ -772,6 +774,97 @@ def verify_managed_positions_against_ibkr(
     return result
 
 
+def managed_positions_to_lifecycle_positions(
+    managed_positions: dict[str, ManagedPosition],
+) -> dict[str, PositionRecord]:
+    positions: dict[str, PositionRecord] = {}
+    session_date = datetime.now(timezone.utc).date().isoformat()
+    for symbol, pos in managed_positions.items():
+        if not pos.active:
+            continue
+        open_qty = 0.0 if pos.exit_sent else float(pos.quantity)
+        state = PositionState.EXIT_PENDING if pos.exit_sent else PositionState.OPEN
+        positions[symbol] = PositionRecord(
+            symbol=symbol,
+            strategy=STRATEGY_NAME,
+            session_date=session_date,
+            state=state,
+            target_quantity=float(pos.quantity),
+            entry_filled_quantity=float(pos.quantity),
+            exit_filled_quantity=0.0,
+            avg_entry_price=pos.entry_price,
+            open_quantity=open_qty,
+            peak_price=pos.peak_price,
+        )
+    return positions
+
+
+def ibkr_open_order_rows(ib: IB) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        trades = list(ib.openTrades())
+    except Exception:
+        trades = []
+    for trade in trades:
+        order = getattr(trade, "order", None)
+        contract = getattr(trade, "contract", None)
+        status = getattr(trade, "orderStatus", None)
+        rows.append({
+            "symbol": str(getattr(contract, "symbol", "") or "").upper(),
+            "ib_order_id": str(getattr(order, "orderId", "") or ""),
+            "perm_id": str(getattr(order, "permId", "") or ""),
+            "action": str(getattr(order, "action", "") or ""),
+            "total_quantity": safe_float(getattr(order, "totalQuantity", None)),
+            "status": str(getattr(status, "status", "") or ""),
+            "filled": safe_float(getattr(status, "filled", None)),
+            "remaining": safe_float(getattr(status, "remaining", None)),
+        })
+    if rows:
+        return rows
+    try:
+        orders = list(ib.openOrders())
+    except Exception:
+        orders = []
+    for order in orders:
+        rows.append({
+            "symbol": "",
+            "ib_order_id": str(getattr(order, "orderId", "") or ""),
+            "perm_id": str(getattr(order, "permId", "") or ""),
+            "action": str(getattr(order, "action", "") or ""),
+            "total_quantity": safe_float(getattr(order, "totalQuantity", None)),
+            "status": "",
+            "filled": None,
+            "remaining": None,
+        })
+    return rows
+
+
+def run_dry_run_reconciliation_report(
+    ib: IB,
+    recorder: LiveDataRecorder,
+    managed_positions: dict[str, ManagedPosition],
+    runtime_state: dict[str, Any],
+    *,
+    reason: str,
+) -> None:
+    try:
+        positions = managed_positions_to_lifecycle_positions(managed_positions)
+        ibkr_quantities = ibkr_position_quantities(ib)
+        open_orders = ibkr_open_order_rows(ib)
+        lifecycle_events = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl")).load_events()
+        report = build_reconciliation_report(
+            positions,
+            ibkr_quantities,
+            lifecycle_events=lifecycle_events,
+            open_orders=open_orders,
+        )
+        runtime_state["reconciliation_last_report"] = report.to_dict()
+        runtime_state["reconciliation_last_reason"] = reason
+        log_reconciliation_report(report, prefix=now_utc())
+    except Exception as exc:
+        print(f"{now_utc()} RECONCILIATION_ERROR reason={reason} error={exc!r}", flush=True)
+
+
 def adopt_existing_long_positions(
     ib: IB,
     recorder: LiveDataRecorder,
@@ -1389,6 +1482,13 @@ def main() -> int:
             "state_rebuild_count": state_rebuild_count,
             "current_session_backfilled_1m_rows": current_session_backfilled_rows,
         })
+        run_dry_run_reconciliation_report(
+            ib,
+            recorder,
+            managed_positions,
+            runtime_state,
+            reason="startup_after_restore_and_control_api_start",
+        )
 
         start = time.time()
         while time.time() - start < args.duration_seconds:
@@ -1524,6 +1624,13 @@ def main() -> int:
                         reason="portfolio_recorder_verification",
                     )
                     runtime_state["portfolio_last_verification"] = verification
+                    run_dry_run_reconciliation_report(
+                        ib,
+                        recorder,
+                        managed_positions,
+                        runtime_state,
+                        reason="periodic_portfolio_record",
+                    )
                     record_strategy_equity(recorder, managed_positions, latest_snapshots)
                     persist_managed_positions(recorder, managed_positions)
                     last_portfolio_record = loop_now
