@@ -11,7 +11,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
-from ib_insync import MarketOrder, Stock
+try:
+    from ib_insync import MarketOrder, Stock
+except ImportError:  # pragma: no cover - exercised on minimal test environments
+    class _MissingIbInsync:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise ImportError("ib_insync is required for live Control API order placement")
+
+    MarketOrder = Stock = _MissingIbInsync
 
 
 JsonDict = dict[str, Any]
