@@ -11,7 +11,14 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
-from ib_insync import IB, Stock
+try:
+    from ib_insync import IB, Stock
+except ImportError:  # pragma: no cover - tests can exercise planning without IBKR deps
+    class _MissingIbInsync:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise ImportError("ib_insync is required for live IBKR collection")
+
+    IB = Stock = _MissingIbInsync
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4002
@@ -128,6 +135,20 @@ def task_key(task: CollectTask) -> str:
 def status_is_complete(status: dict[str, Any], task: CollectTask) -> bool:
     row = status.get(task_key(task)) or {}
     return row.get("status") == "complete"
+
+
+def parquet_exists(output_dir: Path, task: CollectTask) -> bool:
+    path = parquet_path(output_dir, task.symbol, task.session_date, task.session_type)
+    return path.exists() and path.stat().st_size > 0
+
+
+def task_is_complete(status: dict[str, Any], output_dir: Path, task: CollectTask) -> bool:
+    row = status.get(task_key(task)) or {}
+    if row.get("status") == "complete":
+        return True
+    if row.get("status") in {"partial", "failed", "failed_permanent", "no_data", "no_data_permanent"}:
+        return False
+    return parquet_exists(output_dir, task)
 
 
 def status_attempts(failures: dict[str, Any], task: CollectTask) -> int:
@@ -269,8 +290,36 @@ def collect_one(ib: IB, task: CollectTask, output_dir: Path, pause_seconds: floa
     return "complete", rows, None
 
 
-def build_tasks(symbols: list[str], start: date, end: date, session_type: str) -> list[CollectTask]:
-    return [CollectTask(symbol=s, session_date=d, session_type=session_type.upper()) for d in date_range(start, end) for s in symbols]
+def build_tasks(symbols: list[str], start: date, end: date, session_type: str, *, include_weekends: bool = False) -> list[CollectTask]:
+    dates = [d for d in date_range(start, end) if include_weekends or d.weekday() < 5]
+    return [CollectTask(symbol=s, session_date=d, session_type=session_type.upper()) for d in dates for s in symbols]
+
+
+def build_pending_tasks(
+    tasks: list[CollectTask],
+    *,
+    status: dict[str, Any],
+    failures: dict[str, Any],
+    output_dir: Path,
+    max_attempts: int,
+    retry_failed: bool,
+    update_blocked_status: bool = True,
+) -> tuple[list[CollectTask], dict[str, int]]:
+    pending: list[CollectTask] = []
+    stats = {"tasks": len(tasks), "complete": 0, "pending": 0, "blocked_by_attempts": 0}
+    for task in tasks:
+        if task_is_complete(status, output_dir, task):
+            stats["complete"] += 1
+            continue
+        attempts = status_attempts(failures, task)
+        if attempts >= int(max_attempts) and not retry_failed:
+            if update_blocked_status:
+                mark_status(status, task, "failed_permanent", 0, {"attempts": attempts})
+            stats["blocked_by_attempts"] += 1
+            continue
+        pending.append(task)
+    stats["pending"] = len(pending)
+    return pending, stats
 
 
 def main() -> int:
@@ -297,6 +346,8 @@ def main() -> int:
     parser.add_argument("--premarket-start-utc", default="20:15")
     parser.add_argument("--premarket-end-utc", default="15:00")
     parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument("--include-weekends", action="store_true")
+    parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
 
     current = now_utc()
@@ -329,27 +380,31 @@ def main() -> int:
     failures: dict[str, Any] = load_json(failures_path, {})
 
     symbols = load_universe(args.alpha_rank_csv, args.limit_symbols)
-    tasks = build_tasks(symbols, start, end, args.session_type)
-
-    pending: list[CollectTask] = []
-    for task in tasks:
-        if status_is_complete(status, task):
-            continue
-        attempts = status_attempts(failures, task)
-        if attempts >= int(args.max_attempts) and not args.retry_failed:
-            mark_status(status, task, "failed_permanent", 0, {"attempts": attempts})
-            continue
-        pending.append(task)
+    tasks = build_tasks(symbols, start, end, args.session_type, include_weekends=bool(args.include_weekends))
+    pending, plan = build_pending_tasks(
+        tasks,
+        status=status,
+        failures=failures,
+        output_dir=output_dir,
+        max_attempts=int(args.max_attempts),
+        retry_failed=bool(args.retry_failed),
+        update_blocked_status=not bool(args.plan_only),
+    )
 
     if args.max_tasks and args.max_tasks > 0:
         pending = pending[: int(args.max_tasks)]
 
     print(
         f"{now_iso()} HISTORY_COLLECTOR_START symbols={len(symbols)} tasks={len(tasks)} "
+        f"complete={plan['complete']} missing={plan['pending']} blocked_by_attempts={plan['blocked_by_attempts']} "
         f"pending={len(pending)} start={start} end={end} session={args.session_type} "
-        f"output_dir={output_dir}",
+        f"include_weekends={bool(args.include_weekends)} output_dir={output_dir}",
         flush=True,
     )
+
+    if args.plan_only:
+        write_json_atomic(status_path, status)
+        return 0
 
     if not pending:
         write_json_atomic(status_path, status)

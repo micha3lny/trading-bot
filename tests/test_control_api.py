@@ -89,6 +89,19 @@ class ControlApiHelperTests(unittest.TestCase):
         self.assertIn("10", args)
         self.assertIn("--allow-outside-window", args)
 
+    def test_build_history_collector_args_includes_plan_flags(self) -> None:
+        args = _build_history_collector_args(
+            {
+                "start_date": "2026-01-01",
+                "end_date": "2026-05-15",
+                "session_type": "RTH",
+                "plan_only": True,
+                "include_weekends": True,
+            }
+        )
+        self.assertIn("--plan-only", args)
+        self.assertIn("--include-weekends", args)
+
     def test_queue_history_collector_date_sets_single_day_range(self) -> None:
         ctx = ControlApiContext(
             ib=None,

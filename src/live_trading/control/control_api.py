@@ -292,6 +292,8 @@ def _queue_history_collector(ctx: ControlApiContext, body: JsonDict, *, force: b
         "limit_symbols": int(body.get("limit_symbols") or ctx.runtime_state.get("history_collector_limit_symbols") or 0),
         "client_id": int(body.get("client_id") or ctx.runtime_state.get("history_collector_client_id") or 168),
         "force": bool(force),
+        "plan_only": _bool_value(body.get("plan_only"), False),
+        "include_weekends": _bool_value(body.get("include_weekends"), False),
     }
     queue = _ensure_history_queue(ctx)
     queue.append(cmd)
@@ -314,6 +316,10 @@ def _build_history_collector_args(cmd: JsonDict) -> list[str]:
     limit = int(cmd.get("limit_symbols") or 0)
     if limit > 0:
         args.extend(["--limit-symbols", str(limit)])
+    if _bool_value(cmd.get("plan_only"), False):
+        args.append("--plan-only")
+    if _bool_value(cmd.get("include_weekends"), False):
+        args.append("--include-weekends")
     return args
 
 

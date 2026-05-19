@@ -128,6 +128,29 @@ curl -X POST http://127.0.0.1:8767/run_history_collector \
   }'
 ```
 
+Plan missing full-universe candles without connecting to IBKR:
+
+```bash
+curl -X POST http://127.0.0.1:8767/run_history_collector \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start_date":"2026-01-01",
+    "end_date":"2026-05-15",
+    "session_type":"RTH",
+    "max_tasks":3000,
+    "plan_only":true,
+    "force":true
+  }'
+```
+
+The collector logs a coverage line before any IBKR work:
+
+```text
+HISTORY_COLLECTOR_START symbols=2463 tasks=... complete=... missing=... pending=...
+```
+
+`tasks` is `symbols x trading weekdays`. `max_tasks` limits only how many missing tasks this run will process. Re-running the collector for the same range is safe: complete parquet files and complete status rows are skipped, so each batch continues rebuilding the backlog.
+
 Status:
 
 ```bash
