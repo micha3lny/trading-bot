@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.live_trading.ranking.daily_top100_builder import build_daily_top, parquet_path, write_output_csv
+from src.live_trading.ranking.daily_top100_builder import build_daily_top, parquet_path, update_latest_output, write_output_csv
 from src.live_trading.ranking.ranking_store import RankingStore
 
 
@@ -84,6 +84,33 @@ class DailyTop100BuilderTests(unittest.TestCase):
             self.assertIn("components_json", loaded.columns)
             self.assertEqual(loaded["symbol"].tolist(), ["AAA", "BBB"])
 
+    def test_latest_output_only_updates_for_valid_minimum_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dated = root / "daily_top100_2026-05-15.csv"
+            latest = root / "daily_top100_latest.csv"
+            latest.write_text("rank,symbol,score,alpha_score\n1,OLD,1,1\n", encoding="utf-8")
+
+            short_rows = [{"rank": 1, "symbol": "AAA", "score": 90.0, "alpha_score": 90.0}]
+            write_output_csv(dated, short_rows)
+            self.assertFalse(update_latest_output(dated, latest, short_rows))
+            self.assertIn("OLD", latest.read_text(encoding="utf-8"))
+
+            valid_rows = [
+                {
+                    "rank": idx,
+                    "symbol": f"S{idx:03d}",
+                    "score": 100.0 - idx / 1000,
+                    "alpha_score": 100.0 - idx / 1000,
+                }
+                for idx in range(1, 101)
+            ]
+            write_output_csv(dated, valid_rows)
+            self.assertTrue(update_latest_output(dated, latest, valid_rows))
+            loaded = pd.read_csv(latest)
+            self.assertEqual(len(loaded), 100)
+            self.assertEqual(loaded["symbol"].iloc[0], "S001")
+
     def test_ranking_store_replaces_one_day_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = RankingStore(Path(tmp) / "rankings.sqlite")
@@ -107,4 +134,3 @@ class DailyTop100BuilderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

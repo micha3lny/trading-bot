@@ -16,6 +16,7 @@ from src.live_trading.ranking.ranking_store import RankingStore
 DEFAULT_UNIVERSE = "data/universe/v68_final_daytrading_universe.csv"
 DEFAULT_HISTORY_DIR = "data/history/universe_1m"
 DEFAULT_SQLITE_PATH = "data/runtime/rankings.sqlite"
+MIN_LATEST_ROWS = 100
 
 
 @dataclass(frozen=True)
@@ -312,28 +313,60 @@ def build_daily_top(
     return rows, stats
 
 
-def write_output_csv(path: str | Path, rows: list[dict[str, Any]]) -> None:
+CSV_COLUMNS = [
+    "rank",
+    "symbol",
+    "score",
+    "alpha_score",
+    "last_close",
+    "dollar_volume",
+    "day_return_pct",
+    "intraday_high_pct",
+    "range_pct",
+    "volume",
+    "gap_pct",
+    "median_1m_range_bps",
+    "avg_abs_1m_return_bps",
+    "multi_day_return_pct",
+    "reason",
+    "components_json",
+]
+
+
+def render_output_csv(rows: list[dict[str, Any]]) -> str:
+    return pd.DataFrame(rows, columns=CSV_COLUMNS).to_csv(index=False)
+
+
+def write_text_atomic(path: str | Path, content: str) -> None:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    columns = [
-        "rank",
-        "symbol",
-        "score",
-        "alpha_score",
-        "last_close",
-        "dollar_volume",
-        "day_return_pct",
-        "intraday_high_pct",
-        "range_pct",
-        "volume",
-        "gap_pct",
-        "median_1m_range_bps",
-        "avg_abs_1m_return_bps",
-        "multi_day_return_pct",
-        "reason",
-        "components_json",
-    ]
-    pd.DataFrame(rows, columns=columns).to_csv(output, index=False)
+    tmp = output.with_name(f".{output.name}.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(output)
+
+
+def write_output_csv(path: str | Path, rows: list[dict[str, Any]]) -> None:
+    write_text_atomic(path, render_output_csv(rows))
+
+
+def update_latest_output(dated_output: str | Path, latest_output: str | Path, rows: list[dict[str, Any]]) -> bool:
+    if len(rows) < MIN_LATEST_ROWS:
+        print(
+            f"DAILY_TOP100_LATEST_SKIPPED reason=too_few_rows rows={len(rows)} "
+            f"required={MIN_LATEST_ROWS} latest_output={latest_output}",
+            flush=True,
+        )
+        return False
+
+    dated = Path(dated_output)
+    latest = Path(latest_output)
+    content = dated.read_text(encoding="utf-8") if dated.exists() else render_output_csv(rows)
+    write_text_atomic(latest, content)
+    print(
+        f"DAILY_TOP100_LATEST_UPDATED latest_output={latest} rows={len(rows)}",
+        flush=True,
+    )
+    return True
 
 
 def main() -> int:
@@ -342,6 +375,7 @@ def main() -> int:
     parser.add_argument("--universe", default=DEFAULT_UNIVERSE)
     parser.add_argument("--history-dir", default=DEFAULT_HISTORY_DIR)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--latest-output", default=None)
     parser.add_argument("--top-n", type=int, default=100)
     parser.add_argument("--session-type", default="RTH")
     parser.add_argument("--min-price", type=float, default=5.0)
@@ -367,6 +401,9 @@ def main() -> int:
         prior_sessions=int(args.prior_sessions),
     )
     write_output_csv(args.output, rows)
+    latest_ok = None
+    if args.latest_output:
+        latest_ok = update_latest_output(args.output, args.latest_output, rows)
     stored = 0
     if not args.no_sqlite:
         stored = RankingStore(args.sqlite_path).replace_daily_rankings(ranking_date.isoformat(), rows)
@@ -378,6 +415,8 @@ def main() -> int:
     )
     if len(rows) < int(args.top_n):
         print(f"DAILY_TOP100_WARNING requested_top_n={args.top_n} produced={len(rows)}", flush=True)
+    if latest_ok is False:
+        return 2
     return 0
 
 

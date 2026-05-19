@@ -6,6 +6,12 @@ Codziennie po zebraniu świeżych świec 1m dla pełnego universe budujemy plik 
 
 Runtime v67 nadal dostaje zwykły CSV przez `--alpha-rank-csv`. Ten etap nie zmienia startu bota, orderów ani logiki strategii.
 
+Stabilny plik dla systemd/live startup:
+
+```text
+data/universe/daily_top100_latest.csv
+```
+
 ## Co robi obecny runtime
 
 `src/live_trading/v67_live_top100_expansion_paper_trader.py` ładuje symbole przez `load_top_symbols(...)`.
@@ -115,8 +121,11 @@ python -m src.live_trading.ranking.daily_top100_builder \
   --universe data/universe/v68_final_daytrading_universe.csv \
   --history-dir data/history/universe_1m \
   --output data/universe/daily_top100_2026-05-16.csv \
+  --latest-output data/universe/daily_top100_latest.csv \
   --top-n 100
 ```
+
+Builder zawsze zapisuje dated output. `daily_top100_latest.csv` jest aktualizowany atomowo tylko wtedy, gdy build zakończy się poprawnie i wynik ma minimum 100 wierszy. Jeśli wynik ma mniej niż 100 wierszy, stary latest zostaje nietknięty, a proces kończy się kodem niezerowym.
 
 Output CSV jest kompatybilny z `--alpha-rank-csv`:
 
@@ -148,16 +157,37 @@ python -m src.live_trading.ranking.daily_top100_builder ... --no-sqlite
 
 ## Pre-market flow
 
-1. Po sesji uruchom history collector dla pełnego universe i sesji RTH.
+Collector i ranking są osobnymi krokami.
+
+1. Po sesji, w weekend albo poza godzinami handlu uruchom history collector dla pełnego 2463-symbolowego universe i sesji RTH.
 2. Sprawdź, czy parquet-y są zapisane w `data/history/universe_1m`.
-3. Uruchom daily Top100 builder dla ostatniej kompletnej sesji.
-4. Zweryfikuj top 20.
-5. Przy starcie bota podaj wygenerowany CSV przez `--alpha-rank-csv`.
+3. Premarket uruchom daily Top100 builder dla ostatniej kompletnej sesji.
+4. Builder zapisuje dated CSV oraz, jeśli wynik jest valid, atomowo aktualizuje `data/universe/daily_top100_latest.csv`.
+5. Live bot czyta stabilny latest przez `--alpha-rank-csv data/universe/daily_top100_latest.csv`.
+
+Wrapper premarket:
+
+```bash
+scripts/build_daily_top100_premarket.sh 2026-05-15
+```
+
+Bez argumentu wrapper wybiera poprzedni dzień roboczy względem daty systemowej.
 
 Inspekcja top 20:
 
 ```bash
-python -c 'import pandas as pd; df=pd.read_csv("data/universe/daily_top100_2026-05-16.csv"); print(df.head(20).to_string(index=False))'
+python -c 'import pandas as pd; df=pd.read_csv("data/universe/daily_top100_latest.csv"); print(df.head(20).to_string(index=False))'
+```
+
+Przykład konfiguracji live bota:
+
+```bash
+python -u -m src.live_trading.v67_live_top100_expansion_paper_trader \
+  --host 127.0.0.1 \
+  --port 4002 \
+  --client-id 67 \
+  --alpha-rank-csv data/universe/daily_top100_latest.csv \
+  --top-n 100
 ```
 
 ## Safety notes
@@ -165,6 +195,6 @@ python -c 'import pandas as pd; df=pd.read_csv("data/universe/daily_top100_2026-
 - Builder nie łączy się z IBKR.
 - Brak danych dla pojedynczego symbolu jest logowany jako `DAILY_TOP100_MISSING_DATA` i nie przerywa całego runu.
 - Jeśli valid symboli jest mniej niż `--top-n`, builder zapisuje mniej wierszy i loguje warning.
+- `daily_top100_latest.csv` nie jest aktualizowany, jeśli output ma mniej niż 100 wierszy.
 - Ten etap nie zmienia `v67_live_top100_expansion_paper_trader.py`.
 - Ten etap nie zmienia order lifecycle, EOD flatten ani control API.
-
