@@ -82,11 +82,14 @@ class ControlApiHelperTests(unittest.TestCase):
                 "session_type": "RTH",
                 "client_id": 168,
                 "max_tasks": 300,
+                "max_attempts": 1,
                 "limit_symbols": 10,
             }
         )
         self.assertIn("--limit-symbols", args)
         self.assertIn("10", args)
+        self.assertIn("--max-attempts", args)
+        self.assertIn("1", args)
         self.assertIn("--allow-outside-window", args)
 
     def test_build_history_collector_args_includes_plan_flags(self) -> None:
@@ -97,10 +100,12 @@ class ControlApiHelperTests(unittest.TestCase):
                 "session_type": "RTH",
                 "plan_only": True,
                 "include_weekends": True,
+                "retry_failed": True,
             }
         )
         self.assertIn("--plan-only", args)
         self.assertIn("--include-weekends", args)
+        self.assertIn("--retry-failed", args)
 
     def test_queue_history_collector_date_sets_single_day_range(self) -> None:
         ctx = ControlApiContext(
@@ -116,6 +121,7 @@ class ControlApiHelperTests(unittest.TestCase):
                 "date": "2026-05-15",
                 "session_type": "RTH",
                 "max_tasks": 3000,
+                "max_attempts": 1,
                 "force": True,
             },
             force=True,
@@ -126,6 +132,7 @@ class ControlApiHelperTests(unittest.TestCase):
         self.assertEqual(command["start_date"], "2026-05-15")
         self.assertEqual(command["end_date"], "2026-05-15")
         self.assertEqual(command["max_tasks"], 3000)
+        self.assertEqual(command["max_attempts"], 1)
 
 
 if __name__ == "__main__":

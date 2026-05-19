@@ -289,11 +289,13 @@ def _queue_history_collector(ctx: ControlApiContext, body: JsonDict, *, force: b
         "end_date": end_date,
         "session_type": str(body.get("session_type") or ctx.runtime_state.get("history_collector_session_type") or "RTH").upper(),
         "max_tasks": int(body.get("max_tasks") or ctx.runtime_state.get("history_collector_max_tasks") or 300),
+        "max_attempts": int(body.get("max_attempts") or ctx.runtime_state.get("history_collector_max_attempts") or 5),
         "limit_symbols": int(body.get("limit_symbols") or ctx.runtime_state.get("history_collector_limit_symbols") or 0),
         "client_id": int(body.get("client_id") or ctx.runtime_state.get("history_collector_client_id") or 168),
         "force": bool(force),
         "plan_only": _bool_value(body.get("plan_only"), False),
         "include_weekends": _bool_value(body.get("include_weekends"), False),
+        "retry_failed": _bool_value(body.get("retry_failed"), False),
     }
     queue = _ensure_history_queue(ctx)
     queue.append(cmd)
@@ -311,6 +313,7 @@ def _build_history_collector_args(cmd: JsonDict) -> list[str]:
         "--session-type", str(cmd.get("session_type") or "RTH"),
         "--client-id", str(int(cmd.get("client_id") or 168)),
         "--max-tasks", str(int(cmd.get("max_tasks") or 300)),
+        "--max-attempts", str(int(cmd.get("max_attempts") or 5)),
         "--allow-outside-window",
     ]
     limit = int(cmd.get("limit_symbols") or 0)
@@ -320,6 +323,8 @@ def _build_history_collector_args(cmd: JsonDict) -> list[str]:
         args.append("--plan-only")
     if _bool_value(cmd.get("include_weekends"), False):
         args.append("--include-weekends")
+    if _bool_value(cmd.get("retry_failed"), False):
+        args.append("--retry-failed")
     return args
 
 
