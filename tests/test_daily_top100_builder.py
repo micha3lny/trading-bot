@@ -79,10 +79,40 @@ class DailyTop100BuilderTests(unittest.TestCase):
             self.assertEqual(rows[0]["rank"], 1)
             self.assertEqual(rows[0]["symbol"], "AAA")
             self.assertIn("alpha_score", rows[0])
+            self.assertIn("final_score", rows[0])
+            self.assertIn("close_open_pct", rows[0])
+            self.assertIn("momentum_score", rows[0])
+            self.assertIn("liquidity_score", rows[0])
             self.assertEqual(rows[0]["score"], rows[0]["alpha_score"])
             loaded = pd.read_csv(output)
             self.assertIn("components_json", loaded.columns)
             self.assertEqual(loaded["symbol"].tolist(), ["AAA", "BBB"])
+
+    def test_runner_potential_beats_raw_mega_cap_liquidity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            universe = root / "universe.csv"
+            history = root / "history"
+            write_universe(universe, ["MEGA", "RUNR"])
+            write_session(history, "MEGA", date(2026, 5, 15), session_frame("MEGA", 500.0, 501.0, 2_000_000))
+            write_session(history, "RUNR", date(2026, 5, 15), session_frame("RUNR", 12.0, 14.4, 20_000))
+
+            rows, _ = build_daily_top(
+                ranking_date=date(2026, 5, 15),
+                universe_path=universe,
+                history_dir=history,
+                top_n=2,
+                session_type="RTH",
+                min_price=5.0,
+                min_bars=180,
+                min_volume=100_000,
+                min_dollar_volume=500_000,
+                prior_sessions=5,
+            )
+
+            self.assertEqual(rows[0]["symbol"], "RUNR")
+            self.assertGreater(rows[0]["momentum_score"], rows[1]["momentum_score"])
+            self.assertLessEqual(rows[0]["liquidity_score"], rows[1]["liquidity_score"])
 
     def test_latest_output_only_updates_for_valid_minimum_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

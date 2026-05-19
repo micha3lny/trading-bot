@@ -23,6 +23,8 @@ MIN_LATEST_ROWS = 100
 class SymbolRanking:
     symbol: str
     score: float
+    momentum_score: float
+    liquidity_score: float
     last_close: float
     dollar_volume: float
     day_return_pct: float
@@ -68,6 +70,19 @@ def load_universe(path: str | Path) -> list[str]:
         df = df.sort_values("alpha_score", ascending=False)
     symbols = df["symbol"].astype(str).str.upper().str.strip().dropna().drop_duplicates().tolist()
     return [s for s in symbols if s and s != "NAN"]
+
+
+def junk_symbol_reason(symbol: str) -> str | None:
+    s = symbol.upper().strip()
+    if len(s) >= 5 and s.endswith("W"):
+        return "warrant_suffix"
+    if len(s) >= 5 and s.endswith("U"):
+        return "unit_suffix"
+    if len(s) >= 5 and s.endswith("R"):
+        return "rights_suffix"
+    if len(s) >= 5 and s.endswith("P"):
+        return "preferred_or_special_suffix"
+    return None
 
 
 def parquet_path(history_dir: str | Path, symbol: str, session_date: date, session_type: str = "RTH") -> Path:
@@ -148,6 +163,9 @@ def analyze_symbol(
     min_volume: float,
     min_dollar_volume: float,
 ) -> tuple[SymbolRanking | None, str | None]:
+    junk_reason = junk_symbol_reason(symbol)
+    if junk_reason:
+        return None, junk_reason
     if df.empty:
         return None, "missing_history"
     if len(df) < min_bars:
@@ -182,36 +200,54 @@ def analyze_symbol(
     if len(prior_closes) >= 2 and prior_closes[-1] > 0:
         multi_day_return_pct = (last_close / prior_closes[-1] - 1.0) * 100.0
 
+    capped_dollar_volume = min(dollar_volume, 50_000_000.0)
     components = {
-        "intraday_high": scaled(intraday_high_pct, 0.5, 15.0),
-        "day_return": scaled(day_return_pct, -2.0, 10.0),
-        "liquidity": scaled_log(dollar_volume, min_dollar_volume, 75_000_000.0),
-        "range": scaled(range_pct, 1.0, 14.0),
-        "median_1m_range": scaled(median_1m_range_bps, 2.0, 80.0),
-        "gap": scaled(gap_pct, -5.0, 10.0) if gap_pct is not None else 35.0,
-        "multi_day": scaled(multi_day_return_pct, -10.0, 25.0) if multi_day_return_pct is not None else 35.0,
+        "intraday_high": scaled(intraday_high_pct, 1.0, 18.0),
+        "close_open": scaled(day_return_pct, -1.0, 10.0),
+        "range": scaled(range_pct, 2.0, 18.0),
+        "median_1m_range": scaled(median_1m_range_bps, 4.0, 100.0),
+        "avg_abs_1m_return": scaled(avg_abs_1m_return_bps, 2.0, 45.0),
+        "gap": scaled(gap_pct, -3.0, 10.0) if gap_pct is not None else 35.0,
+        "multi_day": scaled(multi_day_return_pct, -5.0, 25.0) if multi_day_return_pct is not None else 35.0,
+        "liquidity": scaled_log(capped_dollar_volume, min_dollar_volume, 50_000_000.0),
+        "data_completeness": scaled(len(df), min_bars, 390.0),
     }
+    momentum_score = (
+        0.35 * components["intraday_high"]
+        + 0.25 * components["range"]
+        + 0.15 * components["close_open"]
+        + 0.15 * components["multi_day"]
+        + 0.10 * components["gap"]
+    )
+    volatility_score = (
+        0.60 * components["median_1m_range"]
+        + 0.40 * components["avg_abs_1m_return"]
+    )
+    liquidity_score = components["liquidity"]
     score = (
-        0.30 * components["intraday_high"]
-        + 0.20 * components["day_return"]
-        + 0.20 * components["liquidity"]
-        + 0.10 * components["range"]
-        + 0.10 * components["median_1m_range"]
-        + 0.05 * components["gap"]
-        + 0.05 * components["multi_day"]
+        0.45 * momentum_score
+        + 0.25 * components["range"]
+        + 0.15 * volatility_score
+        + 0.05 * components["close_open"]
+        + 0.05 * components["data_completeness"]
+        + 0.05 * liquidity_score
     )
     components.update(
         {
             "bars": len(df),
+            "capped_dollar_volume": capped_dollar_volume,
             "prior_close": prior_close,
+            "momentum_score": momentum_score,
+            "volatility_score": volatility_score,
+            "liquidity_score": liquidity_score,
+            "final_score": score,
             "weights": {
-                "intraday_high": 0.30,
-                "day_return": 0.20,
-                "liquidity": 0.20,
-                "range": 0.10,
-                "median_1m_range": 0.10,
-                "gap": 0.05,
-                "multi_day": 0.05,
+                "momentum_score": 0.45,
+                "range": 0.25,
+                "volatility_score": 0.15,
+                "close_open": 0.05,
+                "data_completeness": 0.05,
+                "liquidity_score": 0.05,
             },
         }
     )
@@ -220,6 +256,8 @@ def analyze_symbol(
         SymbolRanking(
             symbol=symbol,
             score=round(float(score), 4),
+            momentum_score=round(float(momentum_score), 4),
+            liquidity_score=round(float(liquidity_score), 4),
             last_close=last_close,
             dollar_volume=dollar_volume,
             day_return_pct=day_return_pct,
@@ -243,9 +281,13 @@ def ranking_to_row(rank: int, item: SymbolRanking) -> dict[str, Any]:
         "symbol": item.symbol,
         "score": item.score,
         "alpha_score": item.score,
+        "final_score": item.score,
+        "momentum_score": item.momentum_score,
+        "liquidity_score": item.liquidity_score,
         "last_close": round(item.last_close, 4),
         "dollar_volume": round(item.dollar_volume, 2),
         "day_return_pct": round(item.day_return_pct, 4),
+        "close_open_pct": round(item.day_return_pct, 4),
         "intraday_high_pct": round(item.intraday_high_pct, 4),
         "range_pct": round(item.range_pct, 4),
         "volume": round(item.volume, 2),
@@ -318,9 +360,13 @@ CSV_COLUMNS = [
     "symbol",
     "score",
     "alpha_score",
+    "final_score",
+    "momentum_score",
+    "liquidity_score",
     "last_close",
     "dollar_volume",
     "day_return_pct",
+    "close_open_pct",
     "intraday_high_pct",
     "range_pct",
     "volume",

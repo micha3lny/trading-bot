@@ -88,28 +88,40 @@ Opcjonalnie używane:
 
 Daily builder używa tylko lokalnych parquetów, bez IBKR:
 
+Top100 jest rankingiem prawdopodobieństwa runnera, nie rankingiem największej płynności. Celem jest znaleźć czyste small/mid caps z wysoką szansą na tradowalny intraday expansion move, typowo +5% do +10%+ od open/high, a nie zdominować listę przez SPY/QQQ/NVDA/MSFT.
+
+Ranking faworyzuje:
+
 - recent momentum z ostatniej sesji RTH
 - `intraday_high_pct`
-- `day_return_pct`, czyli close vs open
-- `volume`
-- `dollar_volume`
+- `close_open_pct`, czyli close vs open
 - `range_pct`
 - `median_1m_range_bps`
+- `avg_abs_1m_return_bps`
 - `gap_pct`, jeśli jest poprzednia sesja
 - `multi_day_return_pct`, jeśli są wcześniejsze sesje
+- wysoką kompletność danych
 - filtry minimum price, bars, volume i dollar volume
 
-Score jest ważony:
+Liquidity działa głównie jako gate bezpieczeństwa. Symbol musi mieć wystarczający `volume` i `dollar_volume`, ale po przejściu filtra liquidity ma tylko lekką wagę w score. Dollar volume jest log-scaled i capowany, więc mega caps nie dostają automatycznej przewagi tylko dlatego, że obracają miliardami.
 
-- 30% intraday high
-- 20% day return
-- 20% liquidity / dollar volume
-- 10% daily range
-- 10% median 1m range
-- 5% gap
-- 5% multi-day momentum
+Final score jest ważony:
+
+- 45% `momentum_score`
+- 25% `range_pct`
+- 15% volatility score z median/average 1m movement
+- 5% `close_open_pct`
+- 5% data completeness
+- 5% `liquidity_score`
 
 To jest ranking kandydatów do obserwacji live, nie gwarancja wejścia. Finalne wejście dalej robi strategia v67 na bieżących danych.
+
+Builder odrzuca oczywiste junk suffixes:
+
+- warrants
+- units
+- rights
+- preferred/special suffix
 
 ## Komenda build
 
@@ -130,7 +142,7 @@ Builder zawsze zapisuje dated output. `daily_top100_latest.csv` jest aktualizowa
 Output CSV jest kompatybilny z `--alpha-rank-csv`:
 
 ```text
-rank,symbol,score,alpha_score,last_close,dollar_volume,day_return_pct,intraday_high_pct,range_pct,volume,gap_pct,median_1m_range_bps,avg_abs_1m_return_bps,multi_day_return_pct,reason,components_json
+rank,symbol,score,alpha_score,final_score,momentum_score,liquidity_score,last_close,dollar_volume,day_return_pct,close_open_pct,intraday_high_pct,range_pct,volume,gap_pct,median_1m_range_bps,avg_abs_1m_return_bps,multi_day_return_pct,reason,components_json
 ```
 
 ## SQLite audit store
