@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.live_trading.ranking.daily_top100_builder import build_daily_top, parquet_path, update_latest_output, write_output_csv
+from src.live_trading.ranking.daily_top100_builder import (
+    build_daily_top,
+    parquet_path,
+    update_latest_output,
+    write_diagnostics_csv,
+    write_output_csv,
+)
 from src.live_trading.ranking.ranking_store import RankingStore
 
 
@@ -87,6 +93,38 @@ class DailyTop100BuilderTests(unittest.TestCase):
             loaded = pd.read_csv(output)
             self.assertIn("components_json", loaded.columns)
             self.assertEqual(loaded["symbol"].tolist(), ["AAA", "BBB"])
+
+    def test_diagnostics_report_contains_missing_and_rejected_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            universe = root / "universe.csv"
+            history = root / "history"
+            diagnostics = root / "diagnostics.csv"
+            write_universe(universe, ["AAA", "MISS", "BADWW"])
+            write_session(history, "AAA", date(2026, 5, 15), session_frame("AAA", 10.0, 13.0, 5_000))
+            write_session(history, "BADWW", date(2026, 5, 15), session_frame("BADWW", 10.0, 13.0, 5_000))
+
+            _, stats = build_daily_top(
+                ranking_date=date(2026, 5, 15),
+                universe_path=universe,
+                history_dir=history,
+                top_n=2,
+                session_type="RTH",
+                min_price=5.0,
+                min_bars=180,
+                min_volume=100_000,
+                min_dollar_volume=500_000,
+                prior_sessions=5,
+                max_missing_log=0,
+                max_reject_log=0,
+            )
+            written = write_diagnostics_csv(diagnostics, date(2026, 5, 15), stats)
+            report = pd.read_csv(diagnostics)
+
+            self.assertEqual(written, 2)
+            self.assertEqual(set(report["status"]), {"missing", "rejected"})
+            self.assertIn("MISS", set(report["symbol"]))
+            self.assertIn("BADWW", set(report["symbol"]))
 
     def test_runner_potential_beats_raw_mega_cap_liquidity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -17,6 +17,8 @@ DEFAULT_UNIVERSE = "data/universe/v68_final_daytrading_universe.csv"
 DEFAULT_HISTORY_DIR = "data/history/universe_1m"
 DEFAULT_SQLITE_PATH = "data/runtime/rankings.sqlite"
 MIN_LATEST_ROWS = 100
+DEFAULT_MAX_MISSING_LOG = 50
+DEFAULT_MAX_REJECT_LOG = 50
 
 
 @dataclass(frozen=True)
@@ -312,6 +314,8 @@ def build_daily_top(
     min_volume: float,
     min_dollar_volume: float,
     prior_sessions: int,
+    max_missing_log: int = DEFAULT_MAX_MISSING_LOG,
+    max_reject_log: int = DEFAULT_MAX_REJECT_LOG,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     symbols = load_universe(universe_path)
     print(
@@ -321,12 +325,17 @@ def build_daily_top(
     )
     ranked: list[SymbolRanking] = []
     stats: dict[str, int] = {"symbols": len(symbols), "valid": 0, "missing": 0, "rejected": 0, "errors": 0}
+    missing_symbols: list[str] = []
+    rejected_rows: list[dict[str, str]] = []
+    error_rows: list[dict[str, str]] = []
     for idx, symbol in enumerate(symbols, 1):
         try:
             df = read_session(history_dir, symbol, ranking_date, session_type)
             if df.empty:
                 stats["missing"] += 1
-                print(f"DAILY_TOP100_MISSING_DATA symbol={symbol} date={ranking_date.isoformat()}", flush=True)
+                missing_symbols.append(symbol)
+                if stats["missing"] <= max(0, max_missing_log):
+                    print(f"DAILY_TOP100_MISSING_DATA symbol={symbol} date={ranking_date.isoformat()}", flush=True)
                 continue
             prior_closes = recent_prior_closes(history_dir, symbol, ranking_date, prior_sessions, session_type)
             item, reject_reason = analyze_symbol(
@@ -340,18 +349,34 @@ def build_daily_top(
             )
             if item is None:
                 stats["rejected"] += 1
-                print(f"DAILY_TOP100_REJECTED symbol={symbol} reason={reject_reason}", flush=True)
+                rejected_rows.append({"symbol": symbol, "reason": reject_reason or "rejected"})
+                if stats["rejected"] <= max(0, max_reject_log):
+                    print(f"DAILY_TOP100_REJECTED symbol={symbol} reason={reject_reason}", flush=True)
                 continue
             ranked.append(item)
             stats["valid"] += 1
         except Exception as exc:
             stats["errors"] += 1
+            error_rows.append({"symbol": symbol, "reason": repr(exc)})
             print(f"DAILY_TOP100_SYMBOL_ERROR symbol={symbol} error={exc!r}", flush=True)
         if idx % 250 == 0:
             print(f"DAILY_TOP100_PROGRESS processed={idx} valid={stats['valid']}", flush=True)
 
     ranked.sort(key=lambda item: (item.score, item.dollar_volume, item.intraday_high_pct), reverse=True)
     rows = [ranking_to_row(rank, item) for rank, item in enumerate(ranked[: max(0, top_n)], 1)]
+    stats["_missing_symbols"] = missing_symbols  # type: ignore[assignment]
+    stats["_rejected_rows"] = rejected_rows  # type: ignore[assignment]
+    stats["_error_rows"] = error_rows  # type: ignore[assignment]
+    if stats["missing"] > max(0, max_missing_log):
+        print(
+            f"DAILY_TOP100_MISSING_DATA_SUPPRESSED count={stats['missing'] - max(0, max_missing_log)}",
+            flush=True,
+        )
+    if stats["rejected"] > max(0, max_reject_log):
+        print(
+            f"DAILY_TOP100_REJECTED_SUPPRESSED count={stats['rejected'] - max(0, max_reject_log)}",
+            flush=True,
+        )
     return rows, stats
 
 
@@ -395,6 +420,20 @@ def write_output_csv(path: str | Path, rows: list[dict[str, Any]]) -> None:
     write_text_atomic(path, render_output_csv(rows))
 
 
+def write_diagnostics_csv(path: str | Path, ranking_date: date, stats: dict[str, Any]) -> int:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    for symbol in stats.get("_missing_symbols", []):
+        rows.append({"date": ranking_date.isoformat(), "symbol": symbol, "status": "missing", "reason": "missing_history"})
+    for row in stats.get("_rejected_rows", []):
+        rows.append({"date": ranking_date.isoformat(), "symbol": row.get("symbol"), "status": "rejected", "reason": row.get("reason")})
+    for row in stats.get("_error_rows", []):
+        rows.append({"date": ranking_date.isoformat(), "symbol": row.get("symbol"), "status": "error", "reason": row.get("reason")})
+    write_text_atomic(output, pd.DataFrame(rows, columns=["date", "symbol", "status", "reason"]).to_csv(index=False))
+    return len(rows)
+
+
 def update_latest_output(dated_output: str | Path, latest_output: str | Path, rows: list[dict[str, Any]]) -> bool:
     if len(rows) < MIN_LATEST_ROWS:
         print(
@@ -430,6 +469,9 @@ def main() -> int:
     parser.add_argument("--min-dollar-volume", type=float, default=500_000.0)
     parser.add_argument("--prior-sessions", type=int, default=5)
     parser.add_argument("--sqlite-path", default=DEFAULT_SQLITE_PATH)
+    parser.add_argument("--diagnostics-output", default=None)
+    parser.add_argument("--max-missing-log", type=int, default=DEFAULT_MAX_MISSING_LOG)
+    parser.add_argument("--max-reject-log", type=int, default=DEFAULT_MAX_REJECT_LOG)
     parser.add_argument("--no-sqlite", action="store_true")
     args = parser.parse_args()
 
@@ -445,8 +487,17 @@ def main() -> int:
         min_volume=float(args.min_volume),
         min_dollar_volume=float(args.min_dollar_volume),
         prior_sessions=int(args.prior_sessions),
+        max_missing_log=int(args.max_missing_log),
+        max_reject_log=int(args.max_reject_log),
     )
     write_output_csv(args.output, rows)
+    diagnostics_rows = 0
+    if args.diagnostics_output:
+        diagnostics_rows = write_diagnostics_csv(args.diagnostics_output, ranking_date, stats)
+        print(
+            f"DAILY_TOP100_DIAGNOSTICS_WRITTEN path={args.diagnostics_output} rows={diagnostics_rows}",
+            flush=True,
+        )
     latest_ok = None
     if args.latest_output:
         latest_ok = update_latest_output(args.output, args.latest_output, rows)
@@ -456,7 +507,7 @@ def main() -> int:
     print(
         f"DAILY_TOP100_DONE date={ranking_date.isoformat()} output={args.output} rows={len(rows)} "
         f"valid={stats['valid']} missing={stats['missing']} rejected={stats['rejected']} "
-        f"errors={stats['errors']} sqlite_rows={stored}",
+        f"errors={stats['errors']} diagnostics_rows={diagnostics_rows} sqlite_rows={stored}",
         flush=True,
     )
     if len(rows) < int(args.top_n):

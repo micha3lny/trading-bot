@@ -134,10 +134,23 @@ python -m src.live_trading.ranking.daily_top100_builder \
   --history-dir data/history/universe_1m \
   --output data/universe/daily_top100_2026-05-16.csv \
   --latest-output data/universe/daily_top100_latest.csv \
+  --diagnostics-output data/universe/daily_top100_2026-05-16_diagnostics.csv \
   --top-n 100
 ```
 
 Builder zawsze zapisuje dated output. `daily_top100_latest.csv` jest aktualizowany atomowo tylko wtedy, gdy build zakończy się poprawnie i wynik ma minimum 100 wierszy. Jeśli wynik ma mniej niż 100 wierszy, stary latest zostaje nietknięty, a proces kończy się kodem niezerowym.
+
+Przy dużych brakach danych builder nie spamuje pełną listą symboli w logu. Domyślnie pokazuje pierwsze 50 missing/rejected i zapisuje pełny raport diagnostyczny:
+
+```text
+data/universe/daily_top100_YYYY-MM-DD_diagnostics.csv
+```
+
+Raport ma kolumny:
+
+```text
+date,symbol,status,reason
+```
 
 Output CSV jest kompatybilny z `--alpha-rank-csv`:
 
@@ -206,6 +219,7 @@ python -u -m src.live_trading.v67_live_top100_expansion_paper_trader \
 
 - Builder nie łączy się z IBKR.
 - Brak danych dla pojedynczego symbolu jest logowany jako `DAILY_TOP100_MISSING_DATA` i nie przerywa całego runu.
+- Pełna lista braków jest zapisywana w diagnostics CSV, żeby było wiadomo co dociągnąć collectorem.
 - Jeśli valid symboli jest mniej niż `--top-n`, builder zapisuje mniej wierszy i loguje warning.
 - `daily_top100_latest.csv` nie jest aktualizowany, jeśli output ma mniej niż 100 wierszy.
 - Ten etap nie zmienia `v67_live_top100_expansion_paper_trader.py`.
