@@ -9,6 +9,8 @@ from src.live_trading.control.control_api import (
     _collector_allowed,
     _history_collector_status,
     _in_utc_window,
+    _queue_history_collector,
+    ControlApiContext,
 )
 
 
@@ -86,6 +88,31 @@ class ControlApiHelperTests(unittest.TestCase):
         self.assertIn("--limit-symbols", args)
         self.assertIn("10", args)
         self.assertIn("--allow-outside-window", args)
+
+    def test_queue_history_collector_date_sets_single_day_range(self) -> None:
+        ctx = ControlApiContext(
+            ib=None,
+            recorder=None,
+            managed_positions={},
+            runtime_state={},
+            record_lifecycle_fn=lambda *args, **kwargs: None,
+        )
+        payload = _queue_history_collector(
+            ctx,
+            {
+                "date": "2026-05-15",
+                "session_type": "RTH",
+                "max_tasks": 3000,
+                "force": True,
+            },
+            force=True,
+        )
+
+        self.assertTrue(payload["ok"])
+        command = payload["command"]
+        self.assertEqual(command["start_date"], "2026-05-15")
+        self.assertEqual(command["end_date"], "2026-05-15")
+        self.assertEqual(command["max_tasks"], 3000)
 
 
 if __name__ == "__main__":

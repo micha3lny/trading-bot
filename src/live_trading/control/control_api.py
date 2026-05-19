@@ -279,11 +279,14 @@ def _queue_history_collector(ctx: ControlApiContext, body: JsonDict, *, force: b
 
     command_id = uuid.uuid4().hex
     today = datetime.now(timezone.utc).date().isoformat()
+    requested_date = body.get("date")
+    start_date = str(body.get("start_date") or requested_date or ctx.runtime_state.get("history_collector_start_date") or "2026-01-01")
+    end_date = str(body.get("end_date") or requested_date or today)
     cmd = {
         "id": command_id,
         "type": "history_collector",
-        "start_date": str(body.get("start_date") or ctx.runtime_state.get("history_collector_start_date") or "2026-01-01"),
-        "end_date": str(body.get("end_date") or today),
+        "start_date": start_date,
+        "end_date": end_date,
         "session_type": str(body.get("session_type") or ctx.runtime_state.get("history_collector_session_type") or "RTH").upper(),
         "max_tasks": int(body.get("max_tasks") or ctx.runtime_state.get("history_collector_max_tasks") or 300),
         "limit_symbols": int(body.get("limit_symbols") or ctx.runtime_state.get("history_collector_limit_symbols") or 0),
