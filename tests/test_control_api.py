@@ -123,6 +123,7 @@ class ControlApiHelperTests(unittest.TestCase):
                 "max_tasks": 3000,
                 "max_attempts": 1,
                 "force": True,
+                "allow_live_session": True,
             },
             force=True,
         )
@@ -133,6 +134,61 @@ class ControlApiHelperTests(unittest.TestCase):
         self.assertEqual(command["end_date"], "2026-05-15")
         self.assertEqual(command["max_tasks"], 3000)
         self.assertEqual(command["max_attempts"], 1)
+
+    def test_queue_history_collector_rejects_force_during_live_session_by_default(self) -> None:
+        ctx = ControlApiContext(
+            ib=None,
+            recorder=None,
+            managed_positions={},
+            runtime_state={
+                "market_open_utc": "00:00",
+                "market_close_utc": "23:59",
+                "history_collector_start_utc": "20:15",
+                "history_collector_end_utc": "15:00",
+            },
+            record_lifecycle_fn=lambda *args, **kwargs: None,
+        )
+        payload = _queue_history_collector(
+            ctx,
+            {
+                "date": "2026-05-15",
+                "session_type": "RTH",
+                "max_tasks": 3000,
+                "force": True,
+            },
+            force=True,
+        )
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["reason"], "market_session_active")
+
+    def test_queue_history_collector_allows_explicit_live_session_override(self) -> None:
+        ctx = ControlApiContext(
+            ib=None,
+            recorder=None,
+            managed_positions={},
+            runtime_state={
+                "market_open_utc": "00:00",
+                "market_close_utc": "23:59",
+                "history_collector_start_utc": "20:15",
+                "history_collector_end_utc": "15:00",
+            },
+            record_lifecycle_fn=lambda *args, **kwargs: None,
+        )
+        payload = _queue_history_collector(
+            ctx,
+            {
+                "date": "2026-05-15",
+                "session_type": "RTH",
+                "max_tasks": 3000,
+                "force": True,
+                "allow_live_session": True,
+            },
+            force=True,
+        )
+
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["command"]["allow_live_session"])
 
 
 if __name__ == "__main__":

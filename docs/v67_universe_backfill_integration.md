@@ -140,8 +140,10 @@ curl -X POST http://127.0.0.1:8767/run_history_collector \
     "max_tasks":3000,
     "plan_only":true,
     "force":true
-  }'
+}'
 ```
+
+By default, even `force:true` must not start a large collector run during the live RTH window. This protects the live trading client from extra IBKR load. If an operator intentionally wants to override this safety gate, the request must include `"allow_live_session": true`.
 
 The collector logs a coverage line before any IBKR work:
 

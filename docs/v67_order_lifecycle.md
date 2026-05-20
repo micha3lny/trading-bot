@@ -2,14 +2,20 @@
 
 This document defines the first formal order lifecycle layer for the v67 intraday momentum paper trader.
 
-Stage 1 is intentionally non-invasive:
+Stage 1 was intentionally non-invasive:
 
 - current order behavior remains unchanged,
 - ENTRY still uses the existing runtime path,
-- EXIT/EOD/control API behavior remains unchanged,
 - formal lifecycle events are emitted alongside existing CSV telemetry,
 - no SQLite migration yet,
 - no live marketable limit migration yet.
+
+Stage 2B adds the first runtime safety correction for EOD:
+
+- ENTRY behavior remains unchanged,
+- BUY still uses the existing `MarketOrder` path,
+- EOD flatten now verifies real IBKR portfolio positions, not only local `managed_positions`,
+- `exit_sent` positions remain persisted until IBKR portfolio confirms they are closed.
 
 ## Why This Exists
 
@@ -155,6 +161,8 @@ The position is closed only when fills or portfolio reconciliation show zero rem
 EXIT_ORDER_FILLED -> CLOSED
 ```
 
+For the same reason, active positions with `exit_sent=true` must stay in restart persistence. They are still exposure risk until execution or IBKR portfolio reconciliation confirms flat.
+
 ## Source Of Truth
 
 During runtime:
@@ -229,5 +237,36 @@ The next stage should not switch to marketable limits yet. Recommended order:
 
 1. Expand formal event emission for all order statuses.
 2. Add startup dry-run reconciliation using IBKR open orders, executions, and portfolio.
-3. Make EXIT/EOD lifecycle state-driven while preserving MarketOrder exits.
-4. Only then add ENTRY marketable limit in shadow mode.
+3. Make EXIT lifecycle state-driven while preserving MarketOrder exits.
+4. Add autonomous IBKR reconnect supervisor.
+5. Only then add ENTRY marketable limit in shadow mode.
+
+## EOD Flatten Safety
+
+EOD flatten must use IBKR portfolio as truth. Local runtime state can be stale after restart, partial fills, reconnects, or missed order status updates.
+
+During EOD the bot now:
+
+```text
+refresh IBKR portfolio
+refresh IBKR openTrades
+for every non-flat portfolio position:
+  if no active opposite-side flatten order exists:
+    submit MarketOrder flatten
+  retry after eod_retry_seconds until portfolio is flat
+```
+
+Expected logs:
+
+```text
+EOD_FLATTEN_VERIFY
+EOD_POSITION_STILL_OPEN
+EOD_FLATTEN_SUBMIT
+EOD_FLATTEN_RETRY
+EOD_FLATTEN_SUCCESS
+EOD_FLATTEN_FAILED
+```
+
+`EOD_FLATTEN_SUCCESS` means IBKR portfolio has no non-flat positions. `exit_sent=true` is never treated as closed by itself.
+
+`eod_max_retries` is now an alert threshold, not a permission to leave exposure open. After it is exceeded, the bot logs `EOD_FLATTEN_FAILED ... max_retries_exceeded_continuing` and still keeps trying as long as IBKR reports non-flat positions.

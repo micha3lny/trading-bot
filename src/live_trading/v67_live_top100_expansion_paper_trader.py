@@ -256,6 +256,7 @@ def formal_event_type_for_legacy_event(event: str) -> LifecycleEventType | None:
         "SIGNAL_READY": LifecycleEventType.ENTRY_SIGNAL,
         "BUY_ORDER_SENT": LifecycleEventType.ENTRY_ORDER_SUBMITTED,
         "SELL_ORDER_SENT": LifecycleEventType.EXIT_ORDER_SUBMITTED,
+        "EOD_FLATTEN_SUBMIT": LifecycleEventType.EXIT_ORDER_SUBMITTED,
         "MANUAL_FLATTEN_SENT": LifecycleEventType.EXIT_ORDER_SUBMITTED,
         "MANUAL_FLATTEN_QUEUED": LifecycleEventType.EXIT_ORDER_PREPARED,
         "MANUAL_FLATTEN_DRY_RUN": LifecycleEventType.EXIT_ORDER_PREPARED,
@@ -406,7 +407,7 @@ def persist_managed_positions(recorder: LiveDataRecorder, positions: dict[str, M
     payload = {
         "recorded_at": now_utc(),
         "strategy": STRATEGY_NAME,
-        "positions": {symbol: managed_position_payload(pos) for symbol, pos in positions.items() if pos.active and not pos.exit_sent},
+        "positions": {symbol: managed_position_payload(pos) for symbol, pos in positions.items() if pos.active},
     }
     recorder.path("managed_positions.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
@@ -708,6 +709,204 @@ def ibkr_position_quantities(ib: IB) -> dict[str, float]:
     return quantities
 
 
+def ibkr_portfolio_position_rows(ib: IB) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in ib.portfolio():
+        contract = getattr(item, "contract", None)
+        symbol = str(getattr(contract, "symbol", "")).upper().strip()
+        if not symbol:
+            continue
+        qty = safe_float(getattr(item, "position", None)) or 0.0
+        if abs(qty) <= 0:
+            continue
+        rows.append({
+            "symbol": symbol,
+            "quantity": qty,
+            "contract": contract,
+            "market_price": safe_float(getattr(item, "marketPrice", None)),
+            "market_value": safe_float(getattr(item, "marketValue", None)),
+            "average_cost": safe_float(getattr(item, "averageCost", None)),
+        })
+    return rows
+
+
+def _flatten_action_for_quantity(quantity: float) -> str:
+    return "SELL" if quantity > 0 else "BUY"
+
+
+def _order_quantity_from_position(quantity: float) -> int | float:
+    qty = abs(float(quantity))
+    rounded = round(qty)
+    if abs(qty - rounded) <= 1e-6:
+        return int(rounded)
+    return qty
+
+
+def open_flatten_order_keys(ib: IB) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
+    done_statuses = {"Cancelled", "ApiCancelled", "Filled", "Inactive"}
+    try:
+        trades = list(ib.openTrades())
+    except Exception:
+        trades = []
+    for trade in trades:
+        order = getattr(trade, "order", None)
+        contract = getattr(trade, "contract", None)
+        status = getattr(getattr(trade, "orderStatus", None), "status", "")
+        if status in done_statuses:
+            continue
+        symbol = str(getattr(contract, "symbol", "") or "").upper().strip()
+        action = str(getattr(order, "action", "") or "").upper().strip()
+        if symbol and action in {"BUY", "SELL"}:
+            keys.add((symbol, action))
+    return keys
+
+
+def submit_eod_flatten_order(
+    ib: IB,
+    recorder: LiveDataRecorder,
+    *,
+    symbol: str,
+    contract: Any,
+    ibkr_quantity: float,
+    reason: str,
+    attempt: int,
+) -> bool:
+    if abs(ibkr_quantity) <= 0:
+        return False
+    action = _flatten_action_for_quantity(ibkr_quantity)
+    quantity = _order_quantity_from_position(ibkr_quantity)
+    if quantity <= 0:
+        return False
+    order = MarketOrder(action, quantity)
+    order.tif = "DAY"
+    order.outsideRth = False
+    trade = ib.placeOrder(contract, order)
+    order_id = getattr(getattr(trade, "order", None), "orderId", None)
+    record_lifecycle_with_formal(
+        recorder,
+        "EOD_FLATTEN_SUBMIT",
+        symbol,
+        action=action,
+        quantity=quantity,
+        order_id=order_id,
+        reason=reason,
+        raw_json={"ibkr_quantity": ibkr_quantity, "attempt": attempt, "tif": order.tif, "outsideRth": order.outsideRth},
+    )
+    print(
+        f"{now_utc()} EOD_FLATTEN_SUBMIT symbol={symbol} action={action} "
+        f"quantity={quantity} ibkr_quantity={ibkr_quantity:.4f} attempt={attempt} "
+        f"orderId={order_id} reason={reason}",
+        flush=True,
+    )
+    return True
+
+
+def hard_eod_flatten_portfolio(
+    ib: IB,
+    recorder: LiveDataRecorder,
+    managed_positions: dict[str, ManagedPosition],
+    args: argparse.Namespace,
+    runtime_state: dict[str, Any],
+    *,
+    reason: str,
+) -> int:
+    try:
+        if hasattr(ib, "isConnected") and not ib.isConnected():
+            print(f"{now_utc()} EOD_FLATTEN_FAILED reason=ibkr_not_connected", flush=True)
+            return 0
+    except Exception as exc:
+        print(f"{now_utc()} EOD_FLATTEN_FAILED reason=ibkr_connection_check_error error={exc!r}", flush=True)
+        return 0
+
+    now_ts = time.time()
+    rows = ibkr_portfolio_position_rows(ib)
+    open_keys = open_flatten_order_keys(ib)
+    attempt_by_symbol = runtime_state.setdefault("eod_flatten_attempts_by_symbol", {})
+    last_submit_by_symbol = runtime_state.setdefault("eod_flatten_last_submit_ts_by_symbol", {})
+    if not isinstance(attempt_by_symbol, dict):
+        attempt_by_symbol = {}
+        runtime_state["eod_flatten_attempts_by_symbol"] = attempt_by_symbol
+    if not isinstance(last_submit_by_symbol, dict):
+        last_submit_by_symbol = {}
+        runtime_state["eod_flatten_last_submit_ts_by_symbol"] = last_submit_by_symbol
+
+    print(
+        f"{now_utc()} EOD_FLATTEN_VERIFY open_positions={len(rows)} open_flatten_orders={len(open_keys)} reason={reason}",
+        flush=True,
+    )
+    runtime_state["eod_last_verification"] = {
+        "recorded_at": now_utc(),
+        "reason": reason,
+        "ibkr_open_symbols": sorted(row["symbol"] for row in rows),
+        "managed_open_symbols": sorted(symbol for symbol, pos in managed_positions.items() if pos.active),
+        "open_flatten_orders": sorted(f"{symbol}:{action}" for symbol, action in open_keys),
+    }
+
+    if not rows:
+        for pos in managed_positions.values():
+            if pos.active:
+                pos.active = False
+        runtime_state["manual_eod_flatten_requested"] = False
+        runtime_state["manual_eod_flatten_force"] = False
+        runtime_state["eod_flatten_attempts_by_symbol"] = {}
+        runtime_state["eod_flatten_last_submit_ts_by_symbol"] = {}
+        print(f"{now_utc()} EOD_FLATTEN_SUCCESS open_positions=0", flush=True)
+        return 0
+
+    submitted = 0
+    force = bool(runtime_state.get("manual_eod_flatten_force", False))
+    retry_seconds = float(getattr(args, "eod_retry_seconds", 60))
+    max_retries = int(getattr(args, "eod_max_retries", 5))
+
+    for row in rows:
+        symbol = row["symbol"]
+        ibkr_qty = float(row["quantity"])
+        action = _flatten_action_for_quantity(ibkr_qty)
+        key = (symbol, action)
+        print(
+            f"{now_utc()} EOD_POSITION_STILL_OPEN symbol={symbol} quantity={ibkr_qty:.4f} "
+            f"action={action} has_open_flatten_order={int(key in open_keys)}",
+            flush=True,
+        )
+        if key in open_keys:
+            continue
+
+        attempts = int(attempt_by_symbol.get(symbol, 0) or 0)
+        last_submit = safe_float(last_submit_by_symbol.get(symbol))
+        retry_due = last_submit is None or (now_ts - last_submit) >= retry_seconds
+        if attempts > 0 and not retry_due and not force:
+            continue
+        if attempts > 0:
+            print(f"{now_utc()} EOD_FLATTEN_RETRY symbol={symbol} attempt={attempts + 1}", flush=True)
+        if attempts >= max_retries and not force:
+            print(
+                f"{now_utc()} EOD_FLATTEN_FAILED symbol={symbol} quantity={ibkr_qty:.4f} "
+                f"attempts={attempts} reason=max_retries_exceeded_continuing",
+                flush=True,
+            )
+        if submit_eod_flatten_order(
+            ib,
+            recorder,
+            symbol=symbol,
+            contract=row["contract"],
+            ibkr_quantity=ibkr_qty,
+            reason=reason,
+            attempt=attempts + 1,
+        ):
+            submitted += 1
+            attempt_by_symbol[symbol] = attempts + 1
+            last_submit_by_symbol[symbol] = now_ts
+            pos = managed_positions.get(symbol)
+            if pos is not None:
+                pos.exit_sent = True
+                pos.last_exit_order_ts = now_ts
+                pos.eod_retry_count = attempts + 1
+
+    runtime_state["manual_eod_flatten_force"] = False
+    return submitted
+
+
 def verify_managed_positions_against_ibkr(
     ib: IB,
     recorder: LiveDataRecorder,
@@ -941,39 +1140,27 @@ def manage_exits(
     if not eod and not is_after_utc(getattr(args, "manage_exits_start_utc", "13:30")):
         return 0
 
-    ibkr_quantities: dict[str, float] = {}
     if eod:
         runtime_state["entries_blocked"] = True
         try:
-            ibkr_quantities = ibkr_position_quantities(ib)
+            exits += hard_eod_flatten_portfolio(
+                ib,
+                recorder,
+                managed_positions,
+                args,
+                runtime_state,
+                reason="manual_eod_flatten" if manual_eod else "scheduled_eod_flatten",
+            )
+            persist_managed_positions(recorder, managed_positions)
+            return exits
         except Exception as exc:
-            print(f"{now_utc()} eod_portfolio_verify_error={exc!r}", flush=True)
+            print(f"{now_utc()} EOD_FLATTEN_FAILED reason=portfolio_flatten_exception error={exc!r}", flush=True)
 
     for symbol, pos in list(managed_positions.items()):
         if not pos.active or pos.exit_sent:
-            if not eod:
-                continue
+            continue
         snap = latest_snapshots.get(symbol) or {}
         price = safe_float(snap.get("price"))
-
-        if eod:
-            ibkr_qty = ibkr_quantities.get(symbol)
-            if ibkr_qty is not None and abs(ibkr_qty) <= 0:
-                pos.active = False
-                continue
-            retry_due = (
-                pos.exit_sent
-                and pos.last_exit_order_ts is not None
-                and (time.time() - pos.last_exit_order_ts) >= args.eod_retry_seconds
-                and pos.eod_retry_count < args.eod_max_retries
-            )
-            should_send = not pos.exit_sent or retry_due or manual_eod_force
-            if should_send:
-                if retry_due or pos.exit_sent:
-                    pos.eod_retry_count += 1
-                if send_exit_order(ib, recorder, pos, "v46_wide_trail_close_exit_eod", price):
-                    exits += 1
-            continue
 
         if price is None or price <= 0:
             continue
@@ -997,22 +1184,6 @@ def manage_exits(
         if reason:
             if not pos.exit_sent and send_exit_order(ib, recorder, pos, reason, price):
                 exits += 1
-
-    if eod:
-        runtime_state["manual_eod_flatten_force"] = False
-        try:
-            verification = verify_managed_positions_against_ibkr(
-                ib,
-                recorder,
-                managed_positions,
-                reason="eod_flatten_verification_pass",
-            )
-            runtime_state["eod_last_verification"] = verification
-            if not verification["managed_open_symbols"]:
-                runtime_state["manual_eod_flatten_requested"] = False
-                runtime_state["manual_eod_flatten_force"] = False
-        except Exception as exc:
-            print(f"{now_utc()} eod_verification_error={exc!r}", flush=True)
     return exits
 
 

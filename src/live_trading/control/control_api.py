@@ -157,6 +157,25 @@ def _collector_allowed(runtime_state: dict[str, Any], *, force: bool = False, no
     return True, "allowed"
 
 
+def _history_collector_live_session_allowed(body_or_cmd: JsonDict) -> bool:
+    return _bool_value(body_or_cmd.get("allow_live_session"), False)
+
+
+def _collector_allowed_for_history_command(
+    runtime_state: dict[str, Any],
+    body_or_cmd: JsonDict,
+    *,
+    force: bool = False,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    live_session_allowed = _history_collector_live_session_allowed(body_or_cmd)
+    if force and not live_session_allowed:
+        allowed_without_force, reason_without_force = _collector_allowed(runtime_state, force=False, now=now)
+        if not allowed_without_force and reason_without_force == "market_session_active":
+            return False, "market_session_active"
+    return _collector_allowed(runtime_state, force=force, now=now)
+
+
 def _ensure_queue(ctx: ControlApiContext) -> list[JsonDict]:
     queue = ctx.runtime_state.setdefault("control_api_commands", [])
     if not isinstance(queue, list):
@@ -268,7 +287,7 @@ def _cancel_history_collector(ctx: ControlApiContext, *, force: bool = False) ->
 
 
 def _queue_history_collector(ctx: ControlApiContext, body: JsonDict, *, force: bool = False) -> JsonDict:
-    allowed, reason = _collector_allowed(ctx.runtime_state, force=force)
+    allowed, reason = _collector_allowed_for_history_command(ctx.runtime_state, body, force=force)
     if not allowed:
         _log("HISTORY_COLLECTOR_REJECTED", reason=reason)
         return {"ok": False, "status": "rejected", "reason": reason}
@@ -293,6 +312,7 @@ def _queue_history_collector(ctx: ControlApiContext, body: JsonDict, *, force: b
         "limit_symbols": int(body.get("limit_symbols") or ctx.runtime_state.get("history_collector_limit_symbols") or 0),
         "client_id": int(body.get("client_id") or ctx.runtime_state.get("history_collector_client_id") or 168),
         "force": bool(force),
+        "allow_live_session": _history_collector_live_session_allowed(body),
         "plan_only": _bool_value(body.get("plan_only"), False),
         "include_weekends": _bool_value(body.get("include_weekends"), False),
         "retry_failed": _bool_value(body.get("retry_failed"), False),
@@ -346,7 +366,12 @@ def process_history_collector_commands(*, runtime_state: dict[str, Any], max_com
     if not queue:
         return 0
 
-    allowed, reason = _collector_allowed(runtime_state, force=bool((queue[0] or {}).get("force")) if queue else False)
+    next_cmd = (queue[0] or {}) if queue else {}
+    allowed, reason = _collector_allowed_for_history_command(
+        runtime_state,
+        next_cmd,
+        force=bool(next_cmd.get("force")) if next_cmd else False,
+    )
     if not allowed:
         _log("HISTORY_COLLECTOR_DEFERRED", reason=reason, pending=len(queue))
         return 0
