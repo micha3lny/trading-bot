@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 import traceback
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ DEFAULT_CLIENT_ID = 168
 DEFAULT_ALPHA_RANK = "data/universe/v68_final_daytrading_universe.csv"
 DEFAULT_OUTPUT_DIR = "data/history/universe_1m"
 DEFAULT_STATUS_DIR = "data/history"
+DEFAULT_LOCK_PATH = "data/runtime/history_collector.lock"
 
 RTH_START_UTC = "13:30"
 RTH_END_UTC = "20:00"
@@ -76,6 +78,41 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     tmp.replace(path)
+
+
+def acquire_lock(path: Path) -> Any | None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("w", encoding="utf-8")
+    try:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    except Exception:
+        handle.close()
+        raise
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"pid={os.getpid()} acquired_at={now_iso()}\n")
+    handle.flush()
+    return handle
+
+
+def release_lock(handle: Any | None) -> None:
+    if handle is None:
+        return
+    try:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        handle.close()
+    except Exception:
+        pass
 
 
 def load_universe(alpha_rank_csv: str, limit: int | None = None) -> list[str]:
@@ -348,6 +385,7 @@ def main() -> int:
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--include-weekends", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--lock-path", default=DEFAULT_LOCK_PATH)
     args = parser.parse_args()
 
     current = now_utc()
@@ -375,106 +413,115 @@ def main() -> int:
     status_dir = Path(args.status_dir)
     status_path = status_dir / "collector_status.json"
     failures_path = status_dir / "collector_failures.json"
-
-    status: dict[str, Any] = load_json(status_path, {})
-    failures: dict[str, Any] = load_json(failures_path, {})
-
-    symbols = load_universe(args.alpha_rank_csv, args.limit_symbols)
-    tasks = build_tasks(symbols, start, end, args.session_type, include_weekends=bool(args.include_weekends))
-    pending, plan = build_pending_tasks(
-        tasks,
-        status=status,
-        failures=failures,
-        output_dir=output_dir,
-        max_attempts=int(args.max_attempts),
-        retry_failed=bool(args.retry_failed),
-        update_blocked_status=not bool(args.plan_only),
-    )
-
-    if args.max_tasks and args.max_tasks > 0:
-        pending = pending[: int(args.max_tasks)]
-
-    print(
-        f"{now_iso()} HISTORY_COLLECTOR_START symbols={len(symbols)} tasks={len(tasks)} "
-        f"complete={plan['complete']} missing={plan['pending']} blocked_by_attempts={plan['blocked_by_attempts']} "
-        f"pending={len(pending)} start={start} end={end} session={args.session_type} "
-        f"include_weekends={bool(args.include_weekends)} output_dir={output_dir}",
-        flush=True,
-    )
-
-    if args.plan_only:
-        write_json_atomic(status_path, status)
+    lock_handle = acquire_lock(Path(args.lock_path))
+    if lock_handle is None:
+        print(f"{now_iso()} HISTORY_COLLECTOR_SKIPPED reason=lock_held lock_path={args.lock_path}", flush=True)
         return 0
 
-    if not pending:
-        write_json_atomic(status_path, status)
-        write_json_atomic(failures_path, failures)
-        return 0
-
-    ib = IB()
-    ib.connect(args.host, int(args.port), clientId=int(args.client_id), timeout=20)
-
-    completed = partial = failed = no_data = 0
     try:
-        for idx, task in enumerate(pending, 1):
-            try:
-                state, rows, error = collect_one(ib, task, output_dir, float(args.request_sleep_seconds))
-            except Exception as exc:
-                state, rows, error = "failed", 0, f"unexpected: {exc!r}"
-                tb = traceback.format_exc(limit=3).replace("\n", " | ")
-                print(
-                    f"{now_iso()} HISTORY_SYMBOL_EXCEPTION {task.symbol} {task.session_date} "
-                    f"error={exc!r} traceback={tb}",
-                    flush=True,
-                )
+        status: dict[str, Any] = load_json(status_path, {})
+        failures: dict[str, Any] = load_json(failures_path, {})
 
-            if state == "complete":
-                completed += 1
-                failures.pop(task_key(task), None)
-                mark_status(status, task, "complete", rows)
-                print(f"{now_iso()} HISTORY_SYMBOL_OK {task.symbol} {task.session_date} rows={rows}", flush=True)
-            elif state == "partial":
-                partial += 1
-                attempts = mark_failure(failures, task, error or "partial")
-                mark_status(status, task, "partial", rows, {"attempts": attempts, "last_error": error})
-                print(f"{now_iso()} HISTORY_SYMBOL_PARTIAL {task.symbol} {task.session_date} rows={rows} attempts={attempts}", flush=True)
-            elif state == "no_data":
-                no_data += 1
-                attempts = mark_failure(failures, task, error or "no_data")
-                terminal = attempts >= int(args.max_attempts)
-                mark_status(status, task, "no_data_permanent" if terminal else "no_data", rows, {"attempts": attempts, "last_error": error})
-                print(f"{now_iso()} HISTORY_SYMBOL_NO_DATA {task.symbol} {task.session_date} attempts={attempts}", flush=True)
-            else:
-                failed += 1
-                attempts = mark_failure(failures, task, error or "failed")
-                terminal = attempts >= int(args.max_attempts)
-                mark_status(status, task, "failed_permanent" if terminal else "failed", rows, {"attempts": attempts, "last_error": error})
-                print(f"{now_iso()} HISTORY_SYMBOL_FAILED {task.symbol} {task.session_date} attempts={attempts} error={error}", flush=True)
+        symbols = load_universe(args.alpha_rank_csv, args.limit_symbols)
+        tasks = build_tasks(symbols, start, end, args.session_type, include_weekends=bool(args.include_weekends))
+        pending, plan = build_pending_tasks(
+            tasks,
+            status=status,
+            failures=failures,
+            output_dir=output_dir,
+            max_attempts=int(args.max_attempts),
+            retry_failed=bool(args.retry_failed),
+            update_blocked_status=not bool(args.plan_only),
+        )
 
-            if idx % 10 == 0:
-                write_json_atomic(status_path, status)
-                write_json_atomic(failures_path, failures)
-                print(
-                    f"{now_iso()} HISTORY_PROGRESS_SAVED idx={idx} pending={len(pending)} "
-                    f"complete={completed} partial={partial} no_data={no_data} failed={failed}",
-                    flush=True,
-                )
+        if args.max_tasks and args.max_tasks > 0:
+            pending = pending[: int(args.max_tasks)]
 
-            if args.batch_size and idx % int(args.batch_size) == 0:
-                print(f"{now_iso()} HISTORY_BATCH_SLEEP idx={idx} sleep={args.batch_sleep_seconds}", flush=True)
-                ib.sleep(float(args.batch_sleep_seconds))
+        print(
+            f"{now_iso()} HISTORY_COLLECTOR_START symbols={len(symbols)} total_symbols={len(symbols)} tasks={len(tasks)} "
+            f"complete={plan['complete']} skipped_existing={plan['complete']} "
+            f"missing={plan['pending']} blocked_by_attempts={plan['blocked_by_attempts']} "
+            f"pending={len(pending)} start={start} end={end} session={args.session_type} "
+            f"include_weekends={bool(args.include_weekends)} output_dir={output_dir}",
+            flush=True,
+        )
 
+        if args.plan_only:
+            write_json_atomic(status_path, status)
+            return 0
+
+        if not pending:
+            write_json_atomic(status_path, status)
+            write_json_atomic(failures_path, failures)
+            return 0
+
+        ib = IB()
+        ib.connect(args.host, int(args.port), clientId=int(args.client_id), timeout=20)
+
+        completed = partial = failed = no_data = 0
+        try:
+            for idx, task in enumerate(pending, 1):
+                try:
+                    state, rows, error = collect_one(ib, task, output_dir, float(args.request_sleep_seconds))
+                except Exception as exc:
+                    state, rows, error = "failed", 0, f"unexpected: {exc!r}"
+                    tb = traceback.format_exc(limit=3).replace("\n", " | ")
+                    print(
+                        f"{now_iso()} HISTORY_SYMBOL_EXCEPTION {task.symbol} {task.session_date} "
+                        f"error={exc!r} traceback={tb}",
+                        flush=True,
+                    )
+
+                if state == "complete":
+                    completed += 1
+                    failures.pop(task_key(task), None)
+                    mark_status(status, task, "complete", rows)
+                    print(f"{now_iso()} HISTORY_SYMBOL_OK {task.symbol} {task.session_date} rows={rows}", flush=True)
+                elif state == "partial":
+                    partial += 1
+                    attempts = mark_failure(failures, task, error or "partial")
+                    mark_status(status, task, "partial", rows, {"attempts": attempts, "last_error": error})
+                    print(f"{now_iso()} HISTORY_SYMBOL_PARTIAL {task.symbol} {task.session_date} rows={rows} attempts={attempts}", flush=True)
+                elif state == "no_data":
+                    no_data += 1
+                    attempts = mark_failure(failures, task, error or "no_data")
+                    terminal = attempts >= int(args.max_attempts)
+                    mark_status(status, task, "no_data_permanent" if terminal else "no_data", rows, {"attempts": attempts, "last_error": error})
+                    print(f"{now_iso()} HISTORY_SYMBOL_NO_DATA {task.symbol} {task.session_date} attempts={attempts}", flush=True)
+                else:
+                    failed += 1
+                    attempts = mark_failure(failures, task, error or "failed")
+                    terminal = attempts >= int(args.max_attempts)
+                    mark_status(status, task, "failed_permanent" if terminal else "failed", rows, {"attempts": attempts, "last_error": error})
+                    print(f"{now_iso()} HISTORY_SYMBOL_FAILED {task.symbol} {task.session_date} attempts={attempts} error={error}", flush=True)
+
+                if idx % 10 == 0:
+                    write_json_atomic(status_path, status)
+                    write_json_atomic(failures_path, failures)
+                    print(
+                        f"{now_iso()} HISTORY_PROGRESS_SAVED idx={idx} pending={len(pending)} "
+                        f"complete={completed} partial={partial} no_data={no_data} failed={failed}",
+                        flush=True,
+                    )
+
+                if args.batch_size and idx % int(args.batch_size) == 0:
+                    print(f"{now_iso()} HISTORY_BATCH_SLEEP idx={idx} sleep={args.batch_sleep_seconds}", flush=True)
+                    ib.sleep(float(args.batch_sleep_seconds))
+
+        finally:
+            write_json_atomic(status_path, status)
+            write_json_atomic(failures_path, failures)
+            ib.disconnect()
+
+        print(
+            f"{now_iso()} HISTORY_COLLECTOR_DONE total_symbols={len(symbols)} processed={len(pending)} "
+            f"skipped_existing={plan['complete']} complete={completed} partial={partial} "
+            f"no_data={no_data} failed={failed} retries={partial + no_data + failed} output_dir={output_dir}",
+            flush=True,
+        )
+        return 0
     finally:
-        write_json_atomic(status_path, status)
-        write_json_atomic(failures_path, failures)
-        ib.disconnect()
-
-    print(
-        f"{now_iso()} HISTORY_COLLECTOR_DONE complete={completed} partial={partial} "
-        f"no_data={no_data} failed={failed} output_dir={output_dir}",
-        flush=True,
-    )
-    return 0
+        release_lock(lock_handle)
 
 
 if __name__ == "__main__":

@@ -148,10 +148,13 @@ By default, even `force:true` must not start a large collector run during the li
 The collector logs a coverage line before any IBKR work:
 
 ```text
-HISTORY_COLLECTOR_START symbols=2463 tasks=... complete=... missing=... pending=...
+HISTORY_COLLECTOR_START symbols=2463 total_symbols=2463 tasks=... complete=... skipped_existing=... missing=... pending=...
+HISTORY_COLLECTOR_DONE total_symbols=2463 processed=... skipped_existing=... complete=... partial=... no_data=... failed=... retries=...
 ```
 
 `tasks` is `symbols x trading weekdays`. `max_tasks` limits only how many missing tasks this run will process. Re-running the collector for the same range is safe: complete parquet files and complete status rows are skipped, so each batch continues rebuilding the backlog.
+
+v67 runtime can queue the overnight collector automatically at `20:15,23:00,03:00,07:00 UTC`. It uses the same single-process guard plus a collector lock file at `data/runtime/history_collector.lock`, so multiple collector instances should not run at the same time.
 
 Status:
 

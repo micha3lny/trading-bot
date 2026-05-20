@@ -182,13 +182,36 @@ python -m src.live_trading.ranking.daily_top100_builder ... --no-sqlite
 
 ## Pre-market flow
 
-Collector i ranking są osobnymi krokami.
+Collector i ranking są osobnymi logicznie krokami. Runtime v67 może je teraz automatycznie odpalać poza RTH.
 
 1. Po sesji, w weekend albo poza godzinami handlu uruchom history collector dla pełnego 2463-symbolowego universe i sesji RTH.
 2. Sprawdź, czy parquet-y są zapisane w `data/history/universe_1m`.
-3. Premarket uruchom daily Top100 builder dla ostatniej kompletnej sesji.
+3. Premarket uruchom daily Top100 builder dla ostatniej kompletnej sesji albo pozwól runtime zrobić to automatycznie o `12:45 UTC`.
 4. Builder zapisuje dated CSV oraz, jeśli wynik jest valid, atomowo aktualizuje `data/universe/daily_top100_latest.csv`.
-5. Live bot czyta stabilny latest przez `--alpha-rank-csv data/universe/daily_top100_latest.csv`.
+5. Live bot czyta stabilny latest przez `--alpha-rank-csv data/universe/daily_top100_latest.csv`. To jest teraz domyślna ścieżka runtime.
+
+Domyślna automatyzacja w v67:
+
+```text
+20:15 UTC overnight collector
+23:00 UTC overnight collector
+03:00 UTC overnight collector
+07:00 UTC overnight collector
+12:45 UTC daily Top100 build
+```
+
+Collector jest inkrementalny: pomija kompletne parquet days i pobiera tylko brakujące albo niekompletne symbol-days. `daily_top100_latest.csv` jest aktualizowany tylko po valid buildzie z minimum 100 wierszami; jeśli build wyprodukuje mniej, poprzedni latest zostaje na miejscu.
+
+Oczekiwane logi automatyzacji:
+
+```text
+OVERNIGHT_COLLECTOR_START
+OVERNIGHT_COLLECTOR_DONE
+OVERNIGHT_COLLECTOR_SKIPPED
+DAILY_TOP100_BUILD_START
+DAILY_TOP100_BUILD_DONE
+DAILY_TOP100_BUILD_FAILED
+```
 
 Wrapper premarket:
 
@@ -222,5 +245,4 @@ python -u -m src.live_trading.v67_live_top100_expansion_paper_trader \
 - Pełna lista braków jest zapisywana w diagnostics CSV, żeby było wiadomo co dociągnąć collectorem.
 - Jeśli valid symboli jest mniej niż `--top-n`, builder zapisuje mniej wierszy i loguje warning.
 - `daily_top100_latest.csv` nie jest aktualizowany, jeśli output ma mniej niż 100 wierszy.
-- Ten etap nie zmienia `v67_live_top100_expansion_paper_trader.py`.
-- Ten etap nie zmienia order lifecycle, EOD flatten ani control API.
+- Runtime default `--alpha-rank-csv` wskazuje na `data/universe/daily_top100_latest.csv`.

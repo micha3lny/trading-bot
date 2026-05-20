@@ -356,6 +356,12 @@ def process_history_collector_commands(*, runtime_state: dict[str, Any], max_com
             return 0
         cmd = runtime_state.get("history_collector_running_command") or {}
         _log("HISTORY_COLLECTOR_DONE", command_id=cmd.get("id"), returncode=rc)
+        if cmd.get("source") == "overnight_scheduler":
+            print(
+                f"{_now_utc()} OVERNIGHT_COLLECTOR_DONE command_id={cmd.get('id')} "
+                f"slot={cmd.get('schedule_slot_utc')} returncode={rc}",
+                flush=True,
+            )
         runtime_state["history_collector_process"] = None
         runtime_state["history_collector_running_command"] = None
         runtime_state["history_collector_last_returncode"] = rc
@@ -383,6 +389,13 @@ def process_history_collector_commands(*, runtime_state: dict[str, Any], max_com
         command_id = cmd.get("id")
         args = _build_history_collector_args(cmd)
         _log("HISTORY_COLLECTOR_START", command_id=command_id, cmd=" ".join(args))
+        if cmd.get("source") == "overnight_scheduler":
+            print(
+                f"{_now_utc()} OVERNIGHT_COLLECTOR_START command_id={command_id} "
+                f"slot={cmd.get('schedule_slot_utc')} start={cmd.get('start_date')} "
+                f"end={cmd.get('end_date')} max_tasks={cmd.get('max_tasks')}",
+                flush=True,
+            )
         try:
             proc = subprocess.Popen(args)
             runtime_state["history_collector_process"] = proc

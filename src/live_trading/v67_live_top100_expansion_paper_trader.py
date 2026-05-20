@@ -4,10 +4,12 @@ import argparse
 import csv
 import json
 import math
+import subprocess
+import sys
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, time as dtime, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +37,9 @@ from src.live_trading.order_lifecycle.reconciliation import build_reconciliation
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4002
 DEFAULT_CLIENT_ID = 65
-DEFAULT_ALPHA_RANK = "data/universe/v68_final_daytrading_universe.csv"
+DEFAULT_ALPHA_RANK = "data/universe/daily_top100_latest.csv"
+DEFAULT_UNIVERSE = "data/universe/v68_final_daytrading_universe.csv"
+DEFAULT_HISTORY_DIR = "data/history/universe_1m"
 DEFAULT_RECORDER_DIR = "data/live/recorder"
 STRATEGY_NAME = "v67_top100_live_safe_expansion_v46_wide_trail"
 
@@ -1204,6 +1208,190 @@ def is_after_utc(value):
     return utc_minutes_now() >= parse_utc_hhmm(value)
 
 
+def parse_utc_schedule(value: str) -> list[str]:
+    slots: list[str] = []
+    for raw in str(value or "").split(","):
+        slot = raw.strip()
+        if not slot:
+            continue
+        parse_utc_hhmm(slot)
+        slots.append(slot)
+    return slots
+
+
+def is_utc_slot_due(now: datetime, slot: str, *, window_minutes: int = 10) -> bool:
+    now_min = now.hour * 60 + now.minute
+    slot_min = parse_utc_hhmm(slot)
+    return slot_min <= now_min < slot_min + max(1, int(window_minutes))
+
+
+def latest_completed_trading_day(now: datetime, market_close_utc: str) -> date:
+    close_min = parse_utc_hhmm(market_close_utc)
+    now_min = now.hour * 60 + now.minute
+    cur = now.date()
+    if cur.weekday() < 5 and now_min >= close_min:
+        return cur
+    cur -= timedelta(days=1)
+    while cur.weekday() >= 5:
+        cur -= timedelta(days=1)
+    return cur
+
+
+def _runtime_set(runtime_state: dict[str, Any], key: str) -> set[str]:
+    value = runtime_state.setdefault(key, set())
+    if isinstance(value, set):
+        return value
+    if isinstance(value, list):
+        out = {str(item) for item in value}
+        runtime_state[key] = out
+        return out
+    out: set[str] = set()
+    runtime_state[key] = out
+    return out
+
+
+def enqueue_overnight_collector_if_due(runtime_state: dict[str, Any], args: argparse.Namespace, now: datetime | None = None) -> None:
+    if not bool(getattr(args, "enable_overnight_automation", True)):
+        return
+    now = now or datetime.now(timezone.utc)
+    slots = parse_utc_schedule(getattr(args, "overnight_collector_times_utc", ""))
+    if not slots:
+        return
+
+    run_keys = _runtime_set(runtime_state, "overnight_collector_run_keys")
+    skip_keys = _runtime_set(runtime_state, "overnight_collector_skip_logged_keys")
+    queue = runtime_state.setdefault("history_collector_commands", [])
+    if not isinstance(queue, list):
+        queue = []
+        runtime_state["history_collector_commands"] = queue
+
+    for slot in slots:
+        if not is_utc_slot_due(now, slot):
+            continue
+        end_date = latest_completed_trading_day(now, getattr(args, "market_close_utc", "20:00")).isoformat()
+        key = f"{end_date}_{slot}"
+        if key in run_keys:
+            continue
+        if runtime_state.get("history_collector_process") is not None or queue:
+            if key not in skip_keys:
+                print(
+                    f"{now_utc()} OVERNIGHT_COLLECTOR_SKIPPED slot={slot} end={end_date} "
+                    f"reason=collector_already_running_or_queued pending={len(queue)}",
+                    flush=True,
+                )
+                skip_keys.add(key)
+            continue
+        command_id = f"overnight_{end_date}_{slot.replace(':', '')}"
+        command = {
+            "id": command_id,
+            "type": "history_collector",
+            "source": "overnight_scheduler",
+            "schedule_slot_utc": slot,
+            "start_date": str(getattr(args, "overnight_collector_start_date", "2026-01-01")),
+            "end_date": end_date,
+            "session_type": "RTH",
+            "max_tasks": int(getattr(args, "overnight_collector_max_tasks", 3000)),
+            "max_attempts": int(getattr(args, "overnight_collector_max_attempts", 5)),
+            "limit_symbols": 0,
+            "client_id": int(getattr(args, "history_collector_client_id", 168)),
+            "force": False,
+            "allow_live_session": False,
+            "plan_only": False,
+            "include_weekends": False,
+            "retry_failed": bool(getattr(args, "overnight_collector_retry_failed", False)),
+        }
+        queue.append(command)
+        run_keys.add(key)
+        skip_keys.discard(key)
+        print(
+            f"{now_utc()} OVERNIGHT_COLLECTOR_QUEUED command_id={command_id} slot={slot} "
+            f"start={command['start_date']} end={end_date} max_tasks={command['max_tasks']}",
+            flush=True,
+        )
+
+
+def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Namespace, now: datetime | None = None) -> None:
+    if not bool(getattr(args, "enable_overnight_automation", True)):
+        return
+    proc = runtime_state.get("daily_top100_process")
+    if proc is not None:
+        rc = proc.poll()
+        if rc is None:
+            return
+        command = runtime_state.get("daily_top100_running_command") or {}
+        if rc == 0:
+            print(
+                f"{now_utc()} DAILY_TOP100_BUILD_DONE ranking_date={command.get('ranking_date')} "
+                f"returncode={rc} latest_output={command.get('latest_output')}",
+                flush=True,
+            )
+        else:
+            print(
+                f"{now_utc()} DAILY_TOP100_BUILD_FAILED ranking_date={command.get('ranking_date')} "
+                f"returncode={rc} latest_output={command.get('latest_output')}",
+                flush=True,
+            )
+        runtime_state["daily_top100_process"] = None
+        runtime_state["daily_top100_running_command"] = None
+
+    now = now or datetime.now(timezone.utc)
+    slot = str(getattr(args, "daily_top100_build_utc", "12:45"))
+    if not is_utc_slot_due(now, slot):
+        return
+
+    ranking_date = latest_completed_trading_day(now, getattr(args, "market_close_utc", "20:00")).isoformat()
+    key = f"{ranking_date}_{slot}"
+    run_keys = _runtime_set(runtime_state, "daily_top100_build_run_keys")
+    if key in run_keys:
+        return
+    if runtime_state.get("daily_top100_process") is not None:
+        return
+
+    output_dir = Path(getattr(args, "daily_top100_output_dir", "data/universe"))
+    dated_output = output_dir / f"daily_top100_{ranking_date}.csv"
+    diagnostics_output = output_dir / f"daily_top100_{ranking_date}_diagnostics.csv"
+    latest_output = Path(getattr(args, "daily_top100_latest_output", "data/universe/daily_top100_latest.csv"))
+    command = [
+        sys.executable,
+        "-m",
+        "src.live_trading.ranking.daily_top100_builder",
+        "--date", ranking_date,
+        "--universe", str(getattr(args, "daily_top100_universe", DEFAULT_UNIVERSE)),
+        "--history-dir", str(getattr(args, "daily_top100_history_dir", DEFAULT_HISTORY_DIR)),
+        "--output", str(dated_output),
+        "--latest-output", str(latest_output),
+        "--diagnostics-output", str(diagnostics_output),
+        "--top-n", str(int(getattr(args, "daily_top100_top_n", 100))),
+    ]
+    sqlite_path = str(getattr(args, "daily_top100_sqlite_path", "data/runtime/rankings.sqlite"))
+    if sqlite_path:
+        command.extend(["--sqlite-path", sqlite_path])
+    print(
+        f"{now_utc()} DAILY_TOP100_BUILD_START ranking_date={ranking_date} "
+        f"output={dated_output} latest_output={latest_output}",
+        flush=True,
+    )
+    try:
+        proc = subprocess.Popen(command)
+    except Exception as exc:
+        print(f"{now_utc()} DAILY_TOP100_BUILD_FAILED ranking_date={ranking_date} error={exc!r}", flush=True)
+        run_keys.add(key)
+        return
+    runtime_state["daily_top100_process"] = proc
+    runtime_state["daily_top100_running_command"] = {
+        "ranking_date": ranking_date,
+        "latest_output": str(latest_output),
+        "command": command,
+    }
+    run_keys.add(key)
+
+
+def process_overnight_automation(runtime_state: dict[str, Any], args: argparse.Namespace) -> None:
+    now = datetime.now(timezone.utc)
+    enqueue_overnight_collector_if_due(runtime_state, args, now)
+    process_daily_top100_build(runtime_state, args, now)
+
+
 def enrich_lifecycle_with_fills(recorder: LiveDataRecorder) -> int:
     lifecycle_path = recorder.path("trade_lifecycle.csv")
     fills_path = recorder.path("fills.csv")
@@ -1544,6 +1732,7 @@ def main() -> int:
     parser.add_argument("--eod-max-retries", type=int, default=5)
     parser.add_argument("--no-new-entries-after-utc", default="19:30")
     parser.add_argument("--market-open-utc", default="13:30")
+    parser.add_argument("--market-close-utc", default="20:00")
     parser.add_argument("--new-entries-start-utc", default="13:35")
     parser.add_argument("--manage-exits-start-utc", default="13:30")
     parser.add_argument("--restart-cooldown-seconds", type=float, default=300.0)
@@ -1554,6 +1743,20 @@ def main() -> int:
     parser.add_argument("--backfill-current-session-on-rebuild-miss", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reconnect-wait-seconds", type=float, default=15.0)
     parser.add_argument("--reconnect-max-attempts", type=int, default=999999)
+    parser.add_argument("--enable-overnight-automation", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--overnight-collector-times-utc", default="20:15,23:00,03:00,07:00")
+    parser.add_argument("--overnight-collector-start-date", default="2026-01-01")
+    parser.add_argument("--overnight-collector-max-tasks", type=int, default=3000)
+    parser.add_argument("--overnight-collector-max-attempts", type=int, default=5)
+    parser.add_argument("--overnight-collector-retry-failed", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--history-collector-client-id", type=int, default=168)
+    parser.add_argument("--daily-top100-build-utc", default="12:45")
+    parser.add_argument("--daily-top100-universe", default=DEFAULT_UNIVERSE)
+    parser.add_argument("--daily-top100-history-dir", default=DEFAULT_HISTORY_DIR)
+    parser.add_argument("--daily-top100-output-dir", default="data/universe")
+    parser.add_argument("--daily-top100-latest-output", default="data/universe/daily_top100_latest.csv")
+    parser.add_argument("--daily-top100-sqlite-path", default="data/runtime/rankings.sqlite")
+    parser.add_argument("--daily-top100-top-n", type=int, default=100)
     args = parser.parse_args()
 
     symbols = load_top_symbols(args.alpha_rank_csv, args.top_n, min_price=args.min_price)
@@ -1571,6 +1774,11 @@ def main() -> int:
         flush=True,
     )
     print(f"Backfill 1m: {args.backfill_1m_on_start} duration={args.backfill_duration} top_n={args.backfill_top_n}", flush=True)
+    print(
+        f"Overnight automation: {args.enable_overnight_automation} "
+        f"collector_slots={args.overnight_collector_times_utc} daily_top100_build={args.daily_top100_build_utc}",
+        flush=True,
+    )
 
     ib = IB()
     connect_ibkr_with_retry(ib, args)
@@ -1587,9 +1795,12 @@ def main() -> int:
         "entries_blocked_reason": "restart_cooldown" if args.restart_cooldown_seconds > 0 else "",
         "control_api_commands": [],
         "history_collector_start_utc": "20:15",
-        "history_collector_end_utc": "15:00",
-        "market_open_utc": "15:00",
-        "market_close_utc": "20:00",
+        "history_collector_end_utc": str(args.market_open_utc),
+        "history_collector_max_tasks": int(args.overnight_collector_max_tasks),
+        "history_collector_max_attempts": int(args.overnight_collector_max_attempts),
+        "history_collector_client_id": int(args.history_collector_client_id),
+        "market_open_utc": str(args.market_open_utc),
+        "market_close_utc": str(args.market_close_utc),
         "manual_eod_flatten_requested": False,
         "manual_eod_flatten_force": False,
     }
@@ -1664,6 +1875,8 @@ def main() -> int:
         start = time.time()
         while time.time() - start < args.duration_seconds:
             try:
+                process_overnight_automation(runtime_state, args)
+
                 process_control_api_commands(
                     ib=ib,
                     recorder=recorder,
