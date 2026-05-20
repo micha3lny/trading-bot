@@ -270,3 +270,65 @@ EOD_FLATTEN_FAILED
 `EOD_FLATTEN_SUCCESS` means IBKR portfolio has no non-flat positions. `exit_sent=true` is never treated as closed by itself.
 
 `eod_max_retries` is now an alert threshold, not a permission to leave exposure open. After it is exceeded, the bot logs `EOD_FLATTEN_FAILED ... max_retries_exceeded_continuing` and still keeps trying as long as IBKR reports non-flat positions.
+
+## Known Remaining Runtime Risks
+
+Current runtime is significantly safer than the earlier versions:
+
+- IBKR portfolio reconciliation exists,
+- EOD flatten verification exists,
+- orphan IBKR positions can be flattened,
+- reconciliation loop exists,
+- `exit_sent` no longer immediately removes positions from persistence,
+- IBKR portfolio is increasingly treated as the exposure source of truth.
+
+However, the system still does not implement a fully deterministic institutional-grade order lifecycle state machine. The remaining known gaps are:
+
+1. Gateway disconnect recovery
+
+   The bot may still require a process restart after an IB Gateway restart. A full reconnect supervisor is not implemented yet.
+
+2. Partial fill restart recovery
+
+   Partial fills during restart or reconnect can still desync local runtime state from IBKR state.
+
+3. Delayed execution after cancel
+
+   IBKR may acknowledge a cancel while a fill still arrives later. The runtime foundation recognizes this risk, but the live order lifecycle is not fully state-machine-driven yet.
+
+4. Formal persistent order state machine missing
+
+   Runtime still needs explicit persistent states such as:
+
+   ```text
+   ENTRY_PENDING
+   ENTRY_PARTIAL
+   ENTRY_FILLED
+   ENTRY_CANCELLED
+   EXIT_PENDING
+   EXIT_PARTIAL
+   EXIT_FILLED
+   EXIT_CANCELLED
+   ```
+
+5. Execution idempotency not fully formalized
+
+   Execution handling needs stricter `execution_id`-based deduplication across restart, reconnect, CSV telemetry, and JSONL lifecycle state.
+
+6. Startup reconciliation is not authoritative yet
+
+   Startup should eventually perform deterministic recovery across:
+
+   ```text
+   IBKR portfolio
+   IBKR open orders
+   IBKR executions
+   persistent lifecycle store
+   managed_positions cache
+   ```
+
+7. `managed_positions` still partially acts as runtime truth/cache
+
+   Long-term target is to treat IBKR plus a persistent lifecycle store as truth, with `managed_positions` reduced to a rebuildable runtime cache.
+
+This means the current runtime is much safer than previous versions, but reconnect, restart, partial-fill, and lifecycle edge cases are not yet fully production-safe for large real-money deployment.
