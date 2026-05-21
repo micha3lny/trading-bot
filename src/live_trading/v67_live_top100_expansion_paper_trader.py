@@ -32,6 +32,7 @@ from src.live_trading.order_lifecycle.models import (
     PositionState,
 )
 from src.live_trading.order_lifecycle.store import JsonlLifecycleStore
+from src.live_trading.order_lifecycle.reducer import reduce_lifecycle_events
 from src.live_trading.order_lifecycle.reconciliation import build_reconciliation_report, log_reconciliation_report
 
 DEFAULT_HOST = "127.0.0.1"
@@ -266,6 +267,9 @@ def formal_event_type_for_legacy_event(event: str) -> LifecycleEventType | None:
         "MANUAL_FLATTEN_DRY_RUN": LifecycleEventType.EXIT_ORDER_PREPARED,
         "MANUAL_FLATTEN_FAILED": LifecycleEventType.EXIT_ORDER_REJECTED,
         "EOD_FLATTEN_FAILED": LifecycleEventType.EXIT_ORDER_REJECTED,
+        "EXIT_ORDER_CANCEL_REQUESTED": LifecycleEventType.EXIT_ORDER_CANCEL_REQUESTED,
+        "EXIT_ORDER_CANCELLED": LifecycleEventType.EXIT_ORDER_CANCELLED,
+        "ORDER_STALE": LifecycleEventType.EXIT_ORDER_STALE,
         "ADOPTED_POSITION": LifecycleEventType.POSITION_ADOPTED,
         "RESTORED_MANAGED_POSITION": LifecycleEventType.POSITION_ADOPTED,
         "POSITION_VERIFIED_CLOSED": LifecycleEventType.POSITION_CLOSED,
@@ -740,6 +744,247 @@ def ibkr_portfolio_position_rows(ib: IB) -> list[dict[str, Any]]:
             "average_cost": safe_float(getattr(item, "averageCost", None)),
         })
     return rows
+
+
+def same_position_direction(managed_qty: float, ibkr_qty: float) -> bool:
+    return (managed_qty > 0 and ibkr_qty > 0) or (managed_qty < 0 and ibkr_qty < 0)
+
+
+def whole_share_quantity(quantity: float) -> bool:
+    return not is_fractional_position_quantity(quantity)
+
+
+def open_ibkr_order_trades(ib: IB) -> list[Any]:
+    out: list[Any] = []
+    try:
+        out.extend(list(ib.openTrades()))
+    except Exception:
+        pass
+    seen_order_ids = {order_trade_id(trade) for trade in out if order_trade_id(trade) is not None}
+    try:
+        for order in ib.openOrders():
+            order_id = getattr(order, "orderId", None)
+            if order_id in seen_order_ids:
+                continue
+            out.append(type("OpenOrderTrade", (), {"order": order, "contract": None})())
+    except Exception:
+        pass
+    return out
+
+
+def order_trade_symbol(trade: Any) -> str:
+    return str(getattr(getattr(trade, "contract", None), "symbol", "") or "").upper().strip()
+
+
+def order_trade_id(trade: Any) -> Any:
+    return getattr(getattr(trade, "order", None), "orderId", None)
+
+
+def order_trade_action(trade: Any) -> str:
+    return str(getattr(getattr(trade, "order", None), "action", "") or "").upper().strip()
+
+
+def order_trade_quantity(trade: Any) -> float | None:
+    return safe_float(getattr(getattr(trade, "order", None), "totalQuantity", None))
+
+
+def startup_reconcile_runtime_state(
+    ib: IB,
+    recorder: LiveDataRecorder,
+    managed_positions: dict[str, ManagedPosition],
+    contract_by_symbol: dict[str, Any],
+    runtime_state: dict[str, Any],
+    *,
+    cancel_stale_orders: bool = True,
+    submit_orphan_flatten: bool = True,
+) -> dict[str, Any]:
+    print(f"{now_utc()} STARTUP_RECONCILIATION_START", flush=True)
+    runtime_state["entries_blocked"] = True
+    runtime_state["entries_blocked_reason"] = "startup_reconciliation"
+
+    lifecycle_events = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl")).load_events()
+    reducer_snapshot = reduce_lifecycle_events(lifecycle_events)
+    reducer_positions = reducer_snapshot.positions
+    ibkr_rows = ibkr_portfolio_position_rows(ib)
+    ibkr_qty_by_symbol = {row["symbol"]: float(row["quantity"]) for row in ibkr_rows}
+    ibkr_row_by_symbol = {row["symbol"]: row for row in ibkr_rows}
+
+    closed_local: list[str] = []
+    drift_symbols: list[str] = []
+    orphans: list[str] = []
+    pending_orders: list[str] = []
+
+    candidate_symbols = sorted(set(managed_positions) | set(reducer_positions))
+    for symbol in candidate_symbols:
+        pos = managed_positions.get(symbol)
+        reduced = reducer_positions.get(symbol)
+        lifecycle_open = reduced is not None and reduced.state in {PositionState.OPEN, PositionState.ENTRY_PENDING, PositionState.EXIT_PENDING, PositionState.RECONCILING}
+        local_open = pos is not None and pos.active
+        ibkr_qty = float(ibkr_qty_by_symbol.get(symbol, 0.0))
+        if (local_open or lifecycle_open) and abs(ibkr_qty) <= 0:
+            if pos is not None and pos.active:
+                pos.active = False
+                pos.exit_sent = False
+            closed_local.append(symbol)
+            record_lifecycle_with_formal(
+                recorder,
+                "POSITION_VERIFIED_CLOSED",
+                symbol,
+                action="VERIFY",
+                quantity=getattr(pos, "quantity", None) if pos is not None else getattr(reduced, "open_quantity", None),
+                reason="startup_reconciliation_ibkr_flat",
+                raw_json={
+                    "managed_active": bool(local_open),
+                    "reducer_state": getattr(getattr(reduced, "state", None), "value", None),
+                    "ibkr_quantity": ibkr_qty,
+                },
+            )
+            print(f"{now_utc()} STARTUP_RECONCILIATION_LOCAL_CLOSED symbol={symbol}", flush=True)
+            continue
+        if pos is not None and pos.active and abs(ibkr_qty) > 0 and abs(float(pos.quantity) - abs(ibkr_qty)) > 1e-9:
+            drift_symbols.append(symbol)
+            record_lifecycle_with_formal(
+                recorder,
+                "POSITION_QUANTITY_DRIFT",
+                symbol,
+                action="VERIFY",
+                quantity=pos.quantity,
+                reason="startup_reconciliation_quantity_drift",
+                raw_json={"managed_quantity": pos.quantity, "ibkr_quantity": ibkr_qty},
+            )
+            if same_position_direction(float(pos.quantity), ibkr_qty) and whole_share_quantity(ibkr_qty):
+                old_qty = pos.quantity
+                pos.quantity = int(abs(round(ibkr_qty)))
+                pos.source = f"{pos.source}:startup_reconciled_qty"
+                print(
+                    f"{now_utc()} STARTUP_RECONCILIATION_DRIFT symbol={symbol} managed_quantity={old_qty} "
+                    f"ibkr_quantity={ibkr_qty:.4f} action=managed_quantity_updated",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"{now_utc()} STARTUP_RECONCILIATION_DRIFT symbol={symbol} managed_quantity={pos.quantity} "
+                    f"ibkr_quantity={ibkr_qty:.4f} action=reconciling_manual_review",
+                    flush=True,
+                )
+
+    for symbol in sorted(set(ibkr_qty_by_symbol) - {s for s, p in managed_positions.items() if p.active}):
+        row = ibkr_row_by_symbol[symbol]
+        ibkr_qty = float(row["quantity"])
+        orphans.append(symbol)
+        record_lifecycle_with_formal(
+            recorder,
+            "ORPHAN_IBKR_POSITION_OBSERVED",
+            symbol,
+            action="ALERT",
+            quantity=ibkr_qty,
+            price=row.get("market_price"),
+            reason="startup_reconciliation_orphan_ibkr_position",
+            raw_json={"ibkr_quantity": ibkr_qty, "average_cost": row.get("average_cost"), "market_value": row.get("market_value")},
+        )
+        print(f"{now_utc()} STARTUP_RECONCILIATION_ORPHAN_DETECTED symbol={symbol} quantity={ibkr_qty:.4f}", flush=True)
+        if submit_orphan_flatten:
+            if whole_share_quantity(ibkr_qty):
+                submit_eod_flatten_order(
+                    ib,
+                    recorder,
+                    symbol=symbol,
+                    contract=row["contract"],
+                    ibkr_quantity=ibkr_qty,
+                    reason="startup_reconciliation_orphan_flatten",
+                    attempt=1,
+                )
+            else:
+                action = _flatten_action_for_quantity(ibkr_qty)
+                record_lifecycle_with_formal(
+                    recorder,
+                    "EOD_FLATTEN_FAILED",
+                    symbol,
+                    action=action,
+                    quantity=abs(float(ibkr_qty)),
+                    reason="fractional_quantity_api_unsupported",
+                    raw_json={
+                        "ibkr_quantity": ibkr_qty,
+                        "manual_action_required": "close_fractional_position_in_ibkr_desktop",
+                        "source": "startup_reconciliation",
+                    },
+                )
+
+    for trade in open_ibkr_order_trades(ib):
+        order_id = order_trade_id(trade)
+        symbol = order_trade_symbol(trade)
+        action = order_trade_action(trade)
+        quantity = order_trade_quantity(trade)
+        pending_orders.append(str(order_id or ""))
+        print(f"{now_utc()} STARTUP_RECONCILIATION_PENDING_ORDER order_id={order_id} symbol={symbol}", flush=True)
+        record_lifecycle_with_formal(
+            recorder,
+            "ORDER_STALE",
+            symbol or "__UNKNOWN__",
+            action=action,
+            quantity=quantity,
+            order_id=order_id,
+            reason="startup_reconciliation_stale_open_order",
+            raw_json={"order_id": order_id, "symbol": symbol, "action": action, "quantity": quantity},
+        )
+        if cancel_stale_orders:
+            record_lifecycle_with_formal(
+                recorder,
+                "EXIT_ORDER_CANCEL_REQUESTED",
+                symbol or "__UNKNOWN__",
+                action=action,
+                quantity=quantity,
+                order_id=order_id,
+                reason="startup_reconciliation_cancel_stale_open_order",
+            )
+            try:
+                ib.cancelOrder(getattr(trade, "order", trade))
+                record_lifecycle_with_formal(
+                    recorder,
+                    "EXIT_ORDER_CANCELLED",
+                    symbol or "__UNKNOWN__",
+                    action=action,
+                    quantity=quantity,
+                    order_id=order_id,
+                    reason="startup_reconciliation_cancel_sent",
+                )
+            except Exception as exc:
+                record_lifecycle_with_formal(
+                    recorder,
+                    "EXIT_ORDER_REJECTED",
+                    symbol or "__UNKNOWN__",
+                    action=action,
+                    quantity=quantity,
+                    order_id=order_id,
+                    reason=f"startup_reconciliation_cancel_failed:{exc!r}",
+                )
+
+    clean = not closed_local and not drift_symbols and not orphans and not pending_orders and not reducer_snapshot.anomalies
+    runtime_state["startup_reconciliation_done"] = True
+    runtime_state["startup_reconciliation_clean"] = bool(clean)
+    runtime_state["startup_reconciliation_orphans"] = sorted(orphans)
+    runtime_state["startup_reconciliation_closed_local"] = sorted(closed_local)
+    runtime_state["startup_reconciliation_pending_orders"] = sorted([p for p in pending_orders if p])
+    runtime_state["startup_reconciliation_drift_symbols"] = sorted(drift_symbols)
+    runtime_state["startup_reconciliation_anomalies"] = list(reducer_snapshot.anomalies)
+    runtime_state["entries_blocked"] = False
+    if runtime_state.get("entries_blocked_reason") == "startup_reconciliation":
+        runtime_state["entries_blocked_reason"] = ""
+    persist_managed_positions(recorder, managed_positions)
+    print(
+        f"{now_utc()} STARTUP_RECONCILIATION_DONE clean={int(clean)} "
+        f"closed_local={len(closed_local)} orphans={len(orphans)} drift={len(drift_symbols)} "
+        f"pending_orders={len(pending_orders)} anomalies={len(reducer_snapshot.anomalies)}",
+        flush=True,
+    )
+    return {
+        "clean": clean,
+        "closed_local": sorted(closed_local),
+        "orphans": sorted(orphans),
+        "drift_symbols": sorted(drift_symbols),
+        "pending_orders": sorted([p for p in pending_orders if p]),
+        "anomalies": list(reducer_snapshot.anomalies),
+    }
 
 
 def _flatten_action_for_quantity(quantity: float) -> str:
@@ -1950,6 +2195,11 @@ def main() -> int:
         "market_close_utc": str(args.market_close_utc),
         "manual_eod_flatten_requested": False,
         "manual_eod_flatten_force": False,
+        "startup_reconciliation_done": False,
+        "startup_reconciliation_clean": False,
+        "startup_reconciliation_orphans": [],
+        "startup_reconciliation_closed_local": [],
+        "startup_reconciliation_pending_orders": [],
     }
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
@@ -2000,6 +2250,14 @@ def main() -> int:
             port=8767,
         )
 
+        startup_reconciliation = startup_reconcile_runtime_state(
+            ib,
+            recorder,
+            managed_positions,
+            contract_by_symbol,
+            runtime_state,
+        )
+
         recorder.record_run_metadata({
             "module": "v67_live_top100_expansion_paper_trader",
             "strategy": STRATEGY_NAME,
@@ -2010,6 +2268,7 @@ def main() -> int:
             "backfilled_1m_rows": backfilled_rows,
             "state_rebuild_count": state_rebuild_count,
             "current_session_backfilled_1m_rows": current_session_backfilled_rows,
+            "startup_reconciliation": startup_reconciliation,
         })
         run_dry_run_reconciliation_report(
             ib,
