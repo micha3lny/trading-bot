@@ -7,10 +7,12 @@ from src.live_trading.control.control_api import (
     _bool_value,
     _build_history_collector_args,
     _collector_allowed,
+    _flatten_request,
     _history_collector_status,
     _in_utc_window,
     _queue_history_collector,
     ControlApiContext,
+    process_control_api_commands,
 )
 
 
@@ -189,6 +191,78 @@ class ControlApiHelperTests(unittest.TestCase):
 
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["command"]["allow_live_session"])
+
+    def test_flatten_request_can_queue_ibkr_portfolio_orphan(self) -> None:
+        class Contract:
+            symbol = "AVLN"
+            currency = "USD"
+
+        class Item:
+            contract = Contract()
+            position = 3
+            averageCost = 10
+            marketPrice = 10.5
+
+        class IB:
+            def portfolio(self):
+                return [Item()]
+
+        events = []
+        ctx = ControlApiContext(
+            ib=IB(),
+            recorder=None,
+            managed_positions={},
+            runtime_state={},
+            record_lifecycle_fn=lambda *args, **kwargs: events.append((args, kwargs)),
+        )
+
+        payload = _flatten_request(ctx, "AVLN", dry_run=False)
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["source"], "ibkr_portfolio")
+        self.assertEqual(len(ctx.runtime_state["control_api_commands"]), 1)
+        self.assertEqual(ctx.runtime_state["control_api_commands"][0]["ibkr_quantity"], 3.0)
+
+    def test_fractional_portfolio_flatten_records_failure_without_order(self) -> None:
+        class Contract:
+            symbol = "ASST"
+            currency = "USD"
+
+        class IB:
+            def qualifyContracts(self, contract):
+                return [contract]
+
+            def placeOrder(self, contract, order):  # pragma: no cover - must not be called
+                raise AssertionError("fractional order should not be placed")
+
+        events = []
+        runtime_state = {
+            "control_api_commands": [
+                {
+                    "id": "cmd1",
+                    "type": "flatten_symbol",
+                    "symbol": "ASST",
+                    "action": "SELL",
+                    "quantity": 0.2,
+                    "ibkr_quantity": 0.2,
+                    "source": "ibkr_portfolio",
+                    "contract": Contract(),
+                }
+            ]
+        }
+
+        processed = process_control_api_commands(
+            ib=IB(),
+            recorder=None,
+            managed_positions={},
+            runtime_state=runtime_state,
+            record_lifecycle_fn=lambda *args, **kwargs: events.append((args, kwargs)),
+        )
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(events[0][0][1], "MANUAL_FLATTEN_FAILED")
+        self.assertEqual(events[0][1]["reason"], "fractional_quantity_api_unsupported")
+        self.assertEqual(runtime_state["control_api_commands"], [])
 
 
 if __name__ == "__main__":

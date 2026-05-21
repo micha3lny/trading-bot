@@ -264,11 +264,14 @@ def formal_event_type_for_legacy_event(event: str) -> LifecycleEventType | None:
         "MANUAL_FLATTEN_SENT": LifecycleEventType.EXIT_ORDER_SUBMITTED,
         "MANUAL_FLATTEN_QUEUED": LifecycleEventType.EXIT_ORDER_PREPARED,
         "MANUAL_FLATTEN_DRY_RUN": LifecycleEventType.EXIT_ORDER_PREPARED,
+        "MANUAL_FLATTEN_FAILED": LifecycleEventType.EXIT_ORDER_REJECTED,
+        "EOD_FLATTEN_FAILED": LifecycleEventType.EXIT_ORDER_REJECTED,
         "ADOPTED_POSITION": LifecycleEventType.POSITION_ADOPTED,
         "RESTORED_MANAGED_POSITION": LifecycleEventType.POSITION_ADOPTED,
         "POSITION_VERIFIED_CLOSED": LifecycleEventType.POSITION_CLOSED,
         "POSITION_QUANTITY_DRIFT": LifecycleEventType.POSITION_DRIFT_DETECTED,
         "POSITION_MISSING_IN_IBKR": LifecycleEventType.POSITION_DRIFT_DETECTED,
+        "ORPHAN_IBKR_POSITION_OBSERVED": LifecycleEventType.POSITION_DRIFT_DETECTED,
     }
     return mapping.get(event)
 
@@ -336,6 +339,11 @@ def record_lifecycle_with_formal(recorder: LiveDataRecorder, event: str, symbol:
         state_before = PositionState.OPEN
         state_after = PositionState.EXIT_PENDING
         position_state = PositionState.EXIT_PENDING
+    elif event_type == LifecycleEventType.EXIT_ORDER_REJECTED:
+        order_state = OrderState.REJECTED
+        state_before = PositionState.OPEN
+        state_after = PositionState.RECONCILING
+        position_state = PositionState.RECONCILING
     elif event_type in {LifecycleEventType.POSITION_ADOPTED, LifecycleEventType.POSITION_DRIFT_DETECTED}:
         position_state = PositionState.RECONCILING if event_type == LifecycleEventType.POSITION_DRIFT_DETECTED else PositionState.OPEN
     elif event_type == LifecycleEventType.POSITION_CLOSED:
@@ -738,6 +746,16 @@ def _flatten_action_for_quantity(quantity: float) -> str:
     return "SELL" if quantity > 0 else "BUY"
 
 
+def is_fractional_position_quantity(quantity: float) -> bool:
+    qty = abs(float(quantity))
+    return not math.isclose(qty, round(qty), rel_tol=0.0, abs_tol=1e-9)
+
+
+def smart_stock_contract_for_flatten(symbol: str, contract: Any | None) -> Any:
+    currency = str(getattr(contract, "currency", "") or "USD")
+    return Stock(symbol, "SMART", currency)
+
+
 def _order_quantity_from_position(quantity: float) -> int | float:
     qty = abs(float(quantity))
     rounded = round(qty)
@@ -778,15 +796,77 @@ def submit_eod_flatten_order(
 ) -> bool:
     if abs(ibkr_quantity) <= 0:
         return False
+    if is_fractional_position_quantity(ibkr_quantity):
+        action = _flatten_action_for_quantity(ibkr_quantity)
+        record_lifecycle_with_formal(
+            recorder,
+            "EOD_FLATTEN_FAILED",
+            symbol,
+            action=action,
+            quantity=abs(float(ibkr_quantity)),
+            reason="fractional_quantity_api_unsupported",
+            raw_json={
+                "ibkr_quantity": ibkr_quantity,
+                "attempt": attempt,
+                "manual_action_required": "close_fractional_position_in_ibkr_desktop",
+            },
+        )
+        print(
+            f"{now_utc()} EOD_FLATTEN_FAILED symbol={symbol} quantity={ibkr_quantity:.4f} "
+            "reason=fractional_quantity_api_unsupported manual_action_required=ibkr_desktop",
+            flush=True,
+        )
+        return False
     action = _flatten_action_for_quantity(ibkr_quantity)
     quantity = _order_quantity_from_position(ibkr_quantity)
     if quantity <= 0:
         return False
+    order_contract = smart_stock_contract_for_flatten(symbol, contract)
+    try:
+        qualified = ib.qualifyContracts(order_contract)
+        if qualified:
+            order_contract = qualified[0]
+    except Exception as exc:
+        record_lifecycle_with_formal(
+            recorder,
+            "EOD_FLATTEN_FAILED",
+            symbol,
+            action=action,
+            quantity=quantity,
+            reason=f"qualify_failed:{exc!r}",
+            raw_json={"ibkr_quantity": ibkr_quantity, "attempt": attempt},
+        )
+        print(f"{now_utc()} EOD_FLATTEN_FAILED symbol={symbol} reason=qualify_failed error={exc!r}", flush=True)
+        return False
     order = MarketOrder(action, quantity)
     order.tif = "DAY"
     order.outsideRth = False
-    trade = ib.placeOrder(contract, order)
+    trade = ib.placeOrder(order_contract, order)
+    try:
+        ib.sleep(0.5)
+    except Exception:
+        pass
     order_id = getattr(getattr(trade, "order", None), "orderId", None)
+    status = str(getattr(getattr(trade, "orderStatus", None), "status", "") or "")
+    if status.lower() == "cancelled":
+        log = getattr(trade, "log", None)
+        error_message = str(log[-1].message) if log else "cancelled"
+        record_lifecycle_with_formal(
+            recorder,
+            "EOD_FLATTEN_FAILED",
+            symbol,
+            action=action,
+            quantity=quantity,
+            order_id=order_id,
+            reason=f"ibkr_cancelled:{error_message}",
+            raw_json={"ibkr_quantity": ibkr_quantity, "attempt": attempt, "status": status},
+        )
+        print(
+            f"{now_utc()} EOD_FLATTEN_FAILED symbol={symbol} action={action} quantity={quantity} "
+            f"orderId={order_id} reason=ibkr_cancelled error={error_message}",
+            flush=True,
+        )
+        return False
     record_lifecycle_with_formal(
         recorder,
         "EOD_FLATTEN_SUBMIT",
@@ -795,7 +875,7 @@ def submit_eod_flatten_order(
         quantity=quantity,
         order_id=order_id,
         reason=reason,
-        raw_json={"ibkr_quantity": ibkr_quantity, "attempt": attempt, "tif": order.tif, "outsideRth": order.outsideRth},
+        raw_json={"ibkr_quantity": ibkr_quantity, "attempt": attempt, "tif": order.tif, "outsideRth": order.outsideRth, "status": status},
     )
     print(
         f"{now_utc()} EOD_FLATTEN_SUBMIT symbol={symbol} action={action} "
@@ -906,6 +986,22 @@ def hard_eod_flatten_portfolio(
                 pos.exit_sent = True
                 pos.last_exit_order_ts = now_ts
                 pos.eod_retry_count = attempts + 1
+
+    if reason == "manual_eod_flatten":
+        blocking_symbols = sorted(
+            row["symbol"]
+            for row in rows
+            if (managed_positions.get(row["symbol"]) is not None and managed_positions[row["symbol"]].active and not managed_positions[row["symbol"]].exit_sent)
+        )
+        if not blocking_symbols:
+            orphan_symbols = sorted(row["symbol"] for row in rows)
+            runtime_state["manual_eod_flatten_requested"] = False
+            runtime_state["manual_eod_flatten_force"] = False
+            runtime_state["entries_blocked"] = False
+            print(
+                f"{now_utc()} EOD_FLATTEN_ORPHANS_REMAINING_NOT_BLOCKING symbols={','.join(orphan_symbols)}",
+                flush=True,
+            )
 
     runtime_state["manual_eod_flatten_force"] = False
     return submitted
@@ -1094,10 +1190,36 @@ def adopt_existing_long_positions(
         market_price = safe_float(getattr(item, "marketPrice", None))
         if quantity is None or quantity <= 0:
             continue
+        if is_fractional_position_quantity(quantity):
+            record_lifecycle_with_formal(
+                recorder,
+                "ORPHAN_IBKR_POSITION_OBSERVED",
+                symbol,
+                action="ALERT",
+                quantity=quantity,
+                price=market_price,
+                reason="fractional_ibkr_position_requires_manual_desktop_close",
+                raw_json={"ibkr_quantity": quantity, "average_cost": avg_cost, "market_price": market_price},
+            )
+            print(f"{now_utc()} ORPHAN_IBKR_POSITION_OBSERVED symbol={symbol} quantity={quantity:.4f} reason=fractional_manual_close_required", flush=True)
+            continue
+        in_runtime_universe = symbol in contract_by_symbol
+        if not in_runtime_universe:
+            record_lifecycle_with_formal(
+                recorder,
+                "ORPHAN_IBKR_POSITION_OBSERVED",
+                symbol,
+                action="ALERT",
+                quantity=quantity,
+                price=market_price,
+                reason="external_ibkr_position_not_adopted_into_strategy",
+                raw_json={"ibkr_quantity": quantity, "average_cost": avg_cost, "market_price": market_price},
+            )
+            print(f"{now_utc()} ORPHAN_IBKR_POSITION_OBSERVED symbol={symbol} quantity={quantity:.4f} reason=external_not_adopted", flush=True)
+            continue
         entry_price = avg_cost or market_price
         if entry_price is None or entry_price <= 0:
             continue
-        in_runtime_universe = symbol in contract_by_symbol
         contract = contract_by_symbol.get(symbol) or item.contract
         if contract is None:
             contract = Stock(symbol, "SMART", "USD")

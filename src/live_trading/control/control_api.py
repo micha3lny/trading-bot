@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 import threading
@@ -128,6 +129,48 @@ def _make_contract(pos: Any, symbol: str) -> Any:
     return Stock(symbol, "SMART", "USD")
 
 
+def _smart_stock_from_contract(symbol: str, contract: Any | None = None) -> Any:
+    currency = str(getattr(contract, "currency", "") or "USD")
+    return Stock(symbol, "SMART", currency)
+
+
+def _portfolio_rows_by_symbol(ctx: ControlApiContext) -> dict[str, JsonDict]:
+    rows: dict[str, JsonDict] = {}
+    try:
+        portfolio = list(ctx.ib.portfolio())
+    except Exception as exc:
+        _log("PORTFOLIO_READ_FAILED", error=repr(exc))
+        return rows
+    for item in portfolio:
+        contract = getattr(item, "contract", None)
+        symbol = str(getattr(contract, "symbol", "") or "").upper().strip()
+        if not symbol:
+            continue
+        try:
+            quantity = float(getattr(item, "position", 0) or 0)
+        except Exception:
+            quantity = 0.0
+        if abs(quantity) <= 0:
+            continue
+        rows[symbol] = {
+            "symbol": symbol,
+            "quantity": quantity,
+            "contract": contract,
+            "average_cost": getattr(item, "averageCost", None),
+            "market_price": getattr(item, "marketPrice", None),
+            "source": "ibkr_portfolio",
+        }
+    return rows
+
+
+def _is_fractional_quantity(quantity: float) -> bool:
+    return not math.isclose(abs(quantity), round(abs(quantity)), rel_tol=0.0, abs_tol=1e-9)
+
+
+def _public_command_payload(cmd: JsonDict) -> JsonDict:
+    return {k: v for k, v in cmd.items() if k != "contract"}
+
+
 def _utc_minutes(value: str) -> int:
     hh, mm = [int(x) for x in str(value).strip().split(":", 1)]
     return hh * 60 + mm
@@ -194,43 +237,61 @@ def _ensure_history_queue(ctx: ControlApiContext) -> list[JsonDict]:
 
 def _flatten_request(ctx: ControlApiContext, symbol: str, dry_run: bool) -> JsonDict:
     pos = _resolve_position(ctx, symbol)
+    portfolio_row = None
     if pos is None:
-        _log("FLATTEN_REJECTED", symbol=symbol, status="not_found_or_inactive")
-        return {"ok": False, "symbol": symbol, "status": "not_found_or_inactive"}
-    if bool(getattr(pos, "exit_sent", False)):
+        portfolio_row = _portfolio_rows_by_symbol(ctx).get(symbol)
+        if portfolio_row is None:
+            _log("FLATTEN_REJECTED", symbol=symbol, status="not_found_or_inactive_or_ibkr_flat")
+            return {"ok": False, "symbol": symbol, "status": "not_found_or_inactive_or_ibkr_flat"}
+    if pos is not None and bool(getattr(pos, "exit_sent", False)):
         _log("FLATTEN_SKIPPED", symbol=symbol, status="already_exit_sent")
         return {"ok": True, "symbol": symbol, "status": "already_exit_sent", "position": _position_payload(symbol, pos)}
 
-    qty_raw = getattr(pos, "quantity", 0)
+    qty_raw = portfolio_row["quantity"] if portfolio_row is not None else getattr(pos, "quantity", 0)
     try:
-        qty = int(abs(float(qty_raw)))
+        qty_float = abs(float(qty_raw))
     except Exception:
-        qty = 0
-    if qty <= 0:
+        qty_float = 0.0
+    if qty_float <= 0:
         _log("FLATTEN_REJECTED", symbol=symbol, status="bad_quantity", quantity=qty_raw)
         return {"ok": False, "symbol": symbol, "status": "bad_quantity", "quantity": qty_raw}
+    fractional = _is_fractional_quantity(float(qty_raw))
+    qty = int(round(qty_float)) if not fractional else qty_float
 
     action = "SELL" if float(qty_raw) > 0 else "BUY"
+    source = "ibkr_portfolio" if portfolio_row is not None else "managed_position"
     payload: JsonDict = {
         "ok": True,
         "symbol": symbol,
         "status": "dry_run" if dry_run else "queued",
         "action": action,
         "quantity": qty,
-        "position": _position_payload(symbol, pos),
+        "source": source,
+        "fractional": fractional,
+        "position": _position_payload(symbol, pos) if pos is not None else None,
+        "ibkr_position": {k: v for k, v in (portfolio_row or {}).items() if k != "contract"} or None,
     }
 
     if dry_run:
-        _log("FLATTEN_DRY_RUN", symbol=symbol, action=action, quantity=qty)
-        ctx.record_lifecycle_fn(ctx.recorder, "MANUAL_FLATTEN_DRY_RUN", symbol, action=action, quantity=qty, reason="control_api_flatten_symbol_dry_run", entry_price=getattr(pos, "entry_price", None), peak_price=getattr(pos, "peak_price", None), raw_json=payload)
+        _log("FLATTEN_DRY_RUN", symbol=symbol, action=action, quantity=qty, source=source)
+        ctx.record_lifecycle_fn(ctx.recorder, "MANUAL_FLATTEN_DRY_RUN", symbol, action=action, quantity=qty, reason="control_api_flatten_symbol_dry_run", entry_price=getattr(pos, "entry_price", None) if pos is not None else None, peak_price=getattr(pos, "peak_price", None) if pos is not None else None, raw_json=payload)
         return payload
 
     command_id = uuid.uuid4().hex
-    command = {"id": command_id, "type": "flatten_symbol", "symbol": symbol, "action": action, "quantity": qty}
+    command = {
+        "id": command_id,
+        "type": "flatten_symbol",
+        "symbol": symbol,
+        "action": action,
+        "quantity": qty,
+        "ibkr_quantity": float(qty_raw),
+        "source": source,
+        "contract": portfolio_row.get("contract") if portfolio_row is not None else None,
+    }
     queue = _ensure_queue(ctx)
     queue.append(command)
-    _log("FLATTEN_QUEUED", symbol=symbol, action=action, quantity=qty, command_id=command_id, pending=len(queue))
-    ctx.record_lifecycle_fn(ctx.recorder, "MANUAL_FLATTEN_QUEUED", symbol, action=action, quantity=qty, reason="control_api_flatten_symbol_queued", entry_price=getattr(pos, "entry_price", None), peak_price=getattr(pos, "peak_price", None), raw_json={**payload, "command_id": command_id})
+    _log("FLATTEN_QUEUED", symbol=symbol, action=action, quantity=qty, source=source, command_id=command_id, pending=len(queue))
+    ctx.record_lifecycle_fn(ctx.recorder, "MANUAL_FLATTEN_QUEUED", symbol, action=action, quantity=qty, reason="control_api_flatten_symbol_queued", entry_price=getattr(pos, "entry_price", None) if pos is not None else None, peak_price=getattr(pos, "peak_price", None) if pos is not None else None, raw_json={**payload, "command_id": command_id})
     payload["command_id"] = command_id
     return payload
 
@@ -431,34 +492,50 @@ def process_control_api_commands(
             _log("COMMAND_SKIPPED", reason="missing_symbol", command_id=command_id)
             continue
         pos = managed_positions.get(symbol)
-        if pos is None or not bool(getattr(pos, "active", False)):
+        source = str(cmd.get("source") or "managed_position")
+        ibkr_quantity = cmd.get("ibkr_quantity")
+        is_portfolio_flatten = source == "ibkr_portfolio" and ibkr_quantity is not None
+        if (pos is None or not bool(getattr(pos, "active", False))) and not is_portfolio_flatten:
             _log("FLATTEN_SKIPPED", symbol=symbol, reason="not_found_or_inactive", command_id=command_id)
-            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_SKIPPED", symbol, reason="not_found_or_inactive", raw_json=cmd)
+            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_SKIPPED", symbol, reason="not_found_or_inactive", raw_json=_public_command_payload(cmd))
             continue
-        if bool(getattr(pos, "exit_sent", False)):
+        if pos is not None and bool(getattr(pos, "exit_sent", False)):
             _log("FLATTEN_SKIPPED", symbol=symbol, reason="already_exit_sent", command_id=command_id)
-            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_SKIPPED", symbol, reason="already_exit_sent", raw_json=cmd)
+            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_SKIPPED", symbol, reason="already_exit_sent", raw_json=_public_command_payload(cmd))
             continue
 
-        qty_raw = getattr(pos, "quantity", cmd.get("quantity", 0))
+        qty_raw = ibkr_quantity if is_portfolio_flatten else getattr(pos, "quantity", cmd.get("quantity", 0))
         try:
-            qty = int(abs(float(qty_raw)))
+            qty_float = abs(float(qty_raw))
         except Exception:
-            qty = 0
-        if qty <= 0:
+            qty_float = 0.0
+        if qty_float <= 0:
             _log("FLATTEN_SKIPPED", symbol=symbol, reason="bad_quantity", quantity=qty_raw, command_id=command_id)
-            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_SKIPPED", symbol, reason="bad_quantity", raw_json=cmd)
+            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_SKIPPED", symbol, reason="bad_quantity", raw_json=_public_command_payload(cmd))
             continue
+        if _is_fractional_quantity(float(qty_raw)):
+            _log("FLATTEN_FAILED", symbol=symbol, reason="fractional_quantity_api_unsupported", quantity=qty_raw, command_id=command_id)
+            record_lifecycle_fn(
+                recorder,
+                "MANUAL_FLATTEN_FAILED",
+                symbol,
+                action=cmd.get("action"),
+                quantity=qty_float,
+                reason="fractional_quantity_api_unsupported",
+                raw_json={**_public_command_payload(cmd), "manual_action_required": "close_fractional_position_in_ibkr_desktop"},
+            )
+            continue
+        qty = int(round(qty_float))
 
         action = "SELL" if float(qty_raw) > 0 else "BUY"
-        contract = _make_contract(pos, symbol)
+        contract = _smart_stock_from_contract(symbol, cmd.get("contract")) if is_portfolio_flatten else _make_contract(pos, symbol)
         try:
             qualified = ib.qualifyContracts(contract)
             if qualified:
                 contract = qualified[0]
         except Exception as exc:
             _log("FLATTEN_FAILED", symbol=symbol, action=action, quantity=qty, reason="qualify_failed", error=repr(exc), command_id=command_id)
-            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_FAILED", symbol, action=action, quantity=qty, reason=f"qualify_failed:{exc!r}", raw_json=cmd)
+            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_FAILED", symbol, action=action, quantity=qty, reason=f"qualify_failed:{exc!r}", raw_json=_public_command_payload(cmd))
             continue
 
         order = MarketOrder(action, qty)
@@ -469,14 +546,28 @@ def process_control_api_commands(
             trade = ib.placeOrder(contract, order)
         except Exception as exc:
             _log("FLATTEN_FAILED", symbol=symbol, action=action, quantity=qty, reason="place_order_failed", error=repr(exc), command_id=command_id)
-            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_FAILED", symbol, action=action, quantity=qty, reason=f"place_order_failed:{exc!r}", raw_json=cmd)
+            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_FAILED", symbol, action=action, quantity=qty, reason=f"place_order_failed:{exc!r}", raw_json=_public_command_payload(cmd))
             continue
+        try:
+            sleep_fn = getattr(ib, "sleep", None)
+            if callable(sleep_fn):
+                sleep_fn(0.5)
+        except Exception:
+            pass
 
         order_id = getattr(getattr(trade, "order", None), "orderId", None)
-        setattr(pos, "exit_sent", True)
-        setattr(pos, "active", False)
+        status = str(getattr(getattr(trade, "orderStatus", None), "status", "") or "")
+        if status.lower() == "cancelled":
+            log = getattr(trade, "log", None)
+            error_message = str(log[-1].message) if log else "cancelled"
+            _log("FLATTEN_FAILED", symbol=symbol, action=action, quantity=qty, reason="ibkr_cancelled", error=error_message, order_id=order_id, command_id=command_id)
+            record_lifecycle_fn(recorder, "MANUAL_FLATTEN_FAILED", symbol, action=action, quantity=qty, order_id=order_id, reason=f"ibkr_cancelled:{error_message}", raw_json={**_public_command_payload(cmd), "order_id": order_id, "status": status})
+            continue
+        if pos is not None:
+            setattr(pos, "exit_sent", True)
+            setattr(pos, "last_exit_order_ts", datetime.now(timezone.utc).timestamp())
         _log("FLATTEN_SENT", symbol=symbol, action=action, quantity=qty, order_id=order_id, command_id=command_id)
-        record_lifecycle_fn(recorder, "MANUAL_FLATTEN_SENT", symbol, action=action, quantity=qty, order_id=order_id, reason="control_api_queue_main_loop", entry_price=getattr(pos, "entry_price", None), peak_price=getattr(pos, "peak_price", None), raw_json={**cmd, "order_id": order_id})
+        record_lifecycle_fn(recorder, "MANUAL_FLATTEN_SENT", symbol, action=action, quantity=qty, order_id=order_id, reason="control_api_queue_main_loop", entry_price=getattr(pos, "entry_price", None) if pos is not None else None, peak_price=getattr(pos, "peak_price", None) if pos is not None else None, raw_json={**_public_command_payload(cmd), "order_id": order_id, "status": status})
         if persist_managed_positions_fn is not None:
             try:
                 persist_managed_positions_fn(recorder, managed_positions)
@@ -557,7 +648,13 @@ class _ControlHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/flatten_all_positions":
             dry_run = _extract_dry_run(parsed, body)
-            symbols = [s for s, p in self.ctx.managed_positions.items() if bool(getattr(p, "active", False)) and not bool(getattr(p, "exit_sent", False))]
+            managed_symbols = {
+                s
+                for s, p in self.ctx.managed_positions.items()
+                if bool(getattr(p, "active", False)) and not bool(getattr(p, "exit_sent", False))
+            }
+            portfolio_symbols = set(_portfolio_rows_by_symbol(self.ctx))
+            symbols = sorted(managed_symbols | portfolio_symbols)
             _log("FLATTEN_ALL_REQUEST", dry_run=dry_run, symbols=len(symbols))
             results = [_flatten_request(self.ctx, s, dry_run) for s in symbols]
             _json_response(self, 200, {"ok": True, "dry_run": dry_run, "count": len(results), "results": results})
