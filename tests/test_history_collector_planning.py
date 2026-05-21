@@ -9,6 +9,7 @@ from src.live_trading.data.v68_universe_1m_parquet_collector import (
     CollectTask,
     build_pending_tasks,
     build_tasks,
+    collect_existing_parquet_keys,
     parquet_path,
 )
 
@@ -42,6 +43,32 @@ class HistoryCollectorPlanningTests(unittest.TestCase):
             self.assertEqual(stats["complete"], 1)
             self.assertEqual(stats["pending"], 0)
 
+    def test_existing_parquet_inventory_can_sync_status_for_fast_future_skips(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            task = CollectTask("AAA", date(2026, 5, 15), "RTH")
+            path = parquet_path(output_dir, task.symbol, task.session_date, task.session_type)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"not-empty")
+            status = {}
+
+            existing_keys = collect_existing_parquet_keys(output_dir, "RTH")
+            pending, stats = build_pending_tasks(
+                [task],
+                status=status,
+                failures={},
+                output_dir=output_dir,
+                max_attempts=5,
+                retry_failed=False,
+                existing_parquet_keys=existing_keys,
+                sync_existing_status=True,
+            )
+
+            self.assertEqual(pending, [])
+            self.assertEqual(stats["complete"], 1)
+            self.assertEqual(stats["synced_existing"], 1)
+            self.assertEqual(status["AAA_2026-05-15_RTH"]["status"], "complete")
+
     def test_partial_status_overrides_existing_parquet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
@@ -66,4 +93,3 @@ class HistoryCollectorPlanningTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

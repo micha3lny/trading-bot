@@ -179,12 +179,39 @@ def parquet_exists(output_dir: Path, task: CollectTask) -> bool:
     return path.exists() and path.stat().st_size > 0
 
 
-def task_is_complete(status: dict[str, Any], output_dir: Path, task: CollectTask) -> bool:
+def collect_existing_parquet_keys(output_dir: Path, session_type: str) -> set[str]:
+    root = output_dir / f"session_type={session_type.upper()}"
+    if not root.exists():
+        return set()
+    keys: set[str] = set()
+    for path in root.glob("symbol=*/year=*/month=*/day=*.parquet"):
+        try:
+            if path.stat().st_size <= 0:
+                continue
+            symbol = path.parent.parent.parent.name.split("=", 1)[1].upper()
+            year = int(path.parent.parent.name.split("=", 1)[1])
+            month = int(path.parent.name.split("=", 1)[1])
+            day = int(path.stem.split("=", 1)[1])
+            keys.add(f"{symbol}_{date(year, month, day).isoformat()}_{session_type.upper()}")
+        except Exception:
+            continue
+    return keys
+
+
+def task_is_complete(
+    status: dict[str, Any],
+    output_dir: Path,
+    task: CollectTask,
+    *,
+    existing_parquet_keys: set[str] | None = None,
+) -> bool:
     row = status.get(task_key(task)) or {}
     if row.get("status") == "complete":
         return True
     if row.get("status") in {"partial", "failed", "failed_permanent", "no_data", "no_data_permanent"}:
         return False
+    if existing_parquet_keys is not None and task_key(task) in existing_parquet_keys:
+        return True
     return parquet_exists(output_dir, task)
 
 
@@ -340,13 +367,27 @@ def build_pending_tasks(
     output_dir: Path,
     max_attempts: int,
     retry_failed: bool,
+    existing_parquet_keys: set[str] | None = None,
+    sync_existing_status: bool = False,
     update_blocked_status: bool = True,
 ) -> tuple[list[CollectTask], dict[str, int]]:
     pending: list[CollectTask] = []
-    stats = {"tasks": len(tasks), "complete": 0, "pending": 0, "blocked_by_attempts": 0}
+    stats = {"tasks": len(tasks), "complete": 0, "pending": 0, "blocked_by_attempts": 0, "synced_existing": 0}
     for task in tasks:
-        if task_is_complete(status, output_dir, task):
+        key = task_key(task)
+        status_row = status.get(key) or {}
+        complete = task_is_complete(status, output_dir, task, existing_parquet_keys=existing_parquet_keys)
+        if complete:
             stats["complete"] += 1
+            if (
+                sync_existing_status
+                and update_blocked_status
+                and status_row.get("status") != "complete"
+                and existing_parquet_keys is not None
+                and key in existing_parquet_keys
+            ):
+                mark_status(status, task, "complete", int(status_row.get("rows", 0) or 0), {"synced_from_parquet": True})
+                stats["synced_existing"] += 1
             continue
         attempts = status_attempts(failures, task)
         if attempts >= int(max_attempts) and not retry_failed:
@@ -385,6 +426,7 @@ def main() -> int:
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--include-weekends", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--sync-status-from-parquet", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lock-path", default=DEFAULT_LOCK_PATH)
     args = parser.parse_args()
 
@@ -424,6 +466,7 @@ def main() -> int:
 
         symbols = load_universe(args.alpha_rank_csv, args.limit_symbols)
         tasks = build_tasks(symbols, start, end, args.session_type, include_weekends=bool(args.include_weekends))
+        existing_parquet_keys = collect_existing_parquet_keys(output_dir, args.session_type)
         pending, plan = build_pending_tasks(
             tasks,
             status=status,
@@ -431,6 +474,8 @@ def main() -> int:
             output_dir=output_dir,
             max_attempts=int(args.max_attempts),
             retry_failed=bool(args.retry_failed),
+            existing_parquet_keys=existing_parquet_keys,
+            sync_existing_status=bool(args.sync_status_from_parquet),
             update_blocked_status=not bool(args.plan_only),
         )
 
@@ -440,6 +485,7 @@ def main() -> int:
         print(
             f"{now_iso()} HISTORY_COLLECTOR_START symbols={len(symbols)} total_symbols={len(symbols)} tasks={len(tasks)} "
             f"complete={plan['complete']} skipped_existing={plan['complete']} "
+            f"synced_existing={plan['synced_existing']} "
             f"missing={plan['pending']} blocked_by_attempts={plan['blocked_by_attempts']} "
             f"pending={len(pending)} start={start} end={end} session={args.session_type} "
             f"include_weekends={bool(args.include_weekends)} output_dir={output_dir}",
