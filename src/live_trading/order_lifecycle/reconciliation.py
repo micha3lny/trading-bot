@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from src.live_trading.order_lifecycle.models import PositionRecord, PositionState
+from src.live_trading.order_lifecycle.reducer import reduce_lifecycle_events
 from src.live_trading.order_lifecycle.store import JsonlLifecycleStore
 
 
@@ -126,11 +127,30 @@ def main() -> int:
     args = parser.parse_args()
 
     events = load_lifecycle_events(args.lifecycle_jsonl)
-    report = build_reconciliation_report({}, {}, lifecycle_events=events, open_orders=[])
+    snapshot = reduce_lifecycle_events(events)
+    report = build_reconciliation_report(snapshot.positions, {}, lifecycle_events=events, open_orders=[])
     if args.json:
-        print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False, default=str))
+        print(
+            json.dumps(
+                {
+                    "reconciliation": report.to_dict(),
+                    "reducer_snapshot": snapshot.to_dict(),
+                },
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
+        )
     else:
         log_reconciliation_report(report)
+        summary = snapshot.to_dict()["summary"]
+        print(
+            "LIFECYCLE_REDUCER_SUMMARY "
+            f"positions={summary['positions']} orders={summary['orders']} anomalies={summary['anomalies']} "
+            f"open={summary['open_positions']} exit_pending={summary['exit_pending_positions']} "
+            f"reconciling={summary['reconciling_positions']}",
+            flush=True,
+        )
     return 0
 
 
