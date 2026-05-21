@@ -797,10 +797,12 @@ def startup_reconcile_runtime_state(
     *,
     cancel_stale_orders: bool = True,
     submit_orphan_flatten: bool = True,
+    log_prefix: str = "STARTUP_RECONCILIATION",
+    reason_prefix: str = "startup_reconciliation",
 ) -> dict[str, Any]:
-    print(f"{now_utc()} STARTUP_RECONCILIATION_START", flush=True)
+    print(f"{now_utc()} {log_prefix}_START", flush=True)
     runtime_state["entries_blocked"] = True
-    runtime_state["entries_blocked_reason"] = "startup_reconciliation"
+    runtime_state["entries_blocked_reason"] = reason_prefix
 
     lifecycle_events = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl")).load_events()
     reducer_snapshot = reduce_lifecycle_events(lifecycle_events)
@@ -832,14 +834,14 @@ def startup_reconcile_runtime_state(
                 symbol,
                 action="VERIFY",
                 quantity=getattr(pos, "quantity", None) if pos is not None else getattr(reduced, "open_quantity", None),
-                reason="startup_reconciliation_ibkr_flat",
+                reason=f"{reason_prefix}_ibkr_flat",
                 raw_json={
                     "managed_active": bool(local_open),
                     "reducer_state": getattr(getattr(reduced, "state", None), "value", None),
                     "ibkr_quantity": ibkr_qty,
                 },
             )
-            print(f"{now_utc()} STARTUP_RECONCILIATION_LOCAL_CLOSED symbol={symbol}", flush=True)
+            print(f"{now_utc()} {log_prefix}_LOCAL_CLOSED symbol={symbol}", flush=True)
             continue
         if pos is not None and pos.active and abs(ibkr_qty) > 0 and abs(float(pos.quantity) - abs(ibkr_qty)) > 1e-9:
             drift_symbols.append(symbol)
@@ -849,21 +851,21 @@ def startup_reconcile_runtime_state(
                 symbol,
                 action="VERIFY",
                 quantity=pos.quantity,
-                reason="startup_reconciliation_quantity_drift",
+                reason=f"{reason_prefix}_quantity_drift",
                 raw_json={"managed_quantity": pos.quantity, "ibkr_quantity": ibkr_qty},
             )
             if same_position_direction(float(pos.quantity), ibkr_qty) and whole_share_quantity(ibkr_qty):
                 old_qty = pos.quantity
                 pos.quantity = int(abs(round(ibkr_qty)))
-                pos.source = f"{pos.source}:startup_reconciled_qty"
+                pos.source = f"{pos.source}:{reason_prefix}_qty"
                 print(
-                    f"{now_utc()} STARTUP_RECONCILIATION_DRIFT symbol={symbol} managed_quantity={old_qty} "
+                    f"{now_utc()} {log_prefix}_DRIFT symbol={symbol} managed_quantity={old_qty} "
                     f"ibkr_quantity={ibkr_qty:.4f} action=managed_quantity_updated",
                     flush=True,
                 )
             else:
                 print(
-                    f"{now_utc()} STARTUP_RECONCILIATION_DRIFT symbol={symbol} managed_quantity={pos.quantity} "
+                    f"{now_utc()} {log_prefix}_DRIFT symbol={symbol} managed_quantity={pos.quantity} "
                     f"ibkr_quantity={ibkr_qty:.4f} action=reconciling_manual_review",
                     flush=True,
                 )
@@ -879,10 +881,10 @@ def startup_reconcile_runtime_state(
             action="ALERT",
             quantity=ibkr_qty,
             price=row.get("market_price"),
-            reason="startup_reconciliation_orphan_ibkr_position",
+            reason=f"{reason_prefix}_orphan_ibkr_position",
             raw_json={"ibkr_quantity": ibkr_qty, "average_cost": row.get("average_cost"), "market_value": row.get("market_value")},
         )
-        print(f"{now_utc()} STARTUP_RECONCILIATION_ORPHAN_DETECTED symbol={symbol} quantity={ibkr_qty:.4f}", flush=True)
+        print(f"{now_utc()} {log_prefix}_ORPHAN_DETECTED symbol={symbol} quantity={ibkr_qty:.4f}", flush=True)
         if submit_orphan_flatten:
             if whole_share_quantity(ibkr_qty):
                 submit_eod_flatten_order(
@@ -891,7 +893,7 @@ def startup_reconcile_runtime_state(
                     symbol=symbol,
                     contract=row["contract"],
                     ibkr_quantity=ibkr_qty,
-                    reason="startup_reconciliation_orphan_flatten",
+                    reason=f"{reason_prefix}_orphan_flatten",
                     attempt=1,
                 )
             else:
@@ -906,7 +908,7 @@ def startup_reconcile_runtime_state(
                     raw_json={
                         "ibkr_quantity": ibkr_qty,
                         "manual_action_required": "close_fractional_position_in_ibkr_desktop",
-                        "source": "startup_reconciliation",
+                        "source": reason_prefix,
                     },
                 )
 
@@ -916,7 +918,7 @@ def startup_reconcile_runtime_state(
         action = order_trade_action(trade)
         quantity = order_trade_quantity(trade)
         pending_orders.append(str(order_id or ""))
-        print(f"{now_utc()} STARTUP_RECONCILIATION_PENDING_ORDER order_id={order_id} symbol={symbol}", flush=True)
+        print(f"{now_utc()} {log_prefix}_PENDING_ORDER order_id={order_id} symbol={symbol}", flush=True)
         record_lifecycle_with_formal(
             recorder,
             "ORDER_STALE",
@@ -924,7 +926,7 @@ def startup_reconcile_runtime_state(
             action=action,
             quantity=quantity,
             order_id=order_id,
-            reason="startup_reconciliation_stale_open_order",
+            reason=f"{reason_prefix}_stale_open_order",
             raw_json={"order_id": order_id, "symbol": symbol, "action": action, "quantity": quantity},
         )
         if cancel_stale_orders:
@@ -935,7 +937,7 @@ def startup_reconcile_runtime_state(
                 action=action,
                 quantity=quantity,
                 order_id=order_id,
-                reason="startup_reconciliation_cancel_stale_open_order",
+                reason=f"{reason_prefix}_cancel_stale_open_order",
             )
             try:
                 ib.cancelOrder(getattr(trade, "order", trade))
@@ -946,7 +948,7 @@ def startup_reconcile_runtime_state(
                     action=action,
                     quantity=quantity,
                     order_id=order_id,
-                    reason="startup_reconciliation_cancel_sent",
+                    reason=f"{reason_prefix}_cancel_sent",
                 )
             except Exception as exc:
                 record_lifecycle_with_formal(
@@ -956,7 +958,7 @@ def startup_reconcile_runtime_state(
                     action=action,
                     quantity=quantity,
                     order_id=order_id,
-                    reason=f"startup_reconciliation_cancel_failed:{exc!r}",
+                    reason=f"{reason_prefix}_cancel_failed:{exc!r}",
                 )
 
     clean = not closed_local and not drift_symbols and not orphans and not pending_orders and not reducer_snapshot.anomalies
@@ -968,11 +970,11 @@ def startup_reconcile_runtime_state(
     runtime_state["startup_reconciliation_drift_symbols"] = sorted(drift_symbols)
     runtime_state["startup_reconciliation_anomalies"] = list(reducer_snapshot.anomalies)
     runtime_state["entries_blocked"] = False
-    if runtime_state.get("entries_blocked_reason") == "startup_reconciliation":
+    if runtime_state.get("entries_blocked_reason") == reason_prefix:
         runtime_state["entries_blocked_reason"] = ""
     persist_managed_positions(recorder, managed_positions)
     print(
-        f"{now_utc()} STARTUP_RECONCILIATION_DONE clean={int(clean)} "
+        f"{now_utc()} {log_prefix}_DONE clean={int(clean)} "
         f"closed_local={len(closed_local)} orphans={len(orphans)} drift={len(drift_symbols)} "
         f"pending_orders={len(pending_orders)} anomalies={len(reducer_snapshot.anomalies)}",
         flush=True,
@@ -2088,6 +2090,103 @@ def resubscribe_market_data(ib: IB, contracts: list[tuple[str, Any]]) -> dict[st
     return tickers
 
 
+def ibkr_connection_alive(ib: IB) -> bool:
+    try:
+        return bool(ib.isConnected())
+    except Exception:
+        return False
+
+
+def handle_ibkr_disconnect_and_recover(
+    ib: IB,
+    recorder: LiveDataRecorder,
+    managed_positions: dict[str, ManagedPosition],
+    contract_by_symbol: dict[str, Any],
+    contracts: list[tuple[str, Any]],
+    runtime_state: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    reason: str,
+    seen_fills: set[str] | None = None,
+    connect_fn: Any | None = None,
+    resubscribe_fn: Any | None = None,
+    reconcile_fn: Any | None = None,
+    record_account_snapshot_fn: Any | None = None,
+    record_recent_fills_fn: Any | None = None,
+) -> dict[str, Any]:
+    print(f"{now_utc()} RECONNECT_SUPERVISOR_START reason={reason}", flush=True)
+    runtime_state["ibkr_connected"] = False
+    runtime_state["reconnect_active"] = True
+    runtime_state["post_reconnect_reconciliation_done"] = False
+    runtime_state["entries_blocked"] = True
+    runtime_state["entries_blocked_reason"] = "ibkr_reconnect"
+
+    if ibkr_connection_alive(ib):
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+    print(f"{now_utc()} RECONNECT_SUPERVISOR_DISCONNECTED reason={reason}", flush=True)
+
+    connect_impl = connect_fn or connect_ibkr_with_retry
+    resubscribe_impl = resubscribe_fn or resubscribe_market_data
+    reconcile_impl = reconcile_fn or startup_reconcile_runtime_state
+    account_snapshot_impl = record_account_snapshot_fn or record_account_snapshot
+    recent_fills_impl = record_recent_fills_fn or record_recent_fills
+
+    attempt = int(runtime_state.get("reconnect_attempts") or 0) + 1
+    runtime_state["reconnect_attempts"] = attempt
+    print(f"{now_utc()} RECONNECT_SUPERVISOR_ATTEMPT attempt={attempt} reason={reason}", flush=True)
+
+    try:
+        connect_impl(ib, args)
+        runtime_state["ibkr_connected"] = True
+        runtime_state["reconnect_last_error"] = ""
+        runtime_state["reconnect_last_success_at"] = now_utc()
+        print(f"{now_utc()} RECONNECT_SUPERVISOR_CONNECTED attempt={attempt}", flush=True)
+
+        tickers = resubscribe_impl(ib, contracts)
+        print(f"{now_utc()} RECONNECT_SUPERVISOR_RESUBSCRIBED symbols={len(tickers)}", flush=True)
+
+        try:
+            account_snapshot_impl(ib, recorder)
+        except Exception as exc:
+            print(f"{now_utc()} RECONNECT_SUPERVISOR_ACCOUNT_RECORD_FAILED error={exc!r}", flush=True)
+        if seen_fills is not None:
+            try:
+                recent_fills_impl(ib, recorder, seen_fills)
+            except Exception as exc:
+                print(f"{now_utc()} RECONNECT_SUPERVISOR_FILLS_RECORD_FAILED error={exc!r}", flush=True)
+
+        reconciliation = reconcile_impl(
+            ib,
+            recorder,
+            managed_positions,
+            contract_by_symbol,
+            runtime_state,
+            log_prefix="POST_RECONNECT_RECONCILIATION",
+            reason_prefix="post_reconnect_reconciliation",
+        )
+        runtime_state["post_reconnect_reconciliation_done"] = True
+        runtime_state["post_reconnect_reconciliation_clean"] = bool(reconciliation.get("clean")) if isinstance(reconciliation, dict) else False
+        runtime_state["post_reconnect_reconciliation_orphans"] = list(reconciliation.get("orphans", [])) if isinstance(reconciliation, dict) else []
+        runtime_state["post_reconnect_reconciliation_pending_orders"] = list(reconciliation.get("pending_orders", [])) if isinstance(reconciliation, dict) else []
+        runtime_state["reconnect_active"] = False
+        runtime_state["entries_blocked"] = False
+        if runtime_state.get("entries_blocked_reason") in {"ibkr_reconnect", "post_reconnect_reconciliation"}:
+            runtime_state["entries_blocked_reason"] = ""
+        return {"ok": True, "tickers": tickers, "reconciliation": reconciliation}
+    except Exception as exc:
+        runtime_state["ibkr_connected"] = False
+        runtime_state["reconnect_active"] = True
+        runtime_state["reconnect_last_error"] = repr(exc)
+        runtime_state["post_reconnect_reconciliation_done"] = False
+        runtime_state["entries_blocked"] = True
+        runtime_state["entries_blocked_reason"] = "ibkr_reconnect"
+        print(f"{now_utc()} RECONNECT_SUPERVISOR_FAILED attempt={attempt} error={exc!r}", flush=True)
+        return {"ok": False, "tickers": {}, "error": repr(exc)}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="v67 live top100 expansion paper trader")
     parser.add_argument("--host", default=DEFAULT_HOST)
@@ -2200,6 +2299,15 @@ def main() -> int:
         "startup_reconciliation_orphans": [],
         "startup_reconciliation_closed_local": [],
         "startup_reconciliation_pending_orders": [],
+        "ibkr_connected": True,
+        "reconnect_active": False,
+        "reconnect_attempts": 0,
+        "reconnect_last_error": "",
+        "reconnect_last_success_at": "",
+        "post_reconnect_reconciliation_done": False,
+        "post_reconnect_reconciliation_clean": False,
+        "post_reconnect_reconciliation_orphans": [],
+        "post_reconnect_reconciliation_pending_orders": [],
     }
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
@@ -2281,6 +2389,24 @@ def main() -> int:
         start = time.time()
         while time.time() - start < args.duration_seconds:
             try:
+                if not ibkr_connection_alive(ib):
+                    recovery = handle_ibkr_disconnect_and_recover(
+                        ib,
+                        recorder,
+                        managed_positions,
+                        contract_by_symbol,
+                        contracts,
+                        runtime_state,
+                        args,
+                        reason="connection_health_check",
+                        seen_fills=seen_fills,
+                    )
+                    if recovery.get("ok"):
+                        tickers = recovery.get("tickers") or tickers
+                    else:
+                        time.sleep(float(args.reconnect_wait_seconds))
+                    continue
+
                 process_overnight_automation(runtime_state, args)
 
                 process_control_api_commands(
@@ -2299,12 +2425,21 @@ def main() -> int:
                 ib.sleep(args.interval_seconds)
             except Exception as exc:
                 print(f"{now_utc()} IBKR_DISCONNECTED during=sleep error={exc!r}", flush=True)
-                try:
-                    ib.disconnect()
-                except Exception:
-                    pass
-                connect_ibkr_with_retry(ib, args)
-                tickers = resubscribe_market_data(ib, contracts)
+                recovery = handle_ibkr_disconnect_and_recover(
+                    ib,
+                    recorder,
+                    managed_positions,
+                    contract_by_symbol,
+                    contracts,
+                    runtime_state,
+                    args,
+                    reason="main_loop_exception",
+                    seen_fills=seen_fills,
+                )
+                if recovery.get("ok"):
+                    tickers = recovery.get("tickers") or tickers
+                else:
+                    time.sleep(float(args.reconnect_wait_seconds))
                 continue
             loop_now = time.time()
             elapsed = loop_now - start
@@ -2323,7 +2458,8 @@ def main() -> int:
             if not restart_entries_blocked and runtime_state.get("entries_blocked_reason") == "restart_cooldown":
                 runtime_state["entries_blocked_reason"] = ""
             manual_entries_blocked = bool(runtime_state.get("entries_blocked", False))
-            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked
+            reconnect_entries_blocked = bool(runtime_state.get("reconnect_active", False))
+            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked
             eod_active = args.enable_eod_flatten and (is_after_utc(args.eod_flatten_utc) or bool(runtime_state.get("manual_eod_flatten_requested", False)))
 
             for symbol, q in contracts:
@@ -2352,7 +2488,14 @@ def main() -> int:
                         action="BUY",
                         price=features.get("entry_price"),
                         reason="entries_blocked_manual_or_time_window",
-                        raw_json={**features, "manual_entries_blocked": manual_entries_blocked, "time_entries_blocked": time_entries_blocked, "restart_entries_blocked": restart_entries_blocked},
+                        raw_json={
+                            **features,
+                            "manual_entries_blocked": manual_entries_blocked,
+                            "time_entries_blocked": time_entries_blocked,
+                            "restart_entries_blocked": restart_entries_blocked,
+                            "reconnect_entries_blocked": reconnect_entries_blocked,
+                            "entries_blocked_reason": runtime_state.get("entries_blocked_reason"),
+                        },
                     )
                 if features["ready"] and not state.signal_sent and not has_active_position and not entries_blocked:
                     ready_count += 1
@@ -2428,12 +2571,21 @@ def main() -> int:
                     print(f"{now_utc()} portfolio_recorder_error={exc!r}", flush=True)
                     if "disconnect" in repr(exc).lower() or "connection" in repr(exc).lower() or "socket" in repr(exc).lower():
                         print(f"{now_utc()} IBKR_DISCONNECTED during=portfolio_recorder error={exc!r}", flush=True)
-                        try:
-                            ib.disconnect()
-                        except Exception:
-                            pass
-                        connect_ibkr_with_retry(ib, args)
-                        tickers = resubscribe_market_data(ib, contracts)
+                        recovery = handle_ibkr_disconnect_and_recover(
+                            ib,
+                            recorder,
+                            managed_positions,
+                            contract_by_symbol,
+                            contracts,
+                            runtime_state,
+                            args,
+                            reason="portfolio_recorder_exception",
+                            seen_fills=seen_fills,
+                        )
+                        if recovery.get("ok"):
+                            tickers = recovery.get("tickers") or tickers
+                        else:
+                            time.sleep(float(args.reconnect_wait_seconds))
 
             ranked = sorted(ranked, key=lambda x: x[1], reverse=True)
             top5_str = " | ".join([f"{s}:{score:.1f}" for s, score, _ in ranked[:5]])
@@ -2447,12 +2599,13 @@ def main() -> int:
             )
             restart_entries_blocked = loop_now < float(runtime_state.get("entries_blocked_until") or 0.0)
             manual_entries_blocked = bool(runtime_state.get("entries_blocked", False))
-            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked
+            reconnect_entries_blocked = bool(runtime_state.get("reconnect_active", False))
+            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked
             eod_active = args.enable_eod_flatten and (is_after_utc(args.eod_flatten_utc) or bool(runtime_state.get("manual_eod_flatten_requested", False)))
             print(
                 f"{now_utc()} heartbeat scanned={len(contracts)} with_data={data_count} ready_new={ready_count} "
                 f"adopted={adopted_count} exits_sent={exit_count} managed_open={active_managed} entries_blocked={int(entries_blocked)} "
-                f"manual_block={int(manual_entries_blocked)} restart_block={int(restart_entries_blocked)} eod_active={int(eod_active)} "
+                f"manual_block={int(manual_entries_blocked)} restart_block={int(restart_entries_blocked)} reconnect_block={int(reconnect_entries_blocked)} eod_active={int(eod_active)} "
                 f"best={best_symbol}:{best_score:.2f} top5=[{top5_str}] rejects=[{rejection_summary}]"
                 f"{portfolio_part}",
                 flush=True,
