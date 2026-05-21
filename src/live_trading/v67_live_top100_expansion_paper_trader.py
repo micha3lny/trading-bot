@@ -1387,11 +1387,19 @@ def enqueue_overnight_collector_if_due(runtime_state: dict[str, Any], args: argp
         queue = []
         runtime_state["history_collector_commands"] = queue
 
+    backlog_slots = set(parse_utc_schedule(getattr(args, "overnight_backlog_collector_times_utc", "")))
+    prioritize_previous_day = bool(getattr(args, "overnight_prioritize_previous_day", True))
+
     for slot in slots:
         if not is_utc_slot_due(now, slot):
             continue
         end_date = latest_completed_trading_day(now, getattr(args, "market_close_utc", "20:00")).isoformat()
-        key = f"{end_date}_{slot}"
+        modes = ["daily"]
+        if slot in backlog_slots:
+            modes.append("backlog")
+        if not prioritize_previous_day:
+            modes = ["backlog"]
+        key = f"{end_date}_{slot}_{'+'.join(modes)}"
         if key in run_keys:
             continue
         if runtime_state.get("history_collector_process") is not None or queue:
@@ -1403,33 +1411,44 @@ def enqueue_overnight_collector_if_due(runtime_state: dict[str, Any], args: argp
                 )
                 skip_keys.add(key)
             continue
-        command_id = f"overnight_{end_date}_{slot.replace(':', '')}"
-        command = {
-            "id": command_id,
-            "type": "history_collector",
-            "source": "overnight_scheduler",
-            "schedule_slot_utc": slot,
-            "start_date": str(getattr(args, "overnight_collector_start_date", "2026-01-01")),
-            "end_date": end_date,
-            "session_type": "RTH",
-            "max_tasks": int(getattr(args, "overnight_collector_max_tasks", 3000)),
-            "max_attempts": int(getattr(args, "overnight_collector_max_attempts", 5)),
-            "limit_symbols": 0,
-            "client_id": int(getattr(args, "history_collector_client_id", 168)),
-            "force": False,
-            "allow_live_session": False,
-            "plan_only": False,
-            "include_weekends": False,
-            "retry_failed": bool(getattr(args, "overnight_collector_retry_failed", False)),
-        }
-        queue.append(command)
+        queued_commands = []
+        for mode in modes:
+            command_id = f"overnight_{mode}_{end_date}_{slot.replace(':', '')}"
+            start_date = end_date if mode == "daily" else str(getattr(args, "overnight_collector_start_date", "2026-01-01"))
+            max_tasks = (
+                int(getattr(args, "overnight_daily_collector_max_tasks", 3000))
+                if mode == "daily"
+                else int(getattr(args, "overnight_collector_max_tasks", 3000))
+            )
+            command = {
+                "id": command_id,
+                "type": "history_collector",
+                "source": "overnight_scheduler",
+                "collector_mode": mode,
+                "schedule_slot_utc": slot,
+                "start_date": start_date,
+                "end_date": end_date,
+                "session_type": "RTH",
+                "max_tasks": max_tasks,
+                "max_attempts": int(getattr(args, "overnight_collector_max_attempts", 5)),
+                "limit_symbols": 0,
+                "client_id": int(getattr(args, "history_collector_client_id", 168)),
+                "force": False,
+                "allow_live_session": False,
+                "plan_only": False,
+                "include_weekends": False,
+                "retry_failed": bool(getattr(args, "overnight_collector_retry_failed", False)),
+            }
+            queue.append(command)
+            queued_commands.append(command)
         run_keys.add(key)
         skip_keys.discard(key)
-        print(
-            f"{now_utc()} OVERNIGHT_COLLECTOR_QUEUED command_id={command_id} slot={slot} "
-            f"start={command['start_date']} end={end_date} max_tasks={command['max_tasks']}",
-            flush=True,
-        )
+        for command in queued_commands:
+            print(
+                f"{now_utc()} OVERNIGHT_COLLECTOR_QUEUED command_id={command['id']} mode={command['collector_mode']} "
+                f"slot={slot} start={command['start_date']} end={end_date} max_tasks={command['max_tasks']}",
+                flush=True,
+            )
 
 
 def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Namespace, now: datetime | None = None) -> None:
@@ -1867,7 +1886,10 @@ def main() -> int:
     parser.add_argument("--reconnect-max-attempts", type=int, default=999999)
     parser.add_argument("--enable-overnight-automation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overnight-collector-times-utc", default="20:15,23:00,03:00,07:00")
+    parser.add_argument("--overnight-backlog-collector-times-utc", default="07:00")
+    parser.add_argument("--overnight-prioritize-previous-day", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overnight-collector-start-date", default="2026-01-01")
+    parser.add_argument("--overnight-daily-collector-max-tasks", type=int, default=3000)
     parser.add_argument("--overnight-collector-max-tasks", type=int, default=3000)
     parser.add_argument("--overnight-collector-max-attempts", type=int, default=5)
     parser.add_argument("--overnight-collector-retry-failed", action=argparse.BooleanOptionalAction, default=False)
@@ -1898,7 +1920,10 @@ def main() -> int:
     print(f"Backfill 1m: {args.backfill_1m_on_start} duration={args.backfill_duration} top_n={args.backfill_top_n}", flush=True)
     print(
         f"Overnight automation: {args.enable_overnight_automation} "
-        f"collector_slots={args.overnight_collector_times_utc} daily_top100_build={args.daily_top100_build_utc}",
+        f"collector_slots={args.overnight_collector_times_utc} "
+        f"backlog_slots={args.overnight_backlog_collector_times_utc} "
+        f"prioritize_previous_day={args.overnight_prioritize_previous_day} "
+        f"daily_top100_build={args.daily_top100_build_utc}",
         flush=True,
     )
 

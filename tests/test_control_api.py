@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
+from src.live_trading.v67_live_top100_expansion_paper_trader import enqueue_overnight_collector_if_due
 from src.live_trading.control.control_api import (
     _bool_value,
     _build_history_collector_args,
@@ -263,6 +265,63 @@ class ControlApiHelperTests(unittest.TestCase):
         self.assertEqual(events[0][0][1], "MANUAL_FLATTEN_FAILED")
         self.assertEqual(events[0][1]["reason"], "fractional_quantity_api_unsupported")
         self.assertEqual(runtime_state["control_api_commands"], [])
+
+    def test_overnight_scheduler_prioritizes_previous_trading_day(self) -> None:
+        runtime_state = {}
+        args = SimpleNamespace(
+            enable_overnight_automation=True,
+            overnight_collector_times_utc="20:15,07:00",
+            overnight_backlog_collector_times_utc="07:00",
+            overnight_prioritize_previous_day=True,
+            market_close_utc="20:00",
+            overnight_collector_start_date="2026-01-01",
+            overnight_daily_collector_max_tasks=3000,
+            overnight_collector_max_tasks=3000,
+            overnight_collector_max_attempts=5,
+            history_collector_client_id=168,
+            overnight_collector_retry_failed=False,
+        )
+
+        enqueue_overnight_collector_if_due(
+            runtime_state,
+            args,
+            now=datetime(2026, 5, 20, 20, 16, tzinfo=timezone.utc),
+        )
+
+        queue = runtime_state["history_collector_commands"]
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["collector_mode"], "daily")
+        self.assertEqual(queue[0]["start_date"], "2026-05-20")
+        self.assertEqual(queue[0]["end_date"], "2026-05-20")
+
+    def test_overnight_backlog_slot_runs_daily_before_catchup(self) -> None:
+        runtime_state = {}
+        args = SimpleNamespace(
+            enable_overnight_automation=True,
+            overnight_collector_times_utc="20:15,07:00",
+            overnight_backlog_collector_times_utc="07:00",
+            overnight_prioritize_previous_day=True,
+            market_close_utc="20:00",
+            overnight_collector_start_date="2026-01-01",
+            overnight_daily_collector_max_tasks=3000,
+            overnight_collector_max_tasks=3000,
+            overnight_collector_max_attempts=5,
+            history_collector_client_id=168,
+            overnight_collector_retry_failed=False,
+        )
+
+        enqueue_overnight_collector_if_due(
+            runtime_state,
+            args,
+            now=datetime(2026, 5, 21, 7, 1, tzinfo=timezone.utc),
+        )
+
+        queue = runtime_state["history_collector_commands"]
+        self.assertEqual([cmd["collector_mode"] for cmd in queue], ["daily", "backlog"])
+        self.assertEqual(queue[0]["start_date"], "2026-05-20")
+        self.assertEqual(queue[0]["end_date"], "2026-05-20")
+        self.assertEqual(queue[1]["start_date"], "2026-01-01")
+        self.assertEqual(queue[1]["end_date"], "2026-05-20")
 
 
 if __name__ == "__main__":
