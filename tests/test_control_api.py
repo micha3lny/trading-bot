@@ -275,6 +275,7 @@ class ControlApiHelperTests(unittest.TestCase):
             overnight_prioritize_previous_day=True,
             market_close_utc="20:00",
             overnight_collector_start_date="2026-01-01",
+            overnight_backlog_lookback_days=30,
             overnight_daily_collector_max_tasks=3000,
             overnight_collector_max_tasks=3000,
             overnight_collector_max_attempts=5,
@@ -303,6 +304,7 @@ class ControlApiHelperTests(unittest.TestCase):
             overnight_prioritize_previous_day=True,
             market_close_utc="20:00",
             overnight_collector_start_date="2026-01-01",
+            overnight_backlog_lookback_days=30,
             overnight_daily_collector_max_tasks=3000,
             overnight_collector_max_tasks=3000,
             overnight_collector_max_attempts=5,
@@ -320,8 +322,37 @@ class ControlApiHelperTests(unittest.TestCase):
         self.assertEqual([cmd["collector_mode"] for cmd in queue], ["daily", "backlog"])
         self.assertEqual(queue[0]["start_date"], "2026-05-20")
         self.assertEqual(queue[0]["end_date"], "2026-05-20")
-        self.assertEqual(queue[1]["start_date"], "2026-01-01")
+        self.assertEqual(queue[1]["start_date"], "2026-04-20")
         self.assertEqual(queue[1]["end_date"], "2026-05-20")
+
+    def test_overnight_backlog_can_fall_back_to_configured_start_date(self) -> None:
+        runtime_state = {}
+        args = SimpleNamespace(
+            enable_overnight_automation=True,
+            overnight_collector_times_utc="07:00",
+            overnight_backlog_collector_times_utc="07:00",
+            overnight_prioritize_previous_day=False,
+            market_close_utc="20:00",
+            overnight_collector_start_date="2026-02-01",
+            overnight_backlog_lookback_days=0,
+            overnight_daily_collector_max_tasks=3000,
+            overnight_collector_max_tasks=3000,
+            overnight_collector_max_attempts=5,
+            history_collector_client_id=168,
+            overnight_collector_retry_failed=False,
+        )
+
+        enqueue_overnight_collector_if_due(
+            runtime_state,
+            args,
+            now=datetime(2026, 5, 21, 7, 1, tzinfo=timezone.utc),
+        )
+
+        queue = runtime_state["history_collector_commands"]
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["collector_mode"], "backlog")
+        self.assertEqual(queue[0]["start_date"], "2026-02-01")
+        self.assertEqual(queue[0]["end_date"], "2026-05-20")
 
 
 if __name__ == "__main__":

@@ -1619,6 +1619,17 @@ def _runtime_set(runtime_state: dict[str, Any], key: str) -> set[str]:
     return out
 
 
+def overnight_backlog_start_date(end_date: str, args: argparse.Namespace) -> str:
+    lookback_days = int(getattr(args, "overnight_backlog_lookback_days", 30) or 0)
+    if lookback_days > 0:
+        try:
+            end = date.fromisoformat(str(end_date))
+            return (end - timedelta(days=lookback_days)).isoformat()
+        except Exception:
+            pass
+    return str(getattr(args, "overnight_collector_start_date", "2026-01-01"))
+
+
 def enqueue_overnight_collector_if_due(runtime_state: dict[str, Any], args: argparse.Namespace, now: datetime | None = None) -> None:
     if not bool(getattr(args, "enable_overnight_automation", True)):
         return
@@ -1661,7 +1672,7 @@ def enqueue_overnight_collector_if_due(runtime_state: dict[str, Any], args: argp
         queued_commands = []
         for mode in modes:
             command_id = f"overnight_{mode}_{end_date}_{slot.replace(':', '')}"
-            start_date = end_date if mode == "daily" else str(getattr(args, "overnight_collector_start_date", "2026-01-01"))
+            start_date = end_date if mode == "daily" else overnight_backlog_start_date(end_date, args)
             max_tasks = (
                 int(getattr(args, "overnight_daily_collector_max_tasks", 3000))
                 if mode == "daily"
@@ -2233,6 +2244,7 @@ def main() -> int:
     parser.add_argument("--overnight-backlog-collector-times-utc", default="07:00")
     parser.add_argument("--overnight-prioritize-previous-day", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overnight-collector-start-date", default="2026-01-01")
+    parser.add_argument("--overnight-backlog-lookback-days", type=int, default=30)
     parser.add_argument("--overnight-daily-collector-max-tasks", type=int, default=3000)
     parser.add_argument("--overnight-collector-max-tasks", type=int, default=3000)
     parser.add_argument("--overnight-collector-max-attempts", type=int, default=5)
@@ -2267,6 +2279,7 @@ def main() -> int:
         f"collector_slots={args.overnight_collector_times_utc} "
         f"backlog_slots={args.overnight_backlog_collector_times_utc} "
         f"prioritize_previous_day={args.overnight_prioritize_previous_day} "
+        f"backlog_lookback_days={args.overnight_backlog_lookback_days} "
         f"daily_top100_build={args.daily_top100_build_utc}",
         flush=True,
     )
