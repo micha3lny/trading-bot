@@ -1724,6 +1724,9 @@ def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Nam
                 f"returncode={rc} latest_output={command.get('latest_output')}",
                 flush=True,
             )
+            runtime_state["top100_reload_requested"] = True
+            runtime_state["top100_reload_path"] = command.get("latest_output")
+            runtime_state["top100_reload_ranking_date"] = command.get("ranking_date")
         else:
             print(
                 f"{now_utc()} DAILY_TOP100_BUILD_FAILED ranking_date={command.get('ranking_date')} "
@@ -1789,6 +1792,123 @@ def process_overnight_automation(runtime_state: dict[str, Any], args: argparse.N
     now = datetime.now(timezone.utc)
     enqueue_overnight_collector_if_due(runtime_state, args, now)
     process_daily_top100_build(runtime_state, args, now)
+
+
+def reload_top100_universe_if_requested(
+    ib: IB,
+    recorder: LiveDataRecorder,
+    states: dict[str, SymbolState],
+    contracts: list[tuple[str, Any]],
+    contract_by_symbol: dict[str, Any],
+    tickers: dict[str, Any],
+    latest_snapshots: dict[str, dict[str, Any]],
+    managed_positions: dict[str, ManagedPosition],
+    runtime_state: dict[str, Any],
+    args: argparse.Namespace,
+) -> bool:
+    if not bool(runtime_state.get("top100_reload_requested", False)):
+        return False
+
+    reload_path = str(runtime_state.get("top100_reload_path") or getattr(args, "daily_top100_latest_output", args.alpha_rank_csv))
+    ranking_date = runtime_state.get("top100_reload_ranking_date")
+    print(f"{now_utc()} TOP100_RELOAD_START ranking_date={ranking_date} path={reload_path}", flush=True)
+    runtime_state["entries_blocked"] = True
+    runtime_state["entries_blocked_reason"] = "top100_reload"
+
+    try:
+        entry_symbols = load_top_symbols(reload_path, int(args.top_n), min_price=args.min_price)
+        if len(entry_symbols) < int(args.top_n):
+            raise RuntimeError(f"top100_reload_too_few_symbols rows={len(entry_symbols)} required={int(args.top_n)}")
+
+        active_symbols = sorted(symbol for symbol, pos in managed_positions.items() if pos.active)
+        subscription_symbols = list(dict.fromkeys(entry_symbols + [s for s in active_symbols if s not in set(entry_symbols)]))
+        previous_symbols = [symbol for symbol, _ in contracts]
+        previous_symbol_set = set(previous_symbols)
+        subscription_symbol_set = set(subscription_symbols)
+
+        for symbol in sorted(previous_symbol_set - subscription_symbol_set):
+            ticker = tickers.pop(symbol, None)
+            contract = getattr(ticker, "contract", None) or contract_by_symbol.get(symbol)
+            if contract is not None:
+                try:
+                    ib.cancelMktData(contract)
+                except Exception as exc:
+                    print(f"{now_utc()} TOP100_RELOAD_CANCEL_MKTDATA_FAILED symbol={symbol} error={exc!r}", flush=True)
+            latest_snapshots.pop(symbol, None)
+
+        new_contracts: list[tuple[str, Any]] = []
+        new_contract_by_symbol: dict[str, Any] = {}
+        subscribed = 0
+        reused = 0
+        failed_symbols: list[str] = []
+        for symbol in subscription_symbols:
+            contract = contract_by_symbol.get(symbol)
+            if contract is None:
+                contract = Stock(symbol, "SMART", "USD")
+                try:
+                    qualified = ib.qualifyContracts(contract)
+                    if not qualified:
+                        failed_symbols.append(symbol)
+                        print(f"{now_utc()} TOP100_RELOAD_CONTRACT_FAILED symbol={symbol} reason=not_qualified", flush=True)
+                        continue
+                    contract = qualified[0]
+                except Exception as exc:
+                    failed_symbols.append(symbol)
+                    print(f"{now_utc()} TOP100_RELOAD_CONTRACT_FAILED symbol={symbol} error={exc!r}", flush=True)
+                    continue
+
+            new_contracts.append((symbol, contract))
+            new_contract_by_symbol[symbol] = contract
+            states.setdefault(symbol, SymbolState(symbol=symbol))
+            if symbol not in tickers:
+                tickers[symbol] = ib.reqMktData(contract, "", False, False)
+                subscribed += 1
+                print(f"{now_utc()} TOP100_RELOAD_SUBSCRIBED symbol={symbol} conId={getattr(contract, 'conId', '')}", flush=True)
+            else:
+                reused += 1
+
+        if len([s for s, _ in new_contracts if s in set(entry_symbols)]) < int(args.top_n):
+            raise RuntimeError(
+                f"top100_reload_qualified_too_few_entry_symbols "
+                f"qualified={len([s for s, _ in new_contracts if s in set(entry_symbols)])} required={int(args.top_n)}"
+            )
+
+        for symbol in list(states):
+            if symbol not in subscription_symbol_set and symbol not in active_symbols:
+                states.pop(symbol, None)
+
+        contracts[:] = new_contracts
+        contract_by_symbol.clear()
+        contract_by_symbol.update(new_contract_by_symbol)
+        runtime_state["entry_symbols"] = set(entry_symbols)
+        runtime_state["top100_reload_requested"] = False
+        runtime_state["top100_reload_done_at"] = now_utc()
+        runtime_state["top100_reload_last_error"] = ""
+        runtime_state["top100_reload_symbols"] = list(entry_symbols)
+
+        traded_symbols_today = load_traded_symbols_today(recorder)
+        if traded_symbols_today and args.max_one_trade_per_symbol_per_day:
+            for symbol in traded_symbols_today:
+                if symbol in states:
+                    states[symbol].signal_sent = True
+        rebuilt = rebuild_symbol_states_from_1m_candles(recorder, states, args)
+
+        print(
+            f"{now_utc()} TOP100_RELOAD_DONE ranking_date={ranking_date} entry_symbols={len(entry_symbols)} "
+            f"subscriptions={len(contracts)} added={subscribed} reused={reused} removed={len(previous_symbol_set - subscription_symbol_set)} "
+            f"active_carried={len(active_symbols)} failed={len(failed_symbols)} state_rebuilt={rebuilt}",
+            flush=True,
+        )
+        return True
+    except Exception as exc:
+        runtime_state["top100_reload_requested"] = False
+        runtime_state["top100_reload_last_error"] = repr(exc)
+        print(f"{now_utc()} TOP100_RELOAD_FAILED ranking_date={ranking_date} path={reload_path} error={exc!r}", flush=True)
+        return False
+    finally:
+        runtime_state["entries_blocked"] = False
+        if runtime_state.get("entries_blocked_reason") == "top100_reload":
+            runtime_state["entries_blocked_reason"] = ""
 
 
 def enrich_lifecycle_with_fills(recorder: LiveDataRecorder) -> int:
@@ -2321,6 +2441,12 @@ def main() -> int:
         "post_reconnect_reconciliation_clean": False,
         "post_reconnect_reconciliation_orphans": [],
         "post_reconnect_reconciliation_pending_orders": [],
+        "entry_symbols": set(symbols),
+        "top100_reload_requested": False,
+        "top100_reload_path": "",
+        "top100_reload_ranking_date": "",
+        "top100_reload_last_error": "",
+        "top100_reload_symbols": list(symbols),
     }
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
@@ -2422,6 +2548,19 @@ def main() -> int:
 
                 process_overnight_automation(runtime_state, args)
 
+                reload_top100_universe_if_requested(
+                    ib,
+                    recorder,
+                    states,
+                    contracts,
+                    contract_by_symbol,
+                    tickers,
+                    latest_snapshots,
+                    managed_positions,
+                    runtime_state,
+                    args,
+                )
+
                 process_control_api_commands(
                     ib=ib,
                     recorder=recorder,
@@ -2493,7 +2632,8 @@ def main() -> int:
                         rejection_counter[reason] += 1
 
                 has_active_position = symbol in managed_positions and managed_positions[symbol].active and not managed_positions[symbol].exit_sent
-                if features["ready"] and not state.signal_sent and not has_active_position and entries_blocked:
+                entry_symbol_allowed = symbol in _runtime_set(runtime_state, "entry_symbols")
+                if features["ready"] and not state.signal_sent and not has_active_position and entry_symbol_allowed and entries_blocked:
                     record_lifecycle_with_formal(
                         recorder,
                         "BUY_BLOCKED",
@@ -2510,7 +2650,7 @@ def main() -> int:
                             "entries_blocked_reason": runtime_state.get("entries_blocked_reason"),
                         },
                     )
-                if features["ready"] and not state.signal_sent and not has_active_position and not entries_blocked:
+                if features["ready"] and not state.signal_sent and not has_active_position and entry_symbol_allowed and not entries_blocked:
                     ready_count += 1
                     price = features.get("entry_price")
                     qty = max(1, int(args.position_usd // price)) if price and price > 0 else 0
