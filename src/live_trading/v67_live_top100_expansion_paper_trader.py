@@ -277,6 +277,7 @@ def formal_event_type_for_legacy_event(event: str) -> LifecycleEventType | None:
         "POSITION_QUANTITY_DRIFT": LifecycleEventType.POSITION_DRIFT_DETECTED,
         "POSITION_MISSING_IN_IBKR": LifecycleEventType.POSITION_DRIFT_DETECTED,
         "ORPHAN_IBKR_POSITION_OBSERVED": LifecycleEventType.POSITION_DRIFT_DETECTED,
+        "FRACTIONAL_ORPHAN_MANUAL_REQUIRED": LifecycleEventType.POSITION_DRIFT_DETECTED,
     }
     return mapping.get(event)
 
@@ -815,6 +816,8 @@ def startup_reconcile_runtime_state(
     closed_local: list[str] = []
     drift_symbols: list[str] = []
     orphans: list[str] = []
+    fractional_orphans: list[str] = []
+    whole_share_orphans: list[str] = []
     pending_orders: list[str] = []
     submitted_flatten_order_ids: set[Any] = set()
 
@@ -876,17 +879,31 @@ def startup_reconcile_runtime_state(
         row = ibkr_row_by_symbol[symbol]
         ibkr_qty = float(row["quantity"])
         orphans.append(symbol)
-        record_lifecycle_with_formal(
-            recorder,
-            "ORPHAN_IBKR_POSITION_OBSERVED",
-            symbol,
-            action="ALERT",
-            quantity=ibkr_qty,
-            price=row.get("market_price"),
-            reason=f"{reason_prefix}_orphan_ibkr_position",
-            raw_json={"ibkr_quantity": ibkr_qty, "average_cost": row.get("average_cost"), "market_value": row.get("market_value")},
-        )
-        print(f"{now_utc()} {log_prefix}_ORPHAN_DETECTED symbol={symbol} quantity={ibkr_qty:.4f}", flush=True)
+        if is_fractional_position_quantity(ibkr_qty):
+            fractional_orphans.append(symbol)
+            record_fractional_orphan_manual_required(
+                recorder,
+                runtime_state,
+                symbol=symbol,
+                quantity=ibkr_qty,
+                price=row.get("market_price"),
+                reason=f"{reason_prefix}_fractional_orphan_manual_required",
+                raw_json={"average_cost": row.get("average_cost"), "market_value": row.get("market_value")},
+                log_prefix=f"{log_prefix}_FRACTIONAL_ORPHAN_MANUAL_REQUIRED",
+            )
+        else:
+            whole_share_orphans.append(symbol)
+            record_lifecycle_with_formal(
+                recorder,
+                "ORPHAN_IBKR_POSITION_OBSERVED",
+                symbol,
+                action="ALERT",
+                quantity=ibkr_qty,
+                price=row.get("market_price"),
+                reason=f"{reason_prefix}_orphan_ibkr_position",
+                raw_json={"ibkr_quantity": ibkr_qty, "average_cost": row.get("average_cost"), "market_value": row.get("market_value")},
+            )
+            print(f"{now_utc()} {log_prefix}_ORPHAN_DETECTED symbol={symbol} quantity={ibkr_qty:.4f}", flush=True)
         if submit_orphan_flatten:
             if whole_share_quantity(ibkr_qty):
                 submitted_order_id = submit_eod_flatten_order(
@@ -897,24 +914,12 @@ def startup_reconcile_runtime_state(
                     ibkr_quantity=ibkr_qty,
                     reason=f"{reason_prefix}_orphan_flatten",
                     attempt=1,
+                    runtime_state=runtime_state,
                 )
                 if submitted_order_id is not None:
                     submitted_flatten_order_ids.add(submitted_order_id)
             else:
-                action = _flatten_action_for_quantity(ibkr_qty)
-                record_lifecycle_with_formal(
-                    recorder,
-                    "EOD_FLATTEN_FAILED",
-                    symbol,
-                    action=action,
-                    quantity=abs(float(ibkr_qty)),
-                    reason="fractional_quantity_api_unsupported",
-                    raw_json={
-                        "ibkr_quantity": ibkr_qty,
-                        "manual_action_required": "close_fractional_position_in_ibkr_desktop",
-                        "source": reason_prefix,
-                    },
-                )
+                runtime_state["startup_reconciliation_fractional_manual_required"] = True
 
     for trade in open_ibkr_order_trades(ib):
         order_id = order_trade_id(trade)
@@ -972,6 +977,8 @@ def startup_reconcile_runtime_state(
     runtime_state["startup_reconciliation_done"] = True
     runtime_state["startup_reconciliation_clean"] = bool(clean)
     runtime_state["startup_reconciliation_orphans"] = sorted(orphans)
+    runtime_state["startup_reconciliation_fractional_orphans"] = sorted(fractional_orphans)
+    runtime_state["startup_reconciliation_whole_share_orphans"] = sorted(whole_share_orphans)
     runtime_state["startup_reconciliation_closed_local"] = sorted(closed_local)
     runtime_state["startup_reconciliation_pending_orders"] = sorted([p for p in pending_orders if p])
     runtime_state["startup_reconciliation_drift_symbols"] = sorted(drift_symbols)
@@ -982,7 +989,8 @@ def startup_reconcile_runtime_state(
     persist_managed_positions(recorder, managed_positions)
     print(
         f"{now_utc()} {log_prefix}_DONE clean={int(clean)} "
-        f"closed_local={len(closed_local)} orphans={len(orphans)} drift={len(drift_symbols)} "
+        f"closed_local={len(closed_local)} orphans={len(orphans)} fractional_orphans={len(fractional_orphans)} "
+        f"whole_share_orphans={len(whole_share_orphans)} drift={len(drift_symbols)} "
         f"pending_orders={len(pending_orders)} anomalies={len(reducer_snapshot.anomalies)}",
         flush=True,
     )
@@ -990,6 +998,8 @@ def startup_reconcile_runtime_state(
         "clean": clean,
         "closed_local": sorted(closed_local),
         "orphans": sorted(orphans),
+        "fractional_orphans": sorted(fractional_orphans),
+        "whole_share_orphans": sorted(whole_share_orphans),
         "drift_symbols": sorted(drift_symbols),
         "pending_orders": sorted([p for p in pending_orders if p]),
         "anomalies": list(reducer_snapshot.anomalies),
@@ -1003,6 +1013,56 @@ def _flatten_action_for_quantity(quantity: float) -> str:
 def is_fractional_position_quantity(quantity: float) -> bool:
     qty = abs(float(quantity))
     return not math.isclose(qty, round(qty), rel_tol=0.0, abs_tol=1e-9)
+
+
+def record_fractional_orphan_manual_required(
+    recorder: LiveDataRecorder,
+    runtime_state: dict[str, Any],
+    *,
+    symbol: str,
+    quantity: float,
+    price: float | None = None,
+    reason: str,
+    raw_json: dict[str, Any] | None = None,
+    log_prefix: str = "FRACTIONAL_ORPHAN_MANUAL_REQUIRED",
+) -> bool:
+    seen = runtime_state.setdefault("fractional_orphan_manual_required_seen", {})
+    suppressed = runtime_state.setdefault("fractional_orphan_manual_required_suppressed", {})
+    if not isinstance(seen, dict):
+        seen = {}
+        runtime_state["fractional_orphan_manual_required_seen"] = seen
+    if not isinstance(suppressed, dict):
+        suppressed = {}
+        runtime_state["fractional_orphan_manual_required_suppressed"] = suppressed
+
+    key = f"{symbol}:{float(quantity):.8f}"
+    if seen.get(key):
+        suppressed[key] = int(suppressed.get(key, 0) or 0) + 1
+        runtime_state["fractional_orphan_manual_required_suppressed_total"] = sum(int(v or 0) for v in suppressed.values())
+        return False
+
+    seen[key] = now_utc()
+    payload = {
+        "ibkr_quantity": quantity,
+        "manual_action_required": "close_fractional_position_in_ibkr_desktop",
+        **(raw_json or {}),
+    }
+    record_lifecycle_with_formal(
+        recorder,
+        "FRACTIONAL_ORPHAN_MANUAL_REQUIRED",
+        symbol,
+        action="ALERT",
+        quantity=quantity,
+        price=price,
+        reason=reason,
+        raw_json=payload,
+    )
+    print(
+        f"{now_utc()} {log_prefix} symbol={symbol} quantity={quantity:.4f} "
+        f"reason={reason} manual_action_required=ibkr_desktop",
+        flush=True,
+    )
+    return True
 
 
 def smart_stock_contract_for_flatten(symbol: str, contract: Any | None) -> Any:
@@ -1038,6 +1098,49 @@ def open_flatten_order_keys(ib: IB) -> set[tuple[str, str]]:
     return keys
 
 
+def write_eod_final_status(
+    recorder: LiveDataRecorder,
+    runtime_state: dict[str, Any],
+    *,
+    rows: list[dict[str, Any]],
+    pending_orders: int,
+    managed_positions: dict[str, ManagedPosition],
+    reason: str,
+) -> dict[str, Any]:
+    managed_open_symbols = sorted(symbol for symbol, pos in managed_positions.items() if pos.active)
+    managed_open_set = set(managed_open_symbols)
+    fractional_orphans = sorted(
+        row["symbol"] for row in rows
+        if is_fractional_position_quantity(float(row["quantity"]))
+    )
+    whole_share_orphans = sorted(
+        row["symbol"] for row in rows
+        if not is_fractional_position_quantity(float(row["quantity"])) and row["symbol"] not in managed_open_set
+    )
+    summary = {
+        "recorded_at": now_utc(),
+        "reason": reason,
+        "clean": not rows and pending_orders == 0 and not managed_open_symbols,
+        "open_positions": len(rows),
+        "open_symbols": sorted(row["symbol"] for row in rows),
+        "fractional_orphans": fractional_orphans,
+        "whole_share_orphans": whole_share_orphans,
+        "pending_orders": pending_orders,
+        "managed_open": len(managed_open_symbols),
+        "managed_open_symbols": managed_open_symbols,
+    }
+    runtime_state["eod_final_status"] = summary
+    recorder.path("eod_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    print(
+        f"{now_utc()} EOD_FINAL_STATUS clean={int(summary['clean'])} "
+        f"open_positions={summary['open_positions']} fractional_orphans={len(fractional_orphans)} "
+        f"whole_share_orphans={len(whole_share_orphans)} pending_orders={pending_orders} "
+        f"managed_open={summary['managed_open']}",
+        flush=True,
+    )
+    return summary
+
+
 def submit_eod_flatten_order(
     ib: IB,
     recorder: LiveDataRecorder,
@@ -1047,29 +1150,40 @@ def submit_eod_flatten_order(
     ibkr_quantity: float,
     reason: str,
     attempt: int,
+    runtime_state: dict[str, Any] | None = None,
 ) -> int | None:
     if abs(ibkr_quantity) <= 0:
         return None
     if is_fractional_position_quantity(ibkr_quantity):
         action = _flatten_action_for_quantity(ibkr_quantity)
-        record_lifecycle_with_formal(
-            recorder,
-            "EOD_FLATTEN_FAILED",
-            symbol,
-            action=action,
-            quantity=abs(float(ibkr_quantity)),
-            reason="fractional_quantity_api_unsupported",
-            raw_json={
-                "ibkr_quantity": ibkr_quantity,
-                "attempt": attempt,
-                "manual_action_required": "close_fractional_position_in_ibkr_desktop",
-            },
-        )
-        print(
-            f"{now_utc()} EOD_FLATTEN_FAILED symbol={symbol} quantity={ibkr_quantity:.4f} "
-            "reason=fractional_quantity_api_unsupported manual_action_required=ibkr_desktop",
-            flush=True,
-        )
+        if runtime_state is not None:
+            record_fractional_orphan_manual_required(
+                recorder,
+                runtime_state,
+                symbol=symbol,
+                quantity=ibkr_quantity,
+                reason=f"{reason}_fractional_quantity_api_unsupported",
+                raw_json={"attempt": attempt, "action": action},
+            )
+        else:
+            record_lifecycle_with_formal(
+                recorder,
+                "EOD_FLATTEN_FAILED",
+                symbol,
+                action=action,
+                quantity=abs(float(ibkr_quantity)),
+                reason="fractional_quantity_api_unsupported",
+                raw_json={
+                    "ibkr_quantity": ibkr_quantity,
+                    "attempt": attempt,
+                    "manual_action_required": "close_fractional_position_in_ibkr_desktop",
+                },
+            )
+            print(
+                f"{now_utc()} EOD_FLATTEN_FAILED symbol={symbol} quantity={ibkr_quantity:.4f} "
+                "reason=fractional_quantity_api_unsupported manual_action_required=ibkr_desktop",
+                flush=True,
+            )
         return None
     action = _flatten_action_for_quantity(ibkr_quantity)
     quantity = _order_quantity_from_position(ibkr_quantity)
@@ -1160,6 +1274,7 @@ def hard_eod_flatten_portfolio(
     now_ts = time.time()
     rows = ibkr_portfolio_position_rows(ib)
     open_keys = open_flatten_order_keys(ib)
+    pending_order_count = len(open_ibkr_order_trades(ib))
     attempt_by_symbol = runtime_state.setdefault("eod_flatten_attempts_by_symbol", {})
     last_submit_by_symbol = runtime_state.setdefault("eod_flatten_last_submit_ts_by_symbol", {})
     if not isinstance(attempt_by_symbol, dict):
@@ -1190,6 +1305,14 @@ def hard_eod_flatten_portfolio(
         runtime_state["eod_flatten_attempts_by_symbol"] = {}
         runtime_state["eod_flatten_last_submit_ts_by_symbol"] = {}
         print(f"{now_utc()} EOD_FLATTEN_SUCCESS open_positions=0", flush=True)
+        write_eod_final_status(
+            recorder,
+            runtime_state,
+            rows=[],
+            pending_orders=pending_order_count,
+            managed_positions=managed_positions,
+            reason=reason,
+        )
         return 0
 
     submitted = 0
@@ -1231,6 +1354,7 @@ def hard_eod_flatten_portfolio(
             ibkr_quantity=ibkr_qty,
             reason=reason,
             attempt=attempts + 1,
+            runtime_state=runtime_state,
         ):
             submitted += 1
             attempt_by_symbol[symbol] = attempts + 1
@@ -1258,6 +1382,18 @@ def hard_eod_flatten_portfolio(
             )
 
     runtime_state["manual_eod_flatten_force"] = False
+    try:
+        pending_order_count = len(open_ibkr_order_trades(ib))
+    except Exception:
+        pass
+    write_eod_final_status(
+        recorder,
+        runtime_state,
+        rows=rows,
+        pending_orders=pending_order_count,
+        managed_positions=managed_positions,
+        reason=reason,
+    )
     return submitted
 
 
@@ -1424,6 +1560,7 @@ def adopt_existing_long_positions(
     contract_by_symbol: dict[str, Any],
     latest_snapshots: dict[str, dict[str, Any]],
     managed_positions: dict[str, ManagedPosition],
+    runtime_state: dict[str, Any] | None = None,
 ) -> int:
     adopted = 0
     exit_sent_symbols = load_exit_sent_symbols(recorder)
@@ -1445,17 +1582,16 @@ def adopt_existing_long_positions(
         if quantity is None or quantity <= 0:
             continue
         if is_fractional_position_quantity(quantity):
-            record_lifecycle_with_formal(
+            state = runtime_state if runtime_state is not None else {}
+            record_fractional_orphan_manual_required(
                 recorder,
-                "ORPHAN_IBKR_POSITION_OBSERVED",
-                symbol,
-                action="ALERT",
+                state,
+                symbol=symbol,
                 quantity=quantity,
                 price=market_price,
                 reason="fractional_ibkr_position_requires_manual_desktop_close",
-                raw_json={"ibkr_quantity": quantity, "average_cost": avg_cost, "market_price": market_price},
+                raw_json={"average_cost": avg_cost, "market_price": market_price},
             )
-            print(f"{now_utc()} ORPHAN_IBKR_POSITION_OBSERVED symbol={symbol} quantity={quantity:.4f} reason=fractional_manual_close_required", flush=True)
             continue
         in_runtime_universe = symbol in contract_by_symbol
         if not in_runtime_universe:
@@ -2439,8 +2575,14 @@ def main() -> int:
         "startup_reconciliation_done": False,
         "startup_reconciliation_clean": False,
         "startup_reconciliation_orphans": [],
+        "startup_reconciliation_fractional_orphans": [],
+        "startup_reconciliation_whole_share_orphans": [],
         "startup_reconciliation_closed_local": [],
         "startup_reconciliation_pending_orders": [],
+        "fractional_orphan_manual_required_seen": {},
+        "fractional_orphan_manual_required_suppressed": {},
+        "fractional_orphan_manual_required_suppressed_total": 0,
+        "eod_final_status": {},
         "ibkr_connected": True,
         "reconnect_active": False,
         "reconnect_attempts": 0,
@@ -2692,7 +2834,7 @@ def main() -> int:
 
             adopted_count = 0
             if args.adopt_existing_positions and not adopted_once and data_count > 0:
-                adopted_count = adopt_existing_long_positions(ib, recorder, contract_by_symbol, latest_snapshots, managed_positions)
+                adopted_count = adopt_existing_long_positions(ib, recorder, contract_by_symbol, latest_snapshots, managed_positions, runtime_state)
                 for symbol in managed_positions:
                     if symbol in states:
                         states[symbol].signal_sent = True

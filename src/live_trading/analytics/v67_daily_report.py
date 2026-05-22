@@ -132,6 +132,40 @@ def load_latest_portfolio(session: Path):
     return out
 
 
+def load_json_file(path: Path, default):
+    try:
+        if not path.exists():
+            return default
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def load_eod_summary(session: Path) -> dict:
+    return load_json_file(session / "eod_summary.json", {})
+
+
+def load_managed_positions_summary(session: Path) -> dict:
+    data = load_json_file(session / "managed_positions.json", {})
+    if isinstance(data, dict):
+        rows = data.get("positions", data)
+    else:
+        rows = data
+    if isinstance(rows, dict):
+        values = rows.values()
+    elif isinstance(rows, list):
+        values = rows
+    else:
+        values = []
+    active = []
+    for row in values:
+        if not isinstance(row, dict):
+            continue
+        if row.get("active", True):
+            active.append(row)
+    return {"active_count": len(active), "active_symbols": sorted(str(x.get("symbol", "")).upper() for x in active if x.get("symbol"))}
+
+
 def load_signal_features(session: Path) -> dict[str, list[dict]]:
     lifecycle = session / "trade_lifecycle.csv"
     by_symbol: dict[str, list[dict]] = defaultdict(list)
@@ -297,6 +331,55 @@ def reconstruct_closed_trades_from_fills(
     return closed
 
 
+def effective_commission_per_trade(fill_closed: list[dict], fallback: float) -> float:
+    if not fill_closed:
+        return fallback
+    total = sum(x.get("estimated_commission", fallback) for x in fill_closed)
+    return total / len(fill_closed) if fill_closed else fallback
+
+
+def simulate_exit_strategies(closed: list[dict], commission_per_trade: float) -> list[dict]:
+    scenarios = [
+        ("actual trailing", None, "actual"),
+        ("fixed TP +2%", 2.0, "fixed"),
+        ("fixed TP +3%", 3.0, "fixed"),
+        ("fixed TP +4%", 4.0, "fixed"),
+        ("fixed TP +5%", 5.0, "fixed"),
+        ("partial 50%@+3%", 3.0, "partial"),
+    ]
+    results: list[dict] = []
+    for name, target_pct, mode in scenarios:
+        gross_total = 0.0
+        captured = 0
+        for trade in closed:
+            qty = f(trade.get("qty"), 0.0)
+            buy = f(trade.get("buy"), 0.0)
+            sell = f(trade.get("sell"), 0.0)
+            mfe = f(trade.get("peak_gain_pct"), 0.0)
+            actual_gross = f(trade.get("gross"), (sell - buy) * qty)
+            if mode == "actual" or not target_pct or buy <= 0 or qty <= 0:
+                gross = actual_gross
+            elif mfe >= target_pct:
+                target_price = buy * (1.0 + target_pct / 100.0)
+                if mode == "partial":
+                    gross = ((target_price - buy) * qty * 0.5) + ((sell - buy) * qty * 0.5)
+                else:
+                    gross = (target_price - buy) * qty
+                captured += 1
+            else:
+                gross = actual_gross
+            gross_total += gross
+        estimated_commission = len(closed) * commission_per_trade
+        results.append({
+            "name": name,
+            "trades": len(closed),
+            "captured": captured,
+            "gross": gross_total,
+            "net": gross_total - estimated_commission,
+        })
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=datetime.now(timezone.utc).strftime("%F"))
@@ -397,10 +480,24 @@ def main():
     fill_estimated_fallback = sum(x["estimated_commission_fallback"] for x in fill_closed)
     fill_net_actual = sum(x["net_actual"] for x in fill_closed)
     fill_net_estimated = sum(x["net_estimated"] for x in fill_closed)
+    commission_per_trade = effective_commission_per_trade(fill_closed, args.commission_per_roundtrip)
+    exit_simulations = simulate_exit_strategies(closed, commission_per_trade)
     fills_without_commission = [
         x for x in fill_rows
         if str(x.get("commission_source") or "").strip().lower() != "ibkr"
     ]
+    eod_summary = load_eod_summary(session)
+    managed_summary = load_managed_positions_summary(session)
+    final_fractional_positions = [
+        sym for sym, pos in latest_portfolio.items()
+        if f(pos.get("position"), 0.0) != 0 and abs(f(pos.get("position"), 0.0) - round(f(pos.get("position"), 0.0))) > 1e-9
+    ]
+    final_whole_positions = [
+        sym for sym, pos in latest_portfolio.items()
+        if f(pos.get("position"), 0.0) != 0 and sym not in set(final_fractional_positions)
+    ]
+    diagnostic_fractional_orphans = (eod_summary.get("fractional_orphans") or []) if "fractional_orphans" in eod_summary else final_fractional_positions
+    diagnostic_whole_share_orphans = (eod_summary.get("whole_share_orphans") or []) if "whole_share_orphans" in eod_summary else final_whole_positions
 
     print(f"=== v67 Daily Report {args.date} ===")
     print(f"Closed trades:        {len(closed)}")
@@ -437,6 +534,25 @@ def main():
                 f"{x['net_actual']:>10.2f} {x['net_estimated']:>10.2f} {x['commission_source']:>9}"
             )
         print()
+
+    print("=== Post-session diagnostics ===")
+    print(f"Final IBKR positions: {len(latest_portfolio)}")
+    print(f"Final managed count:  {managed_summary['active_count']}")
+    print(f"Fractional orphans:   {len(diagnostic_fractional_orphans)}")
+    print(f"Whole-share orphans:  {len(diagnostic_whole_share_orphans)}")
+    print(f"Pending orders:       {eod_summary.get('pending_orders', '')}")
+    clean_value = eod_summary.get("clean")
+    print(f"EOD clean:            {'' if clean_value is None else int(bool(clean_value))}")
+    if latest_portfolio:
+        print(f"Final symbols:        {', '.join(sorted(latest_portfolio))}")
+    print()
+
+    print("=== Exit simulation only ===")
+    print(f"{'SCENARIO':<18} {'TRADES':>7} {'CAPTURED':>8} {'GROSS':>10} {'NET_EST':>10}")
+    print("-" * 58)
+    for row in exit_simulations:
+        print(f"{row['name']:<18} {row['trades']:>7} {row['captured']:>8} {row['gross']:>10.2f} {row['net']:>10.2f}")
+    print()
 
     print("=== Strict/original setup subset ===")
     strict_wins = [x for x in strict_closed if x["gross"] > 0]

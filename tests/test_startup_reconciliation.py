@@ -143,7 +143,11 @@ class StartupReconciliationTests(unittest.TestCase):
             self.assertFalse(runtime_state["entries_blocked"])
             self.assertIn("ASST", result["orphans"])
             events = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl")).load_events()
-            self.assertTrue(any(row["event_type"] == "EXIT_ORDER_REJECTED" for row in events))
+            self.assertTrue(any(
+                row["event_type"] == LifecycleEventType.POSITION_DRIFT_DETECTED.value
+                and row.get("reason") == "startup_reconciliation_fractional_orphan_manual_required"
+                for row in events
+            ))
 
     def test_quantity_drift_updates_managed_qty_when_same_direction_whole_share(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
