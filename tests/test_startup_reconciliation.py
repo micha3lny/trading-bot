@@ -73,6 +73,11 @@ class FakeIB:
         return None
 
 
+class FakeIBWithSubmittedOpenTrades(FakeIB):
+    def openTrades(self):
+        return list(self._open_trades) + list(self.placed_orders)
+
+
 def recorder_in_tmp(tmp: str) -> LiveDataRecorder:
     return LiveDataRecorder(Path(tmp), session_date="2026-05-21")
 
@@ -108,6 +113,23 @@ class StartupReconciliationTests(unittest.TestCase):
             self.assertIn("AVLN", result["orphans"])
             events = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl")).load_events()
             self.assertTrue(any(row["event_type"] == "EXIT_ORDER_SUBMITTED" for row in events))
+
+    def test_startup_reconciliation_does_not_cancel_flatten_order_it_just_submitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            ib = FakeIBWithSubmittedOpenTrades(portfolio=[FakePortfolioItem("AVLN", 3)])
+            runtime_state = {}
+
+            result = startup_reconcile_runtime_state(ib, recorder, {}, {}, runtime_state)
+
+            self.assertEqual(len(ib.placed_orders), 1)
+            self.assertEqual(len(ib.cancelled_orders), 0)
+            self.assertIn(str(ib.placed_orders[0].order.orderId), result["pending_orders"])
+            events = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl")).load_events()
+            event_types = [row["event_type"] for row in events]
+            self.assertIn(LifecycleEventType.EXIT_ORDER_SUBMITTED.value, event_types)
+            self.assertNotIn(LifecycleEventType.EXIT_ORDER_STALE.value, event_types)
+            self.assertNotIn(LifecycleEventType.EXIT_ORDER_CANCEL_REQUESTED.value, event_types)
 
     def test_ibkr_orphan_fractional_records_manual_action_without_blocking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

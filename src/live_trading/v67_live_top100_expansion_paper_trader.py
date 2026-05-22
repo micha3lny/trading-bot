@@ -815,6 +815,7 @@ def startup_reconcile_runtime_state(
     drift_symbols: list[str] = []
     orphans: list[str] = []
     pending_orders: list[str] = []
+    submitted_flatten_order_ids: set[Any] = set()
 
     candidate_symbols = sorted(set(managed_positions) | set(reducer_positions))
     for symbol in candidate_symbols:
@@ -887,7 +888,7 @@ def startup_reconcile_runtime_state(
         print(f"{now_utc()} {log_prefix}_ORPHAN_DETECTED symbol={symbol} quantity={ibkr_qty:.4f}", flush=True)
         if submit_orphan_flatten:
             if whole_share_quantity(ibkr_qty):
-                submit_eod_flatten_order(
+                submitted_order_id = submit_eod_flatten_order(
                     ib,
                     recorder,
                     symbol=symbol,
@@ -896,6 +897,8 @@ def startup_reconcile_runtime_state(
                     reason=f"{reason_prefix}_orphan_flatten",
                     attempt=1,
                 )
+                if submitted_order_id is not None:
+                    submitted_flatten_order_ids.add(submitted_order_id)
             else:
                 action = _flatten_action_for_quantity(ibkr_qty)
                 record_lifecycle_with_formal(
@@ -918,6 +921,9 @@ def startup_reconcile_runtime_state(
         action = order_trade_action(trade)
         quantity = order_trade_quantity(trade)
         pending_orders.append(str(order_id or ""))
+        if order_id in submitted_flatten_order_ids:
+            print(f"{now_utc()} {log_prefix}_PENDING_FLATTEN_ORDER order_id={order_id} symbol={symbol}", flush=True)
+            continue
         print(f"{now_utc()} {log_prefix}_PENDING_ORDER order_id={order_id} symbol={symbol}", flush=True)
         record_lifecycle_with_formal(
             recorder,
@@ -1040,9 +1046,9 @@ def submit_eod_flatten_order(
     ibkr_quantity: float,
     reason: str,
     attempt: int,
-) -> bool:
+) -> int | None:
     if abs(ibkr_quantity) <= 0:
-        return False
+        return None
     if is_fractional_position_quantity(ibkr_quantity):
         action = _flatten_action_for_quantity(ibkr_quantity)
         record_lifecycle_with_formal(
@@ -1063,11 +1069,11 @@ def submit_eod_flatten_order(
             "reason=fractional_quantity_api_unsupported manual_action_required=ibkr_desktop",
             flush=True,
         )
-        return False
+        return None
     action = _flatten_action_for_quantity(ibkr_quantity)
     quantity = _order_quantity_from_position(ibkr_quantity)
     if quantity <= 0:
-        return False
+        return None
     order_contract = smart_stock_contract_for_flatten(symbol, contract)
     try:
         qualified = ib.qualifyContracts(order_contract)
@@ -1084,7 +1090,7 @@ def submit_eod_flatten_order(
             raw_json={"ibkr_quantity": ibkr_quantity, "attempt": attempt},
         )
         print(f"{now_utc()} EOD_FLATTEN_FAILED symbol={symbol} reason=qualify_failed error={exc!r}", flush=True)
-        return False
+        return None
     order = MarketOrder(action, quantity)
     order.tif = "DAY"
     order.outsideRth = False
@@ -1113,7 +1119,7 @@ def submit_eod_flatten_order(
             f"orderId={order_id} reason=ibkr_cancelled error={error_message}",
             flush=True,
         )
-        return False
+        return None
     record_lifecycle_with_formal(
         recorder,
         "EOD_FLATTEN_SUBMIT",
@@ -1130,7 +1136,7 @@ def submit_eod_flatten_order(
         f"orderId={order_id} reason={reason}",
         flush=True,
     )
-    return True
+    return int(order_id) if order_id is not None else 0
 
 
 def hard_eod_flatten_portfolio(
