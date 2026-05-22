@@ -182,6 +182,121 @@ def avg(items, key):
     return sum(vals) / len(vals) if vals else 0.0
 
 
+def load_fills(session: Path) -> list[dict]:
+    p = session / "fills.csv"
+    if not p.exists():
+        return []
+    with p.open(errors="replace") as fh:
+        return list(csv.DictReader(fh))
+
+
+def normalized_fill_action(action: str | None) -> str:
+    value = str(action or "").strip().upper()
+    if value in {"BOT", "BUY"}:
+        return "BUY"
+    if value in {"SLD", "SELL"}:
+        return "SELL"
+    return value
+
+
+def actual_commission(row: dict) -> float | None:
+    if str(row.get("commission_source") or "").strip().lower() != "ibkr":
+        return None
+    commission = f(row.get("commission"), None)
+    return commission if commission is not None else None
+
+
+def reconstruct_closed_trades_from_fills(
+    fills: list[dict],
+    commission_per_roundtrip: float = 1.0,
+) -> list[dict]:
+    """Reconstruct long-side closed trades from execution fills using FIFO lots.
+
+    Commission accounting is conservative: known IBKR commissions are used when
+    present, and only the missing side(s) receive the estimated fallback.
+    """
+    per_side_estimate = commission_per_roundtrip / 2.0
+    open_lots: dict[str, list[dict]] = defaultdict(list)
+    closed: list[dict] = []
+
+    def sort_key(row: dict) -> tuple[str, str]:
+        raw = raw_json_dict(row)
+        execution = raw.get("execution") if isinstance(raw, dict) else {}
+        return (
+            str(row.get("recorded_at") or execution.get("time") or ""),
+            str(row.get("execution_id") or ""),
+        )
+
+    for row in sorted(fills, key=sort_key):
+        symbol = str(row.get("symbol") or "").upper()
+        action = normalized_fill_action(row.get("action"))
+        qty = f(row.get("quantity"), 0.0)
+        price = f(row.get("fill_price"), 0.0)
+        if not symbol or qty <= 0 or price <= 0:
+            continue
+
+        commission = actual_commission(row)
+        if action == "BUY":
+            open_lots[symbol].append({
+                "execution_id": row.get("execution_id"),
+                "remaining_qty": qty,
+                "original_qty": qty,
+                "price": price,
+                "recorded_at": row.get("recorded_at"),
+                "commission": commission,
+                "commission_source": row.get("commission_source") or "missing",
+            })
+            continue
+
+        if action != "SELL":
+            continue
+
+        remaining_sell_qty = qty
+        sell_commission = commission
+        sell_source = row.get("commission_source") or "missing"
+        while remaining_sell_qty > 0 and open_lots[symbol]:
+            lot = open_lots[symbol][0]
+            matched_qty = min(remaining_sell_qty, lot["remaining_qty"])
+            buy_fraction = matched_qty / lot["original_qty"] if lot["original_qty"] else 0.0
+            sell_fraction = matched_qty / qty if qty else 0.0
+
+            buy_actual = (lot["commission"] * buy_fraction) if lot["commission"] is not None else 0.0
+            sell_actual = (sell_commission * sell_fraction) if sell_commission is not None else 0.0
+            buy_fallback = 0.0 if lot["commission"] is not None else per_side_estimate * buy_fraction
+            sell_fallback = 0.0 if sell_commission is not None else per_side_estimate * sell_fraction
+            gross = (price - lot["price"]) * matched_qty
+            actual_total = buy_actual + sell_actual
+            fallback_total = buy_fallback + sell_fallback
+            all_actual = lot["commission"] is not None and sell_commission is not None
+
+            closed.append({
+                "symbol": symbol,
+                "qty": matched_qty,
+                "buy_execution_id": lot.get("execution_id") or "",
+                "sell_execution_id": row.get("execution_id") or "",
+                "buy_time": lot.get("recorded_at") or "",
+                "sell_time": row.get("recorded_at") or "",
+                "buy": lot["price"],
+                "sell": price,
+                "gross": gross,
+                "actual_commission": actual_total,
+                "estimated_commission_fallback": fallback_total,
+                "estimated_commission": actual_total + fallback_total,
+                "net_actual": gross - actual_total,
+                "net_estimated": gross - actual_total - fallback_total,
+                "commission_source": "ibkr" if all_actual else "estimated",
+                "buy_commission_source": lot.get("commission_source") or "missing",
+                "sell_commission_source": sell_source,
+            })
+
+            lot["remaining_qty"] -= matched_qty
+            remaining_sell_qty -= matched_qty
+            if lot["remaining_qty"] <= 1e-9:
+                open_lots[symbol].pop(0)
+
+    return closed
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=datetime.now(timezone.utc).strftime("%F"))
@@ -275,6 +390,17 @@ def main():
     open_upnl = sum(x["unrealized"] for x in open_positions)
     strict_closed = [x for x in closed if x["strict_setup_ready"]]
     strict_open = [x for x in open_positions if x["strict_setup_ready"]]
+    fill_rows = load_fills(session)
+    fill_closed = reconstruct_closed_trades_from_fills(fill_rows, args.commission_per_roundtrip)
+    fill_gross = sum(x["gross"] for x in fill_closed)
+    fill_actual_commission = sum(x["actual_commission"] for x in fill_closed)
+    fill_estimated_fallback = sum(x["estimated_commission_fallback"] for x in fill_closed)
+    fill_net_actual = sum(x["net_actual"] for x in fill_closed)
+    fill_net_estimated = sum(x["net_estimated"] for x in fill_closed)
+    fills_without_commission = [
+        x for x in fill_rows
+        if str(x.get("commission_source") or "").strip().lower() != "ibkr"
+    ]
 
     print(f"=== v67 Daily Report {args.date} ===")
     print(f"Closed trades:        {len(closed)}")
@@ -288,6 +414,29 @@ def main():
     print(f"Avg loss:             ${(sum(x['gross'] for x in losses) / len(losses) if losses else 0):.2f}")
     print(f"Expectancy:           ${(gross_total / len(closed) if closed else 0):.2f}/trade")
     print()
+
+    print("=== IBKR fill ledger ===")
+    print(f"Fill rows:            {len(fill_rows)}")
+    print(f"Fill closed trades:   {len(fill_closed)}")
+    print(f"Gross fill PnL:       ${fill_gross:.2f}")
+    print(f"IBKR commission:      ${fill_actual_commission:.2f}")
+    print(f"Estimated fallback:   ${fill_estimated_fallback:.2f}")
+    print(f"Net actual:           ${fill_net_actual:.2f}")
+    print(f"Net estimated:        ${fill_net_estimated:.2f}")
+    print(f"Fills without comm:   {len(fills_without_commission)}")
+    print()
+
+    if fill_closed:
+        print("=== Closed trades from fills ===")
+        print(f"{'SYM':<7} {'QTY':>8} {'BUY':>10} {'SELL':>10} {'GROSS':>10} {'IBKR_COMM':>10} {'EST_FB':>10} {'NET_ACT':>10} {'NET_EST':>10} {'SRC':>9}")
+        print("-" * 109)
+        for x in sorted(fill_closed, key=lambda r: r["gross"]):
+            print(
+                f"{x['symbol']:<7} {x['qty']:>8.2f} {x['buy']:>10.4f} {x['sell']:>10.4f} "
+                f"{x['gross']:>10.2f} {x['actual_commission']:>10.2f} {x['estimated_commission_fallback']:>10.2f} "
+                f"{x['net_actual']:>10.2f} {x['net_estimated']:>10.2f} {x['commission_source']:>9}"
+            )
+        print()
 
     print("=== Strict/original setup subset ===")
     strict_wins = [x for x in strict_closed if x["gross"] > 0]

@@ -19,6 +19,7 @@ from ib_insync import IB, Stock, MarketOrder
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.control.control_api import process_control_api_commands, process_history_collector_commands, start_control_api
 from src.live_trading.v66_ibkr_account_recorder import (
+    install_commission_report_handler,
     record_account_snapshot,
     record_recent_fills,
 )
@@ -2277,6 +2278,7 @@ def handle_ibkr_disconnect_and_recover(
 
     try:
         connect_impl(ib, args)
+        install_commission_report_handler(ib, recorder)
         runtime_state["ibkr_connected"] = True
         runtime_state["reconnect_last_error"] = ""
         runtime_state["reconnect_last_success_at"] = now_utc()
@@ -2412,6 +2414,7 @@ def main() -> int:
 
     ib = IB()
     connect_ibkr_with_retry(ib, args)
+    install_commission_report_handler(ib, recorder)
 
     tickers: dict[str, Any] = {}
     states = {symbol: SymbolState(symbol=symbol) for symbol in symbols}

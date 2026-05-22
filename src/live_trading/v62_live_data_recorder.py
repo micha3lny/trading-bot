@@ -252,15 +252,20 @@ class OrderIntent:
 
 @dataclass
 class FillEvent:
+    execution_id: str
     symbol: str
     action: str
     quantity: float | None = None
     fill_price: float | None = None
-    commission: float | None = None
     order_id: str = ""
-    client_order_id: str = ""
-    execution_id: str = ""
+    perm_id: str = ""
+    exchange: str = ""
+    liquidity: str = ""
+    commission: float | None = None
+    commission_currency: str = ""
     realized_pnl: float | None = None
+    commission_source: str = "missing"
+    client_order_id: str = ""
     slippage_bps: float | None = None
     raw_json: str = ""
     recorded_at: str = field(default_factory=utc_now_iso)
@@ -470,7 +475,7 @@ def demo_records(recorder: LiveDataRecorder) -> None:
     recorder.record_selection(SelectionEvent(symbol="AAPL", stage="live_safe_expansion", decision="accepted", score=87.5, reason="first_5m_high_pct>=4;first_15m_high_pct>=6.5;or_range_pct>=5", features_json={"first_5m_high_pct": 4.8}))
     recorder.record_signal(SignalSnapshot(symbol="AAPL", signal_name="momentum_or_breakout", action="BUY", score=87.5, threshold=80, reasons="live_safe_expansion"))
     recorder.record_order_intent(OrderIntent(symbol="AAPL", action="BUY", quantity=10, notional_usd=1005, order_type="MKT", strategy="v59_top100_live_safe_expansion", reason="paper demo"))
-    recorder.record_fill(FillEvent(symbol="AAPL", action="BUY", quantity=10, fill_price=100.52, commission=1.0, slippage_bps=2.0))
+    recorder.record_fill(FillEvent(execution_id="demo-exec-1", symbol="AAPL", action="BUY", quantity=10, fill_price=100.52, commission=1.0, commission_source="ibkr", slippage_bps=2.0))
     recorder.record_portfolio(PortfolioSnapshot(account="DEMO", cash=24_000, net_liquidation=25_000, buying_power=100_000, gross_exposure=1_005, open_positions=1, positions_json={"AAPL": 10}))
     recorder.record_error(ErrorEvent(component="demo", severity="INFO", message="demo recorder event"))
     recorder.write_manifest()

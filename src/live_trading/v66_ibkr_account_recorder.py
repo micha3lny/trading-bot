@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from ib_insync import IB, ExecutionFilter
@@ -15,6 +17,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4002
 DEFAULT_CLIENT_ID = 66
 DEFAULT_RECORDER_DIR = "data/live/recorder"
+
+FILL_FIELDS = list(FillEvent.__dataclass_fields__.keys())
 
 
 def now_utc() -> str:
@@ -28,6 +32,32 @@ def safe_float(value: Any) -> float | None:
         return float(value)
     except Exception:
         return None
+
+
+def raw_object(value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, "__dict__"):
+        return dict(value.__dict__)
+    return str(value)
+
+
+def read_csv_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists() or path.stat().st_size <= 0:
+        return []
+    with path.open(newline="", encoding="utf-8", errors="replace") as fh:
+        return list(csv.DictReader(fh))
+
+
+def write_csv_rows_atomic(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+    tmp.replace(path)
 
 
 def account_values_map(ib: IB) -> dict[str, dict[str, str]]:
@@ -103,6 +133,140 @@ def fill_key(fill) -> str:
     return str(getattr(execution, "execId", "")) or f"{getattr(execution, 'orderId', '')}-{getattr(execution, 'time', '')}"
 
 
+def commission_source_for_report(commission_report: Any) -> str:
+    commission = safe_float(getattr(commission_report, "commission", None))
+    if commission is None or commission == 0:
+        return "missing"
+    return "ibkr"
+
+
+def fill_row_from_ibkr_fill(fill: Any) -> dict[str, Any]:
+    contract = fill.contract
+    execution = fill.execution
+    commission_report = getattr(fill, "commissionReport", None)
+    raw = {
+        "contract": raw_object(contract),
+        "execution": raw_object(execution),
+        "commissionReport": raw_object(commission_report),
+    }
+    commission = safe_float(getattr(commission_report, "commission", None))
+    return {
+        "execution_id": str(getattr(execution, "execId", "") or ""),
+        "symbol": str(getattr(contract, "symbol", "") or "").upper(),
+        "action": str(getattr(execution, "side", "") or ""),
+        "quantity": safe_float(getattr(execution, "shares", None)),
+        "fill_price": safe_float(getattr(execution, "price", None)),
+        "order_id": str(getattr(execution, "orderId", "") or ""),
+        "perm_id": str(getattr(execution, "permId", "") or ""),
+        "exchange": str(getattr(execution, "exchange", "") or ""),
+        "liquidity": str(getattr(execution, "lastLiquidity", "") or getattr(execution, "liquidity", "") or ""),
+        "commission": commission if commission_source_for_report(commission_report) == "ibkr" else "",
+        "commission_currency": str(getattr(commission_report, "currency", "") or ""),
+        "realized_pnl": safe_float(getattr(commission_report, "realizedPNL", None)),
+        "commission_source": commission_source_for_report(commission_report),
+        "client_order_id": "",
+        "slippage_bps": "",
+        "raw_json": json.dumps(raw, default=str, ensure_ascii=False),
+        "recorded_at": now_utc(),
+    }
+
+
+def commission_report_row(commission_report: Any) -> dict[str, Any]:
+    commission = safe_float(getattr(commission_report, "commission", None))
+    source = "ibkr" if commission is not None and commission != 0 else "missing"
+    return {
+        "execution_id": str(getattr(commission_report, "execId", "") or ""),
+        "commission": commission if source == "ibkr" else "",
+        "commission_currency": str(getattr(commission_report, "currency", "") or ""),
+        "realized_pnl": safe_float(getattr(commission_report, "realizedPNL", None)),
+        "commission_source": source,
+        "raw_json": json.dumps({"commissionReport": raw_object(commission_report)}, default=str, ensure_ascii=False),
+    }
+
+
+def merge_fill_rows(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    for key in FILL_FIELDS:
+        if key == "recorded_at" and existing.get("recorded_at"):
+            continue
+        if key == "raw_json" and existing.get("raw_json"):
+            continue
+        value = incoming.get(key)
+        if value not in (None, ""):
+            merged[key] = value
+    if existing.get("commission_source") == "ibkr" and incoming.get("commission_source") != "ibkr":
+        merged["commission_source"] = "ibkr"
+        merged["commission"] = existing.get("commission", "")
+        merged["commission_currency"] = existing.get("commission_currency", "")
+        merged["realized_pnl"] = existing.get("realized_pnl", "")
+    return merged
+
+
+def upsert_fill_row(recorder: LiveDataRecorder, row: dict[str, Any]) -> str:
+    execution_id = str(row.get("execution_id") or "").strip()
+    if not execution_id:
+        raise ValueError("fill row missing execution_id")
+    path = recorder.path("fills.csv")
+    rows = read_csv_rows(path)
+    for idx, existing in enumerate(rows):
+        if str(existing.get("execution_id") or "").strip() == execution_id:
+            merged = merge_fill_rows(existing, row)
+            if merged == existing:
+                return "duplicate"
+            rows[idx] = merged
+            write_csv_rows_atomic(path, rows, FILL_FIELDS)
+            return "updated"
+    clean = {k: row.get(k, "") for k in FILL_FIELDS}
+    rows.append(clean)
+    write_csv_rows_atomic(path, rows, FILL_FIELDS)
+    return "inserted"
+
+
+def record_commission_report(recorder: LiveDataRecorder, commission_report: Any) -> str:
+    row = commission_report_row(commission_report)
+    execution_id = row.get("execution_id")
+    if not execution_id:
+        return "missing_exec_id"
+    path = recorder.path("fills.csv")
+    rows = read_csv_rows(path)
+    for idx, existing in enumerate(rows):
+        if str(existing.get("execution_id") or "").strip() == str(execution_id):
+            merged = merge_fill_rows(existing, row)
+            rows[idx] = merged
+            write_csv_rows_atomic(path, rows, FILL_FIELDS)
+            if merged.get("commission_source") == "ibkr":
+                print(f"{now_utc()} COMMISSION_REPORT_MATCHED execution_id={execution_id}", flush=True)
+                return "matched"
+            print(f"{now_utc()} COMMISSION_REPORT_MISSING execution_id={execution_id}", flush=True)
+            return "missing"
+    placeholder = {k: "" for k in FILL_FIELDS}
+    placeholder.update(row)
+    rows.append(placeholder)
+    write_csv_rows_atomic(path, rows, FILL_FIELDS)
+    print(f"{now_utc()} COMMISSION_REPORT_MISSING execution_id={execution_id} reason=execution_not_seen_yet", flush=True)
+    return "placeholder"
+
+
+def install_commission_report_handler(ib: IB, recorder: LiveDataRecorder) -> None:
+    if getattr(ib, "_v67_commission_report_handler_installed", False):
+        return
+    if not hasattr(ib, "commissionReportEvent"):
+        return
+
+    def _on_commission_report(*event_args: Any) -> None:
+        try:
+            report = event_args[-1] if event_args else None
+            record_commission_report(recorder, report)
+        except Exception as exc:
+            print(f"{now_utc()} COMMISSION_REPORT_HANDLER_FAILED error={exc!r}", flush=True)
+
+    try:
+        ib.commissionReportEvent += _on_commission_report
+        setattr(ib, "_v67_commission_report_handler_installed", True)
+    except Exception as exc:
+        print(f"{now_utc()} COMMISSION_REPORT_HANDLER_INSTALL_FAILED error={exc!r}", flush=True)
+
+
 def record_recent_fills(ib: IB, recorder: LiveDataRecorder, seen: set[str]) -> int:
     try:
         fills = ib.reqExecutions(ExecutionFilter())
@@ -111,28 +275,16 @@ def record_recent_fills(ib: IB, recorder: LiveDataRecorder, seen: set[str]) -> i
     count = 0
     for fill in fills:
         key = fill_key(fill)
-        if key in seen:
+        row = fill_row_from_ibkr_fill(fill)
+        status = upsert_fill_row(recorder, row)
+        if status != "duplicate":
+            if row.get("commission_source") != "ibkr":
+                print(f"{now_utc()} FILLS_WITHOUT_COMMISSION execution_id={row.get('execution_id')} symbol={row.get('symbol')}", flush=True)
+            else:
+                print(f"{now_utc()} COMMISSION_REPORT_MATCHED execution_id={row.get('execution_id')}", flush=True)
+        if key in seen and status != "inserted":
             continue
         seen.add(key)
-        contract = fill.contract
-        execution = fill.execution
-        commission_report = fill.commissionReport
-        raw = {
-            "contract": contract.__dict__ if hasattr(contract, "__dict__") else str(contract),
-            "execution": execution.__dict__ if hasattr(execution, "__dict__") else str(execution),
-            "commissionReport": commission_report.__dict__ if hasattr(commission_report, "__dict__") else str(commission_report),
-        }
-        recorder.record_fill(FillEvent(
-            symbol=getattr(contract, "symbol", ""),
-            action=getattr(execution, "side", ""),
-            quantity=safe_float(getattr(execution, "shares", None)),
-            fill_price=safe_float(getattr(execution, "price", None)),
-            commission=safe_float(getattr(commission_report, "commission", None)),
-            order_id=str(getattr(execution, "orderId", "")),
-            execution_id=str(getattr(execution, "execId", "")),
-            realized_pnl=safe_float(getattr(commission_report, "realizedPNL", None)),
-            raw_json=json.dumps(raw, default=str, ensure_ascii=False),
-        ))
         count += 1
     return count
 
@@ -162,6 +314,7 @@ def main() -> int:
 
     ib = IB()
     ib.connect(args.host, args.port, clientId=args.client_id, timeout=15, readonly=True)
+    install_commission_report_handler(ib, recorder)
     seen_fills: set[str] = set()
     start = time.time()
     try:
