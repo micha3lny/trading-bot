@@ -10,6 +10,8 @@ from src.live_trading.data.v68_universe_1m_parquet_collector import (
     build_pending_tasks,
     build_tasks,
     collect_existing_parquet_keys,
+    completion_pct,
+    count_existing_parquets_for_tasks,
     parquet_path,
 )
 
@@ -89,6 +91,20 @@ class HistoryCollectorPlanningTests(unittest.TestCase):
             self.assertEqual(pending, [task])
             self.assertEqual(stats["complete"], 0)
             self.assertEqual(stats["pending"], 1)
+
+    def test_output_summary_counts_existing_parquets_for_requested_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            tasks = [
+                CollectTask("AAA", date(2026, 5, 15), "RTH"),
+                CollectTask("BBB", date(2026, 5, 15), "RTH"),
+            ]
+            path = parquet_path(output_dir, tasks[0].symbol, tasks[0].session_date, tasks[0].session_type)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"not-empty")
+
+            self.assertEqual(count_existing_parquets_for_tasks(output_dir, tasks), 1)
+            self.assertEqual(completion_pct(1, 2), 50.0)
 
 
 if __name__ == "__main__":

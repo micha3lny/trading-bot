@@ -28,6 +28,7 @@ DEFAULT_ALPHA_RANK = "data/universe/v68_final_daytrading_universe.csv"
 DEFAULT_OUTPUT_DIR = "data/history/universe_1m"
 DEFAULT_STATUS_DIR = "data/history"
 DEFAULT_LOCK_PATH = "data/runtime/history_collector.lock"
+LOCK_HELD_EXIT_CODE = 75
 
 RTH_START_UTC = "13:30"
 RTH_END_UTC = "20:00"
@@ -80,9 +81,16 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     tmp.replace(path)
 
 
+def read_lock_info(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip().replace("\n", " | ")
+    except Exception:
+        return ""
+
+
 def acquire_lock(path: Path) -> Any | None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle = path.open("w", encoding="utf-8")
+    handle = path.open("a+", encoding="utf-8")
     try:
         import fcntl
 
@@ -196,6 +204,16 @@ def collect_existing_parquet_keys(output_dir: Path, session_type: str) -> set[st
         except Exception:
             continue
     return keys
+
+
+def count_existing_parquets_for_tasks(output_dir: Path, tasks: list[CollectTask]) -> int:
+    return sum(1 for task in tasks if parquet_exists(output_dir, task))
+
+
+def completion_pct(done: int, total: int) -> float:
+    if total <= 0:
+        return 100.0
+    return round((float(done) / float(total)) * 100.0, 2)
 
 
 def task_is_complete(
@@ -429,6 +447,7 @@ def main() -> int:
     parser.add_argument("--sync-status-from-parquet", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lock-path", default=DEFAULT_LOCK_PATH)
     args = parser.parse_args()
+    started_monotonic = time.monotonic()
 
     current = now_utc()
     if not args.allow_outside_window:
@@ -457,8 +476,13 @@ def main() -> int:
     failures_path = status_dir / "collector_failures.json"
     lock_handle = acquire_lock(Path(args.lock_path))
     if lock_handle is None:
-        print(f"{now_iso()} HISTORY_COLLECTOR_SKIPPED reason=lock_held lock_path={args.lock_path}", flush=True)
-        return 0
+        lock_info = read_lock_info(Path(args.lock_path))
+        print(
+            f"{now_iso()} HISTORY_COLLECTOR_SKIPPED reason=lock_held lock_path={args.lock_path} "
+            f"lock_info={lock_info!r}",
+            flush=True,
+        )
+        return LOCK_HELD_EXIT_CODE
 
     try:
         status: dict[str, Any] = load_json(status_path, {})
@@ -494,17 +518,45 @@ def main() -> int:
 
         if args.plan_only:
             write_json_atomic(status_path, status)
+            parquet_files = count_existing_parquets_for_tasks(output_dir, tasks)
+            duration = int(time.monotonic() - started_monotonic)
+            print(
+                f"{now_iso()} HISTORY_COLLECTOR_OUTPUT_SUMMARY expected_symbols={len(tasks)} "
+                f"parquet_files={parquet_files} completion_pct={completion_pct(parquet_files, len(tasks))}",
+                flush=True,
+            )
+            print(
+                f"{now_iso()} HISTORY_COLLECTOR_DONE duration_seconds={duration} total_symbols={len(symbols)} "
+                f"processed=0 skipped_existing={plan['complete']} complete=0 partial=0 no_data=0 "
+                f"failed=0 retries=0 parquet_files_written=0 output_dir={output_dir}",
+                flush=True,
+            )
             return 0
 
         if not pending:
             write_json_atomic(status_path, status)
             write_json_atomic(failures_path, failures)
+            parquet_files = count_existing_parquets_for_tasks(output_dir, tasks)
+            duration = int(time.monotonic() - started_monotonic)
+            print(
+                f"{now_iso()} HISTORY_COLLECTOR_OUTPUT_SUMMARY expected_symbols={len(tasks)} "
+                f"parquet_files={parquet_files} completion_pct={completion_pct(parquet_files, len(tasks))}",
+                flush=True,
+            )
+            print(
+                f"{now_iso()} HISTORY_COLLECTOR_DONE duration_seconds={duration} total_symbols={len(symbols)} "
+                f"processed=0 skipped_existing={plan['complete']} complete=0 partial=0 no_data=0 "
+                f"failed=0 retries=0 parquet_files_written=0 output_dir={output_dir}",
+                flush=True,
+            )
             return 0
 
         ib = IB()
         ib.connect(args.host, int(args.port), clientId=int(args.client_id), timeout=20)
 
         completed = partial = failed = no_data = 0
+        last_progress_idx = 0
+        last_progress_monotonic = started_monotonic
         try:
             for idx, task in enumerate(pending, 1):
                 try:
@@ -541,6 +593,17 @@ def main() -> int:
                     mark_status(status, task, "failed_permanent" if terminal else "failed", rows, {"attempts": attempts, "last_error": error})
                     print(f"{now_iso()} HISTORY_SYMBOL_FAILED {task.symbol} {task.session_date} attempts={attempts} error={error}", flush=True)
 
+                progress_elapsed = time.monotonic() - last_progress_monotonic
+                if idx == len(pending) or idx - last_progress_idx >= 100 or progress_elapsed >= 60.0:
+                    print(
+                        f"{now_iso()} HISTORY_COLLECTOR_PROGRESS processed={idx}/{len(pending)} "
+                        f"complete={completed} partial={partial} no_data={no_data} failed={failed} "
+                        f"elapsed_seconds={int(time.monotonic() - started_monotonic)}",
+                        flush=True,
+                    )
+                    last_progress_idx = idx
+                    last_progress_monotonic = time.monotonic()
+
                 if idx % 10 == 0:
                     write_json_atomic(status_path, status)
                     write_json_atomic(failures_path, failures)
@@ -559,10 +622,19 @@ def main() -> int:
             write_json_atomic(failures_path, failures)
             ib.disconnect()
 
+        parquet_files = count_existing_parquets_for_tasks(output_dir, tasks)
+        duration = int(time.monotonic() - started_monotonic)
+        parquet_files_written = completed + partial
         print(
-            f"{now_iso()} HISTORY_COLLECTOR_DONE total_symbols={len(symbols)} processed={len(pending)} "
+            f"{now_iso()} HISTORY_COLLECTOR_OUTPUT_SUMMARY expected_symbols={len(tasks)} "
+            f"parquet_files={parquet_files} completion_pct={completion_pct(parquet_files, len(tasks))}",
+            flush=True,
+        )
+        print(
+            f"{now_iso()} HISTORY_COLLECTOR_DONE duration_seconds={duration} total_symbols={len(symbols)} processed={len(pending)} "
             f"skipped_existing={plan['complete']} complete={completed} partial={partial} "
-            f"no_data={no_data} failed={failed} retries={partial + no_data + failed} output_dir={output_dir}",
+            f"no_data={no_data} failed={failed} retries={partial + no_data + failed} "
+            f"parquet_files_written={parquet_files_written} output_dir={output_dir}",
             flush=True,
         )
         return 0

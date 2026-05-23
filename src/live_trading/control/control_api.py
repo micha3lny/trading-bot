@@ -5,6 +5,7 @@ import math
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -335,6 +336,7 @@ def _cancel_history_collector(ctx: ControlApiContext, *, force: bool = False) ->
                 killed = True
     ctx.runtime_state["history_collector_process"] = None
     ctx.runtime_state["history_collector_running_command"] = None
+    ctx.runtime_state["history_collector_started_monotonic"] = None
     ctx.runtime_state["history_collector_last_cancelled_at"] = _now_utc()
     _log("HISTORY_COLLECTOR_CANCELLED", pending=cancelled_pending, force=force, killed=killed)
     return {
@@ -416,7 +418,12 @@ def process_history_collector_commands(*, runtime_state: dict[str, Any], max_com
         if rc is None:
             return 0
         cmd = runtime_state.get("history_collector_running_command") or {}
-        _log("HISTORY_COLLECTOR_DONE", command_id=cmd.get("id"), returncode=rc)
+        started = runtime_state.get("history_collector_started_monotonic")
+        duration = int(time.monotonic() - float(started)) if started is not None else None
+        if duration is None:
+            _log("HISTORY_COLLECTOR_DONE", command_id=cmd.get("id"), returncode=rc)
+        else:
+            _log("HISTORY_COLLECTOR_DONE", command_id=cmd.get("id"), returncode=rc, duration_seconds=duration)
         if cmd.get("source") == "overnight_scheduler":
             print(
                 f"{_now_utc()} OVERNIGHT_COLLECTOR_DONE command_id={cmd.get('id')} "
@@ -425,6 +432,7 @@ def process_history_collector_commands(*, runtime_state: dict[str, Any], max_com
             )
         runtime_state["history_collector_process"] = None
         runtime_state["history_collector_running_command"] = None
+        runtime_state["history_collector_started_monotonic"] = None
         runtime_state["history_collector_last_returncode"] = rc
         if rc == 0:
             runtime_state["history_collector_last_run_key"] = f"{cmd.get('end_date')}_{cmd.get('session_type')}"
@@ -461,8 +469,10 @@ def process_history_collector_commands(*, runtime_state: dict[str, Any], max_com
             proc = subprocess.Popen(args)
             runtime_state["history_collector_process"] = proc
             runtime_state["history_collector_running_command"] = cmd
+            runtime_state["history_collector_started_monotonic"] = time.monotonic()
             _log("HISTORY_COLLECTOR_PROCESS_STARTED", command_id=command_id, pid=proc.pid, remaining=len(queue))
         except Exception as exc:
+            runtime_state["history_collector_started_monotonic"] = None
             _log("HISTORY_COLLECTOR_FAILED", command_id=command_id, error=repr(exc), remaining=len(queue))
     return processed
 
