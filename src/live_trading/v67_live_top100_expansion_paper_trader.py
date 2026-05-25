@@ -59,6 +59,8 @@ class SymbolState:
     or_high: float | None = None
     or_low: float | None = None
     first_seen_ts: float | None = None
+    first_seen_utc: str | None = None
+    latest_seen_utc: str | None = None
     latest_volume: float | None = None
     signal_sent: bool = False
     bars: list[dict[str, Any]] = field(default_factory=list)
@@ -157,26 +159,57 @@ def snapshot_from_ticker(symbol: str, ticker: Any) -> dict[str, Any]:
     }
 
 
-def update_state(state: SymbolState, snap: dict[str, Any], elapsed: float, opening_range_seconds: int) -> None:
+def market_open_datetime_utc(args: argparse.Namespace, now: datetime | None = None) -> datetime:
+    now = now or datetime.now(timezone.utc)
+    hh, mm = [int(x) for x in str(args.market_open_utc).split(":", 1)]
+    return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+
+def update_state(
+    state: SymbolState,
+    snap: dict[str, Any],
+    session_elapsed: float,
+    opening_range_seconds: int,
+    *,
+    observed_at: datetime | None = None,
+) -> None:
     price = safe_float(snap.get("price"))
     if price is None or price <= 0:
         return
-    now_ts = time.time()
+    observed_at = observed_at or datetime.now(timezone.utc)
+    now_ts = observed_at.timestamp()
+    observed_iso = observed_at.isoformat()
+    state.last_price = price
+    state.latest_seen_utc = observed_iso
+    state.latest_volume = safe_float(snap.get("volume"))
+    state.bars.append(
+        {
+            "bar_time_utc": observed_iso,
+            "price": price,
+            "session_elapsed_seconds": round(float(session_elapsed), 3),
+            "source": "live_ticker_snapshot",
+        }
+    )
+    if len(state.bars) > 500:
+        del state.bars[:-500]
+
+    if session_elapsed < 0:
+        return
+
     if state.first_seen_ts is None:
         state.first_seen_ts = now_ts
+        state.first_seen_utc = observed_iso
         state.first_price = price
         state.open_price = price
         state.high = price
         state.low = price
-    state.last_price = price
     state.high = max(state.high or price, price)
     state.low = min(state.low or price, price)
-    state.latest_volume = safe_float(snap.get("volume"))
-    if elapsed <= 5 * 60:
+    if 0 <= session_elapsed < 5 * 60:
         state.first_5m_high = max(state.first_5m_high or price, price)
-    if elapsed <= 15 * 60:
+    if 0 <= session_elapsed < 15 * 60:
         state.first_15m_high = max(state.first_15m_high or price, price)
-    if elapsed <= opening_range_seconds:
+    if 0 <= session_elapsed < opening_range_seconds:
         state.or_high = max(state.or_high or price, price)
         state.or_low = min(state.or_low or price, price)
 
@@ -239,6 +272,55 @@ def compute_live_safe_features(state: SymbolState, snap: dict[str, Any], args: a
         "entry_price": price,
         "spread_bps": spread_bps,
     }
+
+
+def _feature_value_is_zeroish(value: Any) -> bool:
+    numeric = safe_float(value)
+    return numeric is None or abs(numeric) <= 1e-9
+
+
+def features_are_all_zeroish(features: dict[str, Any]) -> bool:
+    return (
+        _feature_value_is_zeroish(features.get("first_5m_high_pct"))
+        and _feature_value_is_zeroish(features.get("first_15m_high_pct"))
+        and _feature_value_is_zeroish(features.get("or_range_pct"))
+        and _feature_value_is_zeroish(features.get("score"))
+    )
+
+
+def log_live_feature_debug(
+    *,
+    runtime_state: dict[str, Any],
+    symbol: str,
+    state: SymbolState,
+    snap: dict[str, Any],
+    features: dict[str, Any],
+    market_open: datetime,
+    session_elapsed: float,
+    reason: str,
+    interval_seconds: float = 60.0,
+) -> None:
+    now_ts = time.time()
+    key = f"live_feature_debug_last_{reason}"
+    if now_ts - float(runtime_state.get(key) or 0.0) < interval_seconds:
+        return
+    runtime_state[key] = now_ts
+    first_bar = state.bars[0] if state.bars else {}
+    last_bar = state.bars[-1] if state.bars else {}
+    print(
+        f"{now_utc()} LIVE_FEATURE_DEBUG reason={reason} symbol={symbol} "
+        f"session_start={market_open.isoformat()} session_elapsed_seconds={session_elapsed:.1f} "
+        f"open_price={state.open_price} first_price={state.first_price} current_price={snap.get('price')} "
+        f"last_price={state.last_price} first_5m_high={state.first_5m_high} "
+        f"first_15m_high={state.first_15m_high} or_high={state.or_high} or_low={state.or_low} "
+        f"first_5m_high_pct={features.get('first_5m_high_pct')} "
+        f"first_15m_high_pct={features.get('first_15m_high_pct')} "
+        f"or_range_pct={features.get('or_range_pct')} score={features.get('score')} "
+        f"spread_bps={features.get('spread_bps')} first_seen_utc={state.first_seen_utc} "
+        f"latest_seen_utc={state.latest_seen_utc} first_candle_ts={first_bar.get('bar_time_utc')} "
+        f"latest_candle_ts={last_bar.get('bar_time_utc')} candle_samples={len(state.bars)}",
+        flush=True,
+    )
 
 
 def record_lifecycle(recorder: LiveDataRecorder, event: str, symbol: str, **kwargs: Any) -> None:
@@ -2289,6 +2371,9 @@ def rebuild_symbol_states_from_1m_candles(
 
         st = states[symbol]
         st.first_seen_ts = time.time()
+        first_ts = _parse_bar_time_utc(rows[0].get("bar_time", ""))
+        st.first_seen_utc = first_ts.isoformat() if first_ts is not None else None
+        st.latest_seen_utc = st.first_seen_utc
         st.first_price = first
         st.open_price = first
         st.high = first
@@ -2297,6 +2382,7 @@ def rebuild_symbol_states_from_1m_candles(
         st.first_15m_high = None
         st.or_high = None
         st.or_low = None
+        st.bars = []
 
         for row in rows:
             ts = _parse_bar_time_utc(row.get("bar_time", ""))
@@ -2317,6 +2403,18 @@ def rebuild_symbol_states_from_1m_candles(
             st.low = min(st.low or low, low)
             st.last_price = close or st.last_price
             st.latest_volume = vol or st.latest_volume
+            st.latest_seen_utc = ts.isoformat()
+            st.bars.append(
+                {
+                    "bar_time_utc": ts.isoformat(),
+                    "open": safe_float(row.get("open")),
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "session_elapsed_seconds": round(minutes * 60.0, 3),
+                    "source": "candles_1m_rebuild",
+                }
+            )
 
             if 0 <= minutes < 5:
                 st.first_5m_high = max(st.first_5m_high or high, high)
@@ -2745,13 +2843,18 @@ def main() -> int:
                     time.sleep(float(args.reconnect_wait_seconds))
                 continue
             loop_now = time.time()
-            elapsed = loop_now - start
+            observed_at = datetime.now(timezone.utc)
+            market_open = market_open_datetime_utc(args, observed_at)
+            session_elapsed = (observed_at - market_open).total_seconds()
             ready_count = 0
             data_count = 0
             best_symbol = None
             best_score = -999999.0
             rejection_counter = Counter()
             ranked = []
+            debug_symbol = contracts[0][0] if contracts else None
+            debug_payload: tuple[str, SymbolState, dict[str, Any], dict[str, Any]] | None = None
+            zeroish_feature_count = 0
             time_entries_blocked = (
                 not is_after_utc(args.new_entries_start_utc)
                 or is_after_utc(args.no_new_entries_after_utc)
@@ -2772,8 +2875,12 @@ def main() -> int:
                 latest_snapshots[symbol] = snap
                 data_count += 1
                 state = states[symbol]
-                update_state(state, snap, elapsed, args.opening_range_seconds)
+                update_state(state, snap, session_elapsed, args.opening_range_seconds, observed_at=observed_at)
                 features = compute_live_safe_features(state, snap, args)
+                if features_are_all_zeroish(features):
+                    zeroish_feature_count += 1
+                if symbol == debug_symbol:
+                    debug_payload = (symbol, state, snap, features)
                 ranked.append((symbol, features["score"], features))
                 if features["score"] > best_score:
                     best_score = features["score"]
@@ -2892,6 +2999,40 @@ def main() -> int:
                             time.sleep(float(args.reconnect_wait_seconds))
 
             ranked = sorted(ranked, key=lambda x: x[1], reverse=True)
+            if debug_payload is not None:
+                symbol, state, snap, features = debug_payload
+                log_live_feature_debug(
+                    runtime_state=runtime_state,
+                    symbol=symbol,
+                    state=state,
+                    snap=snap,
+                    features=features,
+                    market_open=market_open,
+                    session_elapsed=session_elapsed,
+                    reason="top_ranked_symbol",
+                )
+            if data_count > 0 and zeroish_feature_count == data_count:
+                if debug_payload is not None:
+                    symbol, state, snap, features = debug_payload
+                    log_live_feature_debug(
+                        runtime_state=runtime_state,
+                        symbol=symbol,
+                        state=state,
+                        snap=snap,
+                        features=features,
+                        market_open=market_open,
+                        session_elapsed=session_elapsed,
+                        reason="all_features_zero",
+                    )
+                warning_key = "live_features_all_zero_warning_last"
+                if loop_now - float(runtime_state.get(warning_key) or 0.0) >= 60.0:
+                    runtime_state[warning_key] = loop_now
+                    print(
+                        f"{now_utc()} LIVE_FEATURES_ALL_ZERO_WARNING with_data={data_count} "
+                        f"zeroish_features={zeroish_feature_count} session_start={market_open.isoformat()} "
+                        f"session_elapsed_seconds={session_elapsed:.1f} top_symbol={debug_symbol}",
+                        flush=True,
+                    )
             top5_str = " | ".join([f"{s}:{score:.1f}" for s, score, _ in ranked[:5]])
             rejection_summary = ", ".join([f"{k}={v}" for k, v in rejection_counter.most_common(5)])
             portfolio_part = f" portfolio_recorded=1 new_fills={new_fills}" if new_fills is not None else ""
