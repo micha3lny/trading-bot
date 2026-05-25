@@ -24,6 +24,10 @@ class HistoryCollectorPlanningTests(unittest.TestCase):
         with_weekends = build_tasks(["AAA"], date(2026, 1, 2), date(2026, 1, 5), "RTH", include_weekends=True)
         self.assertEqual(len(with_weekends), 4)
 
+    def test_build_tasks_skips_us_market_holidays(self) -> None:
+        tasks = build_tasks(["AAA"], date(2026, 5, 22), date(2026, 5, 26), "RTH")
+        self.assertEqual([task.session_date.isoformat() for task in tasks], ["2026-05-22", "2026-05-26"])
+
     def test_pending_plan_treats_existing_parquet_as_complete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)

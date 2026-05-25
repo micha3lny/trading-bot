@@ -23,7 +23,7 @@ source "venv/bin/activate"
 
 RANKING_DATE="${1:-${RANKING_DATE:-}}"
 if [[ -z "$RANKING_DATE" ]]; then
-  RANKING_DATE="$(python -c 'from datetime import date,timedelta; d=date.today()-timedelta(days=1); print(next((d-timedelta(days=i)).isoformat() for i in range(7) if (d-timedelta(days=i)).weekday() < 5))')"
+  RANKING_DATE="$(python -c 'from datetime import date; from src.live_trading.market_calendar import previous_us_equity_trading_day; print(previous_us_equity_trading_day(date.today()).isoformat())')"
 fi
 
 TOP_N="${TOP_N:-100}"

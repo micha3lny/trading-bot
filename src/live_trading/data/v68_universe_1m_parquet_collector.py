@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
+
+from src.live_trading.market_calendar import is_us_equity_trading_day
+
 try:
     from ib_insync import IB, Stock
 except ImportError:  # pragma: no cover - tests can exercise planning without IBKR deps
@@ -373,8 +376,16 @@ def collect_one(ib: IB, task: CollectTask, output_dir: Path, pause_seconds: floa
 
 
 def build_tasks(symbols: list[str], start: date, end: date, session_type: str, *, include_weekends: bool = False) -> list[CollectTask]:
-    dates = [d for d in date_range(start, end) if include_weekends or d.weekday() < 5]
+    dates = [d for d in date_range(start, end) if is_us_equity_trading_day(d) or (include_weekends and d.weekday() >= 5)]
     return [CollectTask(symbol=s, session_date=d, session_type=session_type.upper()) for d in dates for s in symbols]
+
+
+def market_closed_dates(start: date, end: date, *, include_weekends: bool = False) -> list[date]:
+    return [
+        d
+        for d in date_range(start, end)
+        if d.weekday() < 5 and not is_us_equity_trading_day(d)
+    ]
 
 
 def build_pending_tasks(
@@ -489,6 +500,12 @@ def main() -> int:
         failures: dict[str, Any] = load_json(failures_path, {})
 
         symbols = load_universe(args.alpha_rank_csv, args.limit_symbols)
+        closed_dates = market_closed_dates(start, end, include_weekends=bool(args.include_weekends))
+        for closed_date in closed_dates:
+            print(
+                f"{now_iso()} HISTORY_COLLECTOR_SKIPPED_MARKET_CLOSED date={closed_date.isoformat()} session={args.session_type}",
+                flush=True,
+            )
         tasks = build_tasks(symbols, start, end, args.session_type, include_weekends=bool(args.include_weekends))
         existing_parquet_keys = collect_existing_parquet_keys(output_dir, args.session_type)
         pending, plan = build_pending_tasks(

@@ -10,6 +10,7 @@ from typing import Any
 
 import pandas as pd
 
+from src.live_trading.market_calendar import get_us_equity_session, previous_us_equity_trading_day
 from src.live_trading.ranking.ranking_store import RankingStore
 
 
@@ -475,7 +476,16 @@ def main() -> int:
     parser.add_argument("--no-sqlite", action="store_true")
     args = parser.parse_args()
 
-    ranking_date = parse_date(args.date)
+    requested_date = parse_date(args.date)
+    requested_session = get_us_equity_session(requested_date)
+    ranking_date = requested_date
+    if not requested_session.is_trading_day:
+        ranking_date = previous_us_equity_trading_day(requested_date)
+        print(
+            f"DAILY_TOP100_MARKET_CLOSED_USING_PREVIOUS requested_date={requested_date.isoformat()} "
+            f"effective_date={ranking_date.isoformat()} reason={requested_session.reason}",
+            flush=True,
+        )
     rows, stats = build_daily_top(
         ranking_date=ranking_date,
         universe_path=args.universe,

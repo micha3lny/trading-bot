@@ -18,6 +18,7 @@ from ib_insync import IB, Stock, MarketOrder
 
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.control.control_api import process_control_api_commands, process_history_collector_commands, start_control_api
+from src.live_trading.market_calendar import get_us_equity_session, is_us_equity_trading_day, previous_us_equity_trading_day
 from src.live_trading.v66_ibkr_account_recorder import (
     install_commission_report_handler,
     record_account_snapshot,
@@ -1823,12 +1824,9 @@ def latest_completed_trading_day(now: datetime, market_close_utc: str) -> date:
     close_min = parse_utc_hhmm(market_close_utc)
     now_min = now.hour * 60 + now.minute
     cur = now.date()
-    if cur.weekday() < 5 and now_min >= close_min:
+    if is_us_equity_trading_day(cur) and now_min >= close_min:
         return cur
-    cur -= timedelta(days=1)
-    while cur.weekday() >= 5:
-        cur -= timedelta(days=1)
-    return cur
+    return previous_us_equity_trading_day(cur)
 
 
 def _runtime_set(runtime_state: dict[str, Any], key: str) -> set[str]:
@@ -2696,6 +2694,7 @@ def main() -> int:
         "top100_reload_ranking_date": "",
         "top100_reload_last_error": "",
         "top100_reload_symbols": list(symbols),
+        "market_closed_logged_dates": set(),
     }
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
@@ -2724,7 +2723,15 @@ def main() -> int:
         backfilled_rows = backfill_recent_1m(ib, recorder, contracts, args)
         state_rebuild_count = rebuild_symbol_states_from_1m_candles(recorder, states, args)
         current_session_backfilled_rows = 0
-        if state_rebuild_count == 0 and current_session_candle_count(recorder, args) == 0:
+        today_session = get_us_equity_session(datetime.now(timezone.utc).date())
+        if not today_session.is_trading_day:
+            print(
+                f"{now_utc()} MARKET_CLOSED_HOLIDAY date={today_session.session_date.isoformat()} "
+                f"reason={today_session.reason}",
+                flush=True,
+            )
+            _runtime_set(runtime_state, "market_closed_logged_dates").add(today_session.session_date.isoformat())
+        if today_session.is_trading_day and state_rebuild_count == 0 and current_session_candle_count(recorder, args) == 0:
             current_session_backfilled_rows = backfill_current_session_1m(ib, recorder, contracts, args)
             if current_session_backfilled_rows:
                 state_rebuild_count = rebuild_symbol_states_from_1m_candles(recorder, states, args)
@@ -2846,6 +2853,20 @@ def main() -> int:
             observed_at = datetime.now(timezone.utc)
             market_open = market_open_datetime_utc(args, observed_at)
             session_elapsed = (observed_at - market_open).total_seconds()
+            today_session = get_us_equity_session(observed_at.date())
+            market_closed_today = not today_session.is_trading_day
+            if market_closed_today:
+                runtime_state["entries_blocked_reason"] = "market_closed_holiday"
+                closed_key = today_session.session_date.isoformat()
+                logged_dates = _runtime_set(runtime_state, "market_closed_logged_dates")
+                if closed_key not in logged_dates:
+                    print(
+                        f"{now_utc()} MARKET_CLOSED_HOLIDAY date={closed_key} reason={today_session.reason}",
+                        flush=True,
+                    )
+                    logged_dates.add(closed_key)
+            elif runtime_state.get("entries_blocked_reason") == "market_closed_holiday":
+                runtime_state["entries_blocked_reason"] = ""
             ready_count = 0
             data_count = 0
             best_symbol = None
@@ -2856,6 +2877,8 @@ def main() -> int:
             debug_payload: tuple[str, SymbolState, dict[str, Any], dict[str, Any]] | None = None
             zeroish_feature_count = 0
             time_entries_blocked = (
+                market_closed_today
+                or
                 not is_after_utc(args.new_entries_start_utc)
                 or is_after_utc(args.no_new_entries_after_utc)
                 or is_after_utc(args.eod_flatten_utc)
@@ -3011,7 +3034,7 @@ def main() -> int:
                     session_elapsed=session_elapsed,
                     reason="top_ranked_symbol",
                 )
-            if data_count > 0 and zeroish_feature_count == data_count:
+            if data_count > 0 and zeroish_feature_count == data_count and not market_closed_today:
                 if debug_payload is not None:
                     symbol, state, snap, features = debug_payload
                     log_live_feature_debug(
@@ -3038,7 +3061,8 @@ def main() -> int:
             portfolio_part = f" portfolio_recorded=1 new_fills={new_fills}" if new_fills is not None else ""
             active_managed = sum(1 for p in managed_positions.values() if p.active)
             time_entries_blocked = (
-                not is_after_utc(args.new_entries_start_utc)
+                market_closed_today
+                or not is_after_utc(args.new_entries_start_utc)
                 or is_after_utc(args.no_new_entries_after_utc)
                 or is_after_utc(args.eod_flatten_utc)
             )
