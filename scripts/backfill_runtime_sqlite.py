@@ -50,6 +50,37 @@ def session_dirs(root: Path, start_date: str | None, end_date: str | None) -> li
     return out
 
 
+EventKey = tuple[str, str, str, str, str, str]
+
+
+def runtime_event_key(*, event_time: str, event_type: str, symbol: str, order_id: str, execution_id: str, source: str) -> EventKey:
+    return (event_time, event_type, symbol or "", order_id or "", execution_id or "", source)
+
+
+def load_existing_event_keys(store: SQLiteRuntimeStore, session_date: str) -> set[EventKey]:
+    rows = store.query(
+        """
+        SELECT event_time, event_type, COALESCE(symbol, '') AS symbol,
+               COALESCE(order_id, '') AS order_id, COALESCE(execution_id, '') AS execution_id,
+               source
+        FROM runtime_events
+        WHERE session_date = ?
+        """,
+        [session_date],
+    )
+    return {
+        runtime_event_key(
+            event_time=str(row.get("event_time") or ""),
+            event_type=str(row.get("event_type") or ""),
+            symbol=str(row.get("symbol") or ""),
+            order_id=str(row.get("order_id") or ""),
+            execution_id=str(row.get("execution_id") or ""),
+            source=str(row.get("source") or ""),
+        )
+        for row in rows
+    }
+
+
 def runtime_event_exists(store: SQLiteRuntimeStore, *, event_time: str, event_type: str, symbol: str, order_id: str, execution_id: str, source: str) -> bool:
     rows = store.query(
         """
@@ -63,8 +94,31 @@ def runtime_event_exists(store: SQLiteRuntimeStore, *, event_time: str, event_ty
     return bool(rows)
 
 
-def record_event_once(store: SQLiteRuntimeStore, *, session_date: str, event_time: str, event_type: str, symbol: str = "", order_id: str = "", execution_id: str = "", reason: str = "", source: str, raw_json: Any = None) -> None:
-    if runtime_event_exists(store, event_time=event_time, event_type=event_type, symbol=symbol, order_id=order_id, execution_id=execution_id, source=source):
+def record_event_once(
+    store: SQLiteRuntimeStore,
+    *,
+    session_date: str,
+    event_time: str,
+    event_type: str,
+    symbol: str = "",
+    order_id: str = "",
+    execution_id: str = "",
+    reason: str = "",
+    source: str,
+    raw_json: Any = None,
+    existing_keys: set[EventKey] | None = None,
+) -> None:
+    key = runtime_event_key(
+        event_time=event_time,
+        event_type=event_type,
+        symbol=symbol,
+        order_id=order_id,
+        execution_id=execution_id,
+        source=source,
+    )
+    if existing_keys is not None and key in existing_keys:
+        return
+    if existing_keys is None and runtime_event_exists(store, event_time=event_time, event_type=event_type, symbol=symbol, order_id=order_id, execution_id=execution_id, source=source):
         return
     store.record_runtime_event(
         event_time=event_time,
@@ -79,6 +133,8 @@ def record_event_once(store: SQLiteRuntimeStore, *, session_date: str, event_tim
         action_required=1 if "MANUAL_REQUIRED" in event_type else 0,
         raw_json=raw_json,
     )
+    if existing_keys is not None:
+        existing_keys.add(key)
 
 
 def row_event_time(row: dict[str, Any], session_date: str) -> str:
@@ -94,13 +150,17 @@ def row_event_time(row: dict[str, Any], session_date: str) -> str:
 def import_session(store: SQLiteRuntimeStore, session: Path) -> dict[str, int]:
     session_date = session.name
     counts = {"executions": 0, "events": 0, "positions": 0, "reconciliation": 0}
+    existing_keys = load_existing_event_keys(store, session_date)
+    print(f"BACKFILL_SQLITE_SESSION_START session={session_date}", flush=True)
 
     for row in read_csv_rows(session / "fills.csv"):
         row["session_date"] = session_date
         store.upsert_execution(row)
         counts["executions"] += 1
+    print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=fills executions={counts['executions']}", flush=True)
 
-    for row in read_csv_rows(session / "trade_lifecycle.csv"):
+    trade_lifecycle_rows = read_csv_rows(session / "trade_lifecycle.csv")
+    for row in trade_lifecycle_rows:
         event_time = row_event_time(row, session_date)
         record_event_once(
             store,
@@ -113,11 +173,14 @@ def import_session(store: SQLiteRuntimeStore, session: Path) -> dict[str, int]:
             reason=str(row.get("reason") or ""),
             source="backfill_trade_lifecycle",
             raw_json=row,
+            existing_keys=existing_keys,
         )
         counts["events"] += 1
+    print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=trade_lifecycle rows={len(trade_lifecycle_rows)} events={counts['events']}", flush=True)
 
     lifecycle_jsonl = session / "order_lifecycle.jsonl"
     if lifecycle_jsonl.exists():
+        jsonl_rows = 0
         for line in lifecycle_jsonl.read_text(encoding="utf-8", errors="replace").splitlines():
             if not line.strip():
                 continue
@@ -125,6 +188,7 @@ def import_session(store: SQLiteRuntimeStore, session: Path) -> dict[str, int]:
                 row = json.loads(line)
             except Exception:
                 continue
+            jsonl_rows += 1
             event_time = row_event_time(row, session_date)
             record_event_once(
                 store,
@@ -137,8 +201,10 @@ def import_session(store: SQLiteRuntimeStore, session: Path) -> dict[str, int]:
                 reason=str(row.get("reason") or ""),
                 source="backfill_order_lifecycle",
                 raw_json=row,
+                existing_keys=existing_keys,
             )
             counts["events"] += 1
+        print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=order_lifecycle rows={jsonl_rows} events={counts['events']}", flush=True)
 
     managed = read_json(session / "managed_positions.json") or {}
     managed_positions = managed.get("positions") if isinstance(managed.get("positions"), dict) else managed
@@ -159,6 +225,7 @@ def import_session(store: SQLiteRuntimeStore, session: Path) -> dict[str, int]:
             "raw_json": pos,
         })
         counts["positions"] += 1
+    print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=managed_positions positions={counts['positions']}", flush=True)
 
     eod = read_json(session / "eod_summary.json")
     if isinstance(eod, dict):
@@ -184,10 +251,12 @@ def import_session(store: SQLiteRuntimeStore, session: Path) -> dict[str, int]:
             event_type="EOD_FINAL_STATUS",
             source="backfill_eod_summary",
             raw_json=eod,
+            existing_keys=existing_keys,
         )
         counts["reconciliation"] += 1
 
-    for row in read_csv_rows(session / "run_metadata.csv"):
+    run_metadata_rows = read_csv_rows(session / "run_metadata.csv")
+    for row in run_metadata_rows:
         record_event_once(
             store,
             session_date=session_date,
@@ -195,8 +264,10 @@ def import_session(store: SQLiteRuntimeStore, session: Path) -> dict[str, int]:
             event_type="RUN_METADATA",
             source="backfill_run_metadata",
             raw_json=row.get("metadata_json") or row,
+            existing_keys=existing_keys,
         )
         counts["events"] += 1
+    print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=run_metadata rows={len(run_metadata_rows)} events={counts['events']} reconciliation={counts['reconciliation']}", flush=True)
 
     return counts
 
