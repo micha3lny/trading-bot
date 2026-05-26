@@ -174,6 +174,41 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
             self.assertIn("SESSION 2026-05-22", watch.getvalue())
             self.assertIn("net=4.30", watch.getvalue())
 
+    def test_active_managed_open_position_is_not_counted_as_orphan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "2026-05-22"
+            session.mkdir(parents=True)
+            lifecycle = session / "trade_lifecycle.csv"
+            with lifecycle.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["event", "symbol", "quantity", "price", "entry_price", "peak_price", "recorded_at", "reason"])
+                writer.writeheader()
+                writer.writerow({"event": "BUY_ORDER_SENT", "symbol": "RKLB", "quantity": "10", "price": "10", "peak_price": "10.8", "recorded_at": "2026-05-22T13:30:00+00:00"})
+            (session / "managed_positions.json").write_text(json.dumps({
+                "positions": [{"symbol": "RKLB", "quantity": 10, "entry_price": 10, "active": True}]
+            }))
+            with (session / "portfolio_snapshots.csv").open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["recorded_at", "positions_json"])
+                writer.writeheader()
+                writer.writerow({
+                    "recorded_at": "2026-05-22T14:00:00+00:00",
+                    "positions_json": json.dumps([{"symbol": "RKLB", "position": 10, "marketPrice": 10.5, "unrealizedPNL": 5.0}]),
+                })
+
+            out = io.StringIO()
+            with patch("sys.argv", ["v67_daily_report", "--date", "2026-05-22", "--recorder-dir", str(root)]), contextlib.redirect_stdout(out):
+                v67_daily_report.main()
+
+            text = out.getvalue()
+            self.assertLess(text.index("=== OPEN POSITIONS ==="), text.index("=== EXIT SIMULATION ==="))
+            self.assertIn("RKLB", text)
+            self.assertIn("=== CURRENT POSITION DIAGNOSTICS ===", text)
+            self.assertIn("active_managed_positions: 1", text)
+            self.assertIn("ibkr_positions:           1", text)
+            self.assertIn("matched_positions:        1", text)
+            self.assertIn("true_orphans:             0", text)
+            self.assertIn("whole-share orphans:      0", text)
+
     def test_tp_three_simulation_captures_trades_with_mfe_at_least_three(self) -> None:
         closed = [
             {"symbol": "AAA", "qty": 10, "buy": 10, "sell": 10.1, "gross": 1, "peak_gain_pct": 3.1},

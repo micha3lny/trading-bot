@@ -538,6 +538,47 @@ def pct(value: float) -> str:
     return f"{value:.1f}%"
 
 
+def is_active_rth_report(report_date: str) -> bool:
+    now = datetime.now(timezone.utc)
+    if report_date != now.strftime("%F"):
+        return False
+    start = now.replace(hour=13, minute=30, second=0, microsecond=0)
+    end = now.replace(hour=20, minute=0, second=0, microsecond=0)
+    return start <= now <= end
+
+
+def build_position_diagnostics(latest_portfolio: dict, managed_summary: dict, open_positions: list[dict]) -> dict:
+    ibkr_symbols = {
+        str(sym).upper()
+        for sym, pos in latest_portfolio.items()
+        if f(pos.get("position"), 0.0) != 0
+    }
+    managed_symbols = {
+        str(sym).upper()
+        for sym in managed_summary.get("active_symbols", [])
+        if str(sym).strip()
+    }
+    if not managed_symbols:
+        managed_symbols = {str(row.get("symbol") or "").upper() for row in open_positions if row.get("symbol")}
+    matched = sorted(ibkr_symbols & managed_symbols)
+    true_orphans = sorted(ibkr_symbols - managed_symbols)
+    missing_in_ibkr = sorted(managed_symbols - ibkr_symbols)
+    fractional_orphans = [
+        sym for sym in true_orphans
+        if abs(f(latest_portfolio.get(sym, {}).get("position"), 0.0) - round(f(latest_portfolio.get(sym, {}).get("position"), 0.0))) > 1e-9
+    ]
+    whole_share_orphans = [sym for sym in true_orphans if sym not in set(fractional_orphans)]
+    return {
+        "active_managed_positions": len(managed_symbols),
+        "ibkr_positions": len(ibkr_symbols),
+        "matched_positions": len(matched),
+        "true_orphans": true_orphans,
+        "missing_in_ibkr": missing_in_ibkr,
+        "fractional_orphans": fractional_orphans,
+        "whole_share_orphans": whole_share_orphans,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=datetime.now(timezone.utc).strftime("%F"))
@@ -715,16 +756,8 @@ def main():
     ]
     eod_summary = load_eod_summary(session)
     managed_summary = load_managed_positions_summary(session)
-    final_fractional_positions = [
-        sym for sym, pos in latest_portfolio.items()
-        if f(pos.get("position"), 0.0) != 0 and abs(f(pos.get("position"), 0.0) - round(f(pos.get("position"), 0.0))) > 1e-9
-    ]
-    final_whole_positions = [
-        sym for sym, pos in latest_portfolio.items()
-        if f(pos.get("position"), 0.0) != 0 and sym not in set(final_fractional_positions)
-    ]
-    diagnostic_fractional_orphans = (eod_summary.get("fractional_orphans") or []) if "fractional_orphans" in eod_summary else final_fractional_positions
-    diagnostic_whole_share_orphans = (eod_summary.get("whole_share_orphans") or []) if "whole_share_orphans" in eod_summary else final_whole_positions
+    position_diagnostics = build_position_diagnostics(latest_portfolio, managed_summary, open_positions)
+    active_rth_report = is_active_rth_report(args.date)
     event_counts = lifecycle_event_counts(session)
     avg_win = sum(x["gross"] for x in wins) / len(wins) if wins else 0.0
     avg_loss = sum(x["gross"] for x in losses) / len(losses) if losses else 0.0
@@ -776,16 +809,9 @@ def main():
     print(f"source:               {'sqlite' if sqlite_fills else 'csv/jsonl'}")
     print()
 
-    print("=== EXIT SIMULATION ===")
-    print(f"{'SCENARIO':<18} {'TRADES':>7} {'CAPTURED':>8} {'GROSS':>10} {'NET_EST':>10}")
-    print("-" * 58)
-    for row in exit_simulations:
-        print(f"{row['name']:<18} {row['trades']:>7} {row['captured']:>8} {row['gross']:>10.2f} {row['net']:>10.2f}")
-    print()
-
     print("=== OPEN POSITIONS ===")
-    print(f"{'SYM':<7} {'QTY':>6} {'BUY':>9} {'NOW':>9} {'UPNL':>9} {'NOW%':>7} {'PEAK%':>7} {'FROM_PEAK%':>10} {'IBKR_COMM':>10} {'HOLD':>7} {'BUY_TIME':>8}  EXIT_PLAN / STATUS")
-    print("-" * 136)
+    print(f"{'SYM':<7} {'QTY':>6} {'BUY':>9} {'NOW':>9} {'UPNL':>9} {'NOW%':>7} {'PEAK%':>7} {'FROM_PEAK%':>10} {'IBKR_COMM':>10} {'BUY_TIME':>8}  STATUS")
+    print("-" * 126)
     for x in sorted(open_positions, key=lambda r: r["unrealized"]):
         status = x["status"]
         if x["partial_exit"]:
@@ -795,8 +821,15 @@ def main():
         print(
             f"{x['symbol']:<7} {x['qty']:>6.0f} {x['buy']:>9.4f} {x['current']:>9.4f} {x['unrealized']:>9.2f} "
             f"{x['current_pct']:>6.1f}% {x['peak_gain_pct']:>6.1f}% {x['from_peak_pct']:>9.1f}% "
-            f"{x['ibkr_commission']:>10.2f} {x['hold_min']:>6.1f}m {x['buy_utc']:>8}  {status}"
+            f"{x['ibkr_commission']:>10.2f} {x['buy_utc']:>8}  {status}"
         )
+    print()
+
+    print("=== EXIT SIMULATION ===")
+    print(f"{'SCENARIO':<18} {'TRADES':>7} {'CAPTURED':>8} {'GROSS':>10} {'NET_EST':>10}")
+    print("-" * 58)
+    for row in exit_simulations:
+        print(f"{row['name']:<18} {row['trades']:>7} {row['captured']:>8} {row['gross']:>10.2f} {row['net']:>10.2f}")
     print()
 
     print("=== CLOSED POSITIONS ===")
@@ -811,11 +844,14 @@ def main():
         )
     print()
 
-    print("=== POST-SESSION DIAGNOSTICS ===")
-    print(f"final ibkr positions: {len(latest_portfolio)}")
-    print(f"final managed count:  {managed_summary['active_count']}")
-    print(f"fractional orphans:   {len(diagnostic_fractional_orphans)}")
-    print(f"whole-share orphans:  {len(diagnostic_whole_share_orphans)}")
+    print("=== CURRENT POSITION DIAGNOSTICS ===" if active_rth_report or open_positions else "=== POST-SESSION DIAGNOSTICS ===")
+    print(f"active_managed_positions: {position_diagnostics['active_managed_positions']}")
+    print(f"ibkr_positions:           {position_diagnostics['ibkr_positions']}")
+    print(f"matched_positions:        {position_diagnostics['matched_positions']}")
+    print(f"true_orphans:             {len(position_diagnostics['true_orphans'])}")
+    print(f"missing_in_ibkr:          {len(position_diagnostics['missing_in_ibkr'])}")
+    print(f"fractional orphans:       {len(position_diagnostics['fractional_orphans'])}")
+    print(f"whole-share orphans:      {len(position_diagnostics['whole_share_orphans'])}")
     print(f"pending orders:       {eod_summary.get('pending_orders', '')}")
     clean_value = eod_summary.get("clean")
     print(f"eod clean:            {'' if clean_value is None else int(bool(clean_value))}")
@@ -823,8 +859,10 @@ def main():
     print(f"partial exits:        {event_counts.get('EXIT_ORDER_PARTIAL', 0)}")
     print(f"delayed fill/cancel:  {event_counts.get('DELAYED_FILL_AFTER_CANCEL', 0)}")
     print(f"cancel but position:  {event_counts.get('ORDER_CANCEL_BUT_POSITION_EXISTS', 0)}")
-    if latest_portfolio:
-        print(f"final symbols:        {', '.join(sorted(latest_portfolio))}")
+    if position_diagnostics["true_orphans"]:
+        print(f"orphan symbols:       {', '.join(position_diagnostics['true_orphans'])}")
+    if position_diagnostics["missing_in_ibkr"]:
+        print(f"missing symbols:      {', '.join(position_diagnostics['missing_in_ibkr'])}")
     print()
 
     print("=== Strict/original setup subset ===")
