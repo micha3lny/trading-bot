@@ -172,11 +172,12 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
             with patch("sys.argv", ["v67_daily_report", "--date", "2026-05-22", "--recorder-dir", str(root), "--sqlite-path", str(sqlite_path), "--watch-summary"]), contextlib.redirect_stdout(watch):
                 v67_daily_report.main()
             self.assertIn("SESSION SUMMARY 2026-05-22", watch.getvalue())
-            self.assertIn("net=4.30", watch.getvalue())
+            self.assertIn("net actual pnl:       $4.30", watch.getvalue())
             self.assertIn("CLOSED POSITIONS", watch.getvalue())
             self.assertIn("GROSS", watch.getvalue())
             self.assertIn("IBKR_COMM", watch.getvalue())
-            self.assertIn("NET_ACTUAL_OR_EST", watch.getvalue())
+            self.assertIn("NET_ACTUAL", watch.getvalue())
+            self.assertNotIn("EST_FB", watch.getvalue())
             self.assertIn("fixed TP +3", watch.getvalue())
 
     def test_watch_summary_primary_net_uses_estimated_fallback_when_commission_missing(self) -> None:
@@ -201,11 +202,13 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
                 v67_daily_report.main()
 
             text = watch.getvalue()
-            self.assertIn("gross=5.00", text)
-            self.assertIn("ibkr_comm_confirmed=0.00", text)
-            self.assertIn("est_fallback=1.00", text)
-            self.assertIn("net=4.00", text)
-            self.assertIn("comm_coverage=0/2", text)
+            self.assertIn("gross closed pnl:     $5.00", text)
+            self.assertIn("ibkr commissions:     $0.00", text)
+            self.assertIn("net actual pnl:       $4.00", text)
+            self.assertIn("commission coverage:  0/2", text)
+            self.assertIn("EST_FB", text)
+            self.assertIn("NET_ACTUAL*", text)
+            self.assertIn("* includes estimated fallback for missing commissions", text)
 
     def test_active_managed_open_position_is_not_counted_as_orphan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -323,6 +326,40 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
             self.assertIn("CURRENT POSITION DIAGNOSTICS", text)
             self.assertIn("OPEN", text)
             self.assertIn("DONE", text)
+
+    def test_watch_full_summary_is_multiline_and_sorts_default_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "2026-05-22"
+            session.mkdir(parents=True)
+            with (session / "trade_lifecycle.csv").open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["event", "symbol", "quantity", "price", "entry_price", "peak_price", "peak_gain_pct", "recorded_at", "reason"])
+                writer.writeheader()
+                writer.writerow({"event": "BUY_ORDER_SENT", "symbol": "OPNA", "quantity": "1", "price": "10", "peak_price": "11", "recorded_at": "2026-05-22T13:30:00+00:00"})
+                writer.writerow({"event": "BUY_ORDER_SENT", "symbol": "OPNB", "quantity": "1", "price": "10", "peak_price": "10.2", "recorded_at": "2026-05-22T13:31:00+00:00"})
+                writer.writerow({"event": "BUY_ORDER_SENT", "symbol": "CLSW", "quantity": "1", "price": "20", "recorded_at": "2026-05-22T13:35:00+00:00"})
+                writer.writerow({"event": "SELL_ORDER_SENT", "symbol": "CLSW", "quantity": "1", "price": "23", "entry_price": "20", "peak_price": "24", "peak_gain_pct": "20", "recorded_at": "2026-05-22T13:50:00+00:00", "reason": "trail"})
+                writer.writerow({"event": "BUY_ORDER_SENT", "symbol": "CLSL", "quantity": "1", "price": "30", "recorded_at": "2026-05-22T13:36:00+00:00"})
+                writer.writerow({"event": "SELL_ORDER_SENT", "symbol": "CLSL", "quantity": "1", "price": "28", "entry_price": "30", "peak_price": "30.3", "peak_gain_pct": "1", "recorded_at": "2026-05-22T13:51:00+00:00", "reason": "stop"})
+            with (session / "portfolio_snapshots.csv").open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["recorded_at", "positions_json"])
+                writer.writeheader()
+                writer.writerow({"recorded_at": "2026-05-22T14:00:00+00:00", "positions_json": json.dumps([
+                    {"symbol": "OPNA", "position": 1, "marketPrice": 9.0, "unrealizedPNL": -1.0},
+                    {"symbol": "OPNB", "position": 1, "marketPrice": 11.0, "unrealizedPNL": 1.0},
+                ])})
+
+            out = io.StringIO()
+            with patch("sys.argv", ["v67_daily_report", "--date", "2026-05-22", "--recorder-dir", str(root), "--watch-full"]), contextlib.redirect_stdout(out):
+                v67_daily_report.main()
+
+            lines = out.getvalue().splitlines()
+            self.assertIn("closed trades:        2", lines)
+            self.assertIn("open trades:          2", lines)
+            open_rows = [line for line in lines if line.startswith(("OPNA", "OPNB"))]
+            closed_rows = [line for line in lines if line.startswith(("CLSL", "CLSW"))]
+            self.assertEqual([row[:4].strip() for row in open_rows], ["OPNA", "OPNB"])
+            self.assertEqual([row[:4].strip() for row in closed_rows], ["CLSL", "CLSW"])
 
     def test_tp_three_simulation_captures_trades_with_mfe_at_least_three(self) -> None:
         closed = [

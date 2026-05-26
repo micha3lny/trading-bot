@@ -618,24 +618,24 @@ def choose_fill_snapshot(
     }
 
 
-def format_source_diagnostics(
-    *,
-    fill_snapshot: dict,
-    fill_rows: list[dict],
-    lifecycle_closed_count: int,
-    closed: list[dict],
-    coverage: tuple[int, int],
-    snapshot_loaded_at: str,
-) -> list[str]:
-    confirmed, total = coverage
-    return [
-        f"source={fill_snapshot['source']}",
-        f"executions_count={len(fill_rows)}",
-        f"lifecycle_closed_count={lifecycle_closed_count}",
-        f"reconstructed_closed_count={len(fill_snapshot['reconstructed'])}",
-        f"commission_coverage={confirmed}/{total}",
-        f"snapshot_loaded_at={snapshot_loaded_at}",
-    ]
+def open_sort_key(row: dict, mode: str) -> tuple:
+    symbol = str(row.get("symbol") or "")
+    if mode == "symbol":
+        return (symbol,)
+    if mode == "peak":
+        return (-f(row.get("peak_gain_pct"), 0.0), symbol)
+    return (f(row.get("unrealized"), 0.0), symbol)
+
+
+def closed_report_sort_key(row: dict, mode: str) -> tuple:
+    symbol = str(row.get("symbol") or "")
+    if mode == "time":
+        return closed_sort_key(row)
+    if mode == "symbol":
+        return (symbol, str(row.get("sell_time") or row.get("closed_at") or ""))
+    if mode == "peak":
+        return (-f(row.get("peak_gain_pct"), 0.0), symbol, str(row.get("sell_time") or ""))
+    return (primary_net(row), symbol, str(row.get("sell_time") or ""))
 
 
 def is_active_rth_report(report_date: str) -> bool:
@@ -690,6 +690,8 @@ def main():
     ap.add_argument("--watch-full", action="store_true")
     ap.add_argument("--watch-open-limit", type=int, default=30)
     ap.add_argument("--watch-closed-limit", type=int, default=50)
+    ap.add_argument("--sort-open", choices=["upnl", "symbol", "peak"], default="upnl")
+    ap.add_argument("--sort-closed", choices=["net", "time", "symbol", "peak"], default="net")
     args = ap.parse_args()
 
     snapshot_loaded_at = datetime.now(timezone.utc).isoformat()
@@ -882,34 +884,34 @@ def main():
     best_trade = max(closed, key=primary_net, default=None)
     worst_trade = min(closed, key=primary_net, default=None)
     confirmed_commission_sides, total_commission_sides = commission_coverage(closed)
-    source_diagnostics = format_source_diagnostics(
-        fill_snapshot=fill_snapshot,
-        fill_rows=fill_rows,
-        lifecycle_closed_count=len(lifecycle_closed),
-        closed=closed,
-        coverage=(confirmed_commission_sides, total_commission_sides),
-        snapshot_loaded_at=snapshot_loaded_at,
-    )
+    show_fallback_column = any(f(row.get("estimated_commission_fallback"), 0.0) > 0 for row in closed)
+    net_column_label = "NET_ACTUAL*" if show_fallback_column else "NET_ACTUAL"
 
     if args.watch_summary or args.watch_full:
         print(f"SESSION SUMMARY {args.date}")
-        print(
-            f"closed={len(closed)} open={len(open_positions)} win={(len(wins) / len(closed) * 100 if closed else 0):.1f}% "
-            f"gross={money(gross_total)} ibkr_comm_confirmed={money(ibkr_commission_total)} est_fallback={money(fallback_commission_total)} net={money(net_actual_total)} "
-            f"open_upnl={money(open_upnl)} total={money(net_actual_total + open_upnl)}"
-        )
-        print(
-            f"avg_win={money(avg_win)} avg_loss={money(avg_loss)} expectancy={money(expectancy)} "
-            f"avg_peak={avg_peak:.1f}% avg_giveback={avg_giveback:.1f}% "
-            f"comm_coverage={confirmed_commission_sides}/{total_commission_sides}"
-        )
-        print(" ".join(source_diagnostics))
+        print(f"closed trades:        {len(closed)}")
+        print(f"open trades:          {len(open_positions)}")
+        print(f"win rate:             {(len(wins) / len(closed) * 100 if closed else 0):.1f}%")
+        print(f"gross closed pnl:     ${gross_total:.2f}")
+        print(f"ibkr commissions:     ${ibkr_commission_total:.2f}")
+        print(f"net actual pnl:       ${net_actual_total:.2f}")
+        print(f"open unrealized pnl:  ${open_upnl:.2f}")
+        print(f"total actual pnl:     ${net_actual_total + open_upnl:.2f}")
+        print(f"avg win/loss:         ${avg_win:.2f} / ${avg_loss:.2f}")
+        print(f"expectancy:           ${expectancy:.2f}/trade")
+        print(f"average peak:         {avg_peak:.1f}%")
+        print(f"average giveback:     {avg_giveback:.1f}%")
+        print(f"commission coverage:  {confirmed_commission_sides}/{total_commission_sides}")
+        print(f"source:               {fill_snapshot['source']}")
+        print(f"executions_count:     {len(fill_rows)}")
+        print(f"lifecycle_closed_count: {len(lifecycle_closed)}")
+        print(f"reconstructed_closed_count: {len(fill_snapshot['reconstructed'])}")
         print()
         if open_positions:
             print("OPEN POSITIONS")
             print(f"{'SYM':<6} {'QTY':>5} {'BUY':>8} {'NOW':>8} {'UPNL':>8} {'NOW%':>7} {'PEAK%':>7} {'FROM_PEAK':>10} {'IBKR_COMM':>9} {'BUY_TIME':>8} STATUS")
             open_limit = max(0, args.watch_open_limit)
-            open_rows = sorted(open_positions, key=lambda x: (f(x.get("unrealized"), 0.0), str(x.get("symbol") or "")))
+            open_rows = sorted(open_positions, key=lambda x: open_sort_key(x, args.sort_open))
             open_rows = open_rows if open_limit == 0 else open_rows[:open_limit]
             for row in open_rows:
                 print(
@@ -919,20 +921,30 @@ def main():
                 )
             print()
         closed_limit = max(0, args.watch_closed_limit)
-        closed_rows = sorted(closed, key=closed_sort_key, reverse=True)
+        closed_rows = sorted(closed, key=lambda x: closed_report_sort_key(x, args.sort_closed))
         closed_rows = closed_rows if closed_limit == 0 else closed_rows[:closed_limit]
         if closed_rows:
             print("CLOSED POSITIONS")
-            print(f"{'SYM':<6} {'QTY':>5} {'BUY':>8} {'SELL':>8} {'GROSS':>8} {'IBKR_COMM':>9} {'EST_FB':>8} {'NET_ACTUAL_OR_EST':>17} {'PNL%':>7} {'PEAK%':>7} {'DROP_FROM_PEAK':>14} {'HOLD_MIN':>8} EXIT_REASON")
+            if show_fallback_column:
+                print(f"{'SYM':<6} {'QTY':>5} {'BUY':>8} {'SELL':>8} {'GROSS':>8} {'IBKR_COMM':>9} {'EST_FB':>8} {net_column_label:>11} {'PNL%':>7} {'PEAK%':>7} {'DROP_FROM_PEAK':>14} {'HOLD_MIN':>8} EXIT_REASON")
+            else:
+                print(f"{'SYM':<6} {'QTY':>5} {'BUY':>8} {'SELL':>8} {'GROSS':>8} {'IBKR_COMM':>9} {net_column_label:>11} {'PNL%':>7} {'PEAK%':>7} {'DROP_FROM_PEAK':>14} {'HOLD_MIN':>8} EXIT_REASON")
             for row in closed_rows:
-                print(
+                base = (
                     f"{row['symbol']:<6} {f(row.get('qty'), 0.0):>5.0f} {f(row.get('buy'), 0.0):>8.3f} {f(row.get('sell'), 0.0):>8.3f} "
                     f"{f(row.get('gross'), 0.0):>8.2f} {f(row.get('actual_commission'), 0.0):>9.2f} "
-                    f"{f(row.get('estimated_commission_fallback'), 0.0):>8.2f} {primary_net(row):>17.2f} "
-                    f"{f(row.get('pnl_pct'), 0.0):>6.1f}% {f(row.get('peak_gain_pct'), 0.0):>6.1f}% "
+                )
+                if show_fallback_column:
+                    base += f"{f(row.get('estimated_commission_fallback'), 0.0):>8.2f} {primary_net(row):>11.2f} "
+                else:
+                    base += f"{primary_net(row):>11.2f} "
+                print(
+                    f"{base}{f(row.get('pnl_pct'), 0.0):>6.1f}% {f(row.get('peak_gain_pct'), 0.0):>6.1f}% "
                     f"{f(row.get('drop_from_peak_pct'), 0.0):>13.1f}% {f(row.get('hold_min'), 0.0):>7.0f}m "
                     f"{str(row.get('reason') or '')[:18]}"
                 )
+            if show_fallback_column:
+                print("* includes estimated fallback for missing commissions")
             print()
         print("EXIT SIMULATION")
         for name in ["actual trailing", "fixed TP +2.5%", "fixed TP +3%", "partial 50%@+3%"]:
