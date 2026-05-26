@@ -538,12 +538,27 @@ def pct(value: float) -> str:
     return f"{value:.1f}%"
 
 
+def primary_net(row: dict) -> float:
+    return f(row.get("net_estimated"), f(row.get("net_actual"), f(row.get("net"), f(row.get("gross"), 0.0))))
+
+
 def effective_status(row: dict) -> str:
     if row.get("partial_exit"):
         return "PARTIAL_EXIT"
     if row.get("exit_order_exists"):
         return "EXIT_ORDER"
     return str(row.get("status") or "OPEN")
+
+
+def commission_coverage(closed: list[dict]) -> tuple[int, int]:
+    sides = len(closed) * 2
+    confirmed = 0
+    for row in closed:
+        if str(row.get("buy_commission_source") or "").strip().lower() == "ibkr":
+            confirmed += 1
+        if str(row.get("sell_commission_source") or "").strip().lower() == "ibkr":
+            confirmed += 1
+    return confirmed, sides
 
 
 def is_active_rth_report(report_date: str) -> bool:
@@ -754,7 +769,7 @@ def main():
     gross_total = sum(x["gross"] for x in closed)
     ibkr_commission_total = sum(f(x.get("actual_commission"), 0.0) for x in closed)
     fallback_commission_total = sum(f(x.get("estimated_commission_fallback"), 0.0) for x in closed)
-    net_actual_total = sum(f(x.get("net_actual"), f(x.get("net"), 0.0)) for x in closed)
+    net_actual_total = sum(primary_net(x) for x in closed)
     open_upnl = sum(x["unrealized"] for x in open_positions)
     strict_closed = [x for x in closed if x["strict_setup_ready"]]
     strict_open = [x for x in open_positions if x["strict_setup_ready"]]
@@ -775,25 +790,31 @@ def main():
     avg_peak = avg(closed, lambda x: x.get("peak_gain_pct"))
     avg_giveback = avg(closed, lambda x: x.get("drop_from_peak_pct", x.get("giveback_pct")))
     avg_hold = avg(closed, lambda x: x.get("hold_min"))
-    best_trade = max(closed, key=lambda x: f(x.get("net_actual"), f(x.get("net"), f(x.get("gross"), 0.0))), default=None)
-    worst_trade = min(closed, key=lambda x: f(x.get("net_actual"), f(x.get("net"), f(x.get("gross"), 0.0))), default=None)
+    best_trade = max(closed, key=primary_net, default=None)
+    worst_trade = min(closed, key=primary_net, default=None)
+    confirmed_commission_sides, total_commission_sides = commission_coverage(closed)
 
     if args.watch_summary:
         print(f"SESSION {args.date}")
         print(
             f"closed={len(closed)} open={len(open_positions)} win={(len(wins) / len(closed) * 100 if closed else 0):.1f}% "
-            f"gross={money(gross_total)} comm={money(ibkr_commission_total)} net={money(net_actual_total)} "
+            f"gross={money(gross_total)} ibkr_comm={money(ibkr_commission_total)} fallback={money(fallback_commission_total)} net={money(net_actual_total)} "
             f"open_upnl={money(open_upnl)} total={money(net_actual_total + open_upnl)}"
+        )
+        print(
+            f"avg_win={money(avg_win)} avg_loss={money(avg_loss)} expectancy={money(expectancy)} "
+            f"avg_peak={avg_peak:.1f}% avg_giveback={avg_giveback:.1f}% "
+            f"comm_coverage={confirmed_commission_sides}/{total_commission_sides}"
         )
         print()
         if open_positions:
             print("OPEN POSITIONS")
-            print(f"{'SYM':<6} {'QTY':>5} {'BUY':>8} {'NOW':>8} {'UPNL':>8} {'NOW%':>7} {'PEAK%':>7} {'FROM_PK':>8} {'HOLD':>6} STATUS")
+            print(f"{'SYM':<6} {'QTY':>5} {'BUY':>8} {'NOW':>8} {'UPNL':>8} {'NOW%':>7} {'PEAK%':>7} {'FROM_PEAK':>10} {'IBKR_COMM':>9} {'BUY_TIME':>8} STATUS")
             for row in sorted(open_positions, key=lambda x: x["unrealized"])[: max(0, args.watch_open_limit)]:
                 print(
                     f"{row['symbol']:<6} {row['qty']:>5.0f} {row['buy']:>8.3f} {row['current']:>8.3f} "
                     f"{row['unrealized']:>8.2f} {row['current_pct']:>6.1f}% {row['peak_gain_pct']:>6.1f}% "
-                    f"{row['from_peak_pct']:>7.1f}% {row['hold_min']:>5.0f}m {effective_status(row)}"
+                    f"{row['from_peak_pct']:>9.1f}% {row['ibkr_commission']:>9.2f} {row['buy_utc']:>8} {effective_status(row)}"
                 )
             print()
         closed_limit = max(0, args.watch_closed_limit)
@@ -801,20 +822,22 @@ def main():
         closed_rows = closed_rows if closed_limit == 0 else closed_rows[:closed_limit]
         if closed_rows:
             print("CLOSED POSITIONS")
-            print(f"{'SYM':<6} {'QTY':>5} {'BUY':>8} {'SELL':>8} {'NET_ACT':>8} {'PNL%':>7} {'PEAK%':>7} {'DROP':>7} {'HOLD':>6} EXIT")
+            print(f"{'SYM':<6} {'QTY':>5} {'BUY':>8} {'SELL':>8} {'GROSS':>8} {'IBKR_COMM':>9} {'NET_ACTUAL':>10} {'PNL%':>7} {'PEAK%':>7} {'DROP_FROM_PEAK':>14} {'HOLD_MIN':>8} EXIT_REASON")
             for row in closed_rows:
                 print(
                     f"{row['symbol']:<6} {row['qty']:>5.0f} {row['buy']:>8.3f} {row['sell']:>8.3f} "
-                    f"{f(row.get('net_actual'), f(row.get('net'), f(row.get('gross'), 0.0))):>8.2f} "
+                    f"{row['gross']:>8.2f} {f(row.get('actual_commission'), 0.0):>9.2f} {primary_net(row):>10.2f} "
                     f"{row['pnl_pct']:>6.1f}% {row['peak_gain_pct']:>6.1f}% "
-                    f"{f(row.get('drop_from_peak_pct'), 0.0):>6.1f}% {f(row.get('hold_min'), 0.0):>5.0f}m "
+                    f"{f(row.get('drop_from_peak_pct'), 0.0):>13.1f}% {f(row.get('hold_min'), 0.0):>7.0f}m "
                     f"{str(row.get('reason') or '')[:18]}"
                 )
             print()
-        tp3 = next((row for row in exit_simulations if row["name"] == "fixed TP +3%"), None)
-        if tp3:
-            print(f"EXIT SIM TP +3 gross={tp3['gross']:.2f} net_est={tp3['net']:.2f} captured={tp3['captured']}/{tp3['trades']}")
-            print()
+        print("EXIT SIMULATION")
+        for name in ["actual trailing", "fixed TP +2.5%", "fixed TP +3%", "partial 50%@+3%"]:
+            row = next((x for x in exit_simulations if x["name"] == name), None)
+            if row:
+                print(f"{row['name']:<17} gross={row['gross']:.2f} net_est={row['net']:.2f} captured={row['captured']}/{row['trades']}")
+        print()
         print("CURRENT POSITION DIAGNOSTICS")
         print(
             f"active_managed={position_diagnostics['active_managed_positions']} "
@@ -845,10 +868,11 @@ def main():
     print(f"average peak:         {avg_peak:.2f}%")
     print(f"average giveback:     {avg_giveback:.2f}%")
     print(f"average hold:         {avg_hold:.1f} min")
-    print(f"best trade:           {(best_trade or {}).get('symbol', '')} ${f((best_trade or {}).get('net_actual'), f((best_trade or {}).get('net'), f((best_trade or {}).get('gross'), 0.0))):.2f}")
-    print(f"worst trade:          {(worst_trade or {}).get('symbol', '')} ${f((worst_trade or {}).get('net_actual'), f((worst_trade or {}).get('net'), f((worst_trade or {}).get('gross'), 0.0))):.2f}")
+    print(f"best trade:           {(best_trade or {}).get('symbol', '')} ${primary_net(best_trade or {}):.2f}")
+    print(f"worst trade:          {(worst_trade or {}).get('symbol', '')} ${primary_net(worst_trade or {}):.2f}")
     print(f"commissions/gross:    {(abs(ibkr_commission_total) / abs(gross_total) * 100 if gross_total else 0):.1f}%")
     print(f"estimated fallback:   ${fallback_commission_total:.2f}")
+    print(f"commission coverage:  {confirmed_commission_sides}/{total_commission_sides} sides")
     print(f"fills without comm:   {len(fills_without_commission)}")
     print(f"source:               {'sqlite' if sqlite_fills else 'csv/jsonl'}")
     print()
@@ -874,10 +898,10 @@ def main():
     print("=== CLOSED POSITIONS ===")
     print(f"{'SYM':<7} {'QTY':>6} {'BUY':>9} {'SELL':>9} {'GROSS':>9} {'IBKR_COMM':>10} {'NET_ACTUAL':>10} {'PNL%':>7} {'PEAK%':>7} {'DROP_FROM_PEAK%':>15} {'HOLD_MIN':>9}  EXIT_REASON")
     print("-" * 146)
-    for x in sorted(closed, key=lambda r: f(r.get("net_actual"), f(r.get("gross"), 0.0))):
+    for x in sorted(closed, key=primary_net):
         print(
             f"{x['symbol']:<7} {x['qty']:>6.0f} {x['buy']:>9.4f} {x['sell']:>9.4f} {x['gross']:>9.2f} "
-            f"{f(x.get('actual_commission'), 0.0):>10.2f} {f(x.get('net_actual'), f(x.get('net'), x.get('gross'))):>10.2f} "
+            f"{f(x.get('actual_commission'), 0.0):>10.2f} {primary_net(x):>10.2f} "
             f"{x['pnl_pct']:>6.1f}% {x['peak_gain_pct']:>6.1f}% {f(x.get('drop_from_peak_pct'), 0.0):>14.1f}% "
             f"{f(x.get('hold_min'), 0.0):>9.1f}  {x.get('reason') or ''}"
         )
@@ -912,9 +936,9 @@ def main():
     print(f"Strict open trades:   {len(strict_open)}")
     print(f"Strict win rate:      {(len(strict_wins) / len(strict_closed) * 100 if strict_closed else 0):.1f}%")
     print(f"Strict gross closed:  ${sum(x['gross'] for x in strict_closed):.2f}")
-    print(f"Strict net closed:    ${sum(f(x.get('net_actual'), f(x.get('net'), 0.0)) for x in strict_closed):.2f}")
+    print(f"Strict net closed:    ${sum(primary_net(x) for x in strict_closed):.2f}")
     print(f"Strict open UPNL:     ${sum(x['unrealized'] for x in strict_open):.2f}")
-    print(f"Strict total actual:  ${sum(f(x.get('net_actual'), f(x.get('net'), 0.0)) for x in strict_closed) + sum(x['unrealized'] for x in strict_open):.2f}")
+    print(f"Strict total actual:  ${sum(primary_net(x) for x in strict_closed) + sum(x['unrealized'] for x in strict_open):.2f}")
     print()
 
     print("=== Peak / giveback analytics ===")
@@ -928,7 +952,7 @@ def main():
             f"{avg(rows, lambda x: x['pnl_pct']):>10.2f} "
             f"{avg(rows, lambda x: x['giveback_pct']):>10.2f} "
             f"{sum(x['gross'] for x in rows):>10.2f} "
-            f"{sum(f(x.get('net_actual'), f(x.get('net'), 0.0)) for x in rows):>10.2f}"
+            f"{sum(primary_net(x) for x in rows):>10.2f}"
         )
     print()
 
@@ -938,7 +962,7 @@ def main():
         s = bucket_stats[x["buy_bucket"]]
         s["closed"] += 1
         s["gross"] += x["gross"]
-        s["net"] += f(x.get("net_actual"), f(x.get("net"), 0.0))
+        s["net"] += primary_net(x)
         s["wins"] += 1 if x["gross"] > 0 else 0
         s["strict"] += 1 if x["strict_setup_ready"] else 0
     for x in open_positions:

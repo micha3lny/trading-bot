@@ -174,7 +174,38 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
             self.assertIn("SESSION 2026-05-22", watch.getvalue())
             self.assertIn("net=4.30", watch.getvalue())
             self.assertIn("CLOSED POSITIONS", watch.getvalue())
-            self.assertIn("EXIT SIM TP +3", watch.getvalue())
+            self.assertIn("GROSS", watch.getvalue())
+            self.assertIn("IBKR_COMM", watch.getvalue())
+            self.assertIn("NET_ACTUAL", watch.getvalue())
+            self.assertIn("fixed TP +3", watch.getvalue())
+
+    def test_watch_summary_primary_net_uses_estimated_fallback_when_commission_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "2026-05-22"
+            session.mkdir(parents=True)
+            lifecycle = session / "trade_lifecycle.csv"
+            with lifecycle.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["event", "symbol", "quantity", "price", "entry_price", "peak_price", "peak_gain_pct", "recorded_at", "reason"])
+                writer.writeheader()
+                writer.writerow({"event": "BUY_ORDER_SENT", "symbol": "RKLB", "quantity": "10", "price": "10", "recorded_at": "2026-05-22T13:30:00+00:00"})
+                writer.writerow({"event": "SELL_ORDER_SENT", "symbol": "RKLB", "quantity": "10", "price": "10.5", "entry_price": "10", "peak_price": "10.4", "peak_gain_pct": "4", "recorded_at": "2026-05-22T13:40:00+00:00", "reason": "trail"})
+            with (session / "fills.csv").open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["execution_id", "symbol", "action", "quantity", "fill_price", "commission", "commission_source", "recorded_at"])
+                writer.writeheader()
+                writer.writerow({"execution_id": "B1", "symbol": "RKLB", "action": "BUY", "quantity": "10", "fill_price": "10", "commission": "", "commission_source": "missing", "recorded_at": "2026-05-22T13:30:00+00:00"})
+                writer.writerow({"execution_id": "S1", "symbol": "RKLB", "action": "SELL", "quantity": "10", "fill_price": "10.5", "commission": "", "commission_source": "missing", "recorded_at": "2026-05-22T13:40:00+00:00"})
+
+            watch = io.StringIO()
+            with patch("sys.argv", ["v67_daily_report", "--date", "2026-05-22", "--recorder-dir", str(root), "--disable-sqlite", "--watch-summary"]), contextlib.redirect_stdout(watch):
+                v67_daily_report.main()
+
+            text = watch.getvalue()
+            self.assertIn("gross=5.00", text)
+            self.assertIn("ibkr_comm=0.00", text)
+            self.assertIn("fallback=1.00", text)
+            self.assertIn("net=4.00", text)
+            self.assertIn("comm_coverage=0/2", text)
 
     def test_active_managed_open_position_is_not_counted_as_orphan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -217,7 +248,7 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
             watch_text = watch.getvalue()
             self.assertIn("OPEN POSITIONS", watch_text)
             self.assertIn("SYM", watch_text)
-            self.assertIn("FROM_PK", watch_text)
+            self.assertIn("FROM_PEAK", watch_text)
             self.assertIn("RKLB", watch_text)
             self.assertIn("CURRENT POSITION DIAGNOSTICS", watch_text)
             self.assertIn("true_orphans=0", watch_text)
