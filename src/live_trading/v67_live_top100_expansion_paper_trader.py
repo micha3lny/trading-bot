@@ -353,6 +353,7 @@ def formal_event_type_for_legacy_event(event: str) -> LifecycleEventType | None:
         "EOD_FLATTEN_FAILED": LifecycleEventType.EXIT_ORDER_REJECTED,
         "EXIT_ORDER_CANCEL_REQUESTED": LifecycleEventType.EXIT_ORDER_CANCEL_REQUESTED,
         "EXIT_ORDER_CANCELLED": LifecycleEventType.EXIT_ORDER_CANCELLED,
+        "ORDER_CANCEL_CONFIRMED": LifecycleEventType.EXIT_ORDER_CANCELLED,
         "ORDER_STALE": LifecycleEventType.EXIT_ORDER_STALE,
         "ADOPTED_POSITION": LifecycleEventType.POSITION_ADOPTED,
         "RESTORED_MANAGED_POSITION": LifecycleEventType.POSITION_ADOPTED,
@@ -431,6 +432,10 @@ def record_lifecycle_with_formal(recorder: LiveDataRecorder, event: str, symbol:
     elif event_type == LifecycleEventType.EXIT_ORDER_REJECTED:
         order_state = OrderState.REJECTED
         state_before = PositionState.OPEN
+        state_after = PositionState.RECONCILING
+        position_state = PositionState.RECONCILING
+    elif event_type in {LifecycleEventType.ENTRY_ORDER_CANCELLED, LifecycleEventType.EXIT_ORDER_CANCELLED}:
+        order_state = OrderState.CANCELLED
         state_after = PositionState.RECONCILING
         position_state = PositionState.RECONCILING
     elif event_type in {LifecycleEventType.POSITION_ADOPTED, LifecycleEventType.POSITION_DRIFT_DETECTED}:
@@ -1036,6 +1041,7 @@ def startup_reconcile_runtime_state(
             )
             try:
                 ib.cancelOrder(getattr(trade, "order", trade))
+                print(f"{now_utc()} ORDER_CANCEL_CONFIRMED order_id={order_id} symbol={symbol}", flush=True)
                 record_lifecycle_with_formal(
                     recorder,
                     "EXIT_ORDER_CANCELLED",
@@ -1044,6 +1050,15 @@ def startup_reconcile_runtime_state(
                     quantity=quantity,
                     order_id=order_id,
                     reason=f"{reason_prefix}_cancel_sent",
+                )
+                record_lifecycle_with_formal(
+                    recorder,
+                    "ORDER_CANCEL_CONFIRMED",
+                    symbol or "__UNKNOWN__",
+                    action=action,
+                    quantity=quantity,
+                    order_id=order_id,
+                    reason=f"{reason_prefix}_cancel_confirmed",
                 )
             except Exception as exc:
                 record_lifecycle_with_formal(
@@ -2292,6 +2307,295 @@ def load_traded_symbols_today(recorder: LiveDataRecorder) -> set[str]:
     return symbols
 
 
+def count_entry_orders_today(recorder: LiveDataRecorder) -> int:
+    path = recorder.path("trade_lifecycle.csv")
+    if not path.exists() or path.stat().st_size == 0:
+        return 0
+    count = 0
+    try:
+        with path.open("r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if str(row.get("event", "")).strip() == "BUY_ORDER_SENT":
+                    count += 1
+    except Exception:
+        return 0
+    return count
+
+
+def latest_strategy_equity_metrics(recorder: LiveDataRecorder) -> dict[str, float]:
+    path = recorder.path("strategy_equity.csv")
+    if not path.exists() or path.stat().st_size == 0:
+        return {"unrealized_pnl": 0.0, "gross_exposure": 0.0}
+    try:
+        with path.open("r", newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return {"unrealized_pnl": 0.0, "gross_exposure": 0.0}
+    row = rows[-1] if rows else {}
+    return {
+        "unrealized_pnl": safe_float(row.get("unrealized_pnl")) or 0.0,
+        "gross_exposure": safe_float(row.get("gross_exposure")) or 0.0,
+        "active_positions": safe_float(row.get("active_positions")) or 0.0,
+    }
+
+
+def latest_portfolio_pnl_metrics(recorder: LiveDataRecorder) -> dict[str, float]:
+    path = recorder.path("portfolio_snapshots.csv")
+    if not path.exists() or path.stat().st_size == 0:
+        return {"realized_pnl": 0.0, "unrealized_pnl": 0.0}
+    try:
+        with path.open("r", newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return {"realized_pnl": 0.0, "unrealized_pnl": 0.0}
+    row = rows[-1] if rows else {}
+    return {
+        "realized_pnl": safe_float(row.get("realized_pnl")) or 0.0,
+        "unrealized_pnl": safe_float(row.get("unrealized_pnl")) or 0.0,
+    }
+
+
+def active_position_count(positions: dict[str, ManagedPosition]) -> int:
+    return sum(1 for pos in positions.values() if bool(pos.active))
+
+
+def managed_gross_exposure(positions: dict[str, ManagedPosition], latest_snapshots: dict[str, dict[str, Any]]) -> float:
+    gross = 0.0
+    for symbol, pos in positions.items():
+        if not bool(pos.active):
+            continue
+        price = safe_float((latest_snapshots.get(symbol) or {}).get("price")) or safe_float(getattr(pos, "entry_price", None))
+        qty = safe_float(getattr(pos, "quantity", None)) or 0.0
+        if price and qty:
+            gross += abs(price * qty)
+    return gross
+
+
+def evaluate_risk_guard(
+    recorder: LiveDataRecorder,
+    managed_positions: dict[str, ManagedPosition],
+    latest_snapshots: dict[str, dict[str, Any]],
+    args: argparse.Namespace,
+    *,
+    symbol: str = "",
+    candidate_notional: float = 0.0,
+) -> dict[str, Any]:
+    enabled = bool(getattr(args, "risk_guard_enabled", True))
+    equity = latest_strategy_equity_metrics(recorder)
+    portfolio = latest_portfolio_pnl_metrics(recorder)
+    active_positions = active_position_count(managed_positions)
+    gross_exposure = managed_gross_exposure(managed_positions, latest_snapshots) or safe_float(equity.get("gross_exposure")) or 0.0
+    trades_today = count_entry_orders_today(recorder)
+    realized_pnl = safe_float(portfolio.get("realized_pnl")) or 0.0
+    unrealized_pnl = safe_float(portfolio.get("unrealized_pnl")) or safe_float(equity.get("unrealized_pnl")) or 0.0
+    total_pnl = realized_pnl + unrealized_pnl
+    effective_single_cap = float(getattr(args, "max_single_position_usd", 0.0) or 0.0)
+    if effective_single_cap <= 0:
+        effective_single_cap = float(getattr(args, "position_usd", 0.0) or 0.0)
+
+    metrics: dict[str, Any] = {
+        "enabled": enabled,
+        "blocked": False,
+        "reason": "",
+        "symbol": symbol,
+        "candidate_notional": round(float(candidate_notional or 0.0), 4),
+        "daily_pnl": round(total_pnl, 4),
+        "realized_pnl": round(realized_pnl, 4),
+        "unrealized_pnl": round(unrealized_pnl, 4),
+        "trades_today": trades_today,
+        "active_positions": active_positions,
+        "gross_exposure": round(gross_exposure, 4),
+        "max_daily_loss_usd": float(getattr(args, "max_daily_loss_usd", 0.0) or 0.0),
+        "max_trades_per_day": int(getattr(args, "max_trades_per_day", 0) or 0),
+        "max_open_positions": int(getattr(args, "max_open_positions", 0) or 0),
+        "max_gross_exposure_usd": float(getattr(args, "max_gross_exposure_usd", 0.0) or 0.0),
+        "max_single_position_usd": effective_single_cap,
+    }
+    if not enabled:
+        return metrics
+
+    checks = [
+        ("max_daily_loss", metrics["max_daily_loss_usd"] > 0 and total_pnl <= -metrics["max_daily_loss_usd"]),
+        ("max_trades_per_day", metrics["max_trades_per_day"] > 0 and trades_today >= metrics["max_trades_per_day"]),
+        ("max_open_positions", metrics["max_open_positions"] > 0 and active_positions >= metrics["max_open_positions"]),
+        ("max_gross_exposure", metrics["max_gross_exposure_usd"] > 0 and gross_exposure >= metrics["max_gross_exposure_usd"]),
+        ("max_single_position", effective_single_cap > 0 and candidate_notional > effective_single_cap),
+    ]
+    for reason, blocked in checks:
+        if blocked:
+            metrics["blocked"] = True
+            metrics["reason"] = reason
+            break
+    return metrics
+
+
+def _read_lifecycle_rows(recorder: LiveDataRecorder) -> list[dict[str, Any]]:
+    path = recorder.path("trade_lifecycle.csv")
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    try:
+        with path.open("r", newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+    except Exception:
+        return []
+
+
+def _read_fill_rows(recorder: LiveDataRecorder) -> list[dict[str, Any]]:
+    path = recorder.path("fills.csv")
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    try:
+        with path.open("r", newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+    except Exception:
+        return []
+
+
+def process_fill_lifecycle_diagnostics(
+    ib: IB,
+    recorder: LiveDataRecorder,
+    managed_positions: dict[str, ManagedPosition],
+    runtime_state: dict[str, Any],
+) -> int:
+    fills = _read_fill_rows(recorder)
+    if not fills:
+        return 0
+    lifecycle_rows = _read_lifecycle_rows(recorder)
+    orders: dict[str, dict[str, Any]] = {}
+    cancelled_order_ids: set[str] = set()
+    for row in lifecycle_rows:
+        order_id = str(row.get("order_id") or "").strip()
+        if not order_id:
+            continue
+        event = str(row.get("event") or "").strip()
+        if event in {"BUY_ORDER_SENT", "SELL_ORDER_SENT", "EOD_FLATTEN_SUBMIT", "MANUAL_FLATTEN_SENT"}:
+            orders.setdefault(order_id, row)
+        if event in {"ENTRY_ORDER_CANCELLED", "EXIT_ORDER_CANCELLED", "ORDER_CANCEL_CONFIRMED", "ORDER_STALE"}:
+            cancelled_order_ids.add(order_id)
+
+    processed = runtime_state.setdefault("fill_diagnostic_execution_ids", set())
+    if not isinstance(processed, set):
+        processed = set(processed or [])
+        runtime_state["fill_diagnostic_execution_ids"] = processed
+    portfolio_qty = ibkr_position_quantities(ib)
+    emitted = 0
+    for fill in fills:
+        execution_id = str(fill.get("execution_id") or "").strip()
+        if not execution_id or execution_id in processed:
+            continue
+        processed.add(execution_id)
+        order_id = str(fill.get("order_id") or "").strip()
+        symbol = str(fill.get("symbol") or "").upper().strip()
+        action = str(fill.get("action") or "").upper().strip()
+        fill_qty = abs(safe_float(fill.get("quantity")) or 0.0)
+        order_row = orders.get(order_id) or {}
+        order_qty = abs(safe_float(order_row.get("quantity")) or 0.0)
+        fill_price = safe_float(fill.get("fill_price"))
+
+        if order_id and order_id in cancelled_order_ids:
+            record_lifecycle(
+                recorder,
+                "DELAYED_FILL_AFTER_CANCEL",
+                symbol,
+                action=action,
+                quantity=fill_qty,
+                price=fill_price,
+                order_id=order_id,
+                execution_id=execution_id,
+                reason="fill_arrived_after_cancelled_order",
+                raw_json={"fill": fill, "order": order_row},
+            )
+            record_formal_lifecycle(
+                recorder,
+                LifecycleEventType.EXECUTION_RECORDED,
+                symbol,
+                order_id=order_id,
+                execution_id=execution_id,
+                quantity=fill_qty,
+                price=fill_price,
+                reason="delayed_fill_after_cancel",
+                raw_json={"fill": fill, "order": order_row},
+            )
+            remaining = portfolio_qty.get(symbol, 0.0)
+            if abs(remaining) > 0:
+                record_lifecycle(
+                    recorder,
+                    "ORDER_CANCEL_BUT_POSITION_EXISTS",
+                    symbol,
+                    action=action,
+                    quantity=abs(remaining),
+                    order_id=order_id,
+                    execution_id=execution_id,
+                    reason="ibkr_position_exists_after_cancelled_order_fill",
+                    raw_json={"ibkr_quantity": remaining},
+                )
+                runtime_state["cancel_but_position_exists_count"] = int(runtime_state.get("cancel_but_position_exists_count") or 0) + 1
+            runtime_state["delayed_fill_after_cancel_count"] = int(runtime_state.get("delayed_fill_after_cancel_count") or 0) + 1
+            try:
+                runtime_state["delayed_fill_after_cancel_verification"] = verify_managed_positions_against_ibkr(
+                    ib,
+                    recorder,
+                    managed_positions,
+                    reason="delayed_fill_after_cancel",
+                )
+            except Exception as exc:
+                runtime_state["delayed_fill_after_cancel_verification_error"] = repr(exc)
+            print(f"{now_utc()} DELAYED_FILL_AFTER_CANCEL symbol={symbol} order_id={order_id} execution_id={execution_id} quantity={fill_qty}", flush=True)
+            emitted += 1
+
+        if order_qty > 0 and fill_qty > 0 and fill_qty + 1e-9 < order_qty:
+            partial_event = "ENTRY_ORDER_PARTIAL" if action in {"BOT", "BUY"} else "EXIT_ORDER_PARTIAL"
+            record_lifecycle(
+                recorder,
+                partial_event,
+                symbol,
+                action=action,
+                quantity=fill_qty,
+                price=fill_price,
+                order_id=order_id,
+                execution_id=execution_id,
+                reason="ibkr_partial_fill",
+                raw_json={"order_quantity": order_qty, "fill": fill, "order": order_row},
+            )
+            record_formal_lifecycle(
+                recorder,
+                LifecycleEventType.ENTRY_ORDER_PARTIAL if partial_event == "ENTRY_ORDER_PARTIAL" else LifecycleEventType.EXIT_ORDER_PARTIAL,
+                symbol,
+                order_state=OrderState.PARTIAL,
+                position_state=PositionState.ENTRY_PENDING if partial_event == "ENTRY_ORDER_PARTIAL" else PositionState.EXIT_PENDING,
+                order_id=order_id,
+                execution_id=execution_id,
+                quantity=fill_qty,
+                price=fill_price,
+                reason="ibkr_partial_fill",
+                raw_json={"order_quantity": order_qty},
+            )
+            key = "partial_entry_count" if partial_event == "ENTRY_ORDER_PARTIAL" else "partial_exit_count"
+            runtime_state[key] = int(runtime_state.get(key) or 0) + 1
+            partial_states = runtime_state.setdefault("partial_fill_states", {})
+            if isinstance(partial_states, dict):
+                partial_states[str(order_id or execution_id)] = {
+                    "state": "ENTRY_PARTIAL" if partial_event == "ENTRY_ORDER_PARTIAL" else "EXIT_PARTIAL",
+                    "event": partial_event,
+                    "symbol": symbol,
+                    "order_id": order_id,
+                    "execution_id": execution_id,
+                    "fill_quantity": fill_qty,
+                    "order_quantity": order_qty,
+                }
+            if partial_event == "EXIT_ORDER_PARTIAL" and symbol in managed_positions:
+                remaining = portfolio_qty.get(symbol, 0.0)
+                pos = managed_positions[symbol]
+                if abs(remaining) > 0:
+                    pos.quantity = int(round(abs(remaining)))
+                    pos.active = True
+                else:
+                    pos.active = False
+            print(f"{now_utc()} {partial_event} symbol={symbol} order_id={order_id} execution_id={execution_id} fill_quantity={fill_qty} order_quantity={order_qty}", flush=True)
+            emitted += 1
+    return emitted
+
+
 def _parse_bar_time_utc(value: str):
     raw = str(value or "").strip()
     if not raw:
@@ -2578,6 +2882,12 @@ def main() -> int:
     parser.add_argument("--max-spread-bps", type=float, default=50.0)
     parser.add_argument("--max-one-trade-per-symbol-per-day", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--position-usd", type=float, default=1000.0)
+    parser.add_argument("--risk-guard-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--max-daily-loss-usd", type=float, default=0.0)
+    parser.add_argument("--max-trades-per-day", type=int, default=0)
+    parser.add_argument("--max-open-positions", type=int, default=0)
+    parser.add_argument("--max-gross-exposure-usd", type=float, default=0.0)
+    parser.add_argument("--max-single-position-usd", type=float, default=0.0)
     parser.add_argument("--exit-stop-loss-pct", type=float, default=8.0)
     parser.add_argument("--exit-trailing-activation-pct", type=float, default=3.0)
     parser.add_argument("--exit-trailing-stop-pct", type=float, default=3.0)
@@ -2610,6 +2920,7 @@ def main() -> int:
     parser.add_argument("--overnight-collector-max-attempts", type=int, default=5)
     parser.add_argument("--overnight-collector-retry-failed", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--history-collector-client-id", type=int, default=168)
+    parser.add_argument("--history-collector-max-runtime-minutes", type=float, default=120.0)
     parser.add_argument("--daily-top100-build-utc", default="12:45")
     parser.add_argument("--daily-top100-universe", default=DEFAULT_UNIVERSE)
     parser.add_argument("--daily-top100-history-dir", default=DEFAULT_HISTORY_DIR)
@@ -2664,6 +2975,7 @@ def main() -> int:
         "history_collector_max_tasks": int(args.overnight_collector_max_tasks),
         "history_collector_max_attempts": int(args.overnight_collector_max_attempts),
         "history_collector_client_id": int(args.history_collector_client_id),
+        "history_collector_max_runtime_minutes": float(args.history_collector_max_runtime_minutes),
         "market_open_utc": str(args.market_open_utc),
         "market_close_utc": str(args.market_close_utc),
         "manual_eod_flatten_requested": False,
@@ -2695,6 +3007,16 @@ def main() -> int:
         "top100_reload_last_error": "",
         "top100_reload_symbols": list(symbols),
         "market_closed_logged_dates": set(),
+        "risk_guard_last_status": {
+            "enabled": bool(args.risk_guard_enabled),
+            "blocked": False,
+            "reason": "",
+        },
+        "partial_entry_count": 0,
+        "partial_exit_count": 0,
+        "partial_fill_states": {},
+        "delayed_fill_after_cancel_count": 0,
+        "cancel_but_position_exists_count": 0,
     }
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
@@ -2936,6 +3258,36 @@ def main() -> int:
                     price = features.get("entry_price")
                     qty = max(1, int(args.position_usd // price)) if price and price > 0 else 0
                     record_lifecycle_with_formal(recorder, "SIGNAL_READY", symbol, action="BUY", quantity=qty, price=price, reason=features["reason"], raw_json=features)
+                    candidate_notional = float(qty) * float(price) if qty and price else 0.0
+                    risk_status = evaluate_risk_guard(
+                        recorder,
+                        managed_positions,
+                        latest_snapshots,
+                        args,
+                        symbol=symbol,
+                        candidate_notional=candidate_notional,
+                    )
+                    runtime_state["risk_guard_last_status"] = risk_status
+                    if risk_status.get("blocked"):
+                        reason = str(risk_status.get("reason") or "risk_guard")
+                        print(
+                            f"{now_utc()} RISK_GUARD_BLOCK_ENTRY symbol={symbol} reason={reason} "
+                            f"daily_pnl={risk_status.get('daily_pnl')} trades_today={risk_status.get('trades_today')} "
+                            f"active_positions={risk_status.get('active_positions')} gross_exposure={risk_status.get('gross_exposure')} "
+                            f"candidate_notional={risk_status.get('candidate_notional')}",
+                            flush=True,
+                        )
+                        record_lifecycle_with_formal(
+                            recorder,
+                            "RISK_GUARD_BLOCK_ENTRY",
+                            symbol,
+                            action="BUY",
+                            quantity=qty,
+                            price=price,
+                            reason=reason,
+                            raw_json=risk_status,
+                        )
+                        continue
                     order = MarketOrder("BUY", qty)
                     order.tif = "DAY"
                     order.outsideRth = False
@@ -2982,8 +3334,16 @@ def main() -> int:
                     record_account_snapshot(ib, recorder)
                     new_fills = record_recent_fills(ib, recorder, seen_fills)
                     lifecycle_fills_updated = enrich_lifecycle_with_fills(recorder)
+                    fill_diagnostics_updated = process_fill_lifecycle_diagnostics(
+                        ib,
+                        recorder,
+                        managed_positions,
+                        runtime_state,
+                    )
                     if lifecycle_fills_updated:
                         print(f"{now_utc()} lifecycle_fills_updated={lifecycle_fills_updated}", flush=True)
+                    if fill_diagnostics_updated:
+                        print(f"{now_utc()} fill_lifecycle_diagnostics_updated={fill_diagnostics_updated}", flush=True)
                     verification = verify_managed_positions_against_ibkr(
                         ib,
                         recorder,
@@ -3071,10 +3431,14 @@ def main() -> int:
             reconnect_entries_blocked = bool(runtime_state.get("reconnect_active", False))
             entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked
             eod_active = args.enable_eod_flatten and (is_after_utc(args.eod_flatten_utc) or bool(runtime_state.get("manual_eod_flatten_requested", False)))
+            risk_status = runtime_state.get("risk_guard_last_status") if isinstance(runtime_state.get("risk_guard_last_status"), dict) else {}
+            risk_guard_block = bool((risk_status or {}).get("blocked"))
+            risk_guard_reason = str((risk_status or {}).get("reason") or "")
             print(
                 f"{now_utc()} heartbeat scanned={len(contracts)} with_data={data_count} ready_new={ready_count} "
                 f"adopted={adopted_count} exits_sent={exit_count} managed_open={active_managed} entries_blocked={int(entries_blocked)} "
                 f"manual_block={int(manual_entries_blocked)} restart_block={int(restart_entries_blocked)} reconnect_block={int(reconnect_entries_blocked)} eod_active={int(eod_active)} "
+                f"risk_guard_block={int(risk_guard_block)} risk_guard_reason={risk_guard_reason} "
                 f"best={best_symbol}:{best_score:.2f} top5=[{top5_str}] rejects=[{rejection_summary}]"
                 f"{portfolio_part}",
                 flush=True,

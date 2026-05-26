@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -380,6 +380,22 @@ def simulate_exit_strategies(closed: list[dict], commission_per_trade: float) ->
     return results
 
 
+def lifecycle_event_counts(session: Path) -> Counter:
+    counts: Counter = Counter()
+    lifecycle = session / "trade_lifecycle.csv"
+    if not lifecycle.exists():
+        return counts
+    try:
+        with lifecycle.open(errors="replace") as fh:
+            for row in csv.DictReader(fh):
+                event = str(row.get("event") or "").strip()
+                if event:
+                    counts[event] += 1
+    except Exception:
+        return counts
+    return counts
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=datetime.now(timezone.utc).strftime("%F"))
@@ -498,6 +514,7 @@ def main():
     ]
     diagnostic_fractional_orphans = (eod_summary.get("fractional_orphans") or []) if "fractional_orphans" in eod_summary else final_fractional_positions
     diagnostic_whole_share_orphans = (eod_summary.get("whole_share_orphans") or []) if "whole_share_orphans" in eod_summary else final_whole_positions
+    event_counts = lifecycle_event_counts(session)
 
     print(f"=== v67 Daily Report {args.date} ===")
     print(f"Closed trades:        {len(closed)}")
@@ -543,6 +560,10 @@ def main():
     print(f"Pending orders:       {eod_summary.get('pending_orders', '')}")
     clean_value = eod_summary.get("clean")
     print(f"EOD clean:            {'' if clean_value is None else int(bool(clean_value))}")
+    print(f"Partial entries:      {event_counts.get('ENTRY_ORDER_PARTIAL', 0)}")
+    print(f"Partial exits:        {event_counts.get('EXIT_ORDER_PARTIAL', 0)}")
+    print(f"Delayed fill/cancel:  {event_counts.get('DELAYED_FILL_AFTER_CANCEL', 0)}")
+    print(f"Cancel but position:  {event_counts.get('ORDER_CANCEL_BUT_POSITION_EXISTS', 0)}")
     if latest_portfolio:
         print(f"Final symbols:        {', '.join(sorted(latest_portfolio))}")
     print()

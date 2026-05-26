@@ -311,6 +311,7 @@ def _history_collector_status(runtime_state: dict[str, Any]) -> JsonDict:
         "last_run_key": runtime_state.get("history_collector_last_run_key"),
         "last_cancelled_at": runtime_state.get("history_collector_last_cancelled_at"),
         "last_returncode": runtime_state.get("history_collector_last_returncode"),
+        "max_runtime_minutes": runtime_state.get("history_collector_max_runtime_minutes"),
     }
 
 
@@ -414,16 +415,47 @@ def _build_history_collector_args(cmd: JsonDict) -> list[str]:
 def process_history_collector_commands(*, runtime_state: dict[str, Any], max_commands: int = 1) -> int:
     proc = runtime_state.get("history_collector_process")
     if proc is not None:
-        rc = proc.poll()
-        if rc is None:
-            return 0
         cmd = runtime_state.get("history_collector_running_command") or {}
         started = runtime_state.get("history_collector_started_monotonic")
         duration = int(time.monotonic() - float(started)) if started is not None else None
+        try:
+            rc = proc.poll()
+        except Exception as exc:
+            _log("HISTORY_COLLECTOR_STALE_HANDLE_CLEARED", command_id=cmd.get("id"), pid=getattr(proc, "pid", None), error=repr(exc))
+            runtime_state["history_collector_process"] = None
+            runtime_state["history_collector_running_command"] = None
+            runtime_state["history_collector_started_monotonic"] = None
+            runtime_state["history_collector_last_returncode"] = None
+            return 0
+        if rc is None:
+            max_runtime_minutes = float(runtime_state.get("history_collector_max_runtime_minutes") or 120)
+            if max_runtime_minutes > 0 and duration is not None and duration >= int(max_runtime_minutes * 60):
+                _log(
+                    "HISTORY_COLLECTOR_TIMEOUT",
+                    command_id=cmd.get("id"),
+                    pid=getattr(proc, "pid", None),
+                    max_runtime_minutes=max_runtime_minutes,
+                    duration_seconds=duration,
+                )
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=10)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                runtime_state["history_collector_process"] = None
+                runtime_state["history_collector_running_command"] = None
+                runtime_state["history_collector_started_monotonic"] = None
+                runtime_state["history_collector_last_returncode"] = -9
+                return 0
+            return 0
+        event = "HISTORY_COLLECTOR_DONE" if rc == 0 else "HISTORY_COLLECTOR_FAILED"
         if duration is None:
-            _log("HISTORY_COLLECTOR_DONE", command_id=cmd.get("id"), returncode=rc)
+            _log(event, command_id=cmd.get("id"), returncode=rc)
         else:
-            _log("HISTORY_COLLECTOR_DONE", command_id=cmd.get("id"), returncode=rc, duration_seconds=duration)
+            _log(event, command_id=cmd.get("id"), returncode=rc, duration_seconds=duration)
         if cmd.get("source") == "overnight_scheduler":
             print(
                 f"{_now_utc()} OVERNIGHT_COLLECTOR_DONE command_id={cmd.get('id')} "
@@ -625,6 +657,18 @@ class _ControlHandler(BaseHTTPRequestHandler):
         if parsed.path == "/history_collector/status":
             _json_response(self, 200, _history_collector_status(self.ctx.runtime_state))
             return
+        if parsed.path == "/risk_status":
+            _json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "entries_blocked": bool(self.ctx.runtime_state.get("entries_blocked", False)),
+                    "entries_blocked_reason": self.ctx.runtime_state.get("entries_blocked_reason", ""),
+                    "risk_guard": self.ctx.runtime_state.get("risk_guard_last_status") or {},
+                },
+            )
+            return
         if parsed.path == "/eod/status":
             _json_response(self, 200, {"ok": True, "eod_flatten_requested": bool(self.ctx.runtime_state.get("manual_eod_flatten_requested", False)), "eod_flatten_requested_at": self.ctx.runtime_state.get("manual_eod_flatten_requested_at"), "eod_flatten_force": bool(self.ctx.runtime_state.get("manual_eod_flatten_force", False)), "eod_last_verification": self.ctx.runtime_state.get("eod_last_verification")})
             return
@@ -636,13 +680,31 @@ class _ControlHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/pause_entries":
             self.ctx.runtime_state["entries_blocked"] = True
+            self.ctx.runtime_state["entries_blocked_reason"] = str(body.get("reason") or "manual_control_api")
             _log("PAUSE_ENTRIES")
             _json_response(self, 200, {"ok": True, "entries_blocked": True})
             return
 
         if parsed.path == "/resume_entries":
             self.ctx.runtime_state["entries_blocked"] = False
+            if self.ctx.runtime_state.get("entries_blocked_reason") in {"manual_control_api", "block_entries"}:
+                self.ctx.runtime_state["entries_blocked_reason"] = ""
             _log("RESUME_ENTRIES")
+            _json_response(self, 200, {"ok": True, "entries_blocked": False})
+            return
+
+        if parsed.path == "/block_entries":
+            reason = str(body.get("reason") or "block_entries")
+            self.ctx.runtime_state["entries_blocked"] = True
+            self.ctx.runtime_state["entries_blocked_reason"] = reason
+            _log("BLOCK_ENTRIES", reason=reason)
+            _json_response(self, 200, {"ok": True, "entries_blocked": True, "reason": reason})
+            return
+
+        if parsed.path == "/unblock_entries":
+            self.ctx.runtime_state["entries_blocked"] = False
+            self.ctx.runtime_state["entries_blocked_reason"] = ""
+            _log("UNBLOCK_ENTRIES")
             _json_response(self, 200, {"ok": True, "entries_blocked": False})
             return
 
@@ -693,6 +755,22 @@ class _ControlHandler(BaseHTTPRequestHandler):
             self.ctx.runtime_state["manual_eod_flatten_force"] = force
             _log("EOD_FLATTEN_REQUESTED", force=force, active_positions=len(active))
             _json_response(self, 200, {"ok": True, "status": "queued", "force": force, "active_positions": active, "count": len(active)})
+            return
+
+        if parsed.path == "/emergency_flatten":
+            dry_run = _extract_dry_run(parsed, body)
+            active = [s for s, p in self.ctx.managed_positions.items() if bool(getattr(p, "active", False)) and not bool(getattr(p, "exit_sent", False))]
+            if dry_run:
+                _json_response(self, 200, {"ok": True, "status": "dry_run", "active_positions": active, "count": len(active), "force": True})
+                return
+            self.ctx.runtime_state["entries_blocked"] = True
+            self.ctx.runtime_state["entries_blocked_reason"] = "emergency_flatten"
+            self.ctx.runtime_state["manual_eod_flatten_requested"] = True
+            self.ctx.runtime_state["manual_eod_flatten_requested_at"] = _now_utc()
+            self.ctx.runtime_state["manual_eod_flatten_force"] = True
+            self.ctx.runtime_state["manual_eod_flatten_reason"] = "emergency_flatten"
+            _log("EMERGENCY_FLATTEN_REQUESTED", active_positions=len(active))
+            _json_response(self, 200, {"ok": True, "status": "queued", "force": True, "active_positions": active, "count": len(active)})
             return
 
         _json_response(self, 404, {"ok": False, "error": "not_found"})

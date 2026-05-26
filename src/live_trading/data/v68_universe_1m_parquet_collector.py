@@ -538,7 +538,7 @@ def main() -> int:
             parquet_files = count_existing_parquets_for_tasks(output_dir, tasks)
             duration = int(time.monotonic() - started_monotonic)
             print(
-                f"{now_iso()} HISTORY_COLLECTOR_OUTPUT_SUMMARY expected_symbols={len(tasks)} "
+                f"{now_iso()} HISTORY_COLLECTOR_OUTPUT_SUMMARY start={start} end={end} expected_symbols={len(tasks)} "
                 f"parquet_files={parquet_files} completion_pct={completion_pct(parquet_files, len(tasks))}",
                 flush=True,
             )
@@ -556,7 +556,7 @@ def main() -> int:
             parquet_files = count_existing_parquets_for_tasks(output_dir, tasks)
             duration = int(time.monotonic() - started_monotonic)
             print(
-                f"{now_iso()} HISTORY_COLLECTOR_OUTPUT_SUMMARY expected_symbols={len(tasks)} "
+                f"{now_iso()} HISTORY_COLLECTOR_OUTPUT_SUMMARY start={start} end={end} expected_symbols={len(tasks)} "
                 f"parquet_files={parquet_files} completion_pct={completion_pct(parquet_files, len(tasks))}",
                 flush=True,
             )
@@ -643,7 +643,7 @@ def main() -> int:
         duration = int(time.monotonic() - started_monotonic)
         parquet_files_written = completed + partial
         print(
-            f"{now_iso()} HISTORY_COLLECTOR_OUTPUT_SUMMARY expected_symbols={len(tasks)} "
+            f"{now_iso()} HISTORY_COLLECTOR_OUTPUT_SUMMARY start={start} end={end} expected_symbols={len(tasks)} "
             f"parquet_files={parquet_files} completion_pct={completion_pct(parquet_files, len(tasks))}",
             flush=True,
         )
