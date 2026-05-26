@@ -61,6 +61,41 @@ def write_csv_rows_atomic(path: Path, rows: list[dict[str, Any]], fieldnames: li
     tmp.replace(path)
 
 
+def rate_limited_recorder_log(
+    recorder: LiveDataRecorder,
+    bucket: str,
+    message: str,
+    *,
+    key: str,
+    max_unique: int = 20,
+    window_seconds: float = 60.0,
+) -> None:
+    state = getattr(recorder, "_rate_limited_log_state", None)
+    if not isinstance(state, dict):
+        state = {}
+        setattr(recorder, "_rate_limited_log_state", state)
+    now = time.monotonic()
+    item = state.setdefault(bucket, {"window_start": now, "keys": set(), "suppressed": 0})
+    if now - float(item.get("window_start", now)) >= window_seconds:
+        suppressed = int(item.get("suppressed", 0) or 0)
+        if suppressed:
+            print(f"{now_utc()} {bucket}_SUPPRESSED count={suppressed}", flush=True)
+        item["window_start"] = now
+        item["keys"] = set()
+        item["suppressed"] = 0
+    keys = item.setdefault("keys", set())
+    if not isinstance(keys, set):
+        keys = set()
+        item["keys"] = keys
+    if key in keys:
+        return
+    if len(keys) >= max_unique:
+        item["suppressed"] = int(item.get("suppressed", 0) or 0) + 1
+        return
+    keys.add(key)
+    print(message, flush=True)
+
+
 def account_values_map(ib: IB) -> dict[str, dict[str, str]]:
     out: dict[str, dict[str, str]] = {}
     for v in ib.accountValues():
@@ -237,7 +272,12 @@ def record_commission_report(recorder: LiveDataRecorder, commission_report: Any)
             write_csv_rows_atomic(path, rows, FILL_FIELDS)
             safe_sqlite_call(getattr(recorder, "sqlite_store", None), "upsert_execution", merged)
             if merged.get("commission_source") == "ibkr":
-                print(f"{now_utc()} COMMISSION_REPORT_MATCHED execution_id={execution_id}", flush=True)
+                rate_limited_recorder_log(
+                    recorder,
+                    "COMMISSION_REPORT_MATCHED",
+                    f"{now_utc()} COMMISSION_REPORT_MATCHED execution_id={execution_id}",
+                    key=str(execution_id),
+                )
                 return "matched"
             print(f"{now_utc()} COMMISSION_REPORT_MISSING execution_id={execution_id}", flush=True)
             return "missing"
@@ -283,9 +323,19 @@ def record_recent_fills(ib: IB, recorder: LiveDataRecorder, seen: set[str]) -> i
         safe_sqlite_call(getattr(recorder, "sqlite_store", None), "upsert_execution", row)
         if status != "duplicate":
             if row.get("commission_source") != "ibkr":
-                print(f"{now_utc()} FILLS_WITHOUT_COMMISSION execution_id={row.get('execution_id')} symbol={row.get('symbol')}", flush=True)
+                rate_limited_recorder_log(
+                    recorder,
+                    "FILLS_WITHOUT_COMMISSION",
+                    f"{now_utc()} FILLS_WITHOUT_COMMISSION execution_id={row.get('execution_id')} symbol={row.get('symbol')}",
+                    key=str(row.get("execution_id") or ""),
+                )
             else:
-                print(f"{now_utc()} COMMISSION_REPORT_MATCHED execution_id={row.get('execution_id')}", flush=True)
+                rate_limited_recorder_log(
+                    recorder,
+                    "COMMISSION_REPORT_MATCHED",
+                    f"{now_utc()} COMMISSION_REPORT_MATCHED execution_id={row.get('execution_id')}",
+                    key=str(row.get("execution_id") or ""),
+                )
         if key in seen and status != "inserted":
             continue
         seen.add(key)

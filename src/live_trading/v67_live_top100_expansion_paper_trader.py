@@ -1736,6 +1736,35 @@ def run_dry_run_reconciliation_report(
         )
         runtime_state["reconciliation_last_report"] = report.to_dict()
         runtime_state["reconciliation_last_reason"] = reason
+        signature = json.dumps(
+            {
+                "missing": report.missing_in_ibkr,
+                "orphan": report.orphan_in_ibkr,
+                "drift": report.quantity_drift,
+                "pending": report.pending_order_ids,
+            },
+            sort_keys=True,
+            default=str,
+        )
+        last_signature = runtime_state.get("reconciliation_last_logged_signature")
+        if signature == last_signature:
+            suppressed = int(runtime_state.get("reconciliation_repeat_suppressed", 0) or 0) + 1
+            runtime_state["reconciliation_repeat_suppressed"] = suppressed
+            last_summary = float(runtime_state.get("reconciliation_last_suppressed_summary_at", 0.0) or 0.0)
+            now_mono = time.monotonic()
+            if now_mono - last_summary >= 60.0:
+                print(
+                    f"{now_utc()} RECONCILIATION_REPEAT_SUPPRESSED count={suppressed} clean={int(report.clean)} "
+                    f"missing={len(report.missing_in_ibkr)} orphan={len(report.orphan_in_ibkr)} "
+                    f"drift={len(report.quantity_drift)} pending_orders={len(report.pending_order_ids)}",
+                    flush=True,
+                )
+                runtime_state["reconciliation_repeat_suppressed"] = 0
+                runtime_state["reconciliation_last_suppressed_summary_at"] = now_mono
+            return
+        runtime_state["reconciliation_last_logged_signature"] = signature
+        runtime_state["reconciliation_repeat_suppressed"] = 0
+        runtime_state["reconciliation_last_suppressed_summary_at"] = time.monotonic()
         log_reconciliation_report(report, prefix=now_utc())
     except Exception as exc:
         print(f"{now_utc()} RECONCILIATION_ERROR reason={reason} error={exc!r}", flush=True)
@@ -1944,6 +1973,42 @@ def _runtime_set(runtime_state: dict[str, Any], key: str) -> set[str]:
     out: set[str] = set()
     runtime_state[key] = out
     return out
+
+
+def runtime_rate_limited_log(
+    runtime_state: dict[str, Any],
+    bucket: str,
+    message: str,
+    *,
+    key: str,
+    max_unique: int = 20,
+    window_seconds: float = 60.0,
+) -> bool:
+    state = runtime_state.setdefault("rate_limited_log_state", {})
+    if not isinstance(state, dict):
+        state = {}
+        runtime_state["rate_limited_log_state"] = state
+    now = time.monotonic()
+    item = state.setdefault(bucket, {"window_start": now, "keys": set(), "suppressed": 0})
+    if now - float(item.get("window_start", now)) >= window_seconds:
+        suppressed = int(item.get("suppressed", 0) or 0)
+        if suppressed:
+            print(f"{now_utc()} {bucket}_SUPPRESSED count={suppressed}", flush=True)
+        item["window_start"] = now
+        item["keys"] = set()
+        item["suppressed"] = 0
+    keys = item.setdefault("keys", set())
+    if not isinstance(keys, set):
+        keys = set()
+        item["keys"] = keys
+    if key in keys:
+        return False
+    if len(keys) >= max_unique:
+        item["suppressed"] = int(item.get("suppressed", 0) or 0) + 1
+        return False
+    keys.add(key)
+    print(message, flush=True)
+    return True
 
 
 def overnight_backlog_start_date(end_date: str, args: argparse.Namespace) -> str:
@@ -3363,12 +3428,16 @@ def main() -> int:
                     runtime_state["risk_guard_last_status"] = risk_status
                     if risk_status.get("blocked"):
                         reason = str(risk_status.get("reason") or "risk_guard")
-                        print(
+                        runtime_rate_limited_log(
+                            runtime_state,
+                            "RISK_GUARD_BLOCK_ENTRY",
                             f"{now_utc()} RISK_GUARD_BLOCK_ENTRY symbol={symbol} reason={reason} "
                             f"daily_pnl={risk_status.get('daily_pnl')} trades_today={risk_status.get('trades_today')} "
                             f"active_positions={risk_status.get('active_positions')} gross_exposure={risk_status.get('gross_exposure')} "
                             f"candidate_notional={risk_status.get('candidate_notional')}",
-                            flush=True,
+                            key=f"{reason}:{symbol}",
+                            max_unique=10,
+                            window_seconds=60.0,
                         )
                         record_lifecycle_with_formal(
                             recorder,
