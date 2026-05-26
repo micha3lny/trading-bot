@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from src.dashboard.runtime_queries import DateWindow, list_sessions, list_strategies, load_dashboard_snapshot
+from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
+
+
+class RuntimeDashboardQueriesTests(unittest.TestCase):
+    def test_snapshot_reconstructs_closed_open_summary_and_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_execution({
+                "execution_id": "B1",
+                "session_date": "2026-05-26",
+                "strategy_name": "v67",
+                "symbol": "AAA",
+                "side": "BOT",
+                "quantity": 10,
+                "price": 10,
+                "commission": 0.25,
+                "commission_source": "ibkr",
+                "recorded_at": "2026-05-26T13:30:00+00:00",
+            })
+            store.upsert_execution({
+                "execution_id": "S1",
+                "session_date": "2026-05-26",
+                "strategy_name": "v67",
+                "symbol": "AAA",
+                "side": "SLD",
+                "quantity": 10,
+                "price": 10.5,
+                "commission": 0.25,
+                "commission_source": "ibkr",
+                "recorded_at": "2026-05-26T13:45:00+00:00",
+            })
+            store.upsert_position({
+                "session_date": "2026-05-26",
+                "strategy_name": "v67",
+                "symbol": "BBB",
+                "quantity": 5,
+                "avg_price": 20,
+                "active": 1,
+                "status": "OPEN",
+                "updated_at": "2026-05-26T14:00:00+00:00",
+                "raw_json": {"market_price": 21, "peak_price": 22, "entry_time": "2026-05-26T13:35:00+00:00"},
+            })
+            store.record_runtime_event(
+                session_date="2026-05-26",
+                strategy_name="v67",
+                event_type="DELAYED_FILL_AFTER_CANCEL",
+                symbol="AAA",
+            )
+            store.record_risk_event(
+                session_date="2026-05-26",
+                strategy_name="v67",
+                event_type="RISK_GUARD_BLOCK_ENTRY",
+                symbol="CCC",
+                blocked=1,
+                reason="max_daily_loss",
+            )
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-26", "2026-05-26"), "v67")
+
+            self.assertEqual(snapshot["summary"]["closed_trades"], 1)
+            self.assertEqual(snapshot["summary"]["open_trades"], 1)
+            self.assertAlmostEqual(snapshot["summary"]["gross_pnl"], 5.0)
+            self.assertAlmostEqual(snapshot["summary"]["net_actual_pnl"], 4.5)
+            self.assertEqual(snapshot["closed_positions"].iloc[0]["symbol"], "AAA")
+            self.assertEqual(snapshot["open_positions"].iloc[0]["symbol"], "BBB")
+            self.assertEqual(snapshot["diagnostics"]["delayed_fills"], 1)
+            self.assertEqual(snapshot["diagnostics"]["risk_guard_blocks"], 1)
+
+    def test_sessions_and_strategy_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_execution({
+                "execution_id": "B1",
+                "session_date": "2026-05-25",
+                "strategy_name": "alpha",
+                "symbol": "AAA",
+                "side": "BOT",
+                "quantity": 1,
+                "price": 10,
+            })
+            store.upsert_execution({
+                "execution_id": "B2",
+                "session_date": "2026-05-26",
+                "strategy_name": "beta",
+                "symbol": "BBB",
+                "side": "BOT",
+                "quantity": 1,
+                "price": 20,
+            })
+            store.close()
+
+            self.assertEqual(list_sessions(db), ["2026-05-26", "2026-05-25"])
+            self.assertEqual(list_strategies(db, DateWindow("2026-05-26", "2026-05-26")), ["beta"])
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-25", "2026-05-26"), "alpha")
+            self.assertEqual(set(snapshot["executions"]["strategy"].unique()), {"alpha"})
+
+
+if __name__ == "__main__":
+    unittest.main()
