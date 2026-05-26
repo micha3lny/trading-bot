@@ -7,7 +7,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -25,6 +25,13 @@ def read_csv_rows(path: Path) -> list[dict[str, Any]]:
         return []
     with path.open(newline="", encoding="utf-8", errors="replace") as fh:
         return list(csv.DictReader(fh))
+
+
+def iter_csv_rows(path: Path) -> Iterator[dict[str, Any]]:
+    if not path.exists() or path.stat().st_size <= 0:
+        return
+    with path.open(newline="", encoding="utf-8", errors="replace") as fh:
+        yield from csv.DictReader(fh)
 
 
 def read_json(path: Path) -> Any:
@@ -120,9 +127,38 @@ def record_event_once(
         return
     if existing_keys is None and runtime_event_exists(store, event_time=event_time, event_type=event_type, symbol=symbol, order_id=order_id, execution_id=execution_id, source=source):
         return
+    severity = "WARN" if any(x in event_type for x in ("FAILED", "ERROR", "DRIFT", "ORPHAN")) else "INFO"
+    action_required = 1 if "MANUAL_REQUIRED" in event_type else 0
+    if existing_keys is not None:
+        store.conn.execute(
+            """
+            INSERT INTO runtime_events (
+                event_time, severity, event_type, session_date, symbol, order_id,
+                execution_id, source, reason, action_required, first_seen_at,
+                last_seen_at, repeat_count, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            [
+                event_time,
+                severity,
+                event_type,
+                session_date,
+                symbol or None,
+                order_id or None,
+                execution_id or None,
+                source,
+                reason or None,
+                action_required,
+                event_time,
+                event_time,
+                safe_json(raw_json),
+            ],
+        )
+        existing_keys.add(key)
+        return
     store.record_runtime_event(
         event_time=event_time,
-        severity="WARN" if any(x in event_type for x in ("FAILED", "ERROR", "DRIFT", "ORPHAN")) else "INFO",
+        severity=severity,
         event_type=event_type,
         session_date=session_date,
         symbol=symbol,
@@ -130,11 +166,9 @@ def record_event_once(
         execution_id=execution_id,
         source=source,
         reason=reason,
-        action_required=1 if "MANUAL_REQUIRED" in event_type else 0,
+        action_required=action_required,
         raw_json=raw_json,
     )
-    if existing_keys is not None:
-        existing_keys.add(key)
 
 
 def row_event_time(row: dict[str, Any], session_date: str) -> str:
@@ -147,20 +181,23 @@ def row_event_time(row: dict[str, Any], session_date: str) -> str:
     )
 
 
-def import_session(store: SQLiteRuntimeStore, session: Path) -> dict[str, int]:
+def import_session(store: SQLiteRuntimeStore, session: Path, *, progress_interval: int = 500) -> dict[str, int]:
     session_date = session.name
     counts = {"executions": 0, "events": 0, "positions": 0, "reconciliation": 0}
     existing_keys = load_existing_event_keys(store, session_date)
     print(f"BACKFILL_SQLITE_SESSION_START session={session_date}", flush=True)
 
-    for row in read_csv_rows(session / "fills.csv"):
+    for row in iter_csv_rows(session / "fills.csv"):
         row["session_date"] = session_date
         store.upsert_execution(row)
         counts["executions"] += 1
+        if progress_interval > 0 and counts["executions"] % progress_interval == 0:
+            print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=fills executions={counts['executions']}", flush=True)
     print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=fills executions={counts['executions']}", flush=True)
 
-    trade_lifecycle_rows = read_csv_rows(session / "trade_lifecycle.csv")
-    for row in trade_lifecycle_rows:
+    trade_lifecycle_rows = 0
+    for row in iter_csv_rows(session / "trade_lifecycle.csv"):
+        trade_lifecycle_rows += 1
         event_time = row_event_time(row, session_date)
         record_event_once(
             store,
@@ -176,34 +213,43 @@ def import_session(store: SQLiteRuntimeStore, session: Path) -> dict[str, int]:
             existing_keys=existing_keys,
         )
         counts["events"] += 1
-    print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=trade_lifecycle rows={len(trade_lifecycle_rows)} events={counts['events']}", flush=True)
+        if progress_interval > 0 and trade_lifecycle_rows % progress_interval == 0:
+            store.conn.commit()
+            print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=trade_lifecycle rows={trade_lifecycle_rows} events={counts['events']}", flush=True)
+    store.conn.commit()
+    print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=trade_lifecycle rows={trade_lifecycle_rows} events={counts['events']}", flush=True)
 
     lifecycle_jsonl = session / "order_lifecycle.jsonl"
     if lifecycle_jsonl.exists():
         jsonl_rows = 0
-        for line in lifecycle_jsonl.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except Exception:
-                continue
-            jsonl_rows += 1
-            event_time = row_event_time(row, session_date)
-            record_event_once(
-                store,
-                session_date=session_date,
-                event_time=event_time,
-                event_type=row.get("event_type") or row.get("event") or "ORDER_LIFECYCLE_EVENT",
-                symbol=str(row.get("symbol") or "").upper(),
-                order_id=str(row.get("ib_order_id") or row.get("order_id") or ""),
-                execution_id=str(row.get("execution_id") or ""),
-                reason=str(row.get("reason") or ""),
-                source="backfill_order_lifecycle",
-                raw_json=row,
-                existing_keys=existing_keys,
-            )
-            counts["events"] += 1
+        with lifecycle_jsonl.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                jsonl_rows += 1
+                event_time = row_event_time(row, session_date)
+                record_event_once(
+                    store,
+                    session_date=session_date,
+                    event_time=event_time,
+                    event_type=row.get("event_type") or row.get("event") or "ORDER_LIFECYCLE_EVENT",
+                    symbol=str(row.get("symbol") or "").upper(),
+                    order_id=str(row.get("ib_order_id") or row.get("order_id") or ""),
+                    execution_id=str(row.get("execution_id") or ""),
+                    reason=str(row.get("reason") or ""),
+                    source="backfill_order_lifecycle",
+                    raw_json=row,
+                    existing_keys=existing_keys,
+                )
+                counts["events"] += 1
+                if progress_interval > 0 and jsonl_rows % progress_interval == 0:
+                    store.conn.commit()
+                    print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=order_lifecycle rows={jsonl_rows} events={counts['events']}", flush=True)
+        store.conn.commit()
         print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=order_lifecycle rows={jsonl_rows} events={counts['events']}", flush=True)
 
     managed = read_json(session / "managed_positions.json") or {}
@@ -255,8 +301,9 @@ def import_session(store: SQLiteRuntimeStore, session: Path) -> dict[str, int]:
         )
         counts["reconciliation"] += 1
 
-    run_metadata_rows = read_csv_rows(session / "run_metadata.csv")
-    for row in run_metadata_rows:
+    run_metadata_rows = 0
+    for row in iter_csv_rows(session / "run_metadata.csv"):
+        run_metadata_rows += 1
         record_event_once(
             store,
             session_date=session_date,
@@ -267,7 +314,11 @@ def import_session(store: SQLiteRuntimeStore, session: Path) -> dict[str, int]:
             existing_keys=existing_keys,
         )
         counts["events"] += 1
-    print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=run_metadata rows={len(run_metadata_rows)} events={counts['events']} reconciliation={counts['reconciliation']}", flush=True)
+        if progress_interval > 0 and run_metadata_rows % progress_interval == 0:
+            store.conn.commit()
+            print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=run_metadata rows={run_metadata_rows} events={counts['events']} reconciliation={counts['reconciliation']}", flush=True)
+    store.conn.commit()
+    print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=run_metadata rows={run_metadata_rows} events={counts['events']} reconciliation={counts['reconciliation']}", flush=True)
 
     return counts
 
@@ -278,13 +329,14 @@ def main() -> int:
     ap.add_argument("--sqlite-path", default=None)
     ap.add_argument("--start-date", default=None)
     ap.add_argument("--end-date", default=None)
+    ap.add_argument("--progress-interval", type=int, default=500)
     args = ap.parse_args()
 
     store = SQLiteRuntimeStore(resolve_sqlite_path(args.sqlite_path))
     totals = {"sessions": 0, "executions": 0, "events": 0, "positions": 0, "reconciliation": 0}
     try:
         for session in session_dirs(Path(args.recorder_root), args.start_date, args.end_date):
-            counts = import_session(store, session)
+            counts = import_session(store, session, progress_interval=max(0, int(args.progress_interval)))
             totals["sessions"] += 1
             for key, value in counts.items():
                 totals[key] += value
