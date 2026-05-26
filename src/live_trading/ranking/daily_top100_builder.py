@@ -12,6 +12,7 @@ import pandas as pd
 
 from src.live_trading.market_calendar import get_us_equity_session, previous_us_equity_trading_day
 from src.live_trading.ranking.ranking_store import RankingStore
+from src.live_trading.storage.sqlite_store import open_sqlite_store, safe_sqlite_call
 
 
 DEFAULT_UNIVERSE = "data/universe/v68_final_daytrading_universe.csv"
@@ -470,6 +471,8 @@ def main() -> int:
     parser.add_argument("--min-dollar-volume", type=float, default=500_000.0)
     parser.add_argument("--prior-sessions", type=int, default=5)
     parser.add_argument("--sqlite-path", default=DEFAULT_SQLITE_PATH)
+    parser.add_argument("--runtime-sqlite-path", default=None)
+    parser.add_argument("--disable-runtime-sqlite", action="store_true")
     parser.add_argument("--diagnostics-output", default=None)
     parser.add_argument("--max-missing-log", type=int, default=DEFAULT_MAX_MISSING_LOG)
     parser.add_argument("--max-reject-log", type=int, default=DEFAULT_MAX_REJECT_LOG)
@@ -514,6 +517,38 @@ def main() -> int:
     stored = 0
     if not args.no_sqlite:
         stored = RankingStore(args.sqlite_path).replace_daily_rankings(ranking_date.isoformat(), rows)
+    if not args.disable_runtime_sqlite:
+        runtime_store = open_sqlite_store(args.runtime_sqlite_path)
+        if runtime_store is not None:
+            try:
+                for row in rows:
+                    safe_sqlite_call(
+                        runtime_store,
+                        "upsert_symbol_daily_feature",
+                        {
+                            "date": ranking_date.isoformat(),
+                            "symbol": row.get("symbol"),
+                            "feature_version": "daily_top100_v1",
+                            "close": row.get("last_close"),
+                            "volume": row.get("volume"),
+                            "dollar_volume": row.get("dollar_volume"),
+                            "intraday_high_pct": row.get("intraday_high_pct"),
+                            "range_pct": row.get("range_pct"),
+                            "close_open_pct": row.get("close_open_pct"),
+                            "gap_pct": row.get("gap_pct"),
+                            "multi_day_return_pct": row.get("multi_day_return_pct"),
+                            "median_1m_range_bps": row.get("median_1m_range_bps"),
+                            "avg_abs_1m_return_bps": row.get("avg_abs_1m_return_bps"),
+                            "momentum_score": row.get("momentum_score"),
+                            "liquidity_score": row.get("liquidity_score"),
+                            "final_score": row.get("final_score") or row.get("score"),
+                            "rank": row.get("rank"),
+                            "ranking_version": "daily_top100_builder",
+                            "components_json": row.get("components_json"),
+                        },
+                    )
+            finally:
+                runtime_store.close()
     print(
         f"DAILY_TOP100_DONE date={ranking_date.isoformat()} output={args.output} rows={len(rows)} "
         f"valid={stats['valid']} missing={stats['missing']} rejected={stats['rejected']} "

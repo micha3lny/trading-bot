@@ -14,6 +14,7 @@ from typing import Any, Iterable
 import pandas as pd
 
 from src.live_trading.market_calendar import is_us_equity_trading_day
+from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore, open_sqlite_store, safe_float, safe_sqlite_call, utc_now_iso
 
 try:
     from ib_insync import IB, Stock
@@ -375,6 +376,51 @@ def collect_one(ib: IB, task: CollectTask, output_dir: Path, pause_seconds: floa
     return "complete", rows, None
 
 
+def upsert_collected_session_metadata(
+    store: SQLiteRuntimeStore | None,
+    *,
+    output_dir: Path,
+    task: CollectTask,
+    state: str,
+    rows: int,
+    error: str | None = None,
+) -> None:
+    if store is None:
+        return
+    path = parquet_path(output_dir, task.symbol, task.session_date, task.session_type)
+    summary: dict[str, Any] = {}
+    if path.exists() and rows > 0:
+        try:
+            df = pd.read_parquet(path)
+            if not df.empty:
+                summary = {
+                    "open": safe_float(df.iloc[0].get("open")),
+                    "high": safe_float(df["high"].max()),
+                    "low": safe_float(df["low"].min()),
+                    "close": safe_float(df.iloc[-1].get("close")),
+                    "volume": safe_float(df["volume"].sum()) if "volume" in df.columns else None,
+                }
+                if summary.get("volume") is not None and summary.get("close") is not None:
+                    summary["dollar_volume"] = float(summary["volume"]) * float(summary["close"])
+        except Exception:
+            summary = {}
+    safe_sqlite_call(
+        store,
+        "upsert_market_data_session",
+        {
+            "date": task.session_date.isoformat(),
+            "session_type": task.session_type.upper(),
+            "symbol": task.symbol.upper(),
+            "parquet_path": str(path) if path.exists() else "",
+            "rows": rows,
+            "collection_status": state,
+            "collected_at": utc_now_iso(),
+            "raw_json": {"error": error},
+            **summary,
+        },
+    )
+
+
 def build_tasks(symbols: list[str], start: date, end: date, session_type: str, *, include_weekends: bool = False) -> list[CollectTask]:
     dates = [d for d in date_range(start, end) if is_us_equity_trading_day(d) or (include_weekends and d.weekday() >= 5)]
     return [CollectTask(symbol=s, session_date=d, session_type=session_type.upper()) for d in dates for s in symbols]
@@ -457,8 +503,12 @@ def main() -> int:
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--sync-status-from-parquet", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lock-path", default=DEFAULT_LOCK_PATH)
+    parser.add_argument("--sqlite-path", default=None)
+    parser.add_argument("--disable-sqlite", action="store_true")
     args = parser.parse_args()
     started_monotonic = time.monotonic()
+    sqlite_store = None if args.disable_sqlite else open_sqlite_store(args.sqlite_path)
+    collector_run_id = f"collector:{now_iso()}:{args.start_date}:{args.end_date or args.date}:{args.session_type}"
 
     current = now_utc()
     if not args.allow_outside_window:
@@ -473,6 +523,8 @@ def main() -> int:
                 f"premarket={args.premarket_start_utc}-{args.premarket_end_utc}",
                 flush=True,
             )
+            if sqlite_store is not None:
+                sqlite_store.close()
             return 0
 
     if args.date:
@@ -493,6 +545,26 @@ def main() -> int:
             f"lock_info={lock_info!r}",
             flush=True,
         )
+        safe_sqlite_call(
+            sqlite_store,
+            "record_collector_run",
+            run_id=collector_run_id,
+            started_at=now_iso(),
+            start_date=start.isoformat(),
+            end_date=end.isoformat(),
+            session_type=args.session_type,
+            mode="history_collector",
+            status="lock_held",
+            expected_symbols=None,
+            processed=0,
+            complete=0,
+            partial=0,
+            no_data=0,
+            failed=0,
+            raw_json={"lock_info": lock_info},
+        )
+        if sqlite_store is not None:
+            sqlite_store.close()
         return LOCK_HELD_EXIT_CODE
 
     try:
@@ -548,6 +620,27 @@ def main() -> int:
                 f"failed=0 retries=0 parquet_files_written=0 output_dir={output_dir}",
                 flush=True,
             )
+            safe_sqlite_call(
+                sqlite_store,
+                "record_collector_run",
+                run_id=collector_run_id,
+                started_at=now_iso(),
+                finished_at=now_iso(),
+                start_date=start.isoformat(),
+                end_date=end.isoformat(),
+                session_type=args.session_type,
+                mode="history_collector",
+                status="plan_only",
+                expected_symbols=len(tasks),
+                processed=0,
+                complete=plan["complete"],
+                partial=0,
+                no_data=0,
+                failed=0,
+                parquet_files=parquet_files,
+                duration_seconds=duration,
+                raw_json={"plan": plan},
+            )
             return 0
 
         if not pending:
@@ -565,6 +658,27 @@ def main() -> int:
                 f"processed=0 skipped_existing={plan['complete']} complete=0 partial=0 no_data=0 "
                 f"failed=0 retries=0 parquet_files_written=0 output_dir={output_dir}",
                 flush=True,
+            )
+            safe_sqlite_call(
+                sqlite_store,
+                "record_collector_run",
+                run_id=collector_run_id,
+                started_at=now_iso(),
+                finished_at=now_iso(),
+                start_date=start.isoformat(),
+                end_date=end.isoformat(),
+                session_type=args.session_type,
+                mode="history_collector",
+                status="complete",
+                expected_symbols=len(tasks),
+                processed=0,
+                complete=plan["complete"],
+                partial=0,
+                no_data=0,
+                failed=0,
+                parquet_files=parquet_files,
+                duration_seconds=duration,
+                raw_json={"plan": plan},
             )
             return 0
 
@@ -610,13 +724,42 @@ def main() -> int:
                     mark_status(status, task, "failed_permanent" if terminal else "failed", rows, {"attempts": attempts, "last_error": error})
                     print(f"{now_iso()} HISTORY_SYMBOL_FAILED {task.symbol} {task.session_date} attempts={attempts} error={error}", flush=True)
 
+                upsert_collected_session_metadata(
+                    sqlite_store,
+                    output_dir=output_dir,
+                    task=task,
+                    state=state,
+                    rows=rows,
+                    error=error,
+                )
+
                 progress_elapsed = time.monotonic() - last_progress_monotonic
                 if idx == len(pending) or idx - last_progress_idx >= 100 or progress_elapsed >= 60.0:
+                    elapsed_seconds = int(time.monotonic() - started_monotonic)
                     print(
                         f"{now_iso()} HISTORY_COLLECTOR_PROGRESS processed={idx}/{len(pending)} "
                         f"complete={completed} partial={partial} no_data={no_data} failed={failed} "
-                        f"elapsed_seconds={int(time.monotonic() - started_monotonic)}",
+                        f"elapsed_seconds={elapsed_seconds}",
                         flush=True,
+                    )
+                    safe_sqlite_call(
+                        sqlite_store,
+                        "record_collector_run",
+                        run_id=collector_run_id,
+                        started_at=now_iso(),
+                        start_date=start.isoformat(),
+                        end_date=end.isoformat(),
+                        session_type=args.session_type,
+                        mode="history_collector",
+                        status="running",
+                        expected_symbols=len(tasks),
+                        processed=idx,
+                        complete=completed,
+                        partial=partial,
+                        no_data=no_data,
+                        failed=failed,
+                        duration_seconds=elapsed_seconds,
+                        raw_json={"pending": len(pending), "skipped_existing": plan["complete"]},
                     )
                     last_progress_idx = idx
                     last_progress_monotonic = time.monotonic()
@@ -654,9 +797,32 @@ def main() -> int:
             f"parquet_files_written={parquet_files_written} output_dir={output_dir}",
             flush=True,
         )
+        safe_sqlite_call(
+            sqlite_store,
+            "record_collector_run",
+            run_id=collector_run_id,
+            started_at=now_iso(),
+            finished_at=now_iso(),
+            start_date=start.isoformat(),
+            end_date=end.isoformat(),
+            session_type=args.session_type,
+            mode="history_collector",
+            status="complete" if failed == 0 else "partial_failure",
+            expected_symbols=len(tasks),
+            processed=len(pending),
+            complete=completed,
+            partial=partial,
+            no_data=no_data,
+            failed=failed,
+            parquet_files=parquet_files,
+            duration_seconds=duration,
+            raw_json={"skipped_existing": plan["complete"]},
+        )
         return 0
     finally:
         release_lock(lock_handle)
+        if sqlite_store is not None:
+            sqlite_store.close()
 
 
 if __name__ == "__main__":

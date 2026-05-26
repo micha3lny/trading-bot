@@ -36,6 +36,7 @@ from src.live_trading.order_lifecycle.models import (
 from src.live_trading.order_lifecycle.store import JsonlLifecycleStore
 from src.live_trading.order_lifecycle.reducer import reduce_lifecycle_events
 from src.live_trading.order_lifecycle.reconciliation import build_reconciliation_report, log_reconciliation_report
+from src.live_trading.storage.sqlite_store import open_sqlite_store, safe_sqlite_call
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4002
@@ -338,6 +339,22 @@ def record_lifecycle(recorder: LiveDataRecorder, event: str, symbol: str, **kwar
     if raw and not isinstance(raw, str):
         row["raw_json"] = json.dumps(raw, ensure_ascii=False, default=str)
     append_dict_csv(recorder.path("trade_lifecycle.csv"), row, fields)
+    safe_sqlite_call(
+        getattr(recorder, "sqlite_store", None),
+        "record_runtime_event",
+        event_time=row.get("recorded_at"),
+        severity="WARN" if "FAILED" in event or "REJECTED" in event or "DRIFT" in event or "ORPHAN" in event else "INFO",
+        event_type=event,
+        strategy_name=STRATEGY_NAME,
+        session_date=getattr(recorder, "session_date", None),
+        symbol=symbol,
+        order_id=kwargs.get("order_id"),
+        execution_id=kwargs.get("execution_id"),
+        source="v67_live_runtime",
+        reason=kwargs.get("reason"),
+        action_required=1 if "MANUAL_REQUIRED" in event or "FAILED" in event else 0,
+        raw_json={**kwargs, "legacy_event": event},
+    )
 
 
 def formal_event_type_for_legacy_event(event: str) -> LifecycleEventType | None:
@@ -516,6 +533,25 @@ def persist_managed_positions(recorder: LiveDataRecorder, positions: dict[str, M
         "positions": {symbol: managed_position_payload(pos) for symbol, pos in positions.items() if pos.active},
     }
     recorder.path("managed_positions.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    store = getattr(recorder, "sqlite_store", None)
+    for symbol, pos in positions.items():
+        safe_sqlite_call(
+            store,
+            "upsert_position",
+            {
+                "strategy_name": STRATEGY_NAME,
+                "session_date": getattr(recorder, "session_date", None),
+                "symbol": symbol,
+                "status": "OPEN" if pos.active else "CLOSED",
+                "quantity": pos.quantity,
+                "avg_price": pos.entry_price,
+                "source": pos.source,
+                "active": pos.active,
+                "exit_sent": pos.exit_sent,
+                "updated_at": payload["recorded_at"],
+                "raw_json": managed_position_payload(pos),
+            },
+        )
 
 
 def restore_managed_positions(recorder: LiveDataRecorder, contract_by_symbol: dict[str, Any]) -> dict[str, ManagedPosition]:
@@ -1092,6 +1128,30 @@ def startup_reconcile_runtime_state(
         f"pending_orders={len(pending_orders)} anomalies={len(reducer_snapshot.anomalies)}",
         flush=True,
     )
+    safe_sqlite_call(
+        getattr(recorder, "sqlite_store", None),
+        "record_reconciliation_run",
+        run_id=f"{reason_prefix}:{getattr(recorder, 'session_date', '')}:{int(time.time())}",
+        started_at=now_utc(),
+        finished_at=now_utc(),
+        mode=reason_prefix.replace("_reconciliation", "") or "startup",
+        clean=clean,
+        ibkr_positions_count=len(ibkr_rows),
+        managed_positions_count=len([p for p in managed_positions.values() if p.active]),
+        orphan_count=len(orphans),
+        fractional_orphan_count=len(fractional_orphans),
+        drift_count=len(drift_symbols),
+        pending_orders_count=len(pending_orders),
+        details_json={
+            "closed_local": sorted(closed_local),
+            "orphans": sorted(orphans),
+            "fractional_orphans": sorted(fractional_orphans),
+            "whole_share_orphans": sorted(whole_share_orphans),
+            "drift_symbols": sorted(drift_symbols),
+            "pending_orders": sorted([p for p in pending_orders if p]),
+            "anomalies": list(reducer_snapshot.anomalies),
+        },
+    )
     return {
         "clean": clean,
         "closed_local": sorted(closed_local),
@@ -1229,6 +1289,35 @@ def write_eod_final_status(
     }
     runtime_state["eod_final_status"] = summary
     recorder.path("eod_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    safe_sqlite_call(
+        getattr(recorder, "sqlite_store", None),
+        "record_runtime_event",
+        event_time=summary["recorded_at"],
+        severity="INFO" if summary["clean"] else "WARN",
+        event_type="EOD_FINAL_STATUS",
+        strategy_name=STRATEGY_NAME,
+        session_date=getattr(recorder, "session_date", None),
+        source="v67_live_runtime",
+        reason=reason,
+        action_required=0 if summary["clean"] else 1,
+        raw_json=summary,
+    )
+    safe_sqlite_call(
+        getattr(recorder, "sqlite_store", None),
+        "record_reconciliation_run",
+        run_id=f"eod:{getattr(recorder, 'session_date', '')}:{reason}",
+        started_at=summary["recorded_at"],
+        finished_at=summary["recorded_at"],
+        mode="eod",
+        clean=summary["clean"],
+        ibkr_positions_count=summary["open_positions"],
+        managed_positions_count=summary["managed_open"],
+        orphan_count=len(summary["whole_share_orphans"]) + len(summary["fractional_orphans"]),
+        fractional_orphan_count=len(summary["fractional_orphans"]),
+        drift_count=0,
+        pending_orders_count=summary["pending_orders"],
+        details_json=summary,
+    )
     print(
         f"{now_utc()} EOD_FINAL_STATUS clean={int(summary['clean'])} "
         f"open_positions={summary['open_positions']} fractional_orphans={len(fractional_orphans)} "
@@ -2870,6 +2959,8 @@ def main() -> int:
     parser.add_argument("--alpha-rank-csv", default=DEFAULT_ALPHA_RANK)
     parser.add_argument("--top-n", type=int, default=100)
     parser.add_argument("--recorder-dir", default=DEFAULT_RECORDER_DIR)
+    parser.add_argument("--sqlite-path", default=None)
+    parser.add_argument("--disable-sqlite", action="store_true")
     parser.add_argument("--duration-seconds", type=int, default=28800)
     parser.add_argument("--interval-seconds", type=float, default=5.0)
     parser.add_argument("--portfolio-interval-seconds", type=float, default=10.0)
@@ -2932,6 +3023,8 @@ def main() -> int:
 
     symbols = load_top_symbols(args.alpha_rank_csv, args.top_n, min_price=args.min_price)
     recorder = LiveDataRecorder(args.recorder_dir)
+    sqlite_store = None if args.disable_sqlite else open_sqlite_store(args.sqlite_path)
+    setattr(recorder, "sqlite_store", sqlite_store)
 
     print("=== v67 live top100 expansion paper trader ===", flush=True)
     print(f"Symbols loaded: {len(symbols)}", flush=True)
@@ -3287,6 +3380,23 @@ def main() -> int:
                             reason=reason,
                             raw_json=risk_status,
                         )
+                        safe_sqlite_call(
+                            getattr(recorder, "sqlite_store", None),
+                            "record_risk_event",
+                            event_type="RISK_GUARD_BLOCK_ENTRY",
+                            category="entry_guard",
+                            severity="WARN",
+                            strategy_name=STRATEGY_NAME,
+                            session_date=getattr(recorder, "session_date", None),
+                            symbol=symbol,
+                            blocked=1,
+                            reason=reason,
+                            daily_pnl=risk_status.get("daily_pnl"),
+                            gross_exposure=risk_status.get("gross_exposure"),
+                            active_positions=risk_status.get("active_positions"),
+                            trades_today=risk_status.get("trades_today"),
+                            raw_json=risk_status,
+                        )
                         continue
                     order = MarketOrder("BUY", qty)
                     order.tif = "DAY"
@@ -3446,6 +3556,8 @@ def main() -> int:
 
     finally:
         persist_managed_positions(recorder, managed_positions)
+        if sqlite_store is not None:
+            sqlite_store.close()
         for ticker in tickers.values():
             try:
                 ib.cancelMktData(ticker.contract)

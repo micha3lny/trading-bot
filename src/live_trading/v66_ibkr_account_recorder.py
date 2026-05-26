@@ -11,6 +11,7 @@ from typing import Any
 from ib_insync import IB, ExecutionFilter
 
 from src.live_trading.v62_live_data_recorder import FillEvent, LiveDataRecorder, PortfolioSnapshot
+from src.live_trading.storage.sqlite_store import open_sqlite_store, safe_sqlite_call
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -234,6 +235,7 @@ def record_commission_report(recorder: LiveDataRecorder, commission_report: Any)
             merged = merge_fill_rows(existing, row)
             rows[idx] = merged
             write_csv_rows_atomic(path, rows, FILL_FIELDS)
+            safe_sqlite_call(getattr(recorder, "sqlite_store", None), "upsert_execution", merged)
             if merged.get("commission_source") == "ibkr":
                 print(f"{now_utc()} COMMISSION_REPORT_MATCHED execution_id={execution_id}", flush=True)
                 return "matched"
@@ -243,6 +245,7 @@ def record_commission_report(recorder: LiveDataRecorder, commission_report: Any)
     placeholder.update(row)
     rows.append(placeholder)
     write_csv_rows_atomic(path, rows, FILL_FIELDS)
+    safe_sqlite_call(getattr(recorder, "sqlite_store", None), "upsert_execution", placeholder)
     print(f"{now_utc()} COMMISSION_REPORT_MISSING execution_id={execution_id} reason=execution_not_seen_yet", flush=True)
     return "placeholder"
 
@@ -277,6 +280,7 @@ def record_recent_fills(ib: IB, recorder: LiveDataRecorder, seen: set[str]) -> i
         key = fill_key(fill)
         row = fill_row_from_ibkr_fill(fill)
         status = upsert_fill_row(recorder, row)
+        safe_sqlite_call(getattr(recorder, "sqlite_store", None), "upsert_execution", row)
         if status != "duplicate":
             if row.get("commission_source") != "ibkr":
                 print(f"{now_utc()} FILLS_WITHOUT_COMMISSION execution_id={row.get('execution_id')} symbol={row.get('symbol')}", flush=True)
@@ -295,11 +299,15 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--client-id", type=int, default=DEFAULT_CLIENT_ID)
     parser.add_argument("--recorder-dir", default=DEFAULT_RECORDER_DIR)
+    parser.add_argument("--sqlite-path", default=None)
+    parser.add_argument("--disable-sqlite", action="store_true")
     parser.add_argument("--interval-seconds", type=float, default=10.0)
     parser.add_argument("--duration-seconds", type=int, default=0, help="0 = run forever")
     args = parser.parse_args()
 
     recorder = LiveDataRecorder(args.recorder_dir)
+    sqlite_store = None if args.disable_sqlite else open_sqlite_store(args.sqlite_path)
+    setattr(recorder, "sqlite_store", sqlite_store)
     recorder.record_run_metadata({
         "module": "v66_ibkr_account_recorder",
         "host": args.host,
@@ -327,6 +335,8 @@ def main() -> int:
                 break
             ib.sleep(max(0.0, args.interval_seconds - 1.0))
     finally:
+        if sqlite_store is not None:
+            sqlite_store.close()
         ib.disconnect()
         print("Disconnected")
     return 0
