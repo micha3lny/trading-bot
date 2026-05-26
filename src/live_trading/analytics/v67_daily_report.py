@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sqlite3
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -224,6 +225,62 @@ def load_fills(session: Path) -> list[dict]:
         return list(csv.DictReader(fh))
 
 
+def load_sqlite_executions(sqlite_path: str | None, session_date: str) -> list[dict]:
+    if not sqlite_path:
+        return []
+    path = Path(sqlite_path)
+    if not path.exists():
+        return []
+    try:
+        conn = sqlite3.connect(str(path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT execution_id, symbol, side AS action, quantity, price AS fill_price,
+                   order_id, perm_id, exchange, liquidity, commission,
+                   commission_currency, realized_pnl, commission_source,
+                   raw_json, recorded_at, executed_at
+            FROM executions
+            WHERE session_date = ?
+            ORDER BY COALESCE(executed_at, recorded_at), execution_id
+            """,
+            (session_date,),
+        ).fetchall()
+        conn.close()
+        out = []
+        for row in rows:
+            data = dict(row)
+            data["recorded_at"] = data.get("recorded_at") or data.get("executed_at")
+            out.append(data)
+        return out
+    except Exception:
+        return []
+
+
+def load_sqlite_positions(sqlite_path: str | None, session_date: str) -> list[dict]:
+    if not sqlite_path:
+        return []
+    path = Path(sqlite_path)
+    if not path.exists():
+        return []
+    try:
+        conn = sqlite3.connect(str(path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM positions
+            WHERE session_date = ? AND COALESCE(active, 0) = 1
+            ORDER BY symbol
+            """,
+            (session_date,),
+        ).fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    except Exception:
+        return []
+
+
 def normalized_fill_action(action: str | None) -> str:
     value = str(action or "").strip().upper()
     if value in {"BOT", "BUY"}:
@@ -342,6 +399,7 @@ def simulate_exit_strategies(closed: list[dict], commission_per_trade: float) ->
     scenarios = [
         ("actual trailing", None, "actual"),
         ("fixed TP +2%", 2.0, "fixed"),
+        ("fixed TP +2.5%", 2.5, "fixed"),
         ("fixed TP +3%", 3.0, "fixed"),
         ("fixed TP +4%", 4.0, "fixed"),
         ("fixed TP +5%", 5.0, "fixed"),
@@ -396,66 +454,169 @@ def lifecycle_event_counts(session: Path) -> Counter:
     return counts
 
 
+def hold_minutes(start: str | None, end: str | None = None) -> float:
+    start_dt = parse_dt(start)
+    end_dt = parse_dt(end) or datetime.now(timezone.utc)
+    if start_dt is None:
+        return 0.0
+    return max(0.0, (end_dt - start_dt).total_seconds() / 60.0)
+
+
+def latest_lifecycle_rows(session: Path) -> dict[str, dict]:
+    lifecycle = session / "trade_lifecycle.csv"
+    latest: dict[str, dict] = {}
+    if not lifecycle.exists():
+        return latest
+    try:
+        with lifecycle.open(errors="replace") as fh:
+            for row in csv.DictReader(fh):
+                sym = str(row.get("symbol") or "").upper()
+                if sym:
+                    latest[sym] = row
+    except Exception:
+        return latest
+    return latest
+
+
+def lifecycle_open_status(session: Path) -> dict[str, dict]:
+    lifecycle = session / "trade_lifecycle.csv"
+    status: dict[str, dict] = defaultdict(lambda: {"exit_order_exists": False, "partial_exit": False, "status": "OPEN"})
+    if not lifecycle.exists():
+        return status
+    try:
+        with lifecycle.open(errors="replace") as fh:
+            for row in csv.DictReader(fh):
+                sym = str(row.get("symbol") or "").upper()
+                event = str(row.get("event") or "")
+                if not sym:
+                    continue
+                if event in {"SELL_ORDER_SENT", "EXIT_ORDER_SENT", "EOD_FLATTEN_SUBMIT", "MANUAL_FLATTEN_SENT"}:
+                    status[sym]["exit_order_exists"] = True
+                    status[sym]["status"] = "EXIT_SENT"
+                if event in {"EXIT_ORDER_PARTIAL", "EXIT_PARTIAL"}:
+                    status[sym]["partial_exit"] = True
+                    status[sym]["status"] = "EXIT_PARTIAL"
+    except Exception:
+        return status
+    return status
+
+
+def enrich_closed_with_lifecycle(closed: list[dict], lifecycle_closed: list[dict]) -> list[dict]:
+    by_symbol: dict[str, list[dict]] = defaultdict(list)
+    for row in lifecycle_closed:
+        by_symbol[row["symbol"]].append(row)
+    for row in closed:
+        candidates = by_symbol.get(row["symbol"], [])
+        match = candidates.pop(0) if candidates else {}
+        buy = f(row.get("buy"), 0.0)
+        sell = f(row.get("sell"), 0.0)
+        peak = f(match.get("peak"), max(buy, sell))
+        peak_pct = f(match.get("peak_gain_pct"), ((peak / buy - 1.0) * 100.0 if buy else 0.0))
+        pnl_pct = f(row.get("pnl_pct"), ((sell / buy - 1.0) * 100.0 if buy else 0.0))
+        drop_from_peak = f(match.get("giveback_pct"), pnl_pct - peak_pct)
+        row.update({
+            "peak": peak,
+            "peak_gain_pct": peak_pct,
+            "drop_from_peak_pct": drop_from_peak,
+            "giveback_pct": drop_from_peak,
+            "pnl_pct": pnl_pct,
+            "buy_utc": utc_hhmm(row.get("buy_time")),
+            "buy_bucket": buy_time_bucket(row.get("buy_time")),
+            "minutes_from_open": minutes_from_market_open(row.get("buy_time")),
+            "strict_setup_ready": bool(match.get("strict_setup_ready", False)),
+            "reason": row.get("reason") or match.get("reason") or "",
+            "hold_min": hold_minutes(row.get("buy_time"), row.get("sell_time")),
+        })
+    return closed
+
+
+def money(value: float) -> str:
+    return f"{value:.2f}"
+
+
+def pct(value: float) -> str:
+    return f"{value:.1f}%"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=datetime.now(timezone.utc).strftime("%F"))
     ap.add_argument("--recorder-dir", default="data/live/recorder")
     ap.add_argument("--commission-per-roundtrip", type=float, default=1.0)
+    ap.add_argument("--sqlite-path", default="data/runtime/trading_runtime.sqlite")
+    ap.add_argument("--disable-sqlite", action="store_true")
+    ap.add_argument("--watch-summary", action="store_true")
     args = ap.parse_args()
 
     session = Path(args.recorder_dir) / args.date
     lifecycle = session / "trade_lifecycle.csv"
-    if not lifecycle.exists():
+    sqlite_path = None if args.disable_sqlite else args.sqlite_path
+    sqlite_fills = load_sqlite_executions(sqlite_path, args.date)
+    if not lifecycle.exists() and not sqlite_fills:
         raise SystemExit(f"Missing {lifecycle}")
 
     latest_portfolio = load_latest_portfolio(session)
     signal_features = load_signal_features(session)
+    latest_lifecycle = latest_lifecycle_rows(session)
+    open_status = lifecycle_open_status(session)
     buys: dict[str, list[dict]] = {}
-    closed = []
+    lifecycle_closed = []
 
-    with lifecycle.open(errors="replace") as fh:
-        for r in csv.DictReader(fh):
-            event = r.get("event")
-            sym = str(r.get("symbol", "")).upper()
-            if not sym:
-                continue
-            if event == "BUY_ORDER_SENT":
-                buys.setdefault(sym, []).append(r)
-            elif event == "SELL_ORDER_SENT" and buys.get(sym):
-                b_row = buys[sym].pop(0)
-                buy_px = f(b_row.get("fill_price") or b_row.get("price") or b_row.get("entry_price"))
-                sell_px = f(r.get("fill_price") or r.get("price"))
-                qty = f(r.get("quantity"))
-                buy_time = b_row.get("recorded_at")
-                payload = raw_json_dict(b_row) or best_signal_payload_for_buy(signal_features, sym, buy_time)
-                strict = is_strict_payload(payload, b_row)
-                peak = f(r.get("peak_price"), max(buy_px, sell_px))
-                peak_gain_pct = f(r.get("peak_gain_pct"), ((peak / buy_px - 1) * 100 if buy_px else 0))
-                giveback_pct = f(r.get("giveback_pct"), ((sell_px / peak - 1) * 100 if peak else 0))
-                gross = (sell_px - buy_px) * qty
-                net = gross - args.commission_per_roundtrip
-                closed.append({
-                    "symbol": sym,
-                    "qty": qty,
-                    "buy_time": buy_time,
-                    "buy_utc": utc_hhmm(buy_time),
-                    "buy_bucket": buy_time_bucket(buy_time),
-                    "minutes_from_open": minutes_from_market_open(buy_time),
-                    "strict_setup_ready": strict,
-                    "buy": buy_px,
-                    "sell": sell_px,
-                    "peak": peak,
-                    "gross": gross,
-                    "net": net,
-                    "pnl_pct": ((sell_px / buy_px - 1) * 100 if buy_px else 0),
-                    "peak_gain_pct": peak_gain_pct,
-                    "giveback_pct": giveback_pct,
-                    "reason": r.get("reason"),
-                })
+    if lifecycle.exists():
+        with lifecycle.open(errors="replace") as fh:
+            for r in csv.DictReader(fh):
+                event = r.get("event")
+                sym = str(r.get("symbol", "")).upper()
+                if not sym:
+                    continue
+                if event == "BUY_ORDER_SENT":
+                    buys.setdefault(sym, []).append(r)
+                elif event == "SELL_ORDER_SENT" and buys.get(sym):
+                    b_row = buys[sym].pop(0)
+                    buy_px = f(b_row.get("fill_price") or b_row.get("price") or b_row.get("entry_price"))
+                    sell_px = f(r.get("fill_price") or r.get("price"))
+                    qty = f(r.get("quantity"))
+                    buy_time = b_row.get("recorded_at")
+                    payload = raw_json_dict(b_row) or best_signal_payload_for_buy(signal_features, sym, buy_time)
+                    strict = is_strict_payload(payload, b_row)
+                    peak = f(r.get("peak_price"), max(buy_px, sell_px))
+                    peak_gain_pct = f(r.get("peak_gain_pct"), ((peak / buy_px - 1) * 100 if buy_px else 0))
+                    pnl_pct = ((sell_px / buy_px - 1) * 100 if buy_px else 0)
+                    giveback_pct = f(r.get("giveback_pct"), pnl_pct - peak_gain_pct)
+                    gross = (sell_px - buy_px) * qty
+                    net = gross - args.commission_per_roundtrip
+                    lifecycle_closed.append({
+                        "symbol": sym,
+                        "qty": qty,
+                        "buy_time": buy_time,
+                        "buy_utc": utc_hhmm(buy_time),
+                        "buy_bucket": buy_time_bucket(buy_time),
+                        "minutes_from_open": minutes_from_market_open(buy_time),
+                        "strict_setup_ready": strict,
+                        "buy": buy_px,
+                        "sell": sell_px,
+                        "peak": peak,
+                        "gross": gross,
+                        "net": net,
+                        "pnl_pct": pnl_pct,
+                        "peak_gain_pct": peak_gain_pct,
+                        "giveback_pct": giveback_pct,
+                        "drop_from_peak_pct": giveback_pct,
+                        "hold_min": hold_minutes(buy_time, r.get("recorded_at")),
+                        "reason": r.get("reason"),
+                    })
+
+    fill_rows = sqlite_fills or load_fills(session)
+    fill_closed = reconstruct_closed_trades_from_fills(fill_rows, args.commission_per_roundtrip)
+    closed = enrich_closed_with_lifecycle(fill_closed, lifecycle_closed) if fill_closed else lifecycle_closed
 
     open_positions = []
+    sqlite_positions = load_sqlite_positions(sqlite_path, args.date)
+    sqlite_open_symbols = {str(row.get("symbol") or "").upper() for row in sqlite_positions}
     for sym, rows in buys.items():
         for row in rows:
+            if fill_closed and sym not in latest_portfolio and sym not in sqlite_open_symbols:
+                continue
             buy_px = f(row.get("fill_price") or row.get("price") or row.get("entry_price"))
             qty = f(row.get("quantity"))
             buy_time = row.get("recorded_at")
@@ -464,7 +625,16 @@ def main():
             pf = latest_portfolio.get(sym, {})
             current = f(pf.get("marketPrice"), 0)
             unrealized = f(pf.get("unrealizedPNL"), (current - buy_px) * qty if current else 0)
-            peak = max(f(row.get("peak_price"), buy_px), buy_px, current)
+            lifecycle_row = latest_lifecycle.get(sym, {})
+            peak = max(f(row.get("peak_price"), f(lifecycle_row.get("peak_price"), buy_px)), buy_px, current)
+            peak_pct = ((peak / buy_px - 1) * 100 if buy_px else 0)
+            current_pct = ((current / buy_px - 1) * 100 if buy_px and current else 0)
+            status = open_status.get(sym, {})
+            buy_comm = sum(
+                actual_commission(fill) or 0.0
+                for fill in fill_rows
+                if str(fill.get("symbol") or "").upper() == sym and normalized_fill_action(fill.get("action")) == "BUY"
+            )
             open_positions.append({
                 "symbol": sym,
                 "qty": qty,
@@ -477,25 +647,66 @@ def main():
                 "current": current,
                 "peak": peak,
                 "unrealized": unrealized,
-                "current_pct": ((current / buy_px - 1) * 100 if buy_px and current else 0),
-                "peak_gain_pct": ((peak / buy_px - 1) * 100 if buy_px else 0),
-                "from_peak_pct": ((current / peak - 1) * 100 if peak and current else 0),
+                "current_pct": current_pct,
+                "peak_gain_pct": peak_pct,
+                "from_peak_pct": current_pct - peak_pct,
+                "ibkr_commission": buy_comm,
+                "hold_min": hold_minutes(buy_time),
+                "exit_order_exists": bool(status.get("exit_order_exists")),
+                "partial_exit": bool(status.get("partial_exit")),
+                "status": status.get("status") or "OPEN",
             })
+    existing_open_symbols = {row["symbol"] for row in open_positions}
+    for row in sqlite_positions:
+        sym = str(row.get("symbol") or "").upper()
+        if not sym or sym in existing_open_symbols:
+            continue
+        raw = raw_json_dict(row)
+        buy_px = f(row.get("avg_price") or raw.get("entry_price"), 0.0)
+        qty = f(row.get("quantity") or row.get("ibkr_quantity"), 0.0)
+        pf = latest_portfolio.get(sym, {})
+        current = f(pf.get("marketPrice") or raw.get("market_price"), buy_px)
+        unrealized = f(pf.get("unrealizedPNL"), (current - buy_px) * qty if current else 0.0)
+        peak = max(f(raw.get("peak_price"), buy_px), buy_px, current)
+        current_pct = ((current / buy_px - 1) * 100 if buy_px and current else 0.0)
+        peak_pct = ((peak / buy_px - 1) * 100 if buy_px else 0.0)
+        buy_time = raw.get("entry_time") or row.get("updated_at")
+        buy_comm = sum(
+            actual_commission(fill) or 0.0
+            for fill in fill_rows
+            if str(fill.get("symbol") or "").upper() == sym and normalized_fill_action(fill.get("action")) == "BUY"
+        )
+        open_positions.append({
+            "symbol": sym,
+            "qty": qty,
+            "buy_time": buy_time,
+            "buy_utc": utc_hhmm(buy_time),
+            "buy_bucket": buy_time_bucket(buy_time),
+            "minutes_from_open": minutes_from_market_open(buy_time),
+            "strict_setup_ready": False,
+            "buy": buy_px,
+            "current": current,
+            "peak": peak,
+            "unrealized": unrealized,
+            "current_pct": current_pct,
+            "peak_gain_pct": peak_pct,
+            "from_peak_pct": current_pct - peak_pct,
+            "ibkr_commission": buy_comm,
+            "hold_min": hold_minutes(buy_time),
+            "exit_order_exists": bool(row.get("exit_sent")),
+            "partial_exit": False,
+            "status": row.get("status") or "OPEN",
+        })
 
     wins = [x for x in closed if x["gross"] > 0]
     losses = [x for x in closed if x["gross"] <= 0]
     gross_total = sum(x["gross"] for x in closed)
-    net_total = sum(x["net"] for x in closed)
+    ibkr_commission_total = sum(f(x.get("actual_commission"), 0.0) for x in closed)
+    fallback_commission_total = sum(f(x.get("estimated_commission_fallback"), 0.0) for x in closed)
+    net_actual_total = sum(f(x.get("net_actual"), f(x.get("net"), 0.0)) for x in closed)
     open_upnl = sum(x["unrealized"] for x in open_positions)
     strict_closed = [x for x in closed if x["strict_setup_ready"]]
     strict_open = [x for x in open_positions if x["strict_setup_ready"]]
-    fill_rows = load_fills(session)
-    fill_closed = reconstruct_closed_trades_from_fills(fill_rows, args.commission_per_roundtrip)
-    fill_gross = sum(x["gross"] for x in fill_closed)
-    fill_actual_commission = sum(x["actual_commission"] for x in fill_closed)
-    fill_estimated_fallback = sum(x["estimated_commission_fallback"] for x in fill_closed)
-    fill_net_actual = sum(x["net_actual"] for x in fill_closed)
-    fill_net_estimated = sum(x["net_estimated"] for x in fill_closed)
     commission_per_trade = effective_commission_per_trade(fill_closed, args.commission_per_roundtrip)
     exit_simulations = simulate_exit_strategies(closed, commission_per_trade)
     fills_without_commission = [
@@ -515,64 +726,105 @@ def main():
     diagnostic_fractional_orphans = (eod_summary.get("fractional_orphans") or []) if "fractional_orphans" in eod_summary else final_fractional_positions
     diagnostic_whole_share_orphans = (eod_summary.get("whole_share_orphans") or []) if "whole_share_orphans" in eod_summary else final_whole_positions
     event_counts = lifecycle_event_counts(session)
+    avg_win = sum(x["gross"] for x in wins) / len(wins) if wins else 0.0
+    avg_loss = sum(x["gross"] for x in losses) / len(losses) if losses else 0.0
+    expectancy = gross_total / len(closed) if closed else 0.0
+    avg_peak = avg(closed, lambda x: x.get("peak_gain_pct"))
+    avg_giveback = avg(closed, lambda x: x.get("drop_from_peak_pct", x.get("giveback_pct")))
+    avg_hold = avg(closed, lambda x: x.get("hold_min"))
+    best_trade = max(closed, key=lambda x: f(x.get("net_actual"), f(x.get("net"), f(x.get("gross"), 0.0))), default=None)
+    worst_trade = min(closed, key=lambda x: f(x.get("net_actual"), f(x.get("net"), f(x.get("gross"), 0.0))), default=None)
 
-    print(f"=== v67 Daily Report {args.date} ===")
-    print(f"Closed trades:        {len(closed)}")
-    print(f"Open trades:          {len(open_positions)}")
-    print(f"Win rate:             {(len(wins) / len(closed) * 100 if closed else 0):.1f}%")
-    print(f"Gross closed PnL:     ${gross_total:.2f}")
-    print(f"Net closed est PnL:   ${net_total:.2f}")
-    print(f"Open unrealized PnL:  ${open_upnl:.2f}")
-    print(f"Total est PnL:        ${net_total + open_upnl:.2f}")
-    print(f"Avg win:              ${(sum(x['gross'] for x in wins) / len(wins) if wins else 0):.2f}")
-    print(f"Avg loss:             ${(sum(x['gross'] for x in losses) / len(losses) if losses else 0):.2f}")
-    print(f"Expectancy:           ${(gross_total / len(closed) if closed else 0):.2f}/trade")
-    print()
-
-    print("=== IBKR fill ledger ===")
-    print(f"Fill rows:            {len(fill_rows)}")
-    print(f"Fill closed trades:   {len(fill_closed)}")
-    print(f"Gross fill PnL:       ${fill_gross:.2f}")
-    print(f"IBKR commission:      ${fill_actual_commission:.2f}")
-    print(f"Estimated fallback:   ${fill_estimated_fallback:.2f}")
-    print(f"Net actual:           ${fill_net_actual:.2f}")
-    print(f"Net estimated:        ${fill_net_estimated:.2f}")
-    print(f"Fills without comm:   {len(fills_without_commission)}")
-    print()
-
-    if fill_closed:
-        print("=== Closed trades from fills ===")
-        print(f"{'SYM':<7} {'QTY':>8} {'BUY':>10} {'SELL':>10} {'GROSS':>10} {'IBKR_COMM':>10} {'EST_FB':>10} {'NET_ACT':>10} {'NET_EST':>10} {'SRC':>9}")
-        print("-" * 109)
-        for x in sorted(fill_closed, key=lambda r: r["gross"]):
-            print(
-                f"{x['symbol']:<7} {x['qty']:>8.2f} {x['buy']:>10.4f} {x['sell']:>10.4f} "
-                f"{x['gross']:>10.2f} {x['actual_commission']:>10.2f} {x['estimated_commission_fallback']:>10.2f} "
-                f"{x['net_actual']:>10.2f} {x['net_estimated']:>10.2f} {x['commission_source']:>9}"
-            )
+    if args.watch_summary:
+        print(f"SESSION {args.date}")
+        print(
+            f"closed={len(closed)} open={len(open_positions)} win={(len(wins) / len(closed) * 100 if closed else 0):.1f}% "
+            f"gross={money(gross_total)} comm={money(ibkr_commission_total)} net={money(net_actual_total)} "
+            f"open_upnl={money(open_upnl)} total={money(net_actual_total + open_upnl)}"
+        )
         print()
+        print("OPEN:")
+        for row in sorted(open_positions, key=lambda x: x["current_pct"], reverse=True)[:8]:
+            print(f"{row['symbol']} {row['current_pct']:+.1f}% upnl={row['unrealized']:+.2f} peak={row['peak_gain_pct']:.1f}% {row['status']}")
+        print()
+        print("LAST CLOSED:")
+        for row in sorted(closed, key=lambda x: str(x.get("sell_time") or ""), reverse=True)[:6]:
+            print(f"{row['symbol']} {row['pnl_pct']:+.1f}% net={f(row.get('net_actual'), f(row.get('net'), f(row.get('gross'), 0.0))):+.2f} peak={row['peak_gain_pct']:.1f}%")
+        return
 
-    print("=== Post-session diagnostics ===")
-    print(f"Final IBKR positions: {len(latest_portfolio)}")
-    print(f"Final managed count:  {managed_summary['active_count']}")
-    print(f"Fractional orphans:   {len(diagnostic_fractional_orphans)}")
-    print(f"Whole-share orphans:  {len(diagnostic_whole_share_orphans)}")
-    print(f"Pending orders:       {eod_summary.get('pending_orders', '')}")
-    clean_value = eod_summary.get("clean")
-    print(f"EOD clean:            {'' if clean_value is None else int(bool(clean_value))}")
-    print(f"Partial entries:      {event_counts.get('ENTRY_ORDER_PARTIAL', 0)}")
-    print(f"Partial exits:        {event_counts.get('EXIT_ORDER_PARTIAL', 0)}")
-    print(f"Delayed fill/cancel:  {event_counts.get('DELAYED_FILL_AFTER_CANCEL', 0)}")
-    print(f"Cancel but position:  {event_counts.get('ORDER_CANCEL_BUT_POSITION_EXISTS', 0)}")
-    if latest_portfolio:
-        print(f"Final symbols:        {', '.join(sorted(latest_portfolio))}")
+    print("=== SESSION SUMMARY ===")
+    print(f"date:                 {args.date}")
+    print(f"closed trades:        {len(closed)}")
+    print(f"open trades:          {len(open_positions)}")
+    print(f"win rate:             {(len(wins) / len(closed) * 100 if closed else 0):.1f}%")
+    print(f"gross closed pnl:     ${gross_total:.2f}")
+    print(f"ibkr commissions:     ${ibkr_commission_total:.2f}")
+    print(f"net actual pnl:       ${net_actual_total:.2f}")
+    print(f"open unrealized pnl:  ${open_upnl:.2f}")
+    print(f"total actual pnl:     ${net_actual_total + open_upnl:.2f}")
+    print(f"avg win:              ${avg_win:.2f}")
+    print(f"avg loss:             ${avg_loss:.2f}")
+    print(f"expectancy:           ${expectancy:.2f}/trade")
+    print(f"average peak:         {avg_peak:.2f}%")
+    print(f"average giveback:     {avg_giveback:.2f}%")
+    print(f"average hold:         {avg_hold:.1f} min")
+    print(f"best trade:           {(best_trade or {}).get('symbol', '')} ${f((best_trade or {}).get('net_actual'), f((best_trade or {}).get('net'), f((best_trade or {}).get('gross'), 0.0))):.2f}")
+    print(f"worst trade:          {(worst_trade or {}).get('symbol', '')} ${f((worst_trade or {}).get('net_actual'), f((worst_trade or {}).get('net'), f((worst_trade or {}).get('gross'), 0.0))):.2f}")
+    print(f"commissions/gross:    {(abs(ibkr_commission_total) / abs(gross_total) * 100 if gross_total else 0):.1f}%")
+    print(f"estimated fallback:   ${fallback_commission_total:.2f}")
+    print(f"fills without comm:   {len(fills_without_commission)}")
+    print(f"source:               {'sqlite' if sqlite_fills else 'csv/jsonl'}")
     print()
 
-    print("=== Exit simulation only ===")
+    print("=== EXIT SIMULATION ===")
     print(f"{'SCENARIO':<18} {'TRADES':>7} {'CAPTURED':>8} {'GROSS':>10} {'NET_EST':>10}")
     print("-" * 58)
     for row in exit_simulations:
         print(f"{row['name']:<18} {row['trades']:>7} {row['captured']:>8} {row['gross']:>10.2f} {row['net']:>10.2f}")
+    print()
+
+    print("=== OPEN POSITIONS ===")
+    print(f"{'SYM':<7} {'QTY':>6} {'BUY':>9} {'NOW':>9} {'UPNL':>9} {'NOW%':>7} {'PEAK%':>7} {'FROM_PEAK%':>10} {'IBKR_COMM':>10} {'HOLD':>7} {'BUY_TIME':>8}  EXIT_PLAN / STATUS")
+    print("-" * 136)
+    for x in sorted(open_positions, key=lambda r: r["unrealized"]):
+        status = x["status"]
+        if x["partial_exit"]:
+            status = "PARTIAL_EXIT"
+        elif x["exit_order_exists"]:
+            status = "EXIT_ORDER"
+        print(
+            f"{x['symbol']:<7} {x['qty']:>6.0f} {x['buy']:>9.4f} {x['current']:>9.4f} {x['unrealized']:>9.2f} "
+            f"{x['current_pct']:>6.1f}% {x['peak_gain_pct']:>6.1f}% {x['from_peak_pct']:>9.1f}% "
+            f"{x['ibkr_commission']:>10.2f} {x['hold_min']:>6.1f}m {x['buy_utc']:>8}  {status}"
+        )
+    print()
+
+    print("=== CLOSED POSITIONS ===")
+    print(f"{'SYM':<7} {'QTY':>6} {'BUY':>9} {'SELL':>9} {'GROSS':>9} {'IBKR_COMM':>10} {'NET_ACTUAL':>10} {'PNL%':>7} {'PEAK%':>7} {'DROP_FROM_PEAK%':>15} {'HOLD_MIN':>9}  EXIT_REASON")
+    print("-" * 146)
+    for x in sorted(closed, key=lambda r: f(r.get("net_actual"), f(r.get("gross"), 0.0))):
+        print(
+            f"{x['symbol']:<7} {x['qty']:>6.0f} {x['buy']:>9.4f} {x['sell']:>9.4f} {x['gross']:>9.2f} "
+            f"{f(x.get('actual_commission'), 0.0):>10.2f} {f(x.get('net_actual'), f(x.get('net'), x.get('gross'))):>10.2f} "
+            f"{x['pnl_pct']:>6.1f}% {x['peak_gain_pct']:>6.1f}% {f(x.get('drop_from_peak_pct'), 0.0):>14.1f}% "
+            f"{f(x.get('hold_min'), 0.0):>9.1f}  {x.get('reason') or ''}"
+        )
+    print()
+
+    print("=== POST-SESSION DIAGNOSTICS ===")
+    print(f"final ibkr positions: {len(latest_portfolio)}")
+    print(f"final managed count:  {managed_summary['active_count']}")
+    print(f"fractional orphans:   {len(diagnostic_fractional_orphans)}")
+    print(f"whole-share orphans:  {len(diagnostic_whole_share_orphans)}")
+    print(f"pending orders:       {eod_summary.get('pending_orders', '')}")
+    clean_value = eod_summary.get("clean")
+    print(f"eod clean:            {'' if clean_value is None else int(bool(clean_value))}")
+    print(f"partial entries:      {event_counts.get('ENTRY_ORDER_PARTIAL', 0)}")
+    print(f"partial exits:        {event_counts.get('EXIT_ORDER_PARTIAL', 0)}")
+    print(f"delayed fill/cancel:  {event_counts.get('DELAYED_FILL_AFTER_CANCEL', 0)}")
+    print(f"cancel but position:  {event_counts.get('ORDER_CANCEL_BUT_POSITION_EXISTS', 0)}")
+    if latest_portfolio:
+        print(f"final symbols:        {', '.join(sorted(latest_portfolio))}")
     print()
 
     print("=== Strict/original setup subset ===")
@@ -583,9 +835,9 @@ def main():
     print(f"Strict open trades:   {len(strict_open)}")
     print(f"Strict win rate:      {(len(strict_wins) / len(strict_closed) * 100 if strict_closed else 0):.1f}%")
     print(f"Strict gross closed:  ${sum(x['gross'] for x in strict_closed):.2f}")
-    print(f"Strict net closed:    ${sum(x['net'] for x in strict_closed):.2f}")
+    print(f"Strict net closed:    ${sum(f(x.get('net_actual'), f(x.get('net'), 0.0)) for x in strict_closed):.2f}")
     print(f"Strict open UPNL:     ${sum(x['unrealized'] for x in strict_open):.2f}")
-    print(f"Strict total est:     ${sum(x['net'] for x in strict_closed) + sum(x['unrealized'] for x in strict_open):.2f}")
+    print(f"Strict total actual:  ${sum(f(x.get('net_actual'), f(x.get('net'), 0.0)) for x in strict_closed) + sum(x['unrealized'] for x in strict_open):.2f}")
     print()
 
     print("=== Peak / giveback analytics ===")
@@ -599,7 +851,7 @@ def main():
             f"{avg(rows, lambda x: x['pnl_pct']):>10.2f} "
             f"{avg(rows, lambda x: x['giveback_pct']):>10.2f} "
             f"{sum(x['gross'] for x in rows):>10.2f} "
-            f"{sum(x['net'] for x in rows):>10.2f}"
+            f"{sum(f(x.get('net_actual'), f(x.get('net'), 0.0)) for x in rows):>10.2f}"
         )
     print()
 
@@ -609,7 +861,7 @@ def main():
         s = bucket_stats[x["buy_bucket"]]
         s["closed"] += 1
         s["gross"] += x["gross"]
-        s["net"] += x["net"]
+        s["net"] += f(x.get("net_actual"), f(x.get("net"), 0.0))
         s["wins"] += 1 if x["gross"] > 0 else 0
         s["strict"] += 1 if x["strict_setup_ready"] else 0
     for x in open_positions:
@@ -626,22 +878,6 @@ def main():
             continue
         win_pct = s["wins"] / s["closed"] * 100 if s["closed"] else 0
         print(f"{bucket:<13} {s['closed']:>7} {s['open']:>5} {s['strict']:>7} {win_pct:>6.1f}% {s['gross']:>10.2f} {s['net']:>10.2f} {s['open_upnl']:>11.2f} {s['net'] + s['open_upnl']:>11.2f}")
-    print()
-
-    print("=== Closed trades ===")
-    print(f"{'SYM':<7} {'UTC':>5} {'MIN':>5} {'BUCKET':<13} {'STRICT':>6} {'QTY':>5} {'BUY':>10} {'SELL':>10} {'PEAK':>10} {'GROSS':>10} {'NET':>10} {'PNL%':>8} {'MFE%':>8} {'DROP':>8}  REASON")
-    print("-" * 165)
-    for x in sorted(closed, key=lambda r: r["gross"]):
-        mins = x.get("minutes_from_open")
-        print(f"{x['symbol']:<7} {x['buy_utc']:>5} {str(mins if mins is not None else ''):>5} {x['buy_bucket']:<13} {str(x['strict_setup_ready']):>6} {x['qty']:>5.0f} {x['buy']:>10.4f} {x['sell']:>10.4f} {x['peak']:>10.4f} {x['gross']:>10.2f} {x['net']:>10.2f} {x['pnl_pct']:>7.2f}% {x['peak_gain_pct']:>7.2f}% {x['giveback_pct']:>7.2f}%  {x['reason']}")
-
-    print()
-    print("=== Open trades from today ===")
-    print(f"{'SYM':<7} {'UTC':>5} {'MIN':>5} {'BUCKET':<13} {'STRICT':>6} {'QTY':>5} {'BUY':>10} {'NOW':>10} {'PEAK':>10} {'UPNL':>10} {'NOW%':>8} {'MFE%':>8} {'FROM_PK':>9}  BUY_TIME")
-    print("-" * 158)
-    for x in sorted(open_positions, key=lambda r: r["unrealized"]):
-        mins = x.get("minutes_from_open")
-        print(f"{x['symbol']:<7} {x['buy_utc']:>5} {str(mins if mins is not None else ''):>5} {x['buy_bucket']:<13} {str(x['strict_setup_ready']):>6} {x['qty']:>5.0f} {x['buy']:>10.4f} {x['current']:>10.4f} {x['peak']:>10.4f} {x['unrealized']:>10.2f} {x['current_pct']:>7.2f}% {x['peak_gain_pct']:>7.2f}% {x['from_peak_pct']:>8.2f}%  {x['buy_time']}")
 
 
 if __name__ == "__main__":

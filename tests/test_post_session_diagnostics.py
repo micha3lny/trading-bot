@@ -13,6 +13,7 @@ from unittest.mock import patch
 from src.live_trading.analytics import v67_daily_report
 from src.live_trading.order_lifecycle.models import LifecycleEventType
 from src.live_trading.order_lifecycle.store import JsonlLifecycleStore
+from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.v67_live_top100_expansion_paper_trader import (
     hard_eod_flatten_portfolio,
@@ -138,8 +139,40 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
                 v67_daily_report.main()
 
             text = out.getvalue()
-            self.assertIn("=== Exit simulation only ===", text)
+            self.assertIn("=== EXIT SIMULATION ===", text)
             self.assertIn("fixed TP +3%", text)
+
+    def test_daily_report_prefers_sqlite_commissions_and_watch_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "2026-05-22"
+            session.mkdir(parents=True)
+            lifecycle = session / "trade_lifecycle.csv"
+            with lifecycle.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["event", "symbol", "quantity", "price", "entry_price", "peak_price", "peak_gain_pct", "recorded_at", "reason"])
+                writer.writeheader()
+                writer.writerow({"event": "BUY_ORDER_SENT", "symbol": "RKLB", "quantity": "10", "price": "10", "recorded_at": "2026-05-22T13:30:00+00:00"})
+                writer.writerow({"event": "SELL_ORDER_SENT", "symbol": "RKLB", "quantity": "10", "price": "10.5", "entry_price": "10", "peak_price": "10.4", "peak_gain_pct": "4", "recorded_at": "2026-05-22T13:40:00+00:00", "reason": "trail"})
+            sqlite_path = root / "runtime.sqlite"
+            store = SQLiteRuntimeStore(sqlite_path)
+            store.upsert_execution({"execution_id": "B1", "session_date": "2026-05-22", "symbol": "RKLB", "side": "BOT", "quantity": 10, "price": 10, "commission": 0.35, "commission_source": "ibkr", "recorded_at": "2026-05-22T13:30:00+00:00"})
+            store.upsert_execution({"execution_id": "S1", "session_date": "2026-05-22", "symbol": "RKLB", "side": "SLD", "quantity": 10, "price": 10.5, "commission": 0.35, "commission_source": "ibkr", "recorded_at": "2026-05-22T13:40:00+00:00"})
+            store.close()
+
+            out = io.StringIO()
+            with patch("sys.argv", ["v67_daily_report", "--date", "2026-05-22", "--recorder-dir", str(root), "--sqlite-path", str(sqlite_path)]), contextlib.redirect_stdout(out):
+                v67_daily_report.main()
+
+            text = out.getvalue()
+            self.assertIn("source:               sqlite", text)
+            self.assertIn("ibkr commissions:     $0.70", text)
+            self.assertIn("net actual pnl:       $4.30", text)
+
+            watch = io.StringIO()
+            with patch("sys.argv", ["v67_daily_report", "--date", "2026-05-22", "--recorder-dir", str(root), "--sqlite-path", str(sqlite_path), "--watch-summary"]), contextlib.redirect_stdout(watch):
+                v67_daily_report.main()
+            self.assertIn("SESSION 2026-05-22", watch.getvalue())
+            self.assertIn("net=4.30", watch.getvalue())
 
     def test_tp_three_simulation_captures_trades_with_mfe_at_least_three(self) -> None:
         closed = [
