@@ -538,6 +538,14 @@ def pct(value: float) -> str:
     return f"{value:.1f}%"
 
 
+def effective_status(row: dict) -> str:
+    if row.get("partial_exit"):
+        return "PARTIAL_EXIT"
+    if row.get("exit_order_exists"):
+        return "EXIT_ORDER"
+    return str(row.get("status") or "OPEN")
+
+
 def is_active_rth_report(report_date: str) -> bool:
     now = datetime.now(timezone.utc)
     if report_date != now.strftime("%F"):
@@ -587,6 +595,8 @@ def main():
     ap.add_argument("--sqlite-path", default="data/runtime/trading_runtime.sqlite")
     ap.add_argument("--disable-sqlite", action="store_true")
     ap.add_argument("--watch-summary", action="store_true")
+    ap.add_argument("--watch-open-limit", type=int, default=20)
+    ap.add_argument("--watch-closed-limit", type=int, default=20)
     args = ap.parse_args()
 
     session = Path(args.recorder_dir) / args.date
@@ -776,13 +786,47 @@ def main():
             f"open_upnl={money(open_upnl)} total={money(net_actual_total + open_upnl)}"
         )
         print()
-        print("OPEN:")
-        for row in sorted(open_positions, key=lambda x: x["current_pct"], reverse=True)[:8]:
-            print(f"{row['symbol']} {row['current_pct']:+.1f}% upnl={row['unrealized']:+.2f} peak={row['peak_gain_pct']:.1f}% {row['status']}")
-        print()
-        print("LAST CLOSED:")
-        for row in sorted(closed, key=lambda x: str(x.get("sell_time") or ""), reverse=True)[:6]:
-            print(f"{row['symbol']} {row['pnl_pct']:+.1f}% net={f(row.get('net_actual'), f(row.get('net'), f(row.get('gross'), 0.0))):+.2f} peak={row['peak_gain_pct']:.1f}%")
+        if open_positions:
+            print("OPEN POSITIONS")
+            print(f"{'SYM':<6} {'QTY':>5} {'BUY':>8} {'NOW':>8} {'UPNL':>8} {'NOW%':>7} {'PEAK%':>7} {'FROM_PK':>8} {'HOLD':>6} STATUS")
+            for row in sorted(open_positions, key=lambda x: x["unrealized"])[: max(0, args.watch_open_limit)]:
+                print(
+                    f"{row['symbol']:<6} {row['qty']:>5.0f} {row['buy']:>8.3f} {row['current']:>8.3f} "
+                    f"{row['unrealized']:>8.2f} {row['current_pct']:>6.1f}% {row['peak_gain_pct']:>6.1f}% "
+                    f"{row['from_peak_pct']:>7.1f}% {row['hold_min']:>5.0f}m {effective_status(row)}"
+                )
+            print()
+        closed_limit = max(0, args.watch_closed_limit)
+        closed_rows = sorted(closed, key=lambda x: str(x.get("sell_time") or ""), reverse=True)
+        closed_rows = closed_rows if closed_limit == 0 else closed_rows[:closed_limit]
+        if closed_rows:
+            print("CLOSED POSITIONS")
+            print(f"{'SYM':<6} {'QTY':>5} {'BUY':>8} {'SELL':>8} {'NET_ACT':>8} {'PNL%':>7} {'PEAK%':>7} {'DROP':>7} {'HOLD':>6} EXIT")
+            for row in closed_rows:
+                print(
+                    f"{row['symbol']:<6} {row['qty']:>5.0f} {row['buy']:>8.3f} {row['sell']:>8.3f} "
+                    f"{f(row.get('net_actual'), f(row.get('net'), f(row.get('gross'), 0.0))):>8.2f} "
+                    f"{row['pnl_pct']:>6.1f}% {row['peak_gain_pct']:>6.1f}% "
+                    f"{f(row.get('drop_from_peak_pct'), 0.0):>6.1f}% {f(row.get('hold_min'), 0.0):>5.0f}m "
+                    f"{str(row.get('reason') or '')[:18]}"
+                )
+            print()
+        tp3 = next((row for row in exit_simulations if row["name"] == "fixed TP +3%"), None)
+        if tp3:
+            print(f"EXIT SIM TP +3 gross={tp3['gross']:.2f} net_est={tp3['net']:.2f} captured={tp3['captured']}/{tp3['trades']}")
+            print()
+        print("CURRENT POSITION DIAGNOSTICS")
+        print(
+            f"active_managed={position_diagnostics['active_managed_positions']} "
+            f"ibkr={position_diagnostics['ibkr_positions']} matched={position_diagnostics['matched_positions']} "
+            f"true_orphans={len(position_diagnostics['true_orphans'])} "
+            f"missing_in_ibkr={len(position_diagnostics['missing_in_ibkr'])} "
+            f"whole_orphans={len(position_diagnostics['whole_share_orphans'])}"
+        )
+        if position_diagnostics["true_orphans"]:
+            print(f"orphans={','.join(position_diagnostics['true_orphans'])}")
+        if position_diagnostics["missing_in_ibkr"]:
+            print(f"missing={','.join(position_diagnostics['missing_in_ibkr'])}")
         return
 
     print("=== SESSION SUMMARY ===")
@@ -813,15 +857,10 @@ def main():
     print(f"{'SYM':<7} {'QTY':>6} {'BUY':>9} {'NOW':>9} {'UPNL':>9} {'NOW%':>7} {'PEAK%':>7} {'FROM_PEAK%':>10} {'IBKR_COMM':>10} {'BUY_TIME':>8}  STATUS")
     print("-" * 126)
     for x in sorted(open_positions, key=lambda r: r["unrealized"]):
-        status = x["status"]
-        if x["partial_exit"]:
-            status = "PARTIAL_EXIT"
-        elif x["exit_order_exists"]:
-            status = "EXIT_ORDER"
         print(
             f"{x['symbol']:<7} {x['qty']:>6.0f} {x['buy']:>9.4f} {x['current']:>9.4f} {x['unrealized']:>9.2f} "
             f"{x['current_pct']:>6.1f}% {x['peak_gain_pct']:>6.1f}% {x['from_peak_pct']:>9.1f}% "
-            f"{x['ibkr_commission']:>10.2f} {x['buy_utc']:>8}  {status}"
+            f"{x['ibkr_commission']:>10.2f} {x['buy_utc']:>8}  {effective_status(x)}"
         )
     print()
 

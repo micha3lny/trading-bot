@@ -173,6 +173,8 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
                 v67_daily_report.main()
             self.assertIn("SESSION 2026-05-22", watch.getvalue())
             self.assertIn("net=4.30", watch.getvalue())
+            self.assertIn("CLOSED POSITIONS", watch.getvalue())
+            self.assertIn("EXIT SIM TP +3", watch.getvalue())
 
     def test_active_managed_open_position_is_not_counted_as_orphan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,6 +210,18 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
             self.assertIn("matched_positions:        1", text)
             self.assertIn("true_orphans:             0", text)
             self.assertIn("whole-share orphans:      0", text)
+
+            watch = io.StringIO()
+            with patch("sys.argv", ["v67_daily_report", "--date", "2026-05-22", "--recorder-dir", str(root), "--watch-summary"]), contextlib.redirect_stdout(watch):
+                v67_daily_report.main()
+            watch_text = watch.getvalue()
+            self.assertIn("OPEN POSITIONS", watch_text)
+            self.assertIn("SYM", watch_text)
+            self.assertIn("FROM_PK", watch_text)
+            self.assertIn("RKLB", watch_text)
+            self.assertIn("CURRENT POSITION DIAGNOSTICS", watch_text)
+            self.assertIn("true_orphans=0", watch_text)
+            self.assertIn("whole_orphans=0", watch_text)
 
     def test_tp_three_simulation_captures_trades_with_mfe_at_least_three(self) -> None:
         closed = [
