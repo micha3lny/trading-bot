@@ -538,6 +538,18 @@ def pct(value: float) -> str:
     return f"{value:.1f}%"
 
 
+def fmt(value, width: int = 8, decimals: int = 2) -> str:
+    if value is None or value == "":
+        return "NA".rjust(width)
+    return f"{f(value, 0.0):>{width}.{decimals}f}"
+
+
+def fmt_pct(value, width: int = 6, decimals: int = 1) -> str:
+    if value is None or value == "":
+        return "NA".rjust(width + 1)
+    return f"{f(value, 0.0):>{width}.{decimals}f}%"
+
+
 def primary_net(row: dict) -> float:
     return f(row.get("net_estimated"), f(row.get("net_actual"), f(row.get("net"), f(row.get("gross"), 0.0))))
 
@@ -559,6 +571,71 @@ def commission_coverage(closed: list[dict]) -> tuple[int, int]:
         if str(row.get("sell_commission_source") or "").strip().lower() == "ibkr":
             confirmed += 1
     return confirmed, sides
+
+
+def closed_sort_key(row: dict) -> tuple[str, str, str, str]:
+    return (
+        str(row.get("sell_time") or row.get("closed_at") or ""),
+        str(row.get("symbol") or ""),
+        str(row.get("buy_execution_id") or ""),
+        str(row.get("sell_execution_id") or ""),
+    )
+
+
+def choose_fill_snapshot(
+    *,
+    sqlite_fills: list[dict],
+    csv_fills: list[dict],
+    lifecycle_closed_count: int,
+    commission_per_roundtrip: float,
+) -> dict:
+    sqlite_closed = reconstruct_closed_trades_from_fills(sqlite_fills, commission_per_roundtrip)
+    csv_closed = reconstruct_closed_trades_from_fills(csv_fills, commission_per_roundtrip)
+    if sqlite_fills and (lifecycle_closed_count == 0 or len(sqlite_closed) >= lifecycle_closed_count):
+        source = "sqlite"
+        fills = sqlite_fills
+        reconstructed = sqlite_closed
+    elif csv_fills:
+        source = "csv"
+        fills = csv_fills
+        reconstructed = csv_closed
+    elif sqlite_fills:
+        source = "mixed"
+        fills = sqlite_fills
+        reconstructed = sqlite_closed
+    else:
+        source = "csv"
+        fills = []
+        reconstructed = []
+    return {
+        "source": source,
+        "fills": list(fills),
+        "reconstructed": list(reconstructed),
+        "sqlite_executions_count": len(sqlite_fills),
+        "csv_executions_count": len(csv_fills),
+        "sqlite_reconstructed_count": len(sqlite_closed),
+        "csv_reconstructed_count": len(csv_closed),
+    }
+
+
+def format_source_diagnostics(
+    *,
+    fill_snapshot: dict,
+    fill_rows: list[dict],
+    lifecycle_closed_count: int,
+    closed: list[dict],
+    coverage: tuple[int, int],
+    snapshot_loaded_at: str,
+) -> list[str]:
+    confirmed, total = coverage
+    return [
+        f"source={fill_snapshot['source']}",
+        f"executions_count={len(fill_rows)}",
+        f"lifecycle_closed_count={lifecycle_closed_count}",
+        f"reconstructed_closed_count={len(fill_snapshot['reconstructed'])}",
+        f"commission_coverage={confirmed}/{total}",
+        f"snapshot_loaded_at={snapshot_loaded_at}",
+    ]
 
 
 def is_active_rth_report(report_date: str) -> bool:
@@ -610,10 +687,12 @@ def main():
     ap.add_argument("--sqlite-path", default="data/runtime/trading_runtime.sqlite")
     ap.add_argument("--disable-sqlite", action="store_true")
     ap.add_argument("--watch-summary", action="store_true")
-    ap.add_argument("--watch-open-limit", type=int, default=20)
-    ap.add_argument("--watch-closed-limit", type=int, default=20)
+    ap.add_argument("--watch-full", action="store_true")
+    ap.add_argument("--watch-open-limit", type=int, default=30)
+    ap.add_argument("--watch-closed-limit", type=int, default=50)
     args = ap.parse_args()
 
+    snapshot_loaded_at = datetime.now(timezone.utc).isoformat()
     session = Path(args.recorder_dir) / args.date
     lifecycle = session / "trade_lifecycle.csv"
     sqlite_path = None if args.disable_sqlite else args.sqlite_path
@@ -672,30 +751,40 @@ def main():
                         "reason": r.get("reason"),
                     })
 
-    fill_rows = sqlite_fills or load_fills(session)
-    fill_closed = reconstruct_closed_trades_from_fills(fill_rows, args.commission_per_roundtrip)
+    csv_fills = load_fills(session)
+    fill_snapshot = choose_fill_snapshot(
+        sqlite_fills=sqlite_fills,
+        csv_fills=csv_fills,
+        lifecycle_closed_count=len(lifecycle_closed),
+        commission_per_roundtrip=args.commission_per_roundtrip,
+    )
+    fill_rows = fill_snapshot["fills"]
+    fill_closed = fill_snapshot["reconstructed"]
     closed = enrich_closed_with_lifecycle(fill_closed, lifecycle_closed) if fill_closed else lifecycle_closed
+    closed = sorted(closed, key=closed_sort_key)
 
     open_positions = []
     sqlite_positions = load_sqlite_positions(sqlite_path, args.date)
     sqlite_open_symbols = {str(row.get("symbol") or "").upper() for row in sqlite_positions}
     for sym, rows in buys.items():
         for row in rows:
-            if fill_closed and sym not in latest_portfolio and sym not in sqlite_open_symbols:
-                continue
             buy_px = f(row.get("fill_price") or row.get("price") or row.get("entry_price"))
             qty = f(row.get("quantity"))
             buy_time = row.get("recorded_at")
             payload = raw_json_dict(row) or best_signal_payload_for_buy(signal_features, sym, buy_time)
             strict = is_strict_payload(payload, row)
             pf = latest_portfolio.get(sym, {})
-            current = f(pf.get("marketPrice"), 0)
-            unrealized = f(pf.get("unrealizedPNL"), (current - buy_px) * qty if current else 0)
+            has_ibkr_position = sym in latest_portfolio or sym in sqlite_open_symbols
+            current = f(pf.get("marketPrice"), None) if has_ibkr_position else None
+            unrealized = f(pf.get("unrealizedPNL"), (current - buy_px) * qty if current else None) if has_ibkr_position else None
             lifecycle_row = latest_lifecycle.get(sym, {})
-            peak = max(f(row.get("peak_price"), f(lifecycle_row.get("peak_price"), buy_px)), buy_px, current)
+            peak = max(f(row.get("peak_price"), f(lifecycle_row.get("peak_price"), buy_px)), buy_px, current or buy_px)
             peak_pct = ((peak / buy_px - 1) * 100 if buy_px else 0)
-            current_pct = ((current / buy_px - 1) * 100 if buy_px and current else 0)
+            current_pct = ((current / buy_px - 1) * 100 if buy_px and current else None)
             status = open_status.get(sym, {})
+            status_value = status.get("status") or "OPEN"
+            if not has_ibkr_position:
+                status_value = "MISSING_IN_IBKR/RECONCILING"
             buy_comm = sum(
                 actual_commission(fill) or 0.0
                 for fill in fill_rows
@@ -715,12 +804,12 @@ def main():
                 "unrealized": unrealized,
                 "current_pct": current_pct,
                 "peak_gain_pct": peak_pct,
-                "from_peak_pct": current_pct - peak_pct,
+                "from_peak_pct": (current_pct - peak_pct) if current_pct is not None else None,
                 "ibkr_commission": buy_comm,
                 "hold_min": hold_minutes(buy_time),
                 "exit_order_exists": bool(status.get("exit_order_exists")),
                 "partial_exit": bool(status.get("partial_exit")),
-                "status": status.get("status") or "OPEN",
+                "status": status_value,
             })
     existing_open_symbols = {row["symbol"] for row in open_positions}
     for row in sqlite_positions:
@@ -770,7 +859,7 @@ def main():
     ibkr_commission_total = sum(f(x.get("actual_commission"), 0.0) for x in closed)
     fallback_commission_total = sum(f(x.get("estimated_commission_fallback"), 0.0) for x in closed)
     net_actual_total = sum(primary_net(x) for x in closed)
-    open_upnl = sum(x["unrealized"] for x in open_positions)
+    open_upnl = sum(f(x.get("unrealized"), 0.0) for x in open_positions)
     strict_closed = [x for x in closed if x["strict_setup_ready"]]
     strict_open = [x for x in open_positions if x["strict_setup_ready"]]
     commission_per_trade = effective_commission_per_trade(fill_closed, args.commission_per_roundtrip)
@@ -793,12 +882,20 @@ def main():
     best_trade = max(closed, key=primary_net, default=None)
     worst_trade = min(closed, key=primary_net, default=None)
     confirmed_commission_sides, total_commission_sides = commission_coverage(closed)
+    source_diagnostics = format_source_diagnostics(
+        fill_snapshot=fill_snapshot,
+        fill_rows=fill_rows,
+        lifecycle_closed_count=len(lifecycle_closed),
+        closed=closed,
+        coverage=(confirmed_commission_sides, total_commission_sides),
+        snapshot_loaded_at=snapshot_loaded_at,
+    )
 
-    if args.watch_summary:
-        print(f"SESSION {args.date}")
+    if args.watch_summary or args.watch_full:
+        print(f"SESSION SUMMARY {args.date}")
         print(
             f"closed={len(closed)} open={len(open_positions)} win={(len(wins) / len(closed) * 100 if closed else 0):.1f}% "
-            f"gross={money(gross_total)} ibkr_comm={money(ibkr_commission_total)} fallback={money(fallback_commission_total)} net={money(net_actual_total)} "
+            f"gross={money(gross_total)} ibkr_comm_confirmed={money(ibkr_commission_total)} est_fallback={money(fallback_commission_total)} net={money(net_actual_total)} "
             f"open_upnl={money(open_upnl)} total={money(net_actual_total + open_upnl)}"
         )
         print(
@@ -806,28 +903,33 @@ def main():
             f"avg_peak={avg_peak:.1f}% avg_giveback={avg_giveback:.1f}% "
             f"comm_coverage={confirmed_commission_sides}/{total_commission_sides}"
         )
+        print(" ".join(source_diagnostics))
         print()
         if open_positions:
             print("OPEN POSITIONS")
             print(f"{'SYM':<6} {'QTY':>5} {'BUY':>8} {'NOW':>8} {'UPNL':>8} {'NOW%':>7} {'PEAK%':>7} {'FROM_PEAK':>10} {'IBKR_COMM':>9} {'BUY_TIME':>8} STATUS")
-            for row in sorted(open_positions, key=lambda x: x["unrealized"])[: max(0, args.watch_open_limit)]:
+            open_limit = max(0, args.watch_open_limit)
+            open_rows = sorted(open_positions, key=lambda x: (f(x.get("unrealized"), 0.0), str(x.get("symbol") or "")))
+            open_rows = open_rows if open_limit == 0 else open_rows[:open_limit]
+            for row in open_rows:
                 print(
-                    f"{row['symbol']:<6} {row['qty']:>5.0f} {row['buy']:>8.3f} {row['current']:>8.3f} "
-                    f"{row['unrealized']:>8.2f} {row['current_pct']:>6.1f}% {row['peak_gain_pct']:>6.1f}% "
-                    f"{row['from_peak_pct']:>9.1f}% {row['ibkr_commission']:>9.2f} {row['buy_utc']:>8} {effective_status(row)}"
+                    f"{row['symbol']:<6} {f(row.get('qty'), 0.0):>5.0f} {fmt(row.get('buy'), 8, 3)} {fmt(row.get('current'), 8, 3)} "
+                    f"{fmt(row.get('unrealized'), 8, 2)} {fmt_pct(row.get('current_pct'), 6, 1)} {fmt_pct(row.get('peak_gain_pct'), 6, 1)} "
+                    f"{fmt_pct(row.get('from_peak_pct'), 9, 1)} {fmt(row.get('ibkr_commission'), 9, 2)} {row['buy_utc']:>8} {effective_status(row)}"
                 )
             print()
         closed_limit = max(0, args.watch_closed_limit)
-        closed_rows = sorted(closed, key=lambda x: str(x.get("sell_time") or ""), reverse=True)
+        closed_rows = sorted(closed, key=closed_sort_key, reverse=True)
         closed_rows = closed_rows if closed_limit == 0 else closed_rows[:closed_limit]
         if closed_rows:
             print("CLOSED POSITIONS")
-            print(f"{'SYM':<6} {'QTY':>5} {'BUY':>8} {'SELL':>8} {'GROSS':>8} {'IBKR_COMM':>9} {'NET_ACTUAL':>10} {'PNL%':>7} {'PEAK%':>7} {'DROP_FROM_PEAK':>14} {'HOLD_MIN':>8} EXIT_REASON")
+            print(f"{'SYM':<6} {'QTY':>5} {'BUY':>8} {'SELL':>8} {'GROSS':>8} {'IBKR_COMM':>9} {'EST_FB':>8} {'NET_ACTUAL_OR_EST':>17} {'PNL%':>7} {'PEAK%':>7} {'DROP_FROM_PEAK':>14} {'HOLD_MIN':>8} EXIT_REASON")
             for row in closed_rows:
                 print(
-                    f"{row['symbol']:<6} {row['qty']:>5.0f} {row['buy']:>8.3f} {row['sell']:>8.3f} "
-                    f"{row['gross']:>8.2f} {f(row.get('actual_commission'), 0.0):>9.2f} {primary_net(row):>10.2f} "
-                    f"{row['pnl_pct']:>6.1f}% {row['peak_gain_pct']:>6.1f}% "
+                    f"{row['symbol']:<6} {f(row.get('qty'), 0.0):>5.0f} {f(row.get('buy'), 0.0):>8.3f} {f(row.get('sell'), 0.0):>8.3f} "
+                    f"{f(row.get('gross'), 0.0):>8.2f} {f(row.get('actual_commission'), 0.0):>9.2f} "
+                    f"{f(row.get('estimated_commission_fallback'), 0.0):>8.2f} {primary_net(row):>17.2f} "
+                    f"{f(row.get('pnl_pct'), 0.0):>6.1f}% {f(row.get('peak_gain_pct'), 0.0):>6.1f}% "
                     f"{f(row.get('drop_from_peak_pct'), 0.0):>13.1f}% {f(row.get('hold_min'), 0.0):>7.0f}m "
                     f"{str(row.get('reason') or '')[:18]}"
                 )
@@ -858,8 +960,9 @@ def main():
     print(f"open trades:          {len(open_positions)}")
     print(f"win rate:             {(len(wins) / len(closed) * 100 if closed else 0):.1f}%")
     print(f"gross closed pnl:     ${gross_total:.2f}")
-    print(f"ibkr commissions:     ${ibkr_commission_total:.2f}")
-    print(f"net actual pnl:       ${net_actual_total:.2f}")
+    print(f"ibkr_commissions_confirmed: ${ibkr_commission_total:.2f}")
+    print(f"estimated_fallback:   ${fallback_commission_total:.2f}")
+    print(f"net_after_commissions:${net_actual_total:.2f}")
     print(f"open unrealized pnl:  ${open_upnl:.2f}")
     print(f"total actual pnl:     ${net_actual_total + open_upnl:.2f}")
     print(f"avg win:              ${avg_win:.2f}")
@@ -871,20 +974,23 @@ def main():
     print(f"best trade:           {(best_trade or {}).get('symbol', '')} ${primary_net(best_trade or {}):.2f}")
     print(f"worst trade:          {(worst_trade or {}).get('symbol', '')} ${primary_net(worst_trade or {}):.2f}")
     print(f"commissions/gross:    {(abs(ibkr_commission_total) / abs(gross_total) * 100 if gross_total else 0):.1f}%")
-    print(f"estimated fallback:   ${fallback_commission_total:.2f}")
-    print(f"commission coverage:  {confirmed_commission_sides}/{total_commission_sides} sides")
+    print(f"commission_coverage:  {confirmed_commission_sides}/{total_commission_sides} sides")
     print(f"fills without comm:   {len(fills_without_commission)}")
-    print(f"source:               {'sqlite' if sqlite_fills else 'csv/jsonl'}")
+    print(f"source:               {fill_snapshot['source']}")
+    print(f"executions_count:     {len(fill_rows)}")
+    print(f"lifecycle_closed_count: {len(lifecycle_closed)}")
+    print(f"reconstructed_closed_count: {len(fill_snapshot['reconstructed'])}")
+    print(f"snapshot_loaded_at:   {snapshot_loaded_at}")
     print()
 
     print("=== OPEN POSITIONS ===")
     print(f"{'SYM':<7} {'QTY':>6} {'BUY':>9} {'NOW':>9} {'UPNL':>9} {'NOW%':>7} {'PEAK%':>7} {'FROM_PEAK%':>10} {'IBKR_COMM':>10} {'BUY_TIME':>8}  STATUS")
     print("-" * 126)
-    for x in sorted(open_positions, key=lambda r: r["unrealized"]):
+    for x in sorted(open_positions, key=lambda r: (f(r.get("unrealized"), 0.0), str(r.get("symbol") or ""))):
         print(
-            f"{x['symbol']:<7} {x['qty']:>6.0f} {x['buy']:>9.4f} {x['current']:>9.4f} {x['unrealized']:>9.2f} "
-            f"{x['current_pct']:>6.1f}% {x['peak_gain_pct']:>6.1f}% {x['from_peak_pct']:>9.1f}% "
-            f"{x['ibkr_commission']:>10.2f} {x['buy_utc']:>8}  {effective_status(x)}"
+            f"{x['symbol']:<7} {f(x.get('qty'), 0.0):>6.0f} {fmt(x.get('buy'), 9, 4)} {fmt(x.get('current'), 9, 4)} {fmt(x.get('unrealized'), 9, 2)} "
+            f"{fmt_pct(x.get('current_pct'), 6, 1)} {fmt_pct(x.get('peak_gain_pct'), 6, 1)} {fmt_pct(x.get('from_peak_pct'), 9, 1)} "
+            f"{fmt(x.get('ibkr_commission'), 10, 2)} {x['buy_utc']:>8}  {effective_status(x)}"
         )
     print()
 
@@ -896,12 +1002,12 @@ def main():
     print()
 
     print("=== CLOSED POSITIONS ===")
-    print(f"{'SYM':<7} {'QTY':>6} {'BUY':>9} {'SELL':>9} {'GROSS':>9} {'IBKR_COMM':>10} {'NET_ACTUAL':>10} {'PNL%':>7} {'PEAK%':>7} {'DROP_FROM_PEAK%':>15} {'HOLD_MIN':>9}  EXIT_REASON")
-    print("-" * 146)
-    for x in sorted(closed, key=primary_net):
+    print(f"{'SYM':<7} {'QTY':>6} {'BUY':>9} {'SELL':>9} {'GROSS':>9} {'IBKR_COMM':>10} {'EST_FB':>9} {'NET_ACTUAL_OR_EST':>17} {'PNL%':>7} {'PEAK%':>7} {'DROP_FROM_PEAK%':>15} {'HOLD_MIN':>9}  EXIT_REASON")
+    print("-" * 158)
+    for x in sorted(closed, key=closed_sort_key):
         print(
             f"{x['symbol']:<7} {x['qty']:>6.0f} {x['buy']:>9.4f} {x['sell']:>9.4f} {x['gross']:>9.2f} "
-            f"{f(x.get('actual_commission'), 0.0):>10.2f} {primary_net(x):>10.2f} "
+            f"{f(x.get('actual_commission'), 0.0):>10.2f} {f(x.get('estimated_commission_fallback'), 0.0):>9.2f} {primary_net(x):>17.2f} "
             f"{x['pnl_pct']:>6.1f}% {x['peak_gain_pct']:>6.1f}% {f(x.get('drop_from_peak_pct'), 0.0):>14.1f}% "
             f"{f(x.get('hold_min'), 0.0):>9.1f}  {x.get('reason') or ''}"
         )
@@ -937,8 +1043,8 @@ def main():
     print(f"Strict win rate:      {(len(strict_wins) / len(strict_closed) * 100 if strict_closed else 0):.1f}%")
     print(f"Strict gross closed:  ${sum(x['gross'] for x in strict_closed):.2f}")
     print(f"Strict net closed:    ${sum(primary_net(x) for x in strict_closed):.2f}")
-    print(f"Strict open UPNL:     ${sum(x['unrealized'] for x in strict_open):.2f}")
-    print(f"Strict total actual:  ${sum(primary_net(x) for x in strict_closed) + sum(x['unrealized'] for x in strict_open):.2f}")
+    print(f"Strict open UPNL:     ${sum(f(x.get('unrealized'), 0.0) for x in strict_open):.2f}")
+    print(f"Strict total actual:  ${sum(primary_net(x) for x in strict_closed) + sum(f(x.get('unrealized'), 0.0) for x in strict_open):.2f}")
     print()
 
     print("=== Peak / giveback analytics ===")
@@ -968,7 +1074,7 @@ def main():
     for x in open_positions:
         s = bucket_stats[x["buy_bucket"]]
         s["open"] += 1
-        s["open_upnl"] += x["unrealized"]
+        s["open_upnl"] += f(x.get("unrealized"), 0.0)
         s["strict"] += 1 if x["strict_setup_ready"] else 0
     order = ["pre-open", "13:30-14:00", "14:00-15:00", "15:00-16:00", "16:00-17:00", "17:00-18:00", "18:00-19:00", "19:00+", "unknown"]
     print(f"{'BUCKET':<13} {'CLOSED':>7} {'OPEN':>5} {'STRICT':>7} {'WIN%':>7} {'GROSS':>10} {'NET':>10} {'OPEN_UPNL':>11} {'TOTAL_EST':>11}")
