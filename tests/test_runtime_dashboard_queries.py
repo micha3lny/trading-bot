@@ -105,6 +105,48 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-25", "2026-05-26"), "alpha")
             self.assertEqual(set(snapshot["executions"]["strategy"].unique()), {"alpha"})
 
+    def test_flat_execution_symbol_is_not_shown_as_stale_open_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_execution({
+                "execution_id": "B1",
+                "session_date": "2026-05-26",
+                "strategy_name": "v67",
+                "symbol": "STALE",
+                "side": "BOT",
+                "quantity": 4,
+                "price": 10,
+                "recorded_at": "2026-05-26T13:30:00+00:00",
+            })
+            store.upsert_execution({
+                "execution_id": "S1",
+                "session_date": "2026-05-26",
+                "strategy_name": "v67",
+                "symbol": "STALE",
+                "side": "SLD",
+                "quantity": 4,
+                "price": 11,
+                "recorded_at": "2026-05-26T13:45:00+00:00",
+            })
+            store.upsert_position({
+                "session_date": "2026-05-26",
+                "strategy_name": "v67",
+                "symbol": "STALE",
+                "quantity": 4,
+                "avg_price": 10,
+                "active": 1,
+                "status": "OPEN",
+                "updated_at": "2026-05-26T14:00:00+00:00",
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-26", "2026-05-26"), "v67")
+
+            self.assertEqual(snapshot["summary"]["closed_trades"], 1)
+            self.assertEqual(snapshot["summary"]["open_trades"], 0)
+            self.assertTrue(snapshot["open_positions"].empty)
+
 
 if __name__ == "__main__":
     unittest.main()

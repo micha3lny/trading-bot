@@ -252,7 +252,35 @@ def load_closed_positions(conn: sqlite3.Connection, window: DateWindow, strategy
     return closed.sort_values(["exit_time", "symbol"], na_position="last").reset_index(drop=True)
 
 
-def load_open_positions(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> pd.DataFrame:
+def execution_net_positions(executions: pd.DataFrame | None) -> dict[tuple[str, str, str], float]:
+    if executions is None or executions.empty:
+        return {}
+    net: dict[tuple[str, str, str], float] = {}
+    for row in executions.to_dict("records"):
+        session_date = str(row.get("session_date") or "")
+        strategy = str(row.get("strategy") or "unknown")
+        symbol = str(row.get("symbol") or "").upper()
+        if not session_date or not symbol:
+            continue
+        qty = abs(to_float(row.get("quantity"), 0.0) or 0.0)
+        action = str(row.get("action") or "").upper()
+        if action in {"BOT", "BUY"}:
+            signed_qty = qty
+        elif action in {"SLD", "SELL"}:
+            signed_qty = -qty
+        else:
+            signed_qty = to_float(row.get("quantity"), 0.0) or 0.0
+        key = (session_date, strategy, symbol)
+        net[key] = net.get(key, 0.0) + signed_qty
+    return net
+
+
+def load_open_positions(
+    conn: sqlite3.Connection,
+    window: DateWindow,
+    strategy: str | None,
+    executions: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     clause, params = strategy_clause("p", strategy)
     rows = read_sql(
         conn,
@@ -279,8 +307,15 @@ def load_open_positions(conn: sqlite3.Connection, window: DateWindow, strategy: 
     )
     if rows.empty:
         return rows
+    net_by_execution = execution_net_positions(executions)
     out: list[dict[str, Any]] = []
     for row in rows.to_dict("records"):
+        row_strategy = str(row.get("strategy") or "unknown")
+        symbol = str(row.get("symbol") or "").upper()
+        session_date = str(row.get("session_date") or "")
+        net_key = (session_date, row_strategy, symbol)
+        if net_key in net_by_execution and abs(net_by_execution[net_key]) < 1e-9:
+            continue
         raw = parse_raw_json(row.get("raw_json"))
         qty = to_float(row.get("quantity"), None)
         if qty is None:
@@ -308,9 +343,9 @@ def load_open_positions(conn: sqlite3.Connection, window: DateWindow, strategy: 
             "hold_minutes": hold_minutes(entry_time),
             "ibkr_commission": to_float(raw.get("ibkr_commission"), 0.0) or 0.0,
             "status": row.get("status") or ("EXIT_SENT" if row.get("exit_sent") else "OPEN"),
-            "strategy": row.get("strategy") or "unknown",
+            "strategy": row_strategy,
             "entry_time": entry_time,
-            "session_date": row.get("session_date"),
+            "session_date": session_date,
         })
     return pd.DataFrame(out)
 
@@ -444,7 +479,7 @@ def load_dashboard_snapshot(sqlite_path: str | Path | None, window: DateWindow, 
     try:
         executions = load_executions(conn, window, strategy)
         closed = load_closed_positions(conn, window, strategy, executions)
-        open_positions = load_open_positions(conn, window, strategy)
+        open_positions = load_open_positions(conn, window, strategy, executions)
         return {
             "summary": build_summary(open_positions, closed),
             "open_positions": open_positions,
