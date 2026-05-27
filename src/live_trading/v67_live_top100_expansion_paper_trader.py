@@ -368,6 +368,9 @@ def formal_event_type_for_legacy_event(event: str) -> LifecycleEventType | None:
         "MANUAL_FLATTEN_DRY_RUN": LifecycleEventType.EXIT_ORDER_PREPARED,
         "MANUAL_FLATTEN_FAILED": LifecycleEventType.EXIT_ORDER_REJECTED,
         "EOD_FLATTEN_FAILED": LifecycleEventType.EXIT_ORDER_REJECTED,
+        "EOD_FLATTEN_RETRY": LifecycleEventType.EXIT_ORDER_PREPARED,
+        "EOD_FLATTEN_SUCCESS": LifecycleEventType.POSITION_CLOSED,
+        "EOD_FLATTEN_GIVEUP": LifecycleEventType.EXIT_ORDER_REJECTED,
         "EXIT_ORDER_CANCEL_REQUESTED": LifecycleEventType.EXIT_ORDER_CANCEL_REQUESTED,
         "EXIT_ORDER_CANCELLED": LifecycleEventType.EXIT_ORDER_CANCELLED,
         "ORDER_CANCEL_CONFIRMED": LifecycleEventType.EXIT_ORDER_CANCELLED,
@@ -1286,6 +1289,7 @@ def write_eod_final_status(
         "pending_orders": pending_orders,
         "managed_open": len(managed_open_symbols),
         "managed_open_symbols": managed_open_symbols,
+        "pending_eod_flatten": bool(rows),
     }
     runtime_state["eod_final_status"] = summary
     recorder.path("eod_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
@@ -1328,6 +1332,86 @@ def write_eod_final_status(
     return summary
 
 
+def persist_pending_eod_flatten(
+    recorder: LiveDataRecorder,
+    runtime_state: dict[str, Any],
+    *,
+    pending: bool,
+    reason: str,
+    rows: list[dict[str, Any]] | None = None,
+) -> None:
+    runtime_state["pending_eod_flatten"] = bool(pending)
+    runtime_state["pending_eod_flatten_reason"] = reason if pending else ""
+    runtime_state["pending_eod_flatten_updated_at"] = now_utc()
+    runtime_state["pending_eod_flatten_symbols"] = sorted(row["symbol"] for row in (rows or [])) if pending else []
+    payload = {
+        "recorded_at": runtime_state["pending_eod_flatten_updated_at"],
+        "pending_eod_flatten": bool(pending),
+        "reason": reason,
+        "symbols": runtime_state["pending_eod_flatten_symbols"],
+    }
+    try:
+        recorder.path("eod_pending.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    except Exception as exc:
+        print(f"{now_utc()} EOD_PENDING_PERSIST_FAILED reason={reason} error={exc!r}", flush=True)
+
+
+def load_pending_eod_flatten(recorder: LiveDataRecorder, runtime_state: dict[str, Any]) -> bool:
+    path = recorder.path("eod_pending.json")
+    if not path.exists():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"{now_utc()} EOD_PENDING_LOAD_FAILED error={exc!r}", flush=True)
+        return False
+    pending = bool(payload.get("pending_eod_flatten"))
+    runtime_state["pending_eod_flatten"] = pending
+    runtime_state["pending_eod_flatten_reason"] = str(payload.get("reason") or "")
+    runtime_state["pending_eod_flatten_updated_at"] = str(payload.get("recorded_at") or "")
+    runtime_state["pending_eod_flatten_symbols"] = list(payload.get("symbols") or [])
+    if pending:
+        print(
+            f"{now_utc()} EOD_FLATTEN_PENDING_RESTORED reason={runtime_state['pending_eod_flatten_reason']} "
+            f"symbols={','.join(runtime_state['pending_eod_flatten_symbols'])}",
+            flush=True,
+        )
+    return pending
+
+
+def record_eod_flatten_giveup_once(
+    recorder: LiveDataRecorder,
+    runtime_state: dict[str, Any],
+    *,
+    symbol: str,
+    quantity: float,
+    reason: str,
+    attempt: int,
+) -> None:
+    seen = runtime_state.setdefault("eod_flatten_giveup_seen", set())
+    if not isinstance(seen, set):
+        seen = set(seen or [])
+        runtime_state["eod_flatten_giveup_seen"] = seen
+    key = f"{symbol}:{reason}"
+    if key in seen:
+        return
+    seen.add(key)
+    record_lifecycle_with_formal(
+        recorder,
+        "EOD_FLATTEN_GIVEUP",
+        symbol,
+        action=_flatten_action_for_quantity(quantity),
+        quantity=abs(float(quantity)),
+        reason=reason,
+        raw_json={"ibkr_quantity": quantity, "attempt": attempt},
+    )
+    print(
+        f"{now_utc()} EOD_FLATTEN_GIVEUP symbol={symbol} quantity={quantity:.4f} "
+        f"attempt={attempt} reason={reason}",
+        flush=True,
+    )
+
+
 def submit_eod_flatten_order(
     ib: IB,
     recorder: LiveDataRecorder,
@@ -1351,6 +1435,14 @@ def submit_eod_flatten_order(
                 quantity=ibkr_quantity,
                 reason=f"{reason}_fractional_quantity_api_unsupported",
                 raw_json={"attempt": attempt, "action": action},
+            )
+            record_eod_flatten_giveup_once(
+                recorder,
+                runtime_state,
+                symbol=symbol,
+                quantity=ibkr_quantity,
+                reason="fractional_quantity_manual_required",
+                attempt=attempt,
             )
         else:
             record_lifecycle_with_formal(
@@ -1453,9 +1545,11 @@ def hard_eod_flatten_portfolio(
     try:
         if hasattr(ib, "isConnected") and not ib.isConnected():
             print(f"{now_utc()} EOD_FLATTEN_FAILED reason=ibkr_not_connected", flush=True)
+            persist_pending_eod_flatten(recorder, runtime_state, pending=True, reason="ibkr_not_connected")
             return 0
     except Exception as exc:
         print(f"{now_utc()} EOD_FLATTEN_FAILED reason=ibkr_connection_check_error error={exc!r}", flush=True)
+        persist_pending_eod_flatten(recorder, runtime_state, pending=True, reason="ibkr_connection_check_error")
         return 0
 
     now_ts = time.time()
@@ -1491,7 +1585,18 @@ def hard_eod_flatten_portfolio(
         runtime_state["manual_eod_flatten_force"] = False
         runtime_state["eod_flatten_attempts_by_symbol"] = {}
         runtime_state["eod_flatten_last_submit_ts_by_symbol"] = {}
+        runtime_state["pending_eod_flatten"] = False
+        persist_pending_eod_flatten(recorder, runtime_state, pending=False, reason="ibkr_flat")
         print(f"{now_utc()} EOD_FLATTEN_SUCCESS open_positions=0", flush=True)
+        record_lifecycle_with_formal(
+            recorder,
+            "EOD_FLATTEN_SUCCESS",
+            "__ALL__",
+            action="VERIFY",
+            quantity=0,
+            reason=reason,
+            raw_json={"open_positions": 0},
+        )
         write_eod_final_status(
             recorder,
             runtime_state,
@@ -1527,13 +1632,25 @@ def hard_eod_flatten_portfolio(
             continue
         if attempts > 0:
             print(f"{now_utc()} EOD_FLATTEN_RETRY symbol={symbol} attempt={attempts + 1}", flush=True)
-        if attempts >= max_retries and not force:
-            print(
-                f"{now_utc()} EOD_FLATTEN_FAILED symbol={symbol} quantity={ibkr_qty:.4f} "
-                f"attempts={attempts} reason=max_retries_exceeded_continuing",
-                flush=True,
+            record_lifecycle_with_formal(
+                recorder,
+                "EOD_FLATTEN_RETRY",
+                symbol,
+                action=action,
+                quantity=abs(ibkr_qty),
+                reason=reason,
+                raw_json={"attempt": attempts + 1, "ibkr_quantity": ibkr_qty},
             )
-        if submit_eod_flatten_order(
+        if attempts >= max_retries and not force:
+            record_eod_flatten_giveup_once(
+                recorder,
+                runtime_state,
+                symbol=symbol,
+                quantity=ibkr_qty,
+                reason="max_retries_exceeded_retrying",
+                attempt=attempts,
+            )
+        order_id = submit_eod_flatten_order(
             ib,
             recorder,
             symbol=symbol,
@@ -1542,31 +1659,16 @@ def hard_eod_flatten_portfolio(
             reason=reason,
             attempt=attempts + 1,
             runtime_state=runtime_state,
-        ):
+        )
+        attempt_by_symbol[symbol] = attempts + 1
+        last_submit_by_symbol[symbol] = now_ts
+        if order_id:
             submitted += 1
-            attempt_by_symbol[symbol] = attempts + 1
-            last_submit_by_symbol[symbol] = now_ts
             pos = managed_positions.get(symbol)
             if pos is not None:
                 pos.exit_sent = True
                 pos.last_exit_order_ts = now_ts
                 pos.eod_retry_count = attempts + 1
-
-    if reason == "manual_eod_flatten":
-        blocking_symbols = sorted(
-            row["symbol"]
-            for row in rows
-            if (managed_positions.get(row["symbol"]) is not None and managed_positions[row["symbol"]].active and not managed_positions[row["symbol"]].exit_sent)
-        )
-        if not blocking_symbols:
-            orphan_symbols = sorted(row["symbol"] for row in rows)
-            runtime_state["manual_eod_flatten_requested"] = False
-            runtime_state["manual_eod_flatten_force"] = False
-            runtime_state["entries_blocked"] = False
-            print(
-                f"{now_utc()} EOD_FLATTEN_ORPHANS_REMAINING_NOT_BLOCKING symbols={','.join(orphan_symbols)}",
-                flush=True,
-            )
 
     runtime_state["manual_eod_flatten_force"] = False
     try:
@@ -1581,7 +1683,57 @@ def hard_eod_flatten_portfolio(
         managed_positions=managed_positions,
         reason=reason,
     )
+    persist_pending_eod_flatten(recorder, runtime_state, pending=True, reason=reason, rows=rows)
     return submitted
+
+
+def process_pending_eod_flatten_retry(
+    ib: IB,
+    recorder: LiveDataRecorder,
+    managed_positions: dict[str, ManagedPosition],
+    args: argparse.Namespace,
+    runtime_state: dict[str, Any],
+    *,
+    reason: str,
+    force: bool = False,
+) -> int:
+    if not bool(runtime_state.get("pending_eod_flatten")) and not force:
+        return 0
+    now_ts = time.time()
+    retry_seconds = float(getattr(args, "eod_retry_seconds", 60.0))
+    last_retry = safe_float(runtime_state.get("pending_eod_flatten_last_retry_ts"))
+    if not force and last_retry is not None and now_ts - last_retry < retry_seconds:
+        return 0
+    rows = ibkr_portfolio_position_rows(ib)
+    if rows:
+        print(
+            f"{now_utc()} EOD_FLATTEN_RETRY reason={reason} open_positions={len(rows)} "
+            f"symbols={','.join(sorted(row['symbol'] for row in rows))}",
+            flush=True,
+        )
+        for row in rows:
+            ibkr_qty = float(row["quantity"])
+            record_lifecycle_with_formal(
+                recorder,
+                "EOD_FLATTEN_RETRY",
+                row["symbol"],
+                action=_flatten_action_for_quantity(ibkr_qty),
+                quantity=abs(ibkr_qty),
+                reason=reason,
+                raw_json={
+                    "ibkr_quantity": ibkr_qty,
+                    "source": "pending_eod_flatten_retry",
+                },
+            )
+    runtime_state["pending_eod_flatten_last_retry_ts"] = now_ts
+    return hard_eod_flatten_portfolio(
+        ib,
+        recorder,
+        managed_positions,
+        args,
+        runtime_state,
+        reason=reason,
+    )
 
 
 def verify_managed_positions_against_ibkr(
@@ -3000,6 +3152,16 @@ def handle_ibkr_disconnect_and_recover(
         runtime_state["post_reconnect_reconciliation_clean"] = bool(reconciliation.get("clean")) if isinstance(reconciliation, dict) else False
         runtime_state["post_reconnect_reconciliation_orphans"] = list(reconciliation.get("orphans", [])) if isinstance(reconciliation, dict) else []
         runtime_state["post_reconnect_reconciliation_pending_orders"] = list(reconciliation.get("pending_orders", [])) if isinstance(reconciliation, dict) else []
+        if runtime_state.get("pending_eod_flatten"):
+            process_pending_eod_flatten_retry(
+                ib,
+                recorder,
+                managed_positions,
+                args,
+                runtime_state,
+                reason="reconnect_pending_eod_flatten",
+                force=True,
+            )
         runtime_state["reconnect_active"] = False
         runtime_state["entries_blocked"] = False
         if runtime_state.get("entries_blocked_reason") in {"ibkr_reconnect", "post_reconnect_reconciliation"}:
@@ -3138,6 +3300,10 @@ def main() -> int:
         "market_close_utc": str(args.market_close_utc),
         "manual_eod_flatten_requested": False,
         "manual_eod_flatten_force": False,
+        "pending_eod_flatten": False,
+        "pending_eod_flatten_reason": "",
+        "pending_eod_flatten_symbols": [],
+        "pending_eod_flatten_last_retry_ts": 0.0,
         "startup_reconciliation_done": False,
         "startup_reconciliation_clean": False,
         "startup_reconciliation_orphans": [],
@@ -3176,6 +3342,7 @@ def main() -> int:
         "delayed_fill_after_cancel_count": 0,
         "cancel_but_position_exists_count": 0,
     }
+    load_pending_eod_flatten(recorder, runtime_state)
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
     adopted_once = False
@@ -3240,6 +3407,16 @@ def main() -> int:
             contract_by_symbol,
             runtime_state,
         )
+        if runtime_state.get("pending_eod_flatten"):
+            process_pending_eod_flatten_retry(
+                ib,
+                recorder,
+                managed_positions,
+                args,
+                runtime_state,
+                reason="startup_pending_eod_flatten",
+                force=True,
+            )
 
         recorder.record_run_metadata({
             "module": "v67_live_top100_expansion_paper_trader",
@@ -3309,6 +3486,16 @@ def main() -> int:
                 process_history_collector_commands(
                     runtime_state=runtime_state,
                 )
+
+                if runtime_state.get("pending_eod_flatten"):
+                    process_pending_eod_flatten_retry(
+                        ib,
+                        recorder,
+                        managed_positions,
+                        args,
+                        runtime_state,
+                        reason="periodic_pending_eod_flatten",
+                    )
 
                 ib.sleep(args.interval_seconds)
             except Exception as exc:

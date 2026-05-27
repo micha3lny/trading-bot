@@ -17,6 +17,8 @@ from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.v67_live_top100_expansion_paper_trader import (
     hard_eod_flatten_portfolio,
+    load_pending_eod_flatten,
+    process_pending_eod_flatten_retry,
     startup_reconcile_runtime_state,
 )
 
@@ -62,6 +64,11 @@ class FakeIB:
 
     def sleep(self, _seconds):
         return None
+
+
+class DisconnectedFakeIB(FakeIB):
+    def isConnected(self):
+        return False
 
 
 def recorder_in_tmp(tmp: str) -> LiveDataRecorder:
@@ -122,6 +129,62 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
             summary = json.loads(recorder.path("eod_summary.json").read_text())
             self.assertFalse(summary["clean"])
             self.assertEqual(summary["fractional_orphans"], ["ASST"])
+            self.assertTrue(summary["pending_eod_flatten"])
+            pending = json.loads(recorder.path("eod_pending.json").read_text())
+            self.assertTrue(pending["pending_eod_flatten"])
+            with recorder.path("trade_lifecycle.csv").open(encoding="utf-8") as fh:
+                events = [row["event"] for row in csv.DictReader(fh)]
+            self.assertIn("EOD_FLATTEN_GIVEUP", events)
+
+    def test_eod_flatten_failure_persists_pending_and_startup_reload_retries_until_flat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            runtime_state = {}
+
+            submitted = hard_eod_flatten_portfolio(
+                DisconnectedFakeIB(portfolio=[FakePortfolioItem("RKLB", 3)]),
+                recorder,
+                {},
+                SimpleNamespace(eod_retry_seconds=0.0, eod_max_retries=1),
+                runtime_state,
+                reason="unit_test_disconnect",
+            )
+
+            self.assertEqual(submitted, 0)
+            self.assertTrue(runtime_state["pending_eod_flatten"])
+            self.assertTrue(json.loads(recorder.path("eod_pending.json").read_text())["pending_eod_flatten"])
+
+            restored_state: dict = {}
+            self.assertTrue(load_pending_eod_flatten(recorder, restored_state))
+            retry_ib = FakeIB(portfolio=[FakePortfolioItem("RKLB", 3)])
+            process_pending_eod_flatten_retry(
+                retry_ib,
+                recorder,
+                {},
+                SimpleNamespace(eod_retry_seconds=0.0, eod_max_retries=1),
+                restored_state,
+                reason="startup_pending_eod_flatten",
+                force=True,
+            )
+            self.assertEqual(len(retry_ib.openTrades()), 0)
+            self.assertTrue(restored_state["pending_eod_flatten"])
+
+            retry_ib._portfolio = []
+            process_pending_eod_flatten_retry(
+                retry_ib,
+                recorder,
+                {},
+                SimpleNamespace(eod_retry_seconds=0.0, eod_max_retries=1),
+                restored_state,
+                reason="startup_pending_eod_flatten",
+                force=True,
+            )
+            self.assertFalse(restored_state["pending_eod_flatten"])
+            self.assertFalse(json.loads(recorder.path("eod_pending.json").read_text())["pending_eod_flatten"])
+            with recorder.path("trade_lifecycle.csv").open(encoding="utf-8") as fh:
+                events = [row["event"] for row in csv.DictReader(fh)]
+            self.assertIn("EOD_FLATTEN_RETRY", events)
+            self.assertIn("EOD_FLATTEN_SUCCESS", events)
 
     def test_daily_report_includes_exit_simulation_table(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
