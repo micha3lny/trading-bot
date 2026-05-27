@@ -12,6 +12,7 @@ from ib_insync import IB, ExecutionFilter
 
 from src.live_trading.v62_live_data_recorder import FillEvent, LiveDataRecorder, PortfolioSnapshot
 from src.live_trading.storage.sqlite_store import open_sqlite_store, safe_sqlite_call
+from src.live_trading.unified_logger import install_unified_logger
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -353,8 +354,10 @@ def main() -> int:
     parser.add_argument("--disable-sqlite", action="store_true")
     parser.add_argument("--interval-seconds", type=float, default=10.0)
     parser.add_argument("--duration-seconds", type=int, default=0, help="0 = run forever")
+    parser.add_argument("--log-dir", default=None)
     args = parser.parse_args()
 
+    install_unified_logger(args.log_dir)
     recorder = LiveDataRecorder(args.recorder_dir)
     sqlite_store = None if args.disable_sqlite else open_sqlite_store(args.sqlite_path)
     setattr(recorder, "sqlite_store", sqlite_store)

@@ -8,6 +8,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from src.live_trading.unified_logger import append_unified_log, unified_logger_installed
+
 
 DEFAULT_SQLITE_PATH = "data/runtime/trading_runtime.sqlite"
 
@@ -28,7 +30,10 @@ def open_sqlite_store(path: str | Path | None = None) -> SQLiteRuntimeStore | No
     try:
         return SQLiteRuntimeStore(resolve_sqlite_path(path))
     except Exception as exc:
-        print(f"{utc_now_iso()} SQLITE_WRITE_FAILED method=init error={exc!r}", flush=True)
+        line = f"{utc_now_iso()} SQLITE_WRITE_FAILED method=init error={exc!r}"
+        print(line, flush=True)
+        if not unified_logger_installed():
+            append_unified_log(line)
         return None
 
 
@@ -725,5 +730,8 @@ def safe_sqlite_call(store: SQLiteRuntimeStore | None, method: str, *args: Any, 
     try:
         return getattr(store, method)(*args, **kwargs)
     except Exception as exc:
-        print(f"{utc_now_iso()} SQLITE_WRITE_FAILED method={method} error={exc!r}", flush=True)
+        line = f"{utc_now_iso()} SQLITE_WRITE_FAILED method={method} error={exc!r}"
+        print(line, flush=True)
+        if not unified_logger_installed():
+            append_unified_log(line)
         return None

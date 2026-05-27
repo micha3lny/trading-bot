@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import math
+import shutil
 import subprocess
 import sys
 import time
@@ -37,6 +38,13 @@ from src.live_trading.order_lifecycle.store import JsonlLifecycleStore
 from src.live_trading.order_lifecycle.reducer import reduce_lifecycle_events
 from src.live_trading.order_lifecycle.reconciliation import build_reconciliation_report, log_reconciliation_report
 from src.live_trading.storage.sqlite_store import open_sqlite_store, safe_sqlite_call
+from src.live_trading.unified_logger import (
+    current_git_commit,
+    format_traceback,
+    install_unified_logger,
+    log_event,
+    monitor_disk_usage,
+)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4002
@@ -3246,12 +3254,25 @@ def main() -> int:
     parser.add_argument("--daily-top100-latest-output", default="data/universe/daily_top100_latest.csv")
     parser.add_argument("--daily-top100-sqlite-path", default="data/runtime/rankings.sqlite")
     parser.add_argument("--daily-top100-top-n", type=int, default=100)
+    parser.add_argument("--log-dir", default=None)
     args = parser.parse_args()
 
     symbols = load_top_symbols(args.alpha_rank_csv, args.top_n, min_price=args.min_price)
     recorder = LiveDataRecorder(args.recorder_dir)
+    log_dir = install_unified_logger(args.log_dir)
     sqlite_store = None if args.disable_sqlite else open_sqlite_store(args.sqlite_path)
     setattr(recorder, "sqlite_store", sqlite_store)
+    disk = shutil.disk_usage(str(Path(args.recorder_dir).parent if Path(args.recorder_dir).parent else Path(".")))
+    log_event(
+        "BOT",
+        "BOT_START",
+        log_dir=log_dir,
+        git_commit=current_git_commit(Path.cwd()),
+        cli_args=" ".join(sys.argv[1:]),
+        sqlite_path=args.sqlite_path or "data/runtime/trading_runtime.sqlite",
+        recorder_dir=recorder.session_dir,
+        disk_free_bytes=disk.free,
+    )
 
     print("=== v67 live top100 expansion paper trader ===", flush=True)
     print(f"Symbols loaded: {len(symbols)}", flush=True)
@@ -3336,6 +3357,9 @@ def main() -> int:
             "blocked": False,
             "reason": "",
         },
+        "disk_usage_pct": 0.0,
+        "disk_full_entries_blocked": False,
+        "disk_usage_last_check_ts": 0.0,
         "partial_entry_count": 0,
         "partial_exit_count": 0,
         "partial_fill_states": {},
@@ -3346,6 +3370,7 @@ def main() -> int:
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
     adopted_once = False
+    normal_exit = False
 
     try:
         for symbol in symbols:
@@ -3518,6 +3543,9 @@ def main() -> int:
                 continue
             loop_now = time.time()
             observed_at = datetime.now(timezone.utc)
+            if loop_now - float(runtime_state.get("disk_usage_last_check_ts") or 0.0) >= 60.0:
+                runtime_state["disk_usage_last_check_ts"] = loop_now
+                monitor_disk_usage(args.recorder_dir, runtime_state, log_dir=log_dir)
             market_open = market_open_datetime_utc(args, observed_at)
             session_elapsed = (observed_at - market_open).total_seconds()
             today_session = get_us_equity_session(observed_at.date())
@@ -3555,7 +3583,12 @@ def main() -> int:
                 runtime_state["entries_blocked_reason"] = ""
             manual_entries_blocked = bool(runtime_state.get("entries_blocked", False))
             reconnect_entries_blocked = bool(runtime_state.get("reconnect_active", False))
-            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked
+            disk_entries_blocked = bool(runtime_state.get("disk_full_entries_blocked", False))
+            if disk_entries_blocked:
+                runtime_state["entries_blocked_reason"] = "disk_full_risk"
+            elif runtime_state.get("entries_blocked_reason") == "disk_full_risk":
+                runtime_state["entries_blocked_reason"] = ""
+            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked or disk_entries_blocked
             eod_active = args.enable_eod_flatten and (is_after_utc(args.eod_flatten_utc) or bool(runtime_state.get("manual_eod_flatten_requested", False)))
 
             for symbol, q in contracts:
@@ -3795,7 +3828,8 @@ def main() -> int:
             restart_entries_blocked = loop_now < float(runtime_state.get("entries_blocked_until") or 0.0)
             manual_entries_blocked = bool(runtime_state.get("entries_blocked", False))
             reconnect_entries_blocked = bool(runtime_state.get("reconnect_active", False))
-            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked
+            disk_entries_blocked = bool(runtime_state.get("disk_full_entries_blocked", False))
+            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked or disk_entries_blocked
             eod_active = args.enable_eod_flatten and (is_after_utc(args.eod_flatten_utc) or bool(runtime_state.get("manual_eod_flatten_requested", False)))
             risk_status = runtime_state.get("risk_guard_last_status") if isinstance(runtime_state.get("risk_guard_last_status"), dict) else {}
             risk_guard_block = bool((risk_status or {}).get("blocked"))
@@ -3803,12 +3837,13 @@ def main() -> int:
             print(
                 f"{now_utc()} heartbeat scanned={len(contracts)} with_data={data_count} ready_new={ready_count} "
                 f"adopted={adopted_count} exits_sent={exit_count} managed_open={active_managed} entries_blocked={int(entries_blocked)} "
-                f"manual_block={int(manual_entries_blocked)} restart_block={int(restart_entries_blocked)} reconnect_block={int(reconnect_entries_blocked)} eod_active={int(eod_active)} "
+                f"manual_block={int(manual_entries_blocked)} restart_block={int(restart_entries_blocked)} reconnect_block={int(reconnect_entries_blocked)} disk_block={int(disk_entries_blocked)} eod_active={int(eod_active)} "
                 f"risk_guard_block={int(risk_guard_block)} risk_guard_reason={risk_guard_reason} "
                 f"best={best_symbol}:{best_score:.2f} top5=[{top5_str}] rejects=[{rejection_summary}]"
                 f"{portfolio_part}",
                 flush=True,
             )
+        normal_exit = True
 
     finally:
         persist_managed_positions(recorder, managed_positions)
@@ -3821,8 +3856,17 @@ def main() -> int:
                 pass
         ib.disconnect()
         print("Disconnected", flush=True)
+        if normal_exit:
+            log_event("BOT", "BOT_STOP", log_dir=log_dir, recorder_dir=recorder.session_dir)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        log_event("BOT", "BOT_STOP", reason="keyboard_interrupt")
+        raise
+    except Exception as exc:
+        log_event("BOT", "BOT_CRASH", "CRITICAL", exception=repr(exc), traceback=format_traceback(exc))
+        raise

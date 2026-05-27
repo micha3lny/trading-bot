@@ -15,6 +15,7 @@ import pandas as pd
 
 from src.live_trading.market_calendar import is_us_equity_trading_day
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore, open_sqlite_store, safe_float, safe_sqlite_call, utc_now_iso
+from src.live_trading.unified_logger import install_unified_logger
 
 try:
     from ib_insync import IB, Stock
@@ -505,7 +506,9 @@ def main() -> int:
     parser.add_argument("--lock-path", default=DEFAULT_LOCK_PATH)
     parser.add_argument("--sqlite-path", default=None)
     parser.add_argument("--disable-sqlite", action="store_true")
+    parser.add_argument("--log-dir", default=None)
     args = parser.parse_args()
+    install_unified_logger(args.log_dir)
     started_monotonic = time.monotonic()
     sqlite_store = None if args.disable_sqlite else open_sqlite_store(args.sqlite_path)
     collector_run_id = f"collector:{now_iso()}:{args.start_date}:{args.end_date or args.date}:{args.session_type}"

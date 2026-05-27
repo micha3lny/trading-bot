@@ -13,6 +13,7 @@ import pandas as pd
 from src.live_trading.market_calendar import get_us_equity_session, previous_us_equity_trading_day
 from src.live_trading.ranking.ranking_store import RankingStore
 from src.live_trading.storage.sqlite_store import open_sqlite_store, safe_sqlite_call
+from src.live_trading.unified_logger import install_unified_logger
 
 
 DEFAULT_UNIVERSE = "data/universe/v68_final_daytrading_universe.csv"
@@ -477,7 +478,9 @@ def main() -> int:
     parser.add_argument("--max-missing-log", type=int, default=DEFAULT_MAX_MISSING_LOG)
     parser.add_argument("--max-reject-log", type=int, default=DEFAULT_MAX_REJECT_LOG)
     parser.add_argument("--no-sqlite", action="store_true")
+    parser.add_argument("--log-dir", default=None)
     args = parser.parse_args()
+    install_unified_logger(args.log_dir)
 
     requested_date = parse_date(args.date)
     requested_session = get_us_equity_session(requested_date)
