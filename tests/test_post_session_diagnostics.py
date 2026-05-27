@@ -16,7 +16,9 @@ from src.live_trading.order_lifecycle.store import JsonlLifecycleStore
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.v67_live_top100_expansion_paper_trader import (
+    ManagedPosition,
     apply_pending_eod_entry_block,
+    enforce_eod_flatten_if_due,
     hard_eod_flatten_portfolio,
     load_pending_eod_flatten,
     process_pending_eod_flatten_retry,
@@ -194,6 +196,50 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
         self.assertTrue(apply_pending_eod_entry_block(runtime_state))
 
         self.assertEqual(runtime_state["entries_blocked_reason"], "pending_eod_flatten")
+
+    def test_eod_active_failsafe_submits_and_persists_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            runtime_state: dict = {}
+            pos = ManagedPosition("RKLB", FakeContract("RKLB"), 3, 10.0, "t", 10.0, active=True)
+            ib = FakeIB(portfolio=[FakePortfolioItem("RKLB", 3)])
+
+            submitted = enforce_eod_flatten_if_due(
+                ib,
+                recorder,
+                {"RKLB": pos},
+                SimpleNamespace(enable_eod_flatten=True, eod_flatten_utc="19:45", eod_retry_seconds=60.0, eod_max_retries=1),
+                runtime_state,
+                eod_active=True,
+                reason="unit_test_failsafe",
+            )
+
+            self.assertEqual(submitted, 1)
+            self.assertTrue(runtime_state["pending_eod_flatten"])
+            self.assertEqual(runtime_state["entries_blocked_reason"], "pending_eod_flatten")
+            pending = json.loads(recorder.path("eod_pending.json").read_text())
+            self.assertTrue(pending["pending_eod_flatten"])
+            with recorder.path("trade_lifecycle.csv").open(encoding="utf-8") as fh:
+                events = [row["event"] for row in csv.DictReader(fh)]
+            self.assertIn("EOD_FLATTEN_SUBMIT", events)
+
+    def test_eod_active_failsafe_respects_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            runtime_state: dict = {}
+            pos = ManagedPosition("RKLB", FakeContract("RKLB"), 3, 10.0, "t", 10.0, active=True)
+            args = SimpleNamespace(enable_eod_flatten=True, eod_flatten_utc="19:45", eod_retry_seconds=60.0, eod_max_retries=1)
+            ib = FakeIB(portfolio=[FakePortfolioItem("RKLB", 3)])
+            stdout = io.StringIO()
+
+            with patch("src.live_trading.v67_live_top100_expansion_paper_trader.time.time", return_value=100.0):
+                with contextlib.redirect_stdout(stdout):
+                    enforce_eod_flatten_if_due(ib, recorder, {"RKLB": pos}, args, runtime_state, eod_active=True)
+            with patch("src.live_trading.v67_live_top100_expansion_paper_trader.time.time", return_value=102.0):
+                with contextlib.redirect_stdout(stdout):
+                    enforce_eod_flatten_if_due(ib, recorder, {"RKLB": pos}, args, runtime_state, eod_active=True)
+
+            self.assertEqual(stdout.getvalue().count("EOD_FLATTEN_FAILSAFE_TRIGGER"), 1)
 
     def test_pending_eod_flatten_clears_only_after_ibkr_flat(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

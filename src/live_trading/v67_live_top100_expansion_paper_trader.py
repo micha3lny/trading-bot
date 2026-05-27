@@ -1876,6 +1876,67 @@ def process_portfolio_sync_pending_eod_retry(
     )
 
 
+def enforce_eod_flatten_if_due(
+    ib: IB,
+    recorder: LiveDataRecorder,
+    managed_positions: dict[str, ManagedPosition],
+    args: argparse.Namespace,
+    runtime_state: dict[str, Any],
+    *,
+    eod_active: bool | None = None,
+    reason: str = "eod_active_failsafe",
+    cooldown_seconds: float = 5.0,
+) -> int:
+    if eod_active is None:
+        eod_active = bool(getattr(args, "enable_eod_flatten", False)) and (
+            is_after_utc(getattr(args, "eod_flatten_utc", "19:45"))
+            or bool(runtime_state.get("manual_eod_flatten_requested", False))
+        )
+    if not eod_active:
+        return 0
+
+    runtime_state["entries_blocked"] = True
+    if runtime_state.get("pending_eod_flatten"):
+        runtime_state["entries_blocked_reason"] = "pending_eod_flatten"
+    elif not runtime_state.get("entries_blocked_reason"):
+        runtime_state["entries_blocked_reason"] = "eod_active"
+
+    active_managed = [symbol for symbol, pos in managed_positions.items() if pos.active]
+    try:
+        ibkr_rows = ibkr_portfolio_position_rows(ib)
+    except Exception as exc:
+        print(f"{now_utc()} EOD_FLATTEN_FAILSAFE_PORTFOLIO_ERROR reason={reason} error={exc!r}", flush=True)
+        persist_pending_eod_flatten(recorder, runtime_state, pending=True, reason="eod_failsafe_portfolio_error")
+        apply_pending_eod_entry_block(runtime_state)
+        return 0
+
+    if not active_managed and not ibkr_rows and not runtime_state.get("pending_eod_flatten"):
+        return 0
+
+    now_ts = time.time()
+    last_enforced = safe_float(runtime_state.get("eod_failsafe_last_enforced_ts"))
+    if last_enforced is not None and (now_ts - last_enforced) < cooldown_seconds:
+        return 0
+
+    runtime_state["eod_failsafe_last_enforced_ts"] = now_ts
+    print(
+        f"{now_utc()} EOD_FLATTEN_FAILSAFE_TRIGGER reason={reason} "
+        f"managed_open={len(active_managed)} ibkr_open={len(ibkr_rows)} "
+        f"pending_eod_flatten={int(bool(runtime_state.get('pending_eod_flatten')))}",
+        flush=True,
+    )
+    submitted = hard_eod_flatten_portfolio(
+        ib,
+        recorder,
+        managed_positions,
+        args,
+        runtime_state,
+        reason=reason,
+    )
+    apply_pending_eod_entry_block(runtime_state)
+    return submitted
+
+
 def verify_managed_positions_against_ibkr(
     ib: IB,
     recorder: LiveDataRecorder,
@@ -3957,6 +4018,26 @@ def main() -> int:
                 runtime_state["entries_blocked_reason"] = ""
             entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked or disk_entries_blocked or pending_eod_entries_blocked
             eod_active = args.enable_eod_flatten and (is_after_utc(args.eod_flatten_utc) or bool(runtime_state.get("manual_eod_flatten_requested", False)))
+            if eod_active:
+                enforce_eod_flatten_if_due(
+                    ib,
+                    recorder,
+                    managed_positions,
+                    args,
+                    runtime_state,
+                    eod_active=True,
+                    reason="main_loop_eod_active_failsafe",
+                )
+                pending_eod_entries_blocked = apply_pending_eod_entry_block(runtime_state)
+                manual_entries_blocked = bool(runtime_state.get("entries_blocked", False))
+                entries_blocked = (
+                    time_entries_blocked
+                    or manual_entries_blocked
+                    or restart_entries_blocked
+                    or reconnect_entries_blocked
+                    or disk_entries_blocked
+                    or pending_eod_entries_blocked
+                )
 
             for symbol, q in contracts:
                 snap = snapshot_from_ticker(symbol, tickers[symbol])
