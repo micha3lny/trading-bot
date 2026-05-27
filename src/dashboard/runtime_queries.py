@@ -308,13 +308,17 @@ def load_open_positions(
     if rows.empty:
         return rows
     net_by_execution = execution_net_positions(executions)
+    historical_window = window.end_date < utc_today()
     out: list[dict[str, Any]] = []
     for row in rows.to_dict("records"):
         row_strategy = str(row.get("strategy") or "unknown")
         symbol = str(row.get("symbol") or "").upper()
         session_date = str(row.get("session_date") or "")
         net_key = (session_date, row_strategy, symbol)
-        if net_key in net_by_execution and abs(net_by_execution[net_key]) < 1e-9:
+        execution_net = net_by_execution.get(net_key)
+        if historical_window and (execution_net is None or execution_net <= 1e-9):
+            continue
+        if execution_net is not None and abs(execution_net) < 1e-9:
             continue
         raw = parse_raw_json(row.get("raw_json"))
         qty = to_float(row.get("quantity"), None)

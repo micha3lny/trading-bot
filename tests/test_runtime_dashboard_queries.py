@@ -4,18 +4,19 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.dashboard.runtime_queries import DateWindow, list_sessions, list_strategies, load_dashboard_snapshot
+from src.dashboard.runtime_queries import DateWindow, list_sessions, list_strategies, load_dashboard_snapshot, utc_today
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
 
 class RuntimeDashboardQueriesTests(unittest.TestCase):
     def test_snapshot_reconstructs_closed_open_summary_and_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            session_date = utc_today()
             db = Path(tmp) / "runtime.sqlite"
             store = SQLiteRuntimeStore(db)
             store.upsert_execution({
                 "execution_id": "B1",
-                "session_date": "2026-05-26",
+                "session_date": session_date,
                 "strategy_name": "v67",
                 "symbol": "AAA",
                 "side": "BOT",
@@ -23,11 +24,11 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 "price": 10,
                 "commission": 0.25,
                 "commission_source": "ibkr",
-                "recorded_at": "2026-05-26T13:30:00+00:00",
+                "recorded_at": f"{session_date}T13:30:00+00:00",
             })
             store.upsert_execution({
                 "execution_id": "S1",
-                "session_date": "2026-05-26",
+                "session_date": session_date,
                 "strategy_name": "v67",
                 "symbol": "AAA",
                 "side": "SLD",
@@ -35,27 +36,27 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 "price": 10.5,
                 "commission": 0.25,
                 "commission_source": "ibkr",
-                "recorded_at": "2026-05-26T13:45:00+00:00",
+                "recorded_at": f"{session_date}T13:45:00+00:00",
             })
             store.upsert_position({
-                "session_date": "2026-05-26",
+                "session_date": session_date,
                 "strategy_name": "v67",
                 "symbol": "BBB",
                 "quantity": 5,
                 "avg_price": 20,
                 "active": 1,
                 "status": "OPEN",
-                "updated_at": "2026-05-26T14:00:00+00:00",
-                "raw_json": {"market_price": 21, "peak_price": 22, "entry_time": "2026-05-26T13:35:00+00:00"},
+                "updated_at": f"{session_date}T14:00:00+00:00",
+                "raw_json": {"market_price": 21, "peak_price": 22, "entry_time": f"{session_date}T13:35:00+00:00"},
             })
             store.record_runtime_event(
-                session_date="2026-05-26",
+                session_date=session_date,
                 strategy_name="v67",
                 event_type="DELAYED_FILL_AFTER_CANCEL",
                 symbol="AAA",
             )
             store.record_risk_event(
-                session_date="2026-05-26",
+                session_date=session_date,
                 strategy_name="v67",
                 event_type="RISK_GUARD_BLOCK_ENTRY",
                 symbol="CCC",
@@ -64,7 +65,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             )
             store.close()
 
-            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-26", "2026-05-26"), "v67")
+            snapshot = load_dashboard_snapshot(db, DateWindow(session_date, session_date), "v67")
 
             self.assertEqual(snapshot["summary"]["closed_trades"], 1)
             self.assertEqual(snapshot["summary"]["open_trades"], 1)
@@ -144,6 +145,27 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-26", "2026-05-26"), "v67")
 
             self.assertEqual(snapshot["summary"]["closed_trades"], 1)
+            self.assertEqual(snapshot["summary"]["open_trades"], 0)
+            self.assertTrue(snapshot["open_positions"].empty)
+
+    def test_historical_active_position_without_execution_net_is_hidden(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_position({
+                "session_date": "2026-05-26",
+                "strategy_name": "v67",
+                "symbol": "STALE",
+                "quantity": 4,
+                "avg_price": 10,
+                "active": 1,
+                "status": "OPEN",
+                "updated_at": "2026-05-26T14:00:00+00:00",
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-26", "2026-05-26"), "v67")
+
             self.assertEqual(snapshot["summary"]["open_trades"], 0)
             self.assertTrue(snapshot["open_positions"].empty)
 
