@@ -90,6 +90,7 @@ class ManagedPosition:
     exit_order_id: int | None = None
     last_exit_order_ts: float | None = None
     eod_retry_count: int = 0
+    entry_fill_verified: bool = False
 
 
 def now_utc() -> str:
@@ -106,6 +107,21 @@ def safe_float(value: Any) -> float | None:
         return value
     except Exception:
         return None
+
+
+def safe_bool(value: Any, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def append_dict_csv(path: Path, row: dict[str, Any], fieldnames: list[str]) -> None:
@@ -340,7 +356,7 @@ def record_lifecycle(recorder: LiveDataRecorder, event: str, symbol: str, **kwar
         "decision_bid", "decision_ask", "decision_mid", "decision_last",
         "spread_pct", "fill_price", "fill_latency_ms",
         "estimated_commission", "realized_slippage_bps",
-        "close_source", "fill_verified",
+        "close_source", "fill_verified", "entry_fill_verified", "close_fill_verified",
         "raw_json",
     ]
     row = {"recorded_at": now_utc(), "strategy": STRATEGY_NAME, "event": event, "symbol": symbol, **kwargs}
@@ -384,6 +400,10 @@ def formal_event_type_for_legacy_event(event: str) -> LifecycleEventType | None:
         "EXIT_ORDER_CANCELLED": LifecycleEventType.EXIT_ORDER_CANCELLED,
         "ORDER_CANCEL_CONFIRMED": LifecycleEventType.EXIT_ORDER_CANCELLED,
         "ORDER_STALE": LifecycleEventType.EXIT_ORDER_STALE,
+        "ENTRY_NOT_FILLED": LifecycleEventType.POSITION_DRIFT_DETECTED,
+        "ENTRY_EXPIRED": LifecycleEventType.POSITION_DRIFT_DETECTED,
+        "ORDER_NOT_FILLED": LifecycleEventType.POSITION_DRIFT_DETECTED,
+        "EXIT_ORDER_BLOCKED_NO_ENTRY_FILL": LifecycleEventType.EXIT_ORDER_REJECTED,
         "ADOPTED_POSITION": LifecycleEventType.POSITION_ADOPTED,
         "RESTORED_MANAGED_POSITION": LifecycleEventType.POSITION_ADOPTED,
         "POSITION_VERIFIED_CLOSED": LifecycleEventType.POSITION_CLOSED,
@@ -537,6 +557,7 @@ def managed_position_payload(pos: ManagedPosition) -> dict[str, Any]:
         "exit_order_id": pos.exit_order_id,
         "last_exit_order_ts": pos.last_exit_order_ts,
         "eod_retry_count": pos.eod_retry_count,
+        "entry_fill_verified": pos.entry_fill_verified,
     }
 
 
@@ -584,6 +605,10 @@ def restore_managed_positions(recorder: LiveDataRecorder, contract_by_symbol: di
             peak = safe_float(row.get("peak_price")) or entry
             if qty <= 0 or entry is None or entry <= 0:
                 continue
+            exit_sent = safe_bool(row.get("exit_sent"), False)
+            entry_verified = safe_bool(row.get("entry_fill_verified"), False)
+            if "entry_fill_verified" not in row and exit_sent:
+                entry_verified = True
             restored[symbol] = ManagedPosition(
                 symbol=symbol,
                 contract=contract_by_symbol[symbol],
@@ -591,12 +616,13 @@ def restore_managed_positions(recorder: LiveDataRecorder, contract_by_symbol: di
                 entry_price=float(entry),
                 entry_time=str(row.get("entry_time") or f"restored:{now_utc()}"),
                 peak_price=float(peak or entry),
-                active=bool(row.get("active", True)),
-                exit_sent=bool(row.get("exit_sent", False)),
+                active=safe_bool(row.get("active"), True),
+                exit_sent=exit_sent,
                 source=str(row.get("source") or "restored"),
                 exit_order_id=int(float(row["exit_order_id"])) if row.get("exit_order_id") not in (None, "", "None") else None,
                 last_exit_order_ts=safe_float(row.get("last_exit_order_ts")),
                 eod_retry_count=int(float(row.get("eod_retry_count") or 0)),
+                entry_fill_verified=entry_verified,
             )
     except Exception as exc:
         print(f"{now_utc()} managed_positions_restore_error={exc!r}", flush=True)
@@ -609,7 +635,7 @@ def record_strategy_equity(recorder: LiveDataRecorder, positions: dict[str, Mana
     active_count = 0
     rows = []
     for symbol, pos in positions.items():
-        if not pos.active or pos.exit_sent:
+        if not pos.active or pos.exit_sent or not pos.entry_fill_verified:
             continue
         price = safe_float((latest_snapshots.get(symbol) or {}).get("price"))
         if price is None:
@@ -816,6 +842,24 @@ def is_eod_flatten_time(flatten_utc: str) -> bool:
 def send_exit_order(ib: IB, recorder: LiveDataRecorder, pos: ManagedPosition, reason: str, price: float | None) -> bool:
     if not pos.active or pos.quantity <= 0:
         return False
+    if not pos.entry_fill_verified:
+        record_lifecycle_with_formal(
+            recorder,
+            "EXIT_ORDER_BLOCKED_NO_ENTRY_FILL",
+            pos.symbol,
+            action="SELL",
+            quantity=pos.quantity,
+            price=price,
+            reason="entry_fill_not_verified",
+            entry_fill_verified="false",
+            raw_json={"requested_exit_reason": reason, "entry_fill_verified": False},
+        )
+        print(
+            f"{now_utc()} EXIT_ORDER_BLOCKED_NO_ENTRY_FILL symbol={pos.symbol} "
+            f"quantity={pos.quantity} reason={reason}",
+            flush=True,
+        )
+        return False
     order = MarketOrder("SELL", pos.quantity)
     order.tif = "DAY"
     order.outsideRth = False
@@ -839,6 +883,7 @@ def send_exit_order(ib: IB, recorder: LiveDataRecorder, pos: ManagedPosition, re
         decision_mid=None,
         decision_last=price,
         spread_pct=None,
+        entry_fill_verified="true",
     )
     pos.exit_sent = True
     pos.exit_order_id = order_id
@@ -969,10 +1014,26 @@ def startup_reconcile_runtime_state(
         if (local_open or lifecycle_open) and abs(ibkr_qty) <= 0:
             quantity = getattr(pos, "quantity", None) if pos is not None else getattr(reduced, "open_quantity", None)
             backfill_recent_fills_for_verification(ib, recorder, runtime_state)
+            has_entry_fill = entry_fill_verified(recorder, symbol, quantity)
             if pos is not None and pos.active:
                 pos.active = False
                 pos.exit_sent = False
             closed_local.append(symbol)
+            if not has_entry_fill:
+                record_entry_not_filled(
+                    recorder,
+                    symbol,
+                    quantity=quantity,
+                    reason=f"{reason_prefix}_ibkr_flat_entry_not_filled",
+                    ibkr_quantity=ibkr_qty,
+                    runtime_state=runtime_state,
+                    raw_json={
+                        "managed_active": bool(local_open),
+                        "reducer_state": getattr(getattr(reduced, "state", None), "value", None),
+                    },
+                )
+                print(f"{now_utc()} {log_prefix}_ENTRY_NOT_FILLED symbol={symbol}", flush=True)
+                continue
             if not close_fill_verified(recorder, symbol, quantity):
                 record_unverified_reconciliation_close(
                     recorder,
@@ -984,6 +1045,7 @@ def startup_reconcile_runtime_state(
                     raw_json={
                         "managed_active": bool(local_open),
                         "reducer_state": getattr(getattr(reduced, "state", None), "value", None),
+                        "entry_fill_verified": True,
                     },
                 )
                 print(f"{now_utc()} {log_prefix}_LOCAL_CLOSED_UNVERIFIED symbol={symbol}", flush=True)
@@ -997,12 +1059,16 @@ def startup_reconcile_runtime_state(
                 reason=f"{reason_prefix}_ibkr_flat",
                 close_source="fill",
                 fill_verified="true",
+                entry_fill_verified="true",
+                close_fill_verified="true",
                 raw_json={
                     "managed_active": bool(local_open),
                     "reducer_state": getattr(getattr(reduced, "state", None), "value", None),
                     "ibkr_quantity": ibkr_qty,
                     "close_source": "fill",
                     "fill_verified": True,
+                    "entry_fill_verified": True,
+                    "close_fill_verified": True,
                 },
             )
             print(f"{now_utc()} {log_prefix}_LOCAL_CLOSED symbol={symbol}", flush=True)
@@ -1829,6 +1895,26 @@ def verify_managed_positions_against_ibkr(
             continue
         ib_qty = quantities.get(symbol, 0.0)
         if abs(ib_qty) <= 0:
+            backfill_recent_fills_for_verification(ib, recorder, runtime_state)
+            if not pos.entry_fill_verified and entry_fill_verified(recorder, symbol, pos.quantity):
+                pos.entry_fill_verified = True
+            if not pos.entry_fill_verified:
+                pos.active = False
+                closed_symbols.append(symbol)
+                record_entry_not_filled(
+                    recorder,
+                    symbol,
+                    quantity=pos.quantity,
+                    reason=reason,
+                    ibkr_quantity=ib_qty,
+                    runtime_state=runtime_state,
+                    raw_json={
+                        "entry_price": pos.entry_price,
+                        "peak_price": pos.peak_price,
+                        "exit_sent": pos.exit_sent,
+                    },
+                )
+                continue
             if not pos.exit_sent:
                 drift_symbols.append(symbol)
                 record_lifecycle_with_formal(
@@ -1841,7 +1927,6 @@ def verify_managed_positions_against_ibkr(
                     raw_json={"managed_quantity": pos.quantity, "ibkr_quantity": ib_qty},
                 )
                 continue
-            backfill_recent_fills_for_verification(ib, recorder, runtime_state)
             if not close_fill_verified(recorder, symbol, pos.quantity):
                 pos.active = False
                 closed_symbols.append(symbol)
@@ -1856,6 +1941,7 @@ def verify_managed_positions_against_ibkr(
                         "entry_price": pos.entry_price,
                         "peak_price": pos.peak_price,
                         "exit_sent": pos.exit_sent,
+                        "entry_fill_verified": True,
                     },
                 )
                 continue
@@ -1872,7 +1958,9 @@ def verify_managed_positions_against_ibkr(
                 peak_price=pos.peak_price,
                 close_source="fill",
                 fill_verified="true",
-                raw_json={"managed_quantity": pos.quantity, "ibkr_quantity": ib_qty, "fill_verified": True, "close_source": "fill"},
+                entry_fill_verified="true",
+                close_fill_verified="true",
+                raw_json={"managed_quantity": pos.quantity, "ibkr_quantity": ib_qty, "fill_verified": True, "entry_fill_verified": True, "close_fill_verified": True, "close_source": "fill"},
             )
             continue
         open_symbols.append(symbol)
@@ -1907,15 +1995,22 @@ def managed_positions_to_lifecycle_positions(
     for symbol, pos in managed_positions.items():
         if not pos.active:
             continue
-        open_qty = 0.0 if pos.exit_sent else float(pos.quantity)
-        state = PositionState.EXIT_PENDING if pos.exit_sent else PositionState.OPEN
+        fill_verified_for_state = bool(pos.entry_fill_verified or pos.exit_sent)
+        if not fill_verified_for_state:
+            open_qty = 0.0
+            state = PositionState.ENTRY_PENDING
+            entry_filled_quantity = 0.0
+        else:
+            open_qty = 0.0 if pos.exit_sent else float(pos.quantity)
+            state = PositionState.EXIT_PENDING if pos.exit_sent else PositionState.OPEN
+            entry_filled_quantity = float(pos.quantity)
         positions[symbol] = PositionRecord(
             symbol=symbol,
             strategy=STRATEGY_NAME,
             session_date=session_date,
             state=state,
             target_quantity=float(pos.quantity),
-            entry_filled_quantity=float(pos.quantity),
+            entry_filled_quantity=entry_filled_quantity,
             exit_filled_quantity=0.0,
             avg_entry_price=pos.entry_price,
             open_quantity=open_qty,
@@ -2089,6 +2184,7 @@ def adopt_existing_long_positions(
             entry_time=f"adopted_on_restart:{now_utc()}",
             peak_price=float(peak_price),
             source="adopted_from_ibkr_portfolio_top100" if in_runtime_universe else "adopted_from_ibkr_portfolio_external",
+            entry_fill_verified=True,
         )
         record_lifecycle_with_formal(
             recorder,
@@ -2100,6 +2196,7 @@ def adopt_existing_long_positions(
             entry_price=entry_price,
             peak_price=peak_price,
             reason="restart_recovery_from_ibkr_portfolio",
+            entry_fill_verified="true",
         )
         print(f"ADOPTED EXISTING POSITION symbol={symbol} qty={int(quantity)} entry={entry_price:.2f} peak={peak_price:.2f}", flush=True)
         adopted += 1
@@ -2138,7 +2235,7 @@ def manage_exits(
             print(f"{now_utc()} EOD_FLATTEN_FAILED reason=portfolio_flatten_exception error={exc!r}", flush=True)
 
     for symbol, pos in list(managed_positions.items()):
-        if not pos.active or pos.exit_sent:
+        if not pos.active or pos.exit_sent or not pos.entry_fill_verified:
             continue
         snap = latest_snapshots.get(symbol) or {}
         price = safe_float(snap.get("price"))
@@ -2636,6 +2733,8 @@ def enrich_lifecycle_with_fills(recorder: LiveDataRecorder) -> int:
                         raw_json={"legacy_order_event": event},
                     ),
                 )
+                entry_verified = side == "BUY"
+                close_verified = side != "BUY"
                 record_formal_lifecycle(
                     recorder,
                     LifecycleEventType.POSITION_OPENED if side == "BUY" else LifecycleEventType.POSITION_CLOSED,
@@ -2647,6 +2746,11 @@ def enrich_lifecycle_with_fills(recorder: LiveDataRecorder) -> int:
                     quantity=execution.quantity,
                     price=execution.price,
                     reason="fill_enriched_lifecycle",
+                    raw_json={
+                        "entry_fill_verified": entry_verified,
+                        "close_fill_verified": close_verified,
+                        "source": "enrich_lifecycle_with_fills",
+                    },
                 )
             except Exception as exc:
                 print(f"{now_utc()} formal_fill_record_error order_id={oid} error={exc!r}", flush=True)
@@ -2759,13 +2863,13 @@ def latest_portfolio_pnl_metrics(recorder: LiveDataRecorder) -> dict[str, float]
 
 
 def active_position_count(positions: dict[str, ManagedPosition]) -> int:
-    return sum(1 for pos in positions.values() if bool(pos.active))
+    return sum(1 for pos in positions.values() if bool(pos.active) and bool(pos.entry_fill_verified or pos.exit_sent))
 
 
 def managed_gross_exposure(positions: dict[str, ManagedPosition], latest_snapshots: dict[str, dict[str, Any]]) -> float:
     gross = 0.0
     for symbol, pos in positions.items():
-        if not bool(pos.active):
+        if not bool(pos.active) or not bool(pos.entry_fill_verified or pos.exit_sent):
             continue
         price = safe_float((latest_snapshots.get(symbol) or {}).get("price")) or safe_float(getattr(pos, "entry_price", None))
         qty = safe_float(getattr(pos, "quantity", None)) or 0.0
@@ -2867,6 +2971,55 @@ def exit_fill_quantity_for_symbol(recorder: LiveDataRecorder, symbol: str) -> fl
     return total
 
 
+def entry_fill_quantity_for_symbol(recorder: LiveDataRecorder, symbol: str) -> float:
+    symbol = str(symbol or "").upper().strip()
+    total = 0.0
+    for row in _read_fill_rows(recorder):
+        if str(row.get("symbol") or "").upper().strip() != symbol:
+            continue
+        action = str(row.get("action") or "").upper().strip()
+        if action not in {"BOT", "BUY"}:
+            continue
+        total += abs(safe_float(row.get("quantity")) or 0.0)
+    return total
+
+
+def entry_fill_verified(recorder: LiveDataRecorder, symbol: str, managed_quantity: Any) -> bool:
+    required = abs(safe_float(managed_quantity) or 0.0)
+    if required <= 0:
+        return False
+    return entry_fill_quantity_for_symbol(recorder, symbol) + 1e-9 >= required
+
+
+def sync_managed_entry_fill_verification(
+    recorder: LiveDataRecorder,
+    managed_positions: dict[str, ManagedPosition],
+) -> int:
+    updated = 0
+    for symbol, pos in managed_positions.items():
+        if not pos.active or pos.entry_fill_verified:
+            continue
+        if not entry_fill_verified(recorder, symbol, pos.quantity):
+            continue
+        pos.entry_fill_verified = True
+        record_lifecycle_with_formal(
+            recorder,
+            "POSITION_OPENED",
+            symbol,
+            action="VERIFY",
+            quantity=pos.quantity,
+            price=pos.entry_price,
+            entry_price=pos.entry_price,
+            peak_price=pos.peak_price,
+            reason="entry_fill_verified_from_ibkr_execution",
+            entry_fill_verified="true",
+            raw_json={"entry_fill_verified": True, "source": "fills_csv"},
+        )
+        print(f"{now_utc()} ENTRY_FILL_VERIFIED symbol={symbol} quantity={pos.quantity}", flush=True)
+        updated += 1
+    return updated
+
+
 def backfill_recent_fills_for_verification(ib: IB, recorder: LiveDataRecorder, runtime_state: dict[str, Any]) -> int:
     try:
         return int(record_recent_fills(ib, recorder, set()) or 0)
@@ -2881,6 +3034,42 @@ def close_fill_verified(recorder: LiveDataRecorder, symbol: str, managed_quantit
     if required <= 0:
         return False
     return exit_fill_quantity_for_symbol(recorder, symbol) + 1e-9 >= required
+
+
+def record_entry_not_filled(
+    recorder: LiveDataRecorder,
+    symbol: str,
+    *,
+    quantity: Any,
+    reason: str,
+    ibkr_quantity: float,
+    runtime_state: dict[str, Any],
+    raw_json: dict[str, Any] | None = None,
+) -> None:
+    payload = {
+        "managed_quantity": quantity,
+        "ibkr_quantity": ibkr_quantity,
+        "entry_fill_verified": False,
+        "close_fill_verified": False,
+        **(raw_json or {}),
+    }
+    record_lifecycle_with_formal(
+        recorder,
+        "ENTRY_NOT_FILLED",
+        symbol,
+        action="VERIFY",
+        quantity=quantity,
+        reason=reason,
+        entry_fill_verified="false",
+        close_fill_verified="false",
+        raw_json=payload,
+    )
+    runtime_state["entry_not_filled_count"] = int(runtime_state.get("entry_not_filled_count") or 0) + 1
+    print(
+        f"{now_utc()} ENTRY_NOT_FILLED symbol={symbol} managed_quantity={quantity} "
+        f"ibkr_quantity={ibkr_quantity} reason={reason}",
+        flush=True,
+    )
 
 
 def record_unverified_reconciliation_close(
@@ -2899,6 +3088,8 @@ def record_unverified_reconciliation_close(
         "ibkr_quantity": ibkr_quantity,
         "close_source": close_source,
         "fill_verified": False,
+        "entry_fill_verified": True,
+        "close_fill_verified": False,
         **(raw_json or {}),
     }
     record_lifecycle_with_formal(
@@ -2910,6 +3101,8 @@ def record_unverified_reconciliation_close(
         reason=reason,
         close_source=close_source,
         fill_verified="false",
+        entry_fill_verified="true",
+        close_fill_verified="false",
         raw_json=payload,
     )
     record_lifecycle_with_formal(
@@ -2921,6 +3114,8 @@ def record_unverified_reconciliation_close(
         reason=reason,
         close_source=close_source,
         fill_verified="false",
+        entry_fill_verified="true",
+        close_fill_verified="false",
         raw_json=payload,
     )
     runtime_state["reconciliation_close_without_fill_count"] = int(runtime_state.get("reconciliation_close_without_fill_count") or 0) + 1
@@ -3864,7 +4059,15 @@ def main() -> int:
                     order.outsideRth = False
                     trade = ib.placeOrder(q, order)
                     if qty > 0 and price and price > 0:
-                        managed_positions[symbol] = ManagedPosition(symbol=symbol, contract=q, quantity=qty, entry_price=float(price), entry_time=now_utc(), peak_price=float(price))
+                        managed_positions[symbol] = ManagedPosition(
+                            symbol=symbol,
+                            contract=q,
+                            quantity=qty,
+                            entry_price=float(price),
+                            entry_time=now_utc(),
+                            peak_price=float(price),
+                            entry_fill_verified=False,
+                        )
                         persist_managed_positions(recorder, managed_positions)
                     record_lifecycle_with_formal(
                         recorder,
@@ -3881,6 +4084,7 @@ def main() -> int:
                         decision_mid=snap.get("mid_price"),
                         decision_last=snap.get("last"),
                         spread_pct=((snap.get("spread") / snap.get("mid_price") * 100.0) if snap.get("spread") and snap.get("mid_price") else None),
+                        entry_fill_verified="false",
                     )
                     print(f"PAPER BUY SENT symbol={symbol} qty={qty} price={price:.2f} score={features['score']:.2f} orderId={trade.order.orderId} tif={order.tif} outsideRth={order.outsideRth}", flush=True)
                     state.signal_sent = True
@@ -3905,6 +4109,7 @@ def main() -> int:
                     record_account_snapshot(ib, recorder)
                     new_fills = record_recent_fills(ib, recorder, seen_fills)
                     lifecycle_fills_updated = enrich_lifecycle_with_fills(recorder)
+                    entry_fills_verified = sync_managed_entry_fill_verification(recorder, managed_positions)
                     fill_diagnostics_updated = process_fill_lifecycle_diagnostics(
                         ib,
                         recorder,
@@ -3915,6 +4120,8 @@ def main() -> int:
                         print(f"{now_utc()} lifecycle_fills_updated={lifecycle_fills_updated}", flush=True)
                     if fill_diagnostics_updated:
                         print(f"{now_utc()} fill_lifecycle_diagnostics_updated={fill_diagnostics_updated}", flush=True)
+                    if entry_fills_verified:
+                        print(f"{now_utc()} entry_fills_verified={entry_fills_verified}", flush=True)
                     verification = verify_managed_positions_against_ibkr(
                         ib,
                         recorder,

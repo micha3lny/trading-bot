@@ -247,6 +247,19 @@ def _flatten_request(ctx: ControlApiContext, symbol: str, dry_run: bool) -> Json
     if pos is not None and bool(getattr(pos, "exit_sent", False)):
         _log("FLATTEN_SKIPPED", symbol=symbol, status="already_exit_sent")
         return {"ok": True, "symbol": symbol, "status": "already_exit_sent", "position": _position_payload(symbol, pos)}
+    if pos is not None and not bool(getattr(pos, "entry_fill_verified", False)):
+        _log("FLATTEN_REJECTED", symbol=symbol, status="entry_fill_not_verified")
+        ctx.record_lifecycle_fn(
+            ctx.recorder,
+            "EXIT_ORDER_BLOCKED_NO_ENTRY_FILL",
+            symbol,
+            action="SELL",
+            quantity=getattr(pos, "quantity", 0),
+            reason="control_api_entry_fill_not_verified",
+            entry_fill_verified="false",
+            raw_json={"source": "control_api_flatten_symbol"},
+        )
+        return {"ok": False, "symbol": symbol, "status": "entry_fill_not_verified", "position": _position_payload(symbol, pos)}
 
     qty_raw = portfolio_row["quantity"] if portfolio_row is not None else getattr(pos, "quantity", 0)
     try:
@@ -544,6 +557,19 @@ def process_control_api_commands(
         if pos is not None and bool(getattr(pos, "exit_sent", False)):
             _log("FLATTEN_SKIPPED", symbol=symbol, reason="already_exit_sent", command_id=command_id)
             record_lifecycle_fn(recorder, "MANUAL_FLATTEN_SKIPPED", symbol, reason="already_exit_sent", raw_json=_public_command_payload(cmd))
+            continue
+        if pos is not None and not is_portfolio_flatten and not bool(getattr(pos, "entry_fill_verified", False)):
+            _log("FLATTEN_SKIPPED", symbol=symbol, reason="entry_fill_not_verified", command_id=command_id)
+            record_lifecycle_fn(
+                recorder,
+                "EXIT_ORDER_BLOCKED_NO_ENTRY_FILL",
+                symbol,
+                action=cmd.get("action"),
+                quantity=getattr(pos, "quantity", cmd.get("quantity", 0)),
+                reason="control_api_entry_fill_not_verified",
+                entry_fill_verified="false",
+                raw_json=_public_command_payload(cmd),
+            )
             continue
 
         qty_raw = ibkr_quantity if is_portfolio_flatten else getattr(pos, "quantity", cmd.get("quantity", 0))

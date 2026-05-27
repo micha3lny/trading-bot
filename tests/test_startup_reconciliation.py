@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import csv
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ from src.live_trading.order_lifecycle.store import JsonlLifecycleStore
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.v67_live_top100_expansion_paper_trader import (
     ManagedPosition,
+    send_exit_order,
     startup_reconcile_runtime_state,
 )
 
@@ -99,16 +101,53 @@ class StartupReconciliationTests(unittest.TestCase):
             self.assertIn("RKLB", result["closed_local"])
             events = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl")).load_events()
             self.assertFalse(any(row["event_type"] == "POSITION_CLOSED" for row in events))
-            self.assertTrue(any(
-                row["event_type"] == LifecycleEventType.POSITION_DRIFT_DETECTED.value
-                and row.get("reason") == "startup_reconciliation_ibkr_flat_without_fill"
-                for row in events
-            ))
+            self.assertTrue(any(row["event_type"] == LifecycleEventType.POSITION_DRIFT_DETECTED.value for row in events))
+            lifecycle_text = recorder.path("trade_lifecycle.csv").read_text(encoding="utf-8")
+            self.assertIn("ENTRY_NOT_FILLED", lifecycle_text)
+            self.assertIn("entry_fill_verified", lifecycle_text)
+            self.assertIn("false", lifecycle_text)
+
+    def test_ibkr_flat_after_verified_entry_without_sell_fill_is_unverified_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            fills_path = recorder.path("fills.csv")
+            with fills_path.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["execution_id", "symbol", "action", "quantity", "fill_price"])
+                writer.writeheader()
+                writer.writerow({"execution_id": "B1", "symbol": "RKLB", "action": "BOT", "quantity": "10", "fill_price": "12"})
+            contract = FakeContract("RKLB")
+            managed = {
+                "RKLB": ManagedPosition("RKLB", contract, 10, 12.0, "restored", 12.5, entry_fill_verified=True, exit_sent=True),
+            }
+            runtime_state = {}
+
+            result = startup_reconcile_runtime_state(FakeIB(), recorder, managed, {"RKLB": contract}, runtime_state)
+
+            self.assertFalse(managed["RKLB"].active)
+            self.assertIn("RKLB", result["closed_local"])
+            events = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl")).load_events()
+            self.assertFalse(any(row["event_type"] == LifecycleEventType.POSITION_CLOSED.value for row in events))
             lifecycle_text = recorder.path("trade_lifecycle.csv").read_text(encoding="utf-8")
             self.assertIn("RECONCILIATION_CLOSE_WITHOUT_FILL", lifecycle_text)
             self.assertIn("POSITION_CLOSED_UNVERIFIED", lifecycle_text)
-            self.assertIn("reconciliation", lifecycle_text)
+            self.assertIn("close_fill_verified", lifecycle_text)
             self.assertIn("false", lifecycle_text)
+
+    def test_exit_order_blocked_until_entry_fill_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            contract = FakeContract("RKLB")
+            pos = ManagedPosition("RKLB", contract, 10, 12.0, "restored", 12.5, entry_fill_verified=False)
+            ib = FakeIB()
+
+            sent = send_exit_order(ib, recorder, pos, "unit_test_exit", 11.5)
+
+            self.assertFalse(sent)
+            self.assertEqual(len(ib.placed_orders), 0)
+            lifecycle_text = recorder.path("trade_lifecycle.csv").read_text(encoding="utf-8")
+            self.assertIn("EXIT_ORDER_BLOCKED_NO_ENTRY_FILL", lifecycle_text)
+            events = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl")).load_events()
+            self.assertFalse(any(row["event_type"] == LifecycleEventType.EXIT_ORDER_SUBMITTED.value for row in events))
 
     def test_ibkr_orphan_whole_share_flattens_and_does_not_block(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
