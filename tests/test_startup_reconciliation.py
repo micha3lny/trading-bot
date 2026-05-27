@@ -98,7 +98,17 @@ class StartupReconciliationTests(unittest.TestCase):
             self.assertFalse(runtime_state["entries_blocked"])
             self.assertIn("RKLB", result["closed_local"])
             events = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl")).load_events()
-            self.assertTrue(any(row["event_type"] == "POSITION_CLOSED" for row in events))
+            self.assertFalse(any(row["event_type"] == "POSITION_CLOSED" for row in events))
+            self.assertTrue(any(
+                row["event_type"] == LifecycleEventType.POSITION_DRIFT_DETECTED.value
+                and row.get("reason") == "startup_reconciliation_ibkr_flat_without_fill"
+                for row in events
+            ))
+            lifecycle_text = recorder.path("trade_lifecycle.csv").read_text(encoding="utf-8")
+            self.assertIn("RECONCILIATION_CLOSE_WITHOUT_FILL", lifecycle_text)
+            self.assertIn("POSITION_CLOSED_UNVERIFIED", lifecycle_text)
+            self.assertIn("reconciliation", lifecycle_text)
+            self.assertIn("false", lifecycle_text)
 
     def test_ibkr_orphan_whole_share_flattens_and_does_not_block(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
