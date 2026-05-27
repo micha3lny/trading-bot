@@ -16,9 +16,11 @@ from src.live_trading.order_lifecycle.store import JsonlLifecycleStore
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.v67_live_top100_expansion_paper_trader import (
+    apply_pending_eod_entry_block,
     hard_eod_flatten_portfolio,
     load_pending_eod_flatten,
     process_pending_eod_flatten_retry,
+    process_portfolio_sync_pending_eod_retry,
     startup_reconcile_runtime_state,
 )
 
@@ -185,6 +187,74 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
                 events = [row["event"] for row in csv.DictReader(fh)]
             self.assertIn("EOD_FLATTEN_RETRY", events)
             self.assertIn("EOD_FLATTEN_SUCCESS", events)
+
+    def test_pending_eod_flatten_blocks_new_entries(self) -> None:
+        runtime_state = {"pending_eod_flatten": True, "entries_blocked_reason": ""}
+
+        self.assertTrue(apply_pending_eod_entry_block(runtime_state))
+
+        self.assertEqual(runtime_state["entries_blocked_reason"], "pending_eod_flatten")
+
+    def test_pending_eod_flatten_clears_only_after_ibkr_flat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            runtime_state = {"pending_eod_flatten": True, "pending_eod_flatten_last_retry_ts": 0.0}
+            args = SimpleNamespace(eod_retry_seconds=0.0, eod_max_retries=1)
+
+            process_pending_eod_flatten_retry(
+                FakeIB(portfolio=[FakePortfolioItem("RKLB", 3)]),
+                recorder,
+                {},
+                args,
+                runtime_state,
+                reason="unit_test_pending",
+                force=True,
+            )
+            self.assertTrue(runtime_state["pending_eod_flatten"])
+
+            process_pending_eod_flatten_retry(
+                FakeIB(portfolio=[]),
+                recorder,
+                {},
+                args,
+                runtime_state,
+                reason="unit_test_pending",
+                force=True,
+            )
+            self.assertFalse(runtime_state["pending_eod_flatten"])
+
+    def test_portfolio_sync_triggers_immediate_pending_eod_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            runtime_state = {"pending_eod_flatten": True, "pending_eod_flatten_last_retry_ts": 0.0}
+
+            process_portfolio_sync_pending_eod_retry(
+                FakeIB(portfolio=[FakePortfolioItem("RKLB", 3)]),
+                recorder,
+                {},
+                SimpleNamespace(eod_retry_seconds=60.0, eod_max_retries=1),
+                runtime_state,
+            )
+
+            with recorder.path("trade_lifecycle.csv").open(encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertTrue(any(row["event"] == "EOD_FLATTEN_RETRY" and row["reason"] == "portfolio_sync_pending_eod" for row in rows))
+
+    def test_portfolio_sync_pending_eod_retry_respects_five_second_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            runtime_state = {"pending_eod_flatten": True, "pending_eod_flatten_last_retry_ts": 100.0}
+            args = SimpleNamespace(eod_retry_seconds=60.0, eod_max_retries=1)
+            ib = FakeIB(portfolio=[FakePortfolioItem("RKLB", 3)])
+
+            with patch("src.live_trading.v67_live_top100_expansion_paper_trader.time.time", return_value=103.0):
+                sent = process_portfolio_sync_pending_eod_retry(ib, recorder, {}, args, runtime_state)
+            self.assertEqual(sent, 0)
+            self.assertFalse(recorder.path("trade_lifecycle.csv").exists())
+
+            with patch("src.live_trading.v67_live_top100_expansion_paper_trader.time.time", return_value=106.0):
+                process_portfolio_sync_pending_eod_retry(ib, recorder, {}, args, runtime_state)
+            self.assertTrue(recorder.path("trade_lifecycle.csv").exists())
 
     def test_daily_report_includes_exit_simulation_table(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

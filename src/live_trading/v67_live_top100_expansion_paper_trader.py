@@ -1387,6 +1387,23 @@ def load_pending_eod_flatten(recorder: LiveDataRecorder, runtime_state: dict[str
     return pending
 
 
+def apply_pending_eod_entry_block(runtime_state: dict[str, Any]) -> bool:
+    pending = bool(runtime_state.get("pending_eod_flatten"))
+    if pending:
+        runtime_state["entries_blocked_reason"] = "pending_eod_flatten"
+    elif runtime_state.get("entries_blocked_reason") == "pending_eod_flatten":
+        runtime_state["entries_blocked_reason"] = ""
+    return pending
+
+
+def pending_eod_retry_age_seconds(runtime_state: dict[str, Any], now_ts: float | None = None) -> float | None:
+    last_retry = safe_float(runtime_state.get("pending_eod_flatten_last_retry_ts"))
+    if last_retry is None or last_retry <= 0:
+        return None
+    now_ts = time.time() if now_ts is None else now_ts
+    return max(0.0, now_ts - last_retry)
+
+
 def record_eod_flatten_giveup_once(
     recorder: LiveDataRecorder,
     runtime_state: dict[str, Any],
@@ -1704,43 +1721,68 @@ def process_pending_eod_flatten_retry(
     *,
     reason: str,
     force: bool = False,
+    cooldown_seconds: float | None = None,
 ) -> int:
     if not bool(runtime_state.get("pending_eod_flatten")) and not force:
         return 0
-    now_ts = time.time()
-    retry_seconds = float(getattr(args, "eod_retry_seconds", 60.0))
-    last_retry = safe_float(runtime_state.get("pending_eod_flatten_last_retry_ts"))
-    if not force and last_retry is not None and now_ts - last_retry < retry_seconds:
+    if runtime_state.get("eod_recovery_active") and not force:
         return 0
-    rows = ibkr_portfolio_position_rows(ib)
-    if rows:
-        print(
-            f"{now_utc()} EOD_FLATTEN_RETRY reason={reason} open_positions={len(rows)} "
-            f"symbols={','.join(sorted(row['symbol'] for row in rows))}",
-            flush=True,
-        )
-        for row in rows:
-            ibkr_qty = float(row["quantity"])
-            record_lifecycle_with_formal(
-                recorder,
-                "EOD_FLATTEN_RETRY",
-                row["symbol"],
-                action=_flatten_action_for_quantity(ibkr_qty),
-                quantity=abs(ibkr_qty),
-                reason=reason,
-                raw_json={
-                    "ibkr_quantity": ibkr_qty,
-                    "source": "pending_eod_flatten_retry",
-                },
+    now_ts = time.time()
+    retry_seconds = float(cooldown_seconds if cooldown_seconds is not None else getattr(args, "eod_retry_seconds", 60.0))
+    retry_age = pending_eod_retry_age_seconds(runtime_state, now_ts)
+    if not force and retry_age is not None and retry_age < retry_seconds:
+        return 0
+    runtime_state["eod_recovery_active"] = True
+    try:
+        rows = ibkr_portfolio_position_rows(ib)
+        if rows:
+            print(
+                f"{now_utc()} EOD_FLATTEN_RETRY reason={reason} open_positions={len(rows)} "
+                f"symbols={','.join(sorted(row['symbol'] for row in rows))}",
+                flush=True,
             )
-    runtime_state["pending_eod_flatten_last_retry_ts"] = now_ts
-    return hard_eod_flatten_portfolio(
+            for row in rows:
+                ibkr_qty = float(row["quantity"])
+                record_lifecycle_with_formal(
+                    recorder,
+                    "EOD_FLATTEN_RETRY",
+                    row["symbol"],
+                    action=_flatten_action_for_quantity(ibkr_qty),
+                    quantity=abs(ibkr_qty),
+                    reason=reason,
+                    raw_json={
+                        "ibkr_quantity": ibkr_qty,
+                        "source": "pending_eod_flatten_retry",
+                    },
+                )
+        runtime_state["pending_eod_flatten_last_retry_ts"] = now_ts
+        return hard_eod_flatten_portfolio(
+            ib,
+            recorder,
+            managed_positions,
+            args,
+            runtime_state,
+            reason=reason,
+        )
+    finally:
+        runtime_state["eod_recovery_active"] = False
+
+
+def process_portfolio_sync_pending_eod_retry(
+    ib: IB,
+    recorder: LiveDataRecorder,
+    managed_positions: dict[str, ManagedPosition],
+    args: argparse.Namespace,
+    runtime_state: dict[str, Any],
+) -> int:
+    return process_pending_eod_flatten_retry(
         ib,
         recorder,
         managed_positions,
         args,
         runtime_state,
-        reason=reason,
+        reason="portfolio_sync_pending_eod",
+        cooldown_seconds=5.0,
     )
 
 
@@ -3325,6 +3367,7 @@ def main() -> int:
         "pending_eod_flatten_reason": "",
         "pending_eod_flatten_symbols": [],
         "pending_eod_flatten_last_retry_ts": 0.0,
+        "eod_recovery_active": False,
         "startup_reconciliation_done": False,
         "startup_reconciliation_clean": False,
         "startup_reconciliation_orphans": [],
@@ -3367,6 +3410,7 @@ def main() -> int:
         "cancel_but_position_exists_count": 0,
     }
     load_pending_eod_flatten(recorder, runtime_state)
+    apply_pending_eod_entry_block(runtime_state)
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
     adopted_once = False
@@ -3562,6 +3606,7 @@ def main() -> int:
                     logged_dates.add(closed_key)
             elif runtime_state.get("entries_blocked_reason") == "market_closed_holiday":
                 runtime_state["entries_blocked_reason"] = ""
+            pending_eod_entries_blocked = apply_pending_eod_entry_block(runtime_state)
             ready_count = 0
             data_count = 0
             best_symbol = None
@@ -3584,11 +3629,13 @@ def main() -> int:
             manual_entries_blocked = bool(runtime_state.get("entries_blocked", False))
             reconnect_entries_blocked = bool(runtime_state.get("reconnect_active", False))
             disk_entries_blocked = bool(runtime_state.get("disk_full_entries_blocked", False))
-            if disk_entries_blocked:
+            if pending_eod_entries_blocked:
+                runtime_state["entries_blocked_reason"] = "pending_eod_flatten"
+            elif disk_entries_blocked:
                 runtime_state["entries_blocked_reason"] = "disk_full_risk"
             elif runtime_state.get("entries_blocked_reason") == "disk_full_risk":
                 runtime_state["entries_blocked_reason"] = ""
-            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked or disk_entries_blocked
+            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked or disk_entries_blocked or pending_eod_entries_blocked
             eod_active = args.enable_eod_flatten and (is_after_utc(args.eod_flatten_utc) or bool(runtime_state.get("manual_eod_flatten_requested", False)))
 
             for symbol, q in contracts:
@@ -3760,6 +3807,14 @@ def main() -> int:
                     record_strategy_equity(recorder, managed_positions, latest_snapshots)
                     persist_managed_positions(recorder, managed_positions)
                     last_portfolio_record = loop_now
+                    if runtime_state.get("pending_eod_flatten"):
+                        process_portfolio_sync_pending_eod_retry(
+                            ib,
+                            recorder,
+                            managed_positions,
+                            args,
+                            runtime_state,
+                        )
                 except Exception as exc:
                     print(f"{now_utc()} portfolio_recorder_error={exc!r}", flush=True)
                     if "disconnect" in repr(exc).lower() or "connection" in repr(exc).lower() or "socket" in repr(exc).lower():
@@ -3829,15 +3884,21 @@ def main() -> int:
             manual_entries_blocked = bool(runtime_state.get("entries_blocked", False))
             reconnect_entries_blocked = bool(runtime_state.get("reconnect_active", False))
             disk_entries_blocked = bool(runtime_state.get("disk_full_entries_blocked", False))
-            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked or disk_entries_blocked
+            pending_eod_entries_blocked = bool(runtime_state.get("pending_eod_flatten"))
+            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked or disk_entries_blocked or pending_eod_entries_blocked
             eod_active = args.enable_eod_flatten and (is_after_utc(args.eod_flatten_utc) or bool(runtime_state.get("manual_eod_flatten_requested", False)))
             risk_status = runtime_state.get("risk_guard_last_status") if isinstance(runtime_state.get("risk_guard_last_status"), dict) else {}
             risk_guard_block = bool((risk_status or {}).get("blocked"))
             risk_guard_reason = str((risk_status or {}).get("reason") or "")
+            last_eod_retry_age = pending_eod_retry_age_seconds(runtime_state, loop_now)
+            last_eod_retry_age_text = "" if last_eod_retry_age is None else f"{last_eod_retry_age:.1f}"
             print(
                 f"{now_utc()} heartbeat scanned={len(contracts)} with_data={data_count} ready_new={ready_count} "
                 f"adopted={adopted_count} exits_sent={exit_count} managed_open={active_managed} entries_blocked={int(entries_blocked)} "
-                f"manual_block={int(manual_entries_blocked)} restart_block={int(restart_entries_blocked)} reconnect_block={int(reconnect_entries_blocked)} disk_block={int(disk_entries_blocked)} eod_active={int(eod_active)} "
+                f"entries_blocked_reason={runtime_state.get('entries_blocked_reason') or ''} "
+                f"manual_block={int(manual_entries_blocked)} restart_block={int(restart_entries_blocked)} reconnect_block={int(reconnect_entries_blocked)} disk_block={int(disk_entries_blocked)} "
+                f"pending_eod_flatten={int(pending_eod_entries_blocked)} eod_recovery_active={int(bool(runtime_state.get('eod_recovery_active')))} "
+                f"last_eod_retry_age_seconds={last_eod_retry_age_text} eod_active={int(eod_active)} "
                 f"risk_guard_block={int(risk_guard_block)} risk_guard_reason={risk_guard_reason} "
                 f"best={best_symbol}:{best_score:.2f} top5=[{top5_str}] rejects=[{rejection_summary}]"
                 f"{portfolio_part}",
