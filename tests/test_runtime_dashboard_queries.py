@@ -185,6 +185,39 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(rows[0]["executed_at"], "2026-05-27T13:31:00+00:00")
             self.assertEqual(rows[1]["executed_at"], "2026-05-27T13:41:00+00:00")
 
+    def test_reconstructed_trade_peak_matches_runtime_symbol_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "reconstructed:2026-05-27:AKTX:B:S",
+                "session_date": "2026-05-27",
+                "strategy_name": "unknown",
+                "symbol": "AKTX",
+                "status": "CLOSED",
+                "entry_price": 17.0,
+                "exit_price": 17.3778,
+                "quantity": 1,
+                "gross_pnl": 0.3778,
+                "raw_json": {"reconstruction_source": "executions_pair"},
+            })
+            store.record_runtime_event(
+                session_date="2026-05-27",
+                strategy_name="unknown",
+                event_type="PEAK_UPDATED",
+                symbol="AKTX",
+                raw_json={"entry_price": 17.0, "peak_price": 17.97},
+            )
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "All")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertAlmostEqual(closed["peak_pct"], 5.7059, places=3)
+            self.assertAlmostEqual(closed["drop_from_peak_pct"], -3.2955, places=3)
+            self.assertEqual(closed["peak_source"], "runtime_events_symbol_session")
+            self.assertEqual(closed["peak_match_quality"], "symbol_session_unique")
+
     def test_closed_trade_commission_uses_confirmed_executions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
@@ -443,7 +476,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 closed = snapshot["closed_positions"].iloc[0]
 
                 self.assertAlmostEqual(closed["peak_pct"], 6.25)
-                self.assertEqual(closed["peak_source"], "trade_lifecycle.csv")
+                self.assertEqual(closed["peak_source"], "trade_lifecycle_symbol_session")
             finally:
                 if previous is None:
                     os.environ.pop("TRADING_BOT_RECORDER_DIR", None)

@@ -65,12 +65,26 @@ def raw_json_peak_value(raw: dict[str, Any]) -> float | None:
     return None
 
 
+def raw_price_value(raw: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = to_float(raw.get(key), None)
+        if value is not None:
+            return value
+    return None
+
+
 def raw_execution_time_value(raw_value: Any) -> Any:
     raw = parse_raw_json(raw_value)
     execution = raw.get("execution") if isinstance(raw.get("execution"), dict) else {}
     if execution:
         return execution.get("time") or execution.get("executionTime") or execution.get("executed_at")
     return raw.get("executed_at") or raw.get("execution_time") or raw.get("time")
+
+
+def pct_from_prices(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator in (None, 0):
+        return None
+    return ((numerator / denominator) - 1.0) * 100.0
 
 
 def to_float(value: Any, default: float | None = 0.0) -> float | None:
@@ -391,6 +405,77 @@ def load_runtime_peak_map(conn: sqlite3.Connection, window: DateWindow, strategy
     return peak_map
 
 
+def merge_symbol_peak(
+    out: dict[tuple[str, str, str], dict[str, Any]],
+    key: tuple[str, str, str],
+    *,
+    peak_price: float | None = None,
+    peak_pct: float | None = None,
+    entry_price: float | None = None,
+    exit_price: float | None = None,
+    source: str,
+) -> None:
+    current = out.get(key, {"source": source})
+    if entry_price is not None:
+        current["entry_price"] = entry_price
+    if exit_price is not None:
+        current["exit_price"] = exit_price
+    if peak_price is not None and (current.get("peak_price") is None or peak_price > current["peak_price"]):
+        current["peak_price"] = peak_price
+    if peak_pct is not None and (current.get("peak_pct") is None or peak_pct > current["peak_pct"]):
+        current["peak_pct"] = peak_pct
+    current["source"] = source
+    calculated_peak_pct = pct_from_prices(current.get("peak_price"), current.get("entry_price"))
+    if calculated_peak_pct is not None:
+        current["peak_pct"] = calculated_peak_pct
+    drop_pct = pct_from_prices(current.get("exit_price"), current.get("peak_price"))
+    if drop_pct is not None:
+        current["drop_from_peak_pct"] = drop_pct
+    out[key] = current
+
+
+def load_runtime_symbol_peak_map(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> dict[tuple[str, str, str], dict[str, Any]]:
+    clause, params = strategy_clause("r", strategy)
+    rows = read_sql(
+        conn,
+        f"""
+        SELECT COALESCE(strategy_name, 'unknown') AS strategy, session_date, symbol, event_type, raw_json
+        FROM runtime_events r
+        WHERE COALESCE(r.session_date, substr(r.event_time, 1, 10)) BETWEEN ? AND ? {clause}
+        ORDER BY r.event_time
+        """,
+        [window.start_date, window.end_date, *params],
+    )
+    out: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in rows.to_dict("records"):
+        session_date = str(row.get("session_date") or "")
+        symbol = str(row.get("symbol") or "").upper()
+        if not session_date or not symbol:
+            continue
+        raw = parse_raw_json(row.get("raw_json"))
+        event_type = str(row.get("event_type") or "").upper()
+        peak_price = raw_price_value(raw, ("peak_price", "high_watermark", "mfe_price")) if "PEAK" in event_type or raw.get("peak_price") is not None else None
+        entry_price = raw_price_value(raw, ("entry_price", "buy", "buy_price"))
+        exit_price = raw_price_value(raw, ("exit_price", "sell_price", "decision_price", "price")) if event_type in {"SELL_ORDER_SENT", "POSITION_VERIFIED_CLOSED", "POSITION_CLOSED"} else None
+        peak_pct = raw_json_peak_value(raw)
+        if peak_price is None and entry_price is not None and peak_pct is not None:
+            peak_price = entry_price * (1.0 + peak_pct / 100.0)
+        if peak_price is None and peak_pct is None and exit_price is None and entry_price is None:
+            continue
+        strategy_name = str(row.get("strategy") or "unknown")
+        for key_strategy in (strategy_name, ""):
+            merge_symbol_peak(
+                out,
+                (session_date, key_strategy, symbol),
+                peak_price=peak_price,
+                peak_pct=peak_pct,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                source="runtime_events_symbol_session",
+            )
+    return out
+
+
 def recorder_root() -> Path:
     return Path(os.environ.get("TRADING_BOT_RECORDER_DIR") or os.environ.get("DASHBOARD_RECORDER_DIR") or DEFAULT_RECORDER_ROOT)
 
@@ -427,6 +512,54 @@ def load_lifecycle_peak_map(window: DateWindow, root: Path | None = None) -> dic
             if previous is None or peak > previous[0]:
                 peak_map[key] = (peak, "trade_lifecycle.csv")
     return peak_map
+
+
+def load_lifecycle_symbol_peak_map(window: DateWindow, root: Path | None = None) -> dict[tuple[str, str], dict[str, Any]]:
+    base = root or recorder_root()
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for session_dir in sorted(base.glob("*")):
+        if not session_dir.is_dir():
+            continue
+        session_date = session_dir.name
+        if session_date < window.start_date or session_date > window.end_date:
+            continue
+        path = session_dir / "trade_lifecycle.csv"
+        if not path.exists():
+            continue
+        try:
+            rows = pd.read_csv(path)
+        except Exception:
+            continue
+        if rows.empty or "symbol" not in rows.columns:
+            continue
+        for row in rows.to_dict("records"):
+            symbol = str(row.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            event_type = str(row.get("event") or row.get("event_type") or "").upper()
+            entry_price = to_float(row.get("entry_price") or row.get("buy") or row.get("buy_price"), None)
+            peak_price = to_float(row.get("peak_price") or row.get("high_watermark") or row.get("mfe_price"), None)
+            if peak_price is None and entry_price is not None:
+                peak_pct = to_float(row.get("peak_gain_pct") or row.get("mfe_pct") or row.get("peak_pct"), None)
+                if peak_pct is not None:
+                    peak_price = entry_price * (1.0 + peak_pct / 100.0)
+            else:
+                peak_pct = to_float(row.get("peak_gain_pct") or row.get("mfe_pct") or row.get("peak_pct"), None)
+            exit_price = None
+            if event_type in {"SELL_ORDER_SENT", "POSITION_VERIFIED_CLOSED", "POSITION_CLOSED"}:
+                exit_price = to_float(row.get("exit_price") or row.get("sell_price") or row.get("decision_price") or row.get("price"), None)
+            if peak_price is None and peak_pct is None and entry_price is None and exit_price is None:
+                continue
+            merge_symbol_peak(
+                out,
+                (session_date, symbol),
+                peak_price=peak_price,
+                peak_pct=peak_pct,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                source="trade_lifecycle_symbol_session",
+            )
+    return out
 
 
 def load_candle_rows(window: DateWindow, root: Path | None = None) -> dict[tuple[str, str], pd.DataFrame]:
@@ -503,13 +636,6 @@ def peak_from_sources(
     runtime_peak = runtime_peak_map.get(trade_key)
     if runtime_peak:
         return runtime_peak
-    runtime_symbol_peak = runtime_peak_map.get(("", trade_key[1], trade_key[2], trade_key[3]))
-    if runtime_symbol_peak:
-        return runtime_symbol_peak
-    symbol_key = (str(row.get("session_date") or ""), str(row.get("symbol") or "").upper())
-    lifecycle_peak = lifecycle_peak_map.get(symbol_key)
-    if lifecycle_peak:
-        return lifecycle_peak
     candle_peak = candle_peak_for_trade(row, candle_rows)
     if candle_peak[0] is not None:
         return candle_peak
@@ -562,6 +688,7 @@ def closed_from_trades(
     exit_times: list[Any] = []
     peak_values: list[float | None] = []
     peak_sources: list[str] = []
+    peak_match_qualities: list[str] = []
     entry_execution_counts: list[int] = []
     exit_execution_counts: list[int] = []
     confirmed_commission_counts: list[int] = []
@@ -580,6 +707,7 @@ def closed_from_trades(
         exit_times.append(exit_time)
         peak_values.append(peak_pct)
         peak_sources.append(peak_source)
+        peak_match_qualities.append("exact_trade_id" if peak_source != "missing" else "missing")
         entry_execution_counts.append(len(buy_rows))
         exit_execution_counts.append(len(sell_rows))
         confirmed_count = confirmed_commission_execution_count(buy_rows, sell_rows)
@@ -594,6 +722,7 @@ def closed_from_trades(
     out["exit_time"] = exit_times
     out["peak_pct"] = peak_values
     out["peak_source"] = peak_sources
+    out["peak_match_quality"] = peak_match_qualities
     out["entry_execution_count"] = entry_execution_counts
     out["exit_execution_count"] = exit_execution_counts
     out["confirmed_commission_execution_count"] = confirmed_commission_counts
@@ -616,7 +745,7 @@ def closed_from_trades(
             "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
             "entry_time", "exit_time", "commission_status", "data_quality", "session_date",
             "entry_execution_count", "exit_execution_count", "confirmed_commission_execution_count",
-            "expected_commission_execution_count", "peak_source", "commission_source_detail",
+            "expected_commission_execution_count", "peak_source", "peak_match_quality", "commission_source_detail",
         ]
     ]
 
@@ -673,6 +802,7 @@ def closed_from_executions(executions: pd.DataFrame) -> pd.DataFrame:
                 "confirmed_commission_execution_count": 2 if commission_status == "OK" else (1 if commission_status == "PARTIAL" else 0),
                 "expected_commission_execution_count": 2,
                 "peak_source": "fills_reconstruction" if raw_peak is not None else "missing",
+                "peak_match_quality": "exact_trade_id" if raw_peak is not None else "missing",
                 "commission_source_detail": "reconstructed",
                 "qty": qty,
                 "buy": buy,
@@ -682,9 +812,67 @@ def closed_from_executions(executions: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def append_quality(existing: Any, flag: str) -> str:
+    parts = {x.strip() for x in str(existing or "").split(";") if x.strip() and x.strip() != "OK"}
+    parts.add(flag)
+    return "; ".join(sorted(parts)) if parts else "OK"
+
+
+def apply_symbol_session_peak_fallbacks(
+    closed: pd.DataFrame,
+    runtime_symbol_peak_map: dict[tuple[str, str, str], dict[str, Any]],
+    lifecycle_symbol_peak_map: dict[tuple[str, str], dict[str, Any]],
+) -> pd.DataFrame:
+    if closed.empty or "peak_pct" not in closed.columns:
+        return closed
+    out = closed.copy()
+    symbol_counts = out.groupby(["session_date", "symbol"], dropna=False).size().to_dict()
+    for idx, row in out.iterrows():
+        if pd.notna(row.get("peak_pct")):
+            out.at[idx, "peak_match_quality"] = out.at[idx, "peak_match_quality"] if "peak_match_quality" in out.columns and pd.notna(out.at[idx, "peak_match_quality"]) else "exact_trade_id"
+            continue
+        session_date = str(row.get("session_date") or "")
+        symbol = str(row.get("symbol") or "").upper()
+        if not session_date or not symbol:
+            out.at[idx, "peak_match_quality"] = "missing"
+            continue
+        has_window = parse_dt(row.get("entry_time")) is not None or parse_dt(row.get("exit_time")) is not None
+        is_unique = symbol_counts.get((session_date, row.get("symbol")), 0) == 1 or symbol_counts.get((session_date, symbol), 0) == 1
+        if not is_unique and not has_window:
+            out.at[idx, "peak_match_quality"] = "ambiguous"
+            out.at[idx, "data_quality"] = append_quality(row.get("data_quality"), "AMBIGUOUS_PEAK_MATCH")
+            continue
+        strategy = str(row.get("strategy") or "unknown")
+        match = (
+            runtime_symbol_peak_map.get((session_date, strategy, symbol))
+            or runtime_symbol_peak_map.get((session_date, "", symbol))
+        )
+        if match is None:
+            match = lifecycle_symbol_peak_map.get((session_date, symbol))
+        if match is None or match.get("peak_pct") is None:
+            out.at[idx, "peak_match_quality"] = "missing"
+            continue
+        peak_pct = float(match["peak_pct"])
+        out.at[idx, "peak_pct"] = peak_pct
+        out.at[idx, "peak_source"] = match.get("source") or "runtime_events_symbol_session"
+        out.at[idx, "peak_match_quality"] = "symbol_session_unique" if is_unique else "time_window"
+        drop_pct = match.get("drop_from_peak_pct")
+        if drop_pct is None:
+            sell = to_float(row.get("sell"), None)
+            peak_price = to_float(match.get("peak_price"), None)
+            drop_pct = pct_from_prices(sell, peak_price)
+        if drop_pct is not None:
+            out.at[idx, "drop_from_peak_pct"] = float(drop_pct)
+        elif pd.notna(row.get("net_pct")):
+            out.at[idx, "drop_from_peak_pct"] = float(row.get("net_pct")) - peak_pct
+    return out
+
+
 def load_closed_positions(conn: sqlite3.Connection, window: DateWindow, strategy: str | None, executions: pd.DataFrame) -> pd.DataFrame:
     runtime_peak_map = load_runtime_peak_map(conn, window, strategy)
+    runtime_symbol_peak_map = load_runtime_symbol_peak_map(conn, window, strategy)
     lifecycle_peak_map = load_lifecycle_peak_map(window)
+    lifecycle_symbol_peak_map = load_lifecycle_symbol_peak_map(window)
     candle_rows = load_candle_rows(window)
     trades = closed_from_trades(conn, window, strategy, executions, runtime_peak_map, lifecycle_peak_map, candle_rows)
     reconstructed = closed_from_executions(executions)
@@ -703,6 +891,7 @@ def load_closed_positions(conn: sqlite3.Connection, window: DateWindow, strategy
     if not frames:
         return pd.DataFrame()
     closed = pd.concat(frames, ignore_index=True, sort=False)
+    closed = apply_symbol_session_peak_fallbacks(closed, runtime_symbol_peak_map, lifecycle_symbol_peak_map)
     return closed.sort_values(["net_actual", "symbol"], na_position="last").reset_index(drop=True)
 
 
