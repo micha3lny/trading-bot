@@ -4,7 +4,7 @@ import json
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +105,24 @@ def parse_dt(value: Any) -> datetime | None:
         return None
 
 
+def date_part(value: Any) -> str:
+    dt = parse_dt(value)
+    if dt is not None:
+        return dt.strftime("%F")
+    text = str(value or "")
+    return text[:10] if len(text) >= 10 else ""
+
+
+def window_contains_date(window: DateWindow, value: Any) -> bool:
+    day = date_part(value)
+    return bool(day and window.start_date <= day <= window.end_date)
+
+
+def expanded_lookup_window(window: DateWindow, days_back: int = 45) -> DateWindow:
+    start = datetime.fromisoformat(window.start_date).date() - timedelta(days=days_back)
+    return DateWindow(start.isoformat(), window.end_date)
+
+
 def is_missing_value(value: Any) -> bool:
     if value in (None, ""):
         return True
@@ -133,6 +151,8 @@ def list_sessions(sqlite_path: str | Path | None = None) -> list[str]:
             SELECT DISTINCT session_date FROM (
                 SELECT session_date FROM executions WHERE session_date IS NOT NULL
                 UNION ALL SELECT session_date FROM trades WHERE session_date IS NOT NULL
+                UNION ALL SELECT substr(exit_fill_time, 1, 10) AS session_date FROM trades WHERE exit_fill_time IS NOT NULL
+                UNION ALL SELECT substr(closed_at, 1, 10) AS session_date FROM trades WHERE closed_at IS NOT NULL
                 UNION ALL SELECT session_date FROM positions WHERE session_date IS NOT NULL
                 UNION ALL SELECT session_date FROM risk_events WHERE session_date IS NOT NULL
                 UNION ALL SELECT session_date FROM runtime_events WHERE session_date IS NOT NULL
@@ -156,6 +176,8 @@ def list_strategies(sqlite_path: str | Path | None, window: DateWindow) -> list[
             SELECT DISTINCT strategy_name FROM (
                 SELECT strategy_name, session_date FROM executions
                 UNION ALL SELECT strategy_name, session_date FROM trades
+                UNION ALL SELECT strategy_name, substr(exit_fill_time, 1, 10) AS session_date FROM trades WHERE exit_fill_time IS NOT NULL
+                UNION ALL SELECT strategy_name, substr(closed_at, 1, 10) AS session_date FROM trades WHERE closed_at IS NOT NULL
                 UNION ALL SELECT strategy_name, session_date FROM positions
                 UNION ALL SELECT strategy_name, session_date FROM risk_events
                 UNION ALL SELECT strategy_name, session_date FROM runtime_events
@@ -292,8 +314,11 @@ def execution_matches_for_trade(row: dict[str, Any], executions: pd.DataFrame) -
             if not matched.empty:
                 matched_by = "reconstructed_pair"
     if matched.empty:
+        entry_date = date_part(row.get("entry_time"))
+        exit_date = date_part(row.get("exit_time") or row.get("closed_at"))
+        allowed_dates = {str(row.get("session_date") or ""), entry_date, exit_date} - {""}
         same = executions[
-            (executions["session_date"].fillna("").astype(str) == str(row.get("session_date") or ""))
+            (executions["session_date"].fillna("").astype(str).isin(allowed_dates))
             & (executions["symbol"].fillna("").astype(str).str.upper() == str(row.get("symbol") or "").upper())
         ]
         has_time_window = parse_dt(row.get("entry_time")) is not None or parse_dt(row.get("exit_time") or row.get("closed_at")) is not None
@@ -682,6 +707,8 @@ def closed_from_trades(
             trade_id,
             COALESCE(strategy_name, 'unknown') AS strategy,
             session_date,
+            substr(entry_fill_time, 1, 10) AS entry_date,
+            COALESCE(substr(exit_fill_time, 1, 10), substr(closed_at, 1, 10)) AS exit_date,
             symbol,
             status,
             entry_fill_time AS entry_time,
@@ -695,11 +722,18 @@ def closed_from_trades(
             exit_reason,
             raw_json
         FROM trades t
-        WHERE t.session_date BETWEEN ? AND ? {clause}
+        WHERE (
+            substr(t.exit_fill_time, 1, 10) BETWEEN ? AND ?
+            OR substr(t.closed_at, 1, 10) BETWEEN ? AND ?
+            OR (
+                COALESCE(t.exit_fill_time, t.closed_at) IS NULL
+                AND t.session_date BETWEEN ? AND ?
+            )
+        ) {clause}
           AND UPPER(COALESCE(t.status, '')) IN ({",".join("?" for _ in CLOSED_STATUSES)})
         ORDER BY COALESCE(t.closed_at, t.exit_fill_time), t.symbol
         """,
-        [window.start_date, window.end_date, *params, *sorted(CLOSED_STATUSES)],
+        [window.start_date, window.end_date, window.start_date, window.end_date, window.start_date, window.end_date, *params, *sorted(CLOSED_STATUSES)],
     )
     if rows.empty:
         return rows
@@ -749,6 +783,8 @@ def closed_from_trades(
     out["data_quality"] = data_quality
     out["entry_time"] = entry_times
     out["exit_time"] = exit_times
+    out["entry_date"] = [date_part(value) or str(session_date or "") for value, session_date in zip(out["entry_time"], out["session_date"])]
+    out["exit_date"] = [date_part(exit_time) or date_part(closed_at) or str(session_date or "") for exit_time, closed_at, session_date in zip(out["exit_time"], out["closed_at"], out["session_date"])]
     out["peak_pct"] = peak_values
     out["peak_source"] = peak_sources
     out["peak_match_quality"] = peak_match_qualities
@@ -775,13 +811,14 @@ def closed_from_trades(
             "trade_id", "symbol", "qty", "ibkr_commission", "buy", "sell", "gross", "net_actual", "net_pct", "pnl_pct", "peak_pct",
             "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
             "entry_time", "exit_time", "commission_status", "data_quality", "session_date",
+            "entry_date", "exit_date",
             "entry_execution_count", "exit_execution_count", "confirmed_commission_execution_count",
             "expected_commission_execution_count", "peak_source", "peak_match_quality", "commission_source_detail",
         ]
     ]
 
 
-def closed_from_executions(executions: pd.DataFrame) -> pd.DataFrame:
+def closed_from_executions(executions: pd.DataFrame, window: DateWindow) -> pd.DataFrame:
     if executions.empty:
         return pd.DataFrame()
     rows: list[dict[str, Any]] = []
@@ -792,6 +829,11 @@ def closed_from_executions(executions: pd.DataFrame) -> pd.DataFrame:
             sell_execution = next((x for x in fill_rows if str(x.get("execution_id") or "") == str(row.get("sell_execution_id") or "")), {})
             buy_time = execution_time_value(buy_execution) if buy_execution else None
             sell_time = execution_time_value(sell_execution) if sell_execution else None
+            if sell_time:
+                if not window_contains_date(window, sell_time):
+                    continue
+            elif not (window.start_date <= str(session_date or "") <= window.end_date):
+                continue
             buy = to_float(row.get("buy"), 0.0) or 0.0
             sell = to_float(row.get("sell"), 0.0) or 0.0
             pnl_pct = ((sell / buy - 1.0) * 100.0) if buy and sell else 0.0
@@ -827,6 +869,8 @@ def closed_from_executions(executions: pd.DataFrame) -> pd.DataFrame:
                 "strategy": strategy or "unknown",
                 "entry_time": buy_time,
                 "exit_time": sell_time,
+                "entry_date": date_part(buy_time) or str(session_date or ""),
+                "exit_date": date_part(sell_time) or str(session_date or ""),
                 "data_quality": quality_label_from_flags(flags),
                 "entry_execution_count": 1,
                 "exit_execution_count": 1,
@@ -906,7 +950,7 @@ def load_closed_positions(conn: sqlite3.Connection, window: DateWindow, strategy
     lifecycle_symbol_peak_map = load_lifecycle_symbol_peak_map(window)
     candle_rows: dict[tuple[str, str], pd.DataFrame] = {}
     trades = closed_from_trades(conn, window, strategy, executions, runtime_peak_map, lifecycle_peak_map, candle_rows)
-    reconstructed = closed_from_executions(executions)
+    reconstructed = closed_from_executions(executions, window)
     if not trades.empty and not reconstructed.empty:
         trade_keys = {
             (str(row.get("session_date") or ""), str(row.get("symbol") or "").upper())
@@ -1184,7 +1228,8 @@ def load_dashboard_snapshot(sqlite_path: str | Path | None, window: DateWindow, 
     conn = connect(path)
     try:
         executions = load_executions(conn, window, strategy)
-        closed = load_closed_positions(conn, window, strategy, executions)
+        execution_lookup = load_executions(conn, expanded_lookup_window(window), strategy)
+        closed = load_closed_positions(conn, window, strategy, execution_lookup)
         open_positions = load_open_positions(conn, window, strategy, executions)
         return {
             "summary": build_summary(open_positions, closed),

@@ -995,6 +995,95 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["summary"]["open_trades"], 0)
             self.assertTrue(snapshot["open_positions"].empty)
 
+    def test_carried_trade_closed_next_day_appears_on_exit_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "T_CARRIED",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "DUOT",
+                "status": "CLOSED",
+                "entry_fill_time": "2026-05-27T19:55:00+00:00",
+                "exit_fill_time": "2026-05-28T13:35:00+00:00",
+                "entry_price": 10,
+                "exit_price": 11,
+                "quantity": 2,
+                "gross_pnl": 2,
+            })
+            store.upsert_execution({
+                "execution_id": "B_DUOT",
+                "trade_id": "T_CARRIED",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "DUOT",
+                "side": "BOT",
+                "quantity": 2,
+                "price": 10,
+                "commission": 0.5,
+                "commission_source": "ibkr",
+                "executed_at": "2026-05-27T19:55:00+00:00",
+            })
+            store.upsert_execution({
+                "execution_id": "S_DUOT",
+                "trade_id": "T_CARRIED",
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "DUOT",
+                "side": "SLD",
+                "quantity": 2,
+                "price": 11,
+                "commission": 0.6,
+                "commission_source": "ibkr",
+                "executed_at": "2026-05-28T13:35:00+00:00",
+            })
+            store.close()
+
+            today = load_dashboard_snapshot(db, DateWindow("2026-05-28", "2026-05-28"), "v67")
+            previous = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
+            combined = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-28"), "v67")
+
+            self.assertEqual(today["closed_positions"].iloc[0]["symbol"], "DUOT")
+            self.assertEqual(today["closed_positions"].iloc[0]["entry_date"], "2026-05-27")
+            self.assertEqual(today["closed_positions"].iloc[0]["exit_date"], "2026-05-28")
+            self.assertAlmostEqual(today["closed_positions"].iloc[0]["ibkr_commission"], 1.1)
+            self.assertTrue(previous["closed_positions"].empty)
+            self.assertEqual(combined["closed_positions"].iloc[0]["symbol"], "DUOT")
+            self.assertIn("2026-05-28", list_sessions(db))
+
+    def test_open_positions_include_entry_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_execution({
+                "execution_id": "B_OPEN",
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "OPENX",
+                "side": "BOT",
+                "quantity": 3,
+                "price": 10,
+                "executed_at": "2026-05-28T13:31:00+00:00",
+            })
+            store.upsert_position({
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "OPENX",
+                "quantity": 3,
+                "avg_price": 10,
+                "active": 1,
+                "status": "OPEN",
+                "updated_at": "2026-05-28T13:40:00+00:00",
+                "raw_json": {"entry_time": "2026-05-28T13:31:00+00:00", "market_price": 11},
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-28", "2026-05-28"), "v67")
+
+            self.assertEqual(snapshot["open_positions"].iloc[0]["symbol"], "OPENX")
+            self.assertEqual(snapshot["open_positions"].iloc[0]["entry_time"], "2026-05-28T13:31:00+00:00")
+
 
 if __name__ == "__main__":
     unittest.main()

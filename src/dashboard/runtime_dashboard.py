@@ -178,9 +178,10 @@ def render_open_positions(df: pd.DataFrame) -> None:
         return
     cols = [
         "symbol", "qty", "buy", "now", "upnl", "now_pct", "peak_pct", "giveback_pct",
-        "hold_minutes", "status", "strategy",
+        "hold_minutes", "entry_time", "status", "strategy",
     ]
     out = filter_table(df[cols].copy(), "open").sort_values(["upnl", "symbol"], na_position="last")
+    out["entry_time"] = out["entry_time"].map(display_time)
     out = out.rename(
         columns={
             "symbol": "Symbol",
@@ -192,11 +193,12 @@ def render_open_positions(df: pd.DataFrame) -> None:
             "peak_pct": "Peak %",
             "giveback_pct": "Drop from Peak %",
             "hold_minutes": "Min",
+            "entry_time": "Entry Time",
             "status": "Status",
             "strategy": "Strategy",
         }
     )
-    out = out[["Symbol", "Qty", "Buy", "Now", "UPNL", "Now %", "Peak %", "Drop from Peak %", "Min", "Status", "Strategy"]]
+    out = out[["Symbol", "Qty", "Buy", "Now", "UPNL", "Now %", "Peak %", "Drop from Peak %", "Min", "Entry Time", "Status", "Strategy"]]
     st.dataframe(
         style_pnl(out, ["UPNL", "Now %"]),
         use_container_width=True,
@@ -210,7 +212,7 @@ def render_closed_positions(df: pd.DataFrame) -> None:
         st.info("No closed positions in the selected window.")
         return
     cols = [
-        "symbol", "qty", "ibkr_commission", "commission_status", "buy", "sell", "gross", "net_actual", "net_pct", "peak_pct",
+        "symbol", "entry_date", "exit_date", "qty", "ibkr_commission", "commission_status", "buy", "sell", "gross", "net_actual", "net_pct", "peak_pct",
         "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
         "entry_time", "exit_time", "data_quality",
     ]
@@ -223,6 +225,8 @@ def render_closed_positions(df: pd.DataFrame) -> None:
     out = out.rename(
         columns={
             "symbol": "Symbol",
+            "entry_date": "Entry Date",
+            "exit_date": "Exit Date",
             "qty": "Quantity",
             "ibkr_commission": "IBKR Comm",
             "commission_status": "Commission Status",
@@ -244,7 +248,7 @@ def render_closed_positions(df: pd.DataFrame) -> None:
     out = out[
         [
             "Symbol", "Quantity", "IBKR Comm", "Commission Status", "Buy", "Sell", "Gross", "Net", "Net %",
-            "Peak %", "Drop from Peak %", "Min", "Exit Reason", "Entry Time", "Exit Time", "Strategy",
+            "Peak %", "Drop from Peak %", "Min", "Exit Reason", "Entry Date", "Exit Date", "Entry Time", "Exit Time", "Strategy",
             "Data Quality",
         ]
     ]
