@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
+import json
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
-from src.live_trading.v67_live_top100_expansion_paper_trader import enqueue_overnight_collector_if_due
+from src.live_trading.v67_live_top100_expansion_paper_trader import (
+    enqueue_overnight_collector_if_due,
+    enqueue_startup_history_repair_if_needed,
+    history_parquet_path,
+    history_task_key,
+)
 from src.live_trading.control.control_api import (
     _bool_value,
     _build_history_collector_args,
@@ -382,6 +390,74 @@ class ControlApiHelperTests(unittest.TestCase):
         self.assertEqual(queue[0]["collector_mode"], "backlog")
         self.assertEqual(queue[0]["start_date"], "2026-02-01")
         self.assertEqual(queue[0]["end_date"], "2026-05-20")
+
+    def test_startup_history_repair_queues_when_previous_day_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            universe = root / "universe.csv"
+            universe.write_text("symbol\nAAA\nBBB\n", encoding="utf-8")
+            history_dir = root / "history" / "universe_1m"
+            history_parquet_path(history_dir, "AAA", datetime(2026, 5, 27, tzinfo=timezone.utc).date()).parent.mkdir(parents=True, exist_ok=True)
+            history_parquet_path(history_dir, "AAA", datetime(2026, 5, 27, tzinfo=timezone.utc).date()).write_bytes(b"x")
+            runtime_state = {}
+            args = SimpleNamespace(
+                startup_history_repair=True,
+                startup_history_repair_min_completion_pct=100.0,
+                startup_history_repair_retry_failed=True,
+                startup_history_repair_max_tasks=3000,
+                daily_top100_history_dir=str(history_dir),
+                daily_top100_universe=str(universe),
+                overnight_collector_max_attempts=5,
+                history_collector_client_id=168,
+            )
+
+            result = enqueue_startup_history_repair_if_needed(
+                runtime_state,
+                args,
+                now=datetime(2026, 5, 28, 8, 0, tzinfo=timezone.utc),
+            )
+
+            self.assertTrue(result["queued"])
+            queue = runtime_state["history_collector_commands"]
+            self.assertEqual(len(queue), 1)
+            self.assertEqual(queue[0]["collector_mode"], "startup_repair")
+            self.assertEqual(queue[0]["start_date"], "2026-05-27")
+            self.assertEqual(queue[0]["end_date"], "2026-05-27")
+            self.assertTrue(queue[0]["force"])
+
+    def test_startup_history_repair_skips_when_status_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            universe = root / "universe.csv"
+            universe.write_text("symbol\nAAA\nBBB\n", encoding="utf-8")
+            history_dir = root / "history" / "universe_1m"
+            status = {
+                history_task_key("AAA", datetime(2026, 5, 27, tzinfo=timezone.utc).date()): {"status": "complete"},
+                history_task_key("BBB", datetime(2026, 5, 27, tzinfo=timezone.utc).date()): {"status": "no_data"},
+            }
+            (root / "history").mkdir(parents=True, exist_ok=True)
+            (root / "history" / "collector_status.json").write_text(json.dumps(status), encoding="utf-8")
+            runtime_state = {}
+            args = SimpleNamespace(
+                startup_history_repair=True,
+                startup_history_repair_min_completion_pct=100.0,
+                startup_history_repair_retry_failed=True,
+                startup_history_repair_max_tasks=3000,
+                daily_top100_history_dir=str(history_dir),
+                daily_top100_universe=str(universe),
+                overnight_collector_max_attempts=5,
+                history_collector_client_id=168,
+            )
+
+            result = enqueue_startup_history_repair_if_needed(
+                runtime_state,
+                args,
+                now=datetime(2026, 5, 28, 8, 0, tzinfo=timezone.utc),
+            )
+
+            self.assertFalse(result["queued"])
+            self.assertEqual(result["reason"], "complete")
+            self.assertNotIn("history_collector_commands", runtime_state)
 
 
 if __name__ == "__main__":

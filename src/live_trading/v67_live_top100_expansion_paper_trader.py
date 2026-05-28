@@ -2429,6 +2429,161 @@ def overnight_backlog_start_date(end_date: str, args: argparse.Namespace) -> str
     return str(getattr(args, "overnight_collector_start_date", "2026-01-01"))
 
 
+def history_parquet_path(history_dir: str | Path, symbol: str, session_date: date, session_type: str = "RTH") -> Path:
+    return (
+        Path(history_dir)
+        / f"session_type={session_type.upper()}"
+        / f"symbol={symbol.upper()}"
+        / f"year={session_date.year:04d}"
+        / f"month={session_date.month:02d}"
+        / f"day={session_date.day:02d}.parquet"
+    )
+
+
+def history_task_key(symbol: str, session_date: date, session_type: str = "RTH") -> str:
+    return f"{symbol.upper()}_{session_date.isoformat()}_{session_type.upper()}"
+
+
+def load_history_status(history_dir: str | Path) -> dict[str, Any]:
+    status_path = Path(history_dir).parent / "collector_status.json"
+    try:
+        if status_path.exists():
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+    except Exception as exc:
+        print(f"{now_utc()} STARTUP_HISTORY_REPAIR_STATUS_LOAD_FAILED path={status_path} error={exc!r}", flush=True)
+    return {}
+
+
+def load_history_universe_symbols(universe_csv: str | Path) -> list[str]:
+    try:
+        df = pd.read_csv(universe_csv)
+    except Exception as exc:
+        print(f"{now_utc()} STARTUP_HISTORY_REPAIR_UNIVERSE_LOAD_FAILED path={universe_csv} error={exc!r}", flush=True)
+        return []
+    if "symbol" not in df.columns:
+        print(f"{now_utc()} STARTUP_HISTORY_REPAIR_UNIVERSE_LOAD_FAILED path={universe_csv} reason=missing_symbol_column", flush=True)
+        return []
+    symbols = [str(symbol).upper().strip() for symbol in df["symbol"].tolist()]
+    return [symbol for symbol in symbols if symbol]
+
+
+def assess_history_completion(
+    *,
+    history_dir: str | Path,
+    universe_csv: str | Path,
+    session_date: date,
+    session_type: str = "RTH",
+) -> dict[str, Any]:
+    symbols = load_history_universe_symbols(universe_csv)
+    status = load_history_status(history_dir)
+    done_statuses = {"complete", "partial", "no_data"}
+    failed_statuses = {"failed"}
+    parquet_files = 0
+    status_done = 0
+    failed = 0
+    missing = 0
+    for symbol in symbols:
+        path = history_parquet_path(history_dir, symbol, session_date, session_type)
+        has_parquet = path.exists() and path.stat().st_size > 0
+        if has_parquet:
+            parquet_files += 1
+        row = status.get(history_task_key(symbol, session_date, session_type))
+        row_status = str(row.get("status") or "").lower() if isinstance(row, dict) else ""
+        if row_status in done_statuses:
+            status_done += 1
+        elif row_status in failed_statuses:
+            failed += 1
+        if not has_parquet and row_status not in done_statuses:
+            missing += 1
+    expected = len(symbols)
+    completed = expected - missing if expected else 0
+    completion_pct_value = round((completed / expected) * 100.0, 2) if expected else 100.0
+    return {
+        "date": session_date.isoformat(),
+        "session_type": session_type.upper(),
+        "expected_symbols": expected,
+        "parquet_files": parquet_files,
+        "status_done": status_done,
+        "failed": failed,
+        "missing": missing,
+        "completed": completed,
+        "completion_pct": completion_pct_value,
+    }
+
+
+def enqueue_startup_history_repair_if_needed(
+    runtime_state: dict[str, Any],
+    args: argparse.Namespace,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    if not bool(getattr(args, "startup_history_repair", True)):
+        return {"queued": False, "reason": "disabled"}
+    now = now or datetime.now(timezone.utc)
+    target_date = previous_us_equity_trading_day(now.date())
+    session_type = "RTH"
+    assessment = assess_history_completion(
+        history_dir=getattr(args, "daily_top100_history_dir", DEFAULT_HISTORY_DIR),
+        universe_csv=getattr(args, "daily_top100_universe", DEFAULT_UNIVERSE),
+        session_date=target_date,
+        session_type=session_type,
+    )
+    min_pct = float(getattr(args, "startup_history_repair_min_completion_pct", 100.0))
+    retry_failed = bool(getattr(args, "startup_history_repair_retry_failed", True))
+    incomplete = assessment["expected_symbols"] > 0 and assessment["completion_pct"] < min_pct
+    has_failed = int(assessment.get("failed") or 0) > 0
+    should_queue = incomplete or (retry_failed and has_failed)
+    print(
+        f"{now_utc()} STARTUP_HISTORY_REPAIR_CHECK date={assessment['date']} "
+        f"completion_pct={assessment['completion_pct']} expected_symbols={assessment['expected_symbols']} "
+        f"parquet_files={assessment['parquet_files']} status_done={assessment['status_done']} "
+        f"missing={assessment['missing']} failed={assessment['failed']} min_completion_pct={min_pct}",
+        flush=True,
+    )
+    if not should_queue:
+        return {**assessment, "queued": False, "reason": "complete"}
+    queue = runtime_state.setdefault("history_collector_commands", [])
+    if not isinstance(queue, list):
+        queue = []
+        runtime_state["history_collector_commands"] = queue
+    if runtime_state.get("history_collector_process") is not None or queue:
+        print(
+            f"{now_utc()} STARTUP_HISTORY_REPAIR_SKIPPED date={assessment['date']} "
+            f"reason=collector_already_running_or_queued pending={len(queue)}",
+            flush=True,
+        )
+        return {**assessment, "queued": False, "reason": "collector_already_running_or_queued"}
+    command_id = f"startup_history_repair_{assessment['date'].replace('-', '')}"
+    command = {
+        "id": command_id,
+        "type": "history_collector",
+        "source": "startup_history_repair",
+        "collector_mode": "startup_repair",
+        "schedule_slot_utc": "startup",
+        "start_date": assessment["date"],
+        "end_date": assessment["date"],
+        "session_type": session_type,
+        "max_tasks": int(getattr(args, "startup_history_repair_max_tasks", getattr(args, "overnight_daily_collector_max_tasks", 3000))),
+        "max_attempts": int(getattr(args, "overnight_collector_max_attempts", 5)),
+        "limit_symbols": 0,
+        "client_id": int(getattr(args, "history_collector_client_id", 168)),
+        "force": True,
+        "allow_live_session": False,
+        "plan_only": False,
+        "include_weekends": False,
+        "retry_failed": retry_failed,
+    }
+    queue.append(command)
+    print(
+        f"{now_utc()} STARTUP_HISTORY_REPAIR_QUEUED command_id={command_id} "
+        f"start={command['start_date']} end={command['end_date']} missing={assessment['missing']} "
+        f"failed={assessment['failed']} completion_pct={assessment['completion_pct']}",
+        flush=True,
+    )
+    return {**assessment, "queued": True, "command_id": command_id}
+
+
 def enqueue_overnight_collector_if_due(runtime_state: dict[str, Any], args: argparse.Namespace, now: datetime | None = None) -> None:
     if not bool(getattr(args, "enable_overnight_automation", True)):
         return
@@ -3670,6 +3825,10 @@ def main() -> int:
     parser.add_argument("--overnight-collector-retry-failed", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--history-collector-client-id", type=int, default=168)
     parser.add_argument("--history-collector-max-runtime-minutes", type=float, default=120.0)
+    parser.add_argument("--startup-history-repair", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--startup-history-repair-min-completion-pct", type=float, default=100.0)
+    parser.add_argument("--startup-history-repair-max-tasks", type=int, default=3000)
+    parser.add_argument("--startup-history-repair-retry-failed", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--daily-top100-build-utc", default="12:45")
     parser.add_argument("--daily-top100-universe", default=DEFAULT_UNIVERSE)
     parser.add_argument("--daily-top100-history-dir", default=DEFAULT_HISTORY_DIR)
@@ -3715,6 +3874,7 @@ def main() -> int:
         f"backlog_slots={args.overnight_backlog_collector_times_utc} "
         f"prioritize_previous_day={args.overnight_prioritize_previous_day} "
         f"backlog_lookback_days={args.overnight_backlog_lookback_days} "
+        f"startup_history_repair={args.startup_history_repair} "
         f"daily_top100_build={args.daily_top100_build_utc}",
         flush=True,
     )
@@ -3792,6 +3952,7 @@ def main() -> int:
     }
     load_pending_eod_flatten(recorder, runtime_state)
     apply_pending_eod_entry_block(runtime_state)
+    enqueue_startup_history_repair_if_needed(runtime_state, args)
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
     adopted_once = False
