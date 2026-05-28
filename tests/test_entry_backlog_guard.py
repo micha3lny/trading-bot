@@ -7,7 +7,9 @@ from src.live_trading.v67_live_top100_expansion_paper_trader import (
     entry_minute_capacity,
     is_stale_ready_candidate,
     mark_entry_block_state,
+    ready_candidate_diagnostics,
     ready_candidate_age_seconds,
+    ready_candidate_rejection_reason,
     record_entry_submission,
 )
 
@@ -39,11 +41,17 @@ class EntryBacklogGuardTests(unittest.TestCase):
             )
         )
 
-    def test_recent_candidate_before_unblock_is_allowed_within_age_threshold(self) -> None:
-        state = SymbolState(symbol="LPTH", ready_since_ts=195.0, ready_since_utc="2026-05-28T18:16:55+00:00")
+    def test_recent_candidate_before_unblock_is_still_rejected(self) -> None:
+        state = SymbolState(
+            symbol="LPTH",
+            ready_since_ts=195.0,
+            ready_since_utc="2026-05-28T18:16:55+00:00",
+            signal_source="live",
+            last_live_update_ts=195.0,
+        )
         runtime_state = {"last_unblock_timestamp": 200.0}
 
-        self.assertFalse(
+        self.assertTrue(
             is_stale_ready_candidate(
                 state,
                 runtime_state,
@@ -52,6 +60,67 @@ class EntryBacklogGuardTests(unittest.TestCase):
             )
         )
         self.assertEqual(ready_candidate_age_seconds(state, 220.0), 25.0)
+        self.assertEqual(
+            ready_candidate_rejection_reason(state, runtime_state, max_age_seconds=60.0, now_ts=220.0),
+            "signal_before_last_unblock",
+        )
+
+    def test_backfill_reconstructed_ready_candidate_is_context_only(self) -> None:
+        state = SymbolState(
+            symbol="AKTX",
+            ready_since_ts=210.0,
+            ready_since_utc="2026-05-28T18:17:10+00:00",
+            signal_source="reconstructed",
+            last_update_source="reconstructed",
+        )
+        runtime_state = {"last_unblock_timestamp": 200.0, "last_restart_unblock_timestamp": 200.0}
+
+        self.assertEqual(
+            ready_candidate_rejection_reason(state, runtime_state, max_age_seconds=60.0, now_ts=220.0),
+            "signal_source_reconstructed",
+        )
+
+    def test_fresh_live_update_after_unblock_is_allowed(self) -> None:
+        state = SymbolState(
+            symbol="CRSR",
+            ready_since_ts=205.0,
+            ready_since_utc="2026-05-28T18:17:05+00:00",
+            signal_source="live",
+            last_live_update_ts=205.0,
+            last_live_update_utc="2026-05-28T18:17:05+00:00",
+        )
+        runtime_state = {"last_unblock_timestamp": 200.0, "last_restart_unblock_timestamp": 200.0}
+
+        self.assertEqual(ready_candidate_rejection_reason(state, runtime_state, max_age_seconds=60.0, now_ts=220.0), "")
+
+    def test_paper_buy_diagnostics_include_live_signal_source_fields(self) -> None:
+        state = SymbolState(
+            symbol="CRSR",
+            ready_since_ts=205.0,
+            ready_since_utc="2026-05-28T18:17:05+00:00",
+            signal_source="live",
+            last_live_update_ts=205.0,
+            last_live_update_utc="2026-05-28T18:17:05+00:00",
+        )
+        runtime_state = {
+            "last_unblock_timestamp": 200.0,
+            "last_unblock_utc": "2026-05-28T18:17:00+00:00",
+            "last_restart_unblock_timestamp": 200.0,
+            "last_restart_unblock_utc": "2026-05-28T18:17:00+00:00",
+        }
+
+        payload = ready_candidate_diagnostics(
+            state,
+            {"score": 81.57},
+            runtime_state,
+            now_ts=220.0,
+            ranking_position=1,
+        )
+
+        self.assertEqual(payload["signal_source"], "live")
+        self.assertEqual(payload["last_live_update_at"], "2026-05-28T18:17:05+00:00")
+        self.assertEqual(payload["last_restart_unblock_time"], "2026-05-28T18:17:00+00:00")
+        self.assertEqual(payload["ranking_position"], 1)
 
     def test_unblock_timestamp_is_recorded_on_transition(self) -> None:
         runtime_state: dict[str, object] = {}

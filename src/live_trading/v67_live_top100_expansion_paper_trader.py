@@ -76,6 +76,10 @@ class SymbolState:
     signal_sent: bool = False
     ready_since_ts: float | None = None
     ready_since_utc: str | None = None
+    signal_source: str = ""
+    last_update_source: str = ""
+    last_live_update_ts: float | None = None
+    last_live_update_utc: str | None = None
     stale_ready_logged: bool = False
     bars: list[dict[str, Any]] = field(default_factory=list)
 
@@ -217,6 +221,7 @@ def update_state(
     opening_range_seconds: int,
     *,
     observed_at: datetime | None = None,
+    source: str = "live",
 ) -> None:
     price = safe_float(snap.get("price"))
     if price is None or price <= 0:
@@ -227,12 +232,16 @@ def update_state(
     state.last_price = price
     state.latest_seen_utc = observed_iso
     state.latest_volume = safe_float(snap.get("volume"))
+    state.last_update_source = source
+    if source == "live":
+        state.last_live_update_ts = now_ts
+        state.last_live_update_utc = observed_iso
     state.bars.append(
         {
             "bar_time_utc": observed_iso,
             "price": price,
             "session_elapsed_seconds": round(float(session_elapsed), 3),
-            "source": "live_ticker_snapshot",
+            "source": "live_ticker_snapshot" if source == "live" else source,
         }
     )
     if len(state.bars) > 500:
@@ -342,10 +351,14 @@ def mark_entry_block_state(runtime_state: dict[str, Any], entries_blocked: bool,
         if not entries_blocked:
             runtime_state.setdefault("last_unblock_timestamp", now_ts)
             runtime_state.setdefault("last_unblock_utc", now_utc())
+            runtime_state.setdefault("last_restart_unblock_timestamp", now_ts)
+            runtime_state.setdefault("last_restart_unblock_utc", runtime_state.get("last_unblock_utc") or now_utc())
         return
     if bool(previous) and not entries_blocked:
         runtime_state["last_unblock_timestamp"] = now_ts
         runtime_state["last_unblock_utc"] = now_utc()
+        runtime_state["last_restart_unblock_timestamp"] = now_ts
+        runtime_state["last_restart_unblock_utc"] = runtime_state["last_unblock_utc"]
     runtime_state["entry_previous_entries_blocked"] = bool(entries_blocked)
 
 
@@ -368,7 +381,33 @@ def is_stale_ready_candidate(
     now_ts = time.time() if now_ts is None else float(now_ts)
     age = ready_candidate_age_seconds(state, now_ts) or 0.0
     last_unblock = float(runtime_state.get("last_unblock_timestamp") or 0.0)
-    return float(state.ready_since_ts) < last_unblock and age > float(max_age_seconds)
+    return float(state.ready_since_ts) < last_unblock or age > float(max_age_seconds)
+
+
+def ready_candidate_rejection_reason(
+    state: SymbolState,
+    runtime_state: dict[str, Any],
+    *,
+    max_age_seconds: float,
+    now_ts: float | None = None,
+) -> str:
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    source = state.signal_source or state.last_update_source or "unknown"
+    last_unblock = float(runtime_state.get("last_restart_unblock_timestamp") or runtime_state.get("last_unblock_timestamp") or 0.0)
+    age = ready_candidate_age_seconds(state, now_ts)
+    if source != "live":
+        return f"signal_source_{source}"
+    if state.ready_since_ts is None:
+        return "missing_signal_time"
+    if float(state.ready_since_ts) < last_unblock:
+        return "signal_before_last_unblock"
+    if state.last_live_update_ts is None:
+        return "missing_live_update"
+    if float(state.last_live_update_ts) < last_unblock:
+        return "live_update_before_last_unblock"
+    if age is not None and age > float(max_age_seconds):
+        return "candidate_age_exceeded"
+    return ""
 
 
 def prune_entry_submit_timestamps(
@@ -418,11 +457,14 @@ def ready_candidate_diagnostics(
     return {
         "signal_time": state.ready_since_utc,
         "ready_since": state.ready_since_utc,
+        "signal_source": state.signal_source or state.last_update_source or "unknown",
+        "last_live_update_at": state.last_live_update_utc,
         "candidate_age_seconds": None if age is None else round(age, 3),
         "entry_decision_time": now_utc(),
         "score": features.get("score"),
         "ranking_position": ranking_position,
         "last_unblock_time": runtime_state.get("last_unblock_utc"),
+        "last_restart_unblock_time": runtime_state.get("last_restart_unblock_utc") or runtime_state.get("last_unblock_utc"),
         "ready_before_last_unblock": bool(state.ready_since_ts is not None and float(state.ready_since_ts) < last_unblock),
     }
 
@@ -3840,6 +3882,13 @@ def rebuild_symbol_states_from_1m_candles(
             continue
 
         st = states[symbol]
+        st.signal_source = "reconstructed"
+        st.last_update_source = "reconstructed"
+        st.last_live_update_ts = None
+        st.last_live_update_utc = None
+        st.ready_since_ts = None
+        st.ready_since_utc = None
+        st.stale_ready_logged = False
         st.first_seen_ts = time.time()
         first_ts = _parse_bar_time_utc(rows[0].get("bar_time", ""))
         st.first_seen_utc = first_ts.isoformat() if first_ts is not None else None
@@ -4178,8 +4227,12 @@ def main() -> int:
         "entry_previous_entries_blocked": None,
         "last_unblock_timestamp": 0.0,
         "last_unblock_utc": "",
+        "last_restart_unblock_timestamp": 0.0,
+        "last_restart_unblock_utc": "",
         "entry_submit_timestamps": [],
         "ready_candidates": 0,
+        "live_ready_candidates": 0,
+        "backfill_context_candidates": 0,
         "stale_ready_candidates": 0,
         "oldest_ready_candidate_age_seconds": None,
         "control_api_commands": [],
@@ -4515,6 +4568,7 @@ def main() -> int:
                         rejection_counter[reason] += 1
                     state.ready_since_ts = None
                     state.ready_since_utc = None
+                    state.signal_source = ""
                     state.stale_ready_logged = False
 
                 has_active_position = symbol in managed_positions and managed_positions[symbol].active and not managed_positions[symbol].exit_sent
@@ -4523,6 +4577,7 @@ def main() -> int:
                     if state.ready_since_ts is None:
                         state.ready_since_ts = loop_now
                         state.ready_since_utc = now_utc()
+                        state.signal_source = state.last_update_source or "unknown"
                         state.stale_ready_logged = False
                     candidate_age = ready_candidate_age_seconds(state, loop_now)
                     entry_candidates.append(
@@ -4559,19 +4614,23 @@ def main() -> int:
                 symbol: idx + 1 for idx, (symbol, _score, _features) in enumerate(sorted(ranked, key=lambda item: item[1], reverse=True))
             }
             ready_candidates_total = len(entry_candidates)
-            stale_ready_candidates = sum(
-                1
-                for candidate in entry_candidates
-                if is_stale_ready_candidate(
+            candidate_rejection_reasons = {
+                candidate["symbol"]: ready_candidate_rejection_reason(
                     candidate["state"],
                     runtime_state,
                     max_age_seconds=float(args.max_entry_candidate_age_seconds),
                     now_ts=loop_now,
                 )
-            )
+                for candidate in entry_candidates
+            }
+            stale_ready_candidates = sum(1 for reason in candidate_rejection_reasons.values() if reason)
+            live_ready_candidates = sum(1 for candidate in entry_candidates if (candidate["state"].signal_source or candidate["state"].last_update_source) == "live")
+            backfill_context_candidates = sum(1 for candidate in entry_candidates if (candidate["state"].signal_source or candidate["state"].last_update_source) in {"backfill", "reconstructed"})
             candidate_ages = [age for age in (candidate.get("candidate_age_seconds") for candidate in entry_candidates) if age is not None]
             oldest_ready_candidate_age = max(candidate_ages) if candidate_ages else None
             runtime_state["ready_candidates"] = ready_candidates_total
+            runtime_state["live_ready_candidates"] = live_ready_candidates
+            runtime_state["backfill_context_candidates"] = backfill_context_candidates
             runtime_state["stale_ready_candidates"] = stale_ready_candidates
             runtime_state["oldest_ready_candidate_age_seconds"] = oldest_ready_candidate_age
 
@@ -4596,23 +4655,30 @@ def main() -> int:
                         now_ts=loop_now,
                         ranking_position=ranking_position,
                     )
-                    if is_stale_ready_candidate(
-                        state,
-                        runtime_state,
-                        max_age_seconds=float(args.max_entry_candidate_age_seconds),
-                        now_ts=loop_now,
-                    ):
+                    skip_reason = candidate_rejection_reasons.get(symbol) or ""
+                    if skip_reason:
                         if not state.stale_ready_logged:
                             record_lifecycle_with_formal(
                                 recorder,
-                                "STALE_READY_CANDIDATE_SKIPPED",
+                                "STALE_OR_BACKFILL_READY_SKIPPED",
                                 symbol,
                                 action="BUY",
                                 price=features.get("entry_price"),
-                                reason="ready_before_unblock_candidate_too_old",
-                                raw_json={**features, **diagnostics},
+                                reason=skip_reason,
+                                raw_json={**features, **diagnostics, "skip_reason": skip_reason},
+                            )
+                            print(
+                                f"{now_utc()} STALE_OR_BACKFILL_READY_SKIPPED symbol={symbol} "
+                                f"signal_source={diagnostics.get('signal_source')} ready_since={diagnostics.get('ready_since') or ''} "
+                                f"signal_time={diagnostics.get('signal_time') or ''} "
+                                f"last_unblock_time={diagnostics.get('last_restart_unblock_time') or ''} "
+                                f"candidate_age_seconds={diagnostics.get('candidate_age_seconds')} reason={skip_reason}",
+                                flush=True,
                             )
                             state.stale_ready_logged = True
+                        state.ready_since_ts = None
+                        state.ready_since_utc = None
+                        state.signal_source = ""
                         continue
                     max_per_cycle = int(args.max_entries_per_cycle or 0)
                     if max_per_cycle > 0 and entries_submitted_this_cycle >= max_per_cycle:
@@ -4769,8 +4835,11 @@ def main() -> int:
                     print(
                         f"PAPER BUY SENT symbol={symbol} qty={qty} price={price:.2f} "
                         f"score={features['score']:.2f} ranking_position={ranking_position or ''} "
+                        f"signal_source={diagnostics.get('signal_source') or ''} "
                         f"signal_time={diagnostics.get('signal_time') or ''} ready_since={diagnostics.get('ready_since') or ''} "
+                        f"last_live_update_at={diagnostics.get('last_live_update_at') or ''} "
                         f"candidate_age_seconds={diagnostics.get('candidate_age_seconds')} "
+                        f"last_restart_unblock_time={diagnostics.get('last_restart_unblock_time') or ''} "
                         f"entry_decision_time={diagnostics.get('entry_decision_time')} "
                         f"orderId={trade.order.orderId} tif={order.tif} outsideRth={order.outsideRth}",
                         flush=True,
@@ -4930,8 +4999,11 @@ def main() -> int:
             heartbeat_line = (
                 f"{now_utc()} heartbeat scanned={len(contracts)} with_data={data_count} ready_new={ready_count} "
                 f"ready_candidates={int(runtime_state.get('ready_candidates') or 0)} "
+                f"live_ready_candidates={int(runtime_state.get('live_ready_candidates') or 0)} "
+                f"backfill_context_candidates={int(runtime_state.get('backfill_context_candidates') or 0)} "
                 f"stale_ready_candidates={int(runtime_state.get('stale_ready_candidates') or 0)} "
                 f"oldest_ready_candidate_age_seconds={oldest_ready_age_text} "
+                f"last_restart_unblock_time={runtime_state.get('last_restart_unblock_utc') or ''} "
                 f"adopted={adopted_count} exits_sent={exit_count} managed_open={active_managed} entries_blocked={int(entries_blocked)} "
                 f"entries_blocked_reason={runtime_state.get('entries_blocked_reason') or ''} "
                 f"manual_block={int(manual_entries_blocked)} restart_block={int(restart_entries_blocked)} reconnect_block={int(reconnect_entries_blocked)} disk_block={int(disk_entries_blocked)} "
