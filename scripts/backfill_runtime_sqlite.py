@@ -199,6 +199,61 @@ def as_float(value: Any) -> float:
         return 0.0
 
 
+def as_optional_float(value: Any) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def parse_dt(value: Any) -> datetime | None:
+    try:
+        if not value:
+            return None
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def parse_raw_json(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def raw_float(raw: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = as_optional_float(raw.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def raw_peak_pct(raw: dict[str, Any]) -> float | None:
+    peak_pct = raw_float(raw, "mfe_pct", "peak_pct", "peak_gain_pct", "max_gain_pct")
+    if peak_pct is not None:
+        return peak_pct
+    entry_price = raw_float(raw, "entry_price", "buy", "buy_price")
+    peak_price = raw_float(raw, "peak_price", "high_watermark", "mfe_price")
+    if entry_price and peak_price is not None:
+        return ((peak_price / entry_price) - 1.0) * 100.0
+    return None
+
+
+def pct_from_prices(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator in (None, 0):
+        return None
+    return ((numerator / denominator) - 1.0) * 100.0
+
+
 def reconstruct_trades_from_execution_pairs(store: SQLiteRuntimeStore, session_date: str) -> int:
     executions = store.query(
         """
@@ -281,6 +336,106 @@ def reconstruct_trades_from_execution_pairs(store: SQLiteRuntimeStore, session_d
     return created
 
 
+def enrich_trades_from_runtime_events(store: SQLiteRuntimeStore, session_date: str) -> int:
+    trades = store.query(
+        """
+        SELECT trade_id, strategy_name, session_date, symbol, entry_fill_time, exit_fill_time,
+               closed_at, entry_price, exit_price, raw_json
+        FROM trades
+        WHERE session_date = ? AND UPPER(COALESCE(status, '')) IN ('CLOSED', 'DONE', 'EXIT_FILLED', 'FLAT')
+        """,
+        [session_date],
+    )
+    if not trades:
+        return 0
+    events = store.query(
+        """
+        SELECT event_time, event_type, COALESCE(strategy_name, 'unknown') AS strategy_name,
+               symbol, raw_json
+        FROM runtime_events
+        WHERE session_date = ?
+        ORDER BY event_time
+        """,
+        [session_date],
+    )
+    events_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        symbol = str(event.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        row = dict(event)
+        row["raw"] = parse_raw_json(row.get("raw_json"))
+        row["event_dt"] = parse_dt(row.get("event_time"))
+        events_by_symbol.setdefault(symbol, []).append(row)
+    trade_counts: dict[str, int] = {}
+    for trade in trades:
+        symbol = str(trade.get("symbol") or "").upper()
+        trade_counts[symbol] = trade_counts.get(symbol, 0) + 1
+    updated = 0
+    for trade in trades:
+        symbol = str(trade.get("symbol") or "").upper()
+        symbol_events = events_by_symbol.get(symbol) or []
+        if not symbol_events:
+            continue
+        start_dt = parse_dt(trade.get("entry_fill_time"))
+        end_dt = parse_dt(trade.get("exit_fill_time") or trade.get("closed_at"))
+        scoped = symbol_events
+        if start_dt or end_dt:
+            scoped = [
+                event for event in symbol_events
+                if event.get("event_dt") is None
+                or ((start_dt is None or event["event_dt"] >= start_dt) and (end_dt is None or event["event_dt"] <= end_dt))
+            ]
+            if not scoped:
+                scoped = symbol_events
+        elif trade_counts.get(symbol, 0) > 1:
+            continue
+
+        best_peak_pct: float | None = None
+        best_peak_price: float | None = None
+        entry_price = as_optional_float(trade.get("entry_price"))
+        exit_price = as_optional_float(trade.get("exit_price"))
+        for event in scoped:
+            raw = event.get("raw") or {}
+            event_type = str(event.get("event_type") or "").upper()
+            entry_price = entry_price or raw_float(raw, "entry_price", "buy", "buy_price")
+            peak_price = raw_float(raw, "peak_price", "high_watermark", "mfe_price")
+            peak_pct = raw_peak_pct(raw)
+            if peak_price is None and entry_price is not None and peak_pct is not None:
+                peak_price = entry_price * (1.0 + peak_pct / 100.0)
+            if peak_pct is None:
+                peak_pct = pct_from_prices(peak_price, entry_price)
+            if peak_pct is not None and (best_peak_pct is None or peak_pct > best_peak_pct):
+                best_peak_pct = peak_pct
+                best_peak_price = peak_price
+            if event_type in {"SELL_ORDER_SENT", "POSITION_VERIFIED_CLOSED", "POSITION_CLOSED"}:
+                exit_price = exit_price or raw_float(raw, "exit_price", "sell_price", "decision_price", "price")
+        if best_peak_pct is None:
+            continue
+        drop_from_peak_pct = pct_from_prices(exit_price, best_peak_price)
+        raw = parse_raw_json(trade.get("raw_json"))
+        raw.update({
+            "peak_source": "runtime_events",
+            "peak_match_quality": "trade_time_window" if (start_dt or end_dt) else "symbol_session_unique",
+            "peak_price": best_peak_price,
+            "peak_gain_pct": best_peak_pct,
+            "drop_from_peak_pct": drop_from_peak_pct,
+        })
+        store.conn.execute(
+            """
+            UPDATE trades
+            SET mfe_pct = ?,
+                raw_json = ?
+            WHERE trade_id = ?
+            """,
+            [best_peak_pct, safe_json(raw), trade.get("trade_id")],
+        )
+        updated += 1
+    if updated:
+        store.conn.commit()
+    return updated
+
+
 def import_session(store: SQLiteRuntimeStore, session: Path, *, progress_interval: int = 500) -> dict[str, int]:
     session_date = session.name
     counts = {"executions": 0, "events": 0, "positions": 0, "reconciliation": 0}
@@ -354,6 +509,10 @@ def import_session(store: SQLiteRuntimeStore, session: Path, *, progress_interva
                     print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=order_lifecycle rows={jsonl_rows} events={counts['events']}", flush=True)
         store.conn.commit()
         print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=order_lifecycle rows={jsonl_rows} events={counts['events']}", flush=True)
+
+    enriched_trades = enrich_trades_from_runtime_events(store, session_date)
+    if enriched_trades:
+        print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=trade_metrics trades={enriched_trades}", flush=True)
 
     managed = read_json(session / "managed_positions.json") or {}
     managed_positions = managed.get("positions") if isinstance(managed.get("positions"), dict) else managed

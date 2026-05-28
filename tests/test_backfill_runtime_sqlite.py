@@ -114,6 +114,31 @@ class BackfillRuntimeSQLiteTests(unittest.TestCase):
                     },
                 ],
             )
+            write_csv(
+                session_dir / "trade_lifecycle.csv",
+                [
+                    {
+                        "recorded_at": "2026-05-27T13:35:00+00:00",
+                        "event": "PEAK_UPDATED",
+                        "symbol": "MRAM",
+                        "price": "10.8",
+                        "entry_price": "10",
+                        "peak_price": "10.8",
+                        "pnl_pct": "",
+                        "reason": "",
+                    },
+                    {
+                        "recorded_at": "2026-05-27T13:41:00+00:00",
+                        "event": "SELL_ORDER_SENT",
+                        "symbol": "MRAM",
+                        "price": "11",
+                        "entry_price": "10",
+                        "peak_price": "10.8",
+                        "pnl_pct": "10",
+                        "reason": "trail",
+                    },
+                ],
+            )
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
             try:
                 import_session(store, session_dir)
@@ -125,6 +150,8 @@ class BackfillRuntimeSQLiteTests(unittest.TestCase):
                 self.assertEqual(trades[0]["entry_fill_time"], "2026-05-27T13:31:00+00:00")
                 self.assertEqual(trades[0]["exit_fill_time"], "2026-05-27T13:41:00+00:00")
                 self.assertAlmostEqual(trades[0]["gross_pnl"], 2.0)
+                self.assertAlmostEqual(trades[0]["mfe_pct"], 8.0)
+                self.assertIn("drop_from_peak_pct", trades[0]["raw_json"])
                 self.assertIn("executions_pair", trades[0]["raw_json"])
                 self.assertEqual(executions[0]["executed_at"], "2026-05-27T13:31:00+00:00")
                 self.assertEqual(executions[1]["executed_at"], "2026-05-27T13:41:00+00:00")

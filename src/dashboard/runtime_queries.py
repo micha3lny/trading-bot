@@ -647,9 +647,6 @@ def peak_from_sources(
     runtime_peak = runtime_peak_map.get(trade_key)
     if runtime_peak:
         return runtime_peak
-    candle_peak = candle_peak_for_trade(row, candle_rows)
-    if candle_peak[0] is not None:
-        return candle_peak
     return None, "missing"
 
 
@@ -700,6 +697,7 @@ def closed_from_trades(
     peak_values: list[float | None] = []
     peak_sources: list[str] = []
     peak_match_qualities: list[str] = []
+    drop_values: list[float | None] = []
     entry_execution_counts: list[int] = []
     exit_execution_counts: list[int] = []
     confirmed_commission_counts: list[int] = []
@@ -711,6 +709,10 @@ def closed_from_trades(
         enriched_row = {**row, "entry_time": entry_time, "exit_time": exit_time}
         commission, commission_status = confirmed_commission_for_execution_rows(buy_rows, sell_rows)
         peak_pct, peak_source = peak_from_sources(enriched_row, runtime_peak_map, lifecycle_peak_map, candle_rows)
+        raw = parse_raw_json(row.get("raw_json"))
+        drop_from_peak = to_float(raw.get("drop_from_peak_pct"), None)
+        if drop_from_peak is None:
+            drop_from_peak = to_float(raw.get("giveback_pct"), None)
         commissions.append(commission)
         commission_statuses.append(commission_status)
         data_quality.append(quality_label(flags, commission_status))
@@ -719,6 +721,7 @@ def closed_from_trades(
         peak_values.append(peak_pct)
         peak_sources.append(peak_source)
         peak_match_qualities.append("exact_trade_id" if peak_source != "missing" else "missing")
+        drop_values.append(drop_from_peak)
         entry_execution_counts.append(len(buy_rows))
         exit_execution_counts.append(len(sell_rows))
         confirmed_count = confirmed_commission_execution_count(buy_rows, sell_rows)
@@ -734,6 +737,7 @@ def closed_from_trades(
     out["peak_pct"] = peak_values
     out["peak_source"] = peak_sources
     out["peak_match_quality"] = peak_match_qualities
+    out["drop_from_peak_pct"] = drop_values
     out["entry_execution_count"] = entry_execution_counts
     out["exit_execution_count"] = exit_execution_counts
     out["confirmed_commission_execution_count"] = confirmed_commission_counts
@@ -748,7 +752,8 @@ def closed_from_trades(
     denominator = (out["buy"] * out["qty"].abs()).replace(0, pd.NA)
     out["net_pct"] = ((out["net_actual"] / denominator) * 100.0).fillna(0.0)
     out["pnl_pct"] = out["net_pct"]
-    out["drop_from_peak_pct"] = out["net_pct"].fillna(0.0) - out["peak_pct"]
+    fallback_drop = out["net_pct"].fillna(0.0) - out["peak_pct"]
+    out["drop_from_peak_pct"] = pd.to_numeric(out["drop_from_peak_pct"], errors="coerce").fillna(fallback_drop)
     out["hold_minutes"] = [hold_minutes(a, b or c) for a, b, c in zip(out["entry_time"], out["exit_time"], out["closed_at"])]
     return out[
         [
@@ -884,7 +889,7 @@ def load_closed_positions(conn: sqlite3.Connection, window: DateWindow, strategy
     runtime_symbol_peak_map = load_runtime_symbol_peak_map(conn, window, strategy)
     lifecycle_peak_map = load_lifecycle_peak_map(window)
     lifecycle_symbol_peak_map = load_lifecycle_symbol_peak_map(window)
-    candle_rows = load_candle_rows(window)
+    candle_rows: dict[tuple[str, str], pd.DataFrame] = {}
     trades = closed_from_trades(conn, window, strategy, executions, runtime_peak_map, lifecycle_peak_map, candle_rows)
     reconstructed = closed_from_executions(executions)
     if not trades.empty and not reconstructed.empty:
