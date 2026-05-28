@@ -353,7 +353,7 @@ def enrich_trades_from_runtime_events(store: SQLiteRuntimeStore, session_date: s
         SELECT event_time, event_type, COALESCE(strategy_name, 'unknown') AS strategy_name,
                symbol, raw_json
         FROM runtime_events
-        WHERE session_date = ?
+        WHERE COALESCE(session_date, substr(event_time, 1, 10)) = ?
         ORDER BY event_time
         """,
         [session_date],

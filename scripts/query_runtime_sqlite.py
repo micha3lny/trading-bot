@@ -30,6 +30,8 @@ def main() -> int:
     p.add_argument("--date", required=True)
     p = sub.add_parser("reconciliation")
     p.add_argument("--date", required=True)
+    p = sub.add_parser("peak-diagnostics")
+    p.add_argument("--date", required=True)
     sub.add_parser("collector-runs")
     args = ap.parse_args()
 
@@ -55,6 +57,18 @@ def main() -> int:
             print_rows(store.query("SELECT * FROM executions WHERE session_date = ? ORDER BY executed_at, recorded_at", [args.date]))
         elif args.command == "reconciliation":
             print_rows(store.query("SELECT * FROM reconciliation_runs WHERE substr(started_at, 1, 10) = ? OR substr(finished_at, 1, 10) = ? ORDER BY started_at", [args.date, args.date]))
+        elif args.command == "peak-diagnostics":
+            print_rows(store.query(
+                """
+                SELECT
+                    ? AS session_date,
+                    (SELECT COUNT(*) FROM trades WHERE session_date = ? AND UPPER(COALESCE(status, '')) IN ('CLOSED', 'DONE', 'EXIT_FILLED', 'FLAT')) AS closed_trades,
+                    (SELECT COUNT(*) FROM trades WHERE session_date = ? AND UPPER(COALESCE(status, '')) IN ('CLOSED', 'DONE', 'EXIT_FILLED', 'FLAT') AND mfe_pct IS NOT NULL) AS trades_with_mfe,
+                    (SELECT COUNT(*) FROM runtime_events WHERE COALESCE(session_date, substr(event_time, 1, 10)) = ? AND (UPPER(event_type) LIKE '%PEAK%' OR raw_json LIKE '%peak_price%' OR raw_json LIKE '%mfe%')) AS peak_events,
+                    (SELECT COUNT(DISTINCT symbol) FROM runtime_events WHERE COALESCE(session_date, substr(event_time, 1, 10)) = ? AND (UPPER(event_type) LIKE '%PEAK%' OR raw_json LIKE '%peak_price%' OR raw_json LIKE '%mfe%')) AS peak_symbols
+                """,
+                [args.date, args.date, args.date, args.date, args.date],
+            ))
         elif args.command == "collector-runs":
             print_rows(store.query("SELECT * FROM collector_runs ORDER BY started_at DESC LIMIT 100"))
     finally:

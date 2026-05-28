@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.backfill_runtime_sqlite import import_session
+from scripts.backfill_runtime_sqlite import enrich_trades_from_runtime_events, import_session
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
 
@@ -155,6 +155,48 @@ class BackfillRuntimeSQLiteTests(unittest.TestCase):
                 self.assertIn("executions_pair", trades[0]["raw_json"])
                 self.assertEqual(executions[0]["executed_at"], "2026-05-27T13:31:00+00:00")
                 self.assertEqual(executions[1]["executed_at"], "2026-05-27T13:41:00+00:00")
+            finally:
+                store.close()
+
+    def test_backfill_enriches_peak_from_runtime_event_without_session_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_trade({
+                    "trade_id": "TNULL",
+                    "session_date": "2026-05-27",
+                    "strategy_name": "unknown",
+                    "symbol": "AKTX",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-05-27T13:30:00+00:00",
+                    "exit_fill_time": "2026-05-27T13:40:00+00:00",
+                    "entry_price": 17.0,
+                    "exit_price": 17.3778,
+                    "quantity": 1,
+                    "gross_pnl": 0.3778,
+                })
+                store.conn.execute(
+                    """
+                    INSERT INTO runtime_events (
+                        event_time, severity, event_type, strategy_name, session_date, symbol, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "2026-05-27T13:35:00+00:00",
+                        "INFO",
+                        "PEAK_UPDATED",
+                        "unknown",
+                        None,
+                        "AKTX",
+                        '{"entry_price": 17.0, "peak_price": 17.97}',
+                    ),
+                )
+                updated = enrich_trades_from_runtime_events(store, "2026-05-27")
+                trades = store.query("SELECT mfe_pct, raw_json FROM trades WHERE trade_id = 'TNULL'")
+
+                self.assertEqual(updated, 1)
+                self.assertAlmostEqual(trades[0]["mfe_pct"], 5.7059, places=3)
+                self.assertIn("drop_from_peak_pct", trades[0]["raw_json"])
             finally:
                 store.close()
 
