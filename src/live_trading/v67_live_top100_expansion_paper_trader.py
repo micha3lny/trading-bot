@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import json
 import math
+import signal
 import shutil
 import subprocess
 import sys
@@ -55,6 +57,7 @@ DEFAULT_UNIVERSE = "data/universe/v68_final_daytrading_universe.csv"
 DEFAULT_HISTORY_DIR = "data/history/universe_1m"
 DEFAULT_RECORDER_DIR = "data/live/recorder"
 STRATEGY_NAME = "v67_top100_live_safe_expansion_v46_wide_trail"
+_ACTIVE_SHUTDOWN_DIAGNOSTICS: "ShutdownDiagnostics | None" = None
 
 
 @dataclass
@@ -103,6 +106,148 @@ class ManagedPosition:
 
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def is_us_equity_session_active_now(args: argparse.Namespace | None = None, *, now: datetime | None = None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    session = get_us_equity_session(now.date())
+    if not session.is_trading_day:
+        return False
+    if session.open_utc and session.close_utc:
+        return session.open_utc <= now < session.close_utc
+    market_open = parse_utc_hhmm(getattr(args, "market_open_utc", "13:30") if args is not None else "13:30")
+    market_close = parse_utc_hhmm(getattr(args, "market_close_utc", "20:00") if args is not None else "20:00")
+    now_min = now.hour * 60 + now.minute
+    return market_open <= now_min < market_close
+
+
+class ShutdownDiagnostics:
+    def __init__(self, *, log_dir: str | Path | None, args: argparse.Namespace | None = None) -> None:
+        self.log_dir = log_dir
+        self.args = args
+        self.start_monotonic = time.monotonic()
+        self.reason = "unknown"
+        self.exit_code: int | None = None
+        self.signal_name = ""
+        self.exit_logged = False
+        self.atexit_logged = False
+
+    def uptime_seconds(self) -> float:
+        return max(0.0, time.monotonic() - self.start_monotonic)
+
+    def set_reason(self, reason: str, *, exit_code: int | None = None) -> None:
+        self.reason = reason or self.reason or "unknown"
+        if exit_code is not None:
+            self.exit_code = int(exit_code)
+
+    def log_signal(self, signum: int) -> None:
+        try:
+            self.signal_name = signal.Signals(signum).name
+        except Exception:
+            self.signal_name = f"SIG{signum}"
+        self.set_reason(f"signal_{self.signal_name.lower()}", exit_code=0)
+        log_event(
+            "BOT",
+            "BOT_SIGNAL_RECEIVED",
+            "WARN",
+            log_dir=self.log_dir,
+            signal=self.signal_name,
+            uptime_seconds=round(self.uptime_seconds(), 3),
+        )
+
+    def install_signal_handlers(self) -> None:
+        def _handler(signum, _frame):
+            self.log_signal(int(signum))
+            if signum == signal.SIGINT:
+                raise KeyboardInterrupt
+            raise SystemExit(0)
+
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            try:
+                signal.signal(signum, _handler)
+            except Exception:
+                pass
+
+    def log_main_loop_exit(self, *, reason: str, exit_code: int = 0) -> None:
+        self.set_reason(reason, exit_code=exit_code)
+        log_event(
+            "BOT",
+            "MAIN_LOOP_EXIT",
+            log_dir=self.log_dir,
+            reason=reason,
+            exit_code=exit_code,
+            uptime_seconds=round(self.uptime_seconds(), 3),
+        )
+
+    def log_exit(self, *, reason: str | None = None, exit_code: int | None = None, recorder_dir: Any = None) -> None:
+        if reason:
+            self.set_reason(reason)
+        if exit_code is not None:
+            self.exit_code = int(exit_code)
+        if self.exit_logged:
+            return
+        self.exit_logged = True
+        code = 0 if self.exit_code is None else int(self.exit_code)
+        log_event(
+            "BOT",
+            "BOT_EXIT",
+            log_dir=self.log_dir,
+            reason=self.reason or "unknown",
+            exit_code=code,
+            signal=self.signal_name,
+            uptime_seconds=round(self.uptime_seconds(), 3),
+            recorder_dir=recorder_dir or "",
+        )
+        log_event(
+            "BOT",
+            "BOT_STOP",
+            log_dir=self.log_dir,
+            reason=self.reason or "unknown",
+            exit_code=code,
+            signal=self.signal_name,
+            recorder_dir=recorder_dir or "",
+        )
+        if code == 0 and is_us_equity_session_active_now(self.args):
+            log_event(
+                "BOT",
+                "UNEXPECTED_CLEAN_EXIT_DURING_SESSION",
+                "WARN",
+                log_dir=self.log_dir,
+                reason=self.reason or "unknown",
+                uptime_seconds=round(self.uptime_seconds(), 3),
+            )
+
+    def atexit(self) -> None:
+        if self.atexit_logged:
+            return
+        self.atexit_logged = True
+        if not self.exit_logged:
+            self.log_exit(reason=f"atexit_{self.reason or 'unknown'}", exit_code=self.exit_code)
+        else:
+            log_event(
+                "BOT",
+                "BOT_EXIT_ATEXIT",
+                log_dir=self.log_dir,
+                reason=self.reason or "unknown",
+                exit_code=0 if self.exit_code is None else self.exit_code,
+                signal=self.signal_name,
+                uptime_seconds=round(self.uptime_seconds(), 3),
+            )
+
+
+def log_ibkr_disconnect_source(
+    runtime_state: dict[str, Any] | None,
+    *,
+    source: str,
+    reason: str,
+    log_dir: str | Path | None = None,
+    **fields: Any,
+) -> None:
+    if runtime_state is not None:
+        runtime_state["ibkr_disconnect_source"] = source
+        runtime_state["ibkr_disconnect_reason"] = reason
+        runtime_state["ibkr_disconnect_at"] = now_utc()
+    log_event("IBKR", "IBKR_DISCONNECT_SOURCE", log_dir=log_dir, source=source, reason=reason, **fields)
 
 
 def emit_heartbeat(line: str, runtime_state: dict[str, Any], log_dir: str | Path | None = None) -> None:
@@ -4011,6 +4156,8 @@ def handle_ibkr_disconnect_and_recover(
     runtime_state["post_reconnect_reconciliation_done"] = False
     runtime_state["entries_blocked"] = True
     runtime_state["entries_blocked_reason"] = "ibkr_reconnect"
+    source = "exception" if "exception" in str(reason).lower() else "api_disconnect"
+    log_ibkr_disconnect_source(runtime_state, source=source, reason=reason)
 
     if ibkr_connection_alive(ib):
         try:
@@ -4090,6 +4237,7 @@ def handle_ibkr_disconnect_and_recover(
 
 
 def main() -> int:
+    global _ACTIVE_SHUTDOWN_DIAGNOSTICS
     parser = argparse.ArgumentParser(description="v67 live top100 expansion paper trader")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -4173,6 +4321,10 @@ def main() -> int:
     symbols = load_top_symbols(args.alpha_rank_csv, args.top_n, min_price=args.min_price)
     recorder = LiveDataRecorder(args.recorder_dir)
     log_dir = install_unified_logger(args.log_dir)
+    shutdown = ShutdownDiagnostics(log_dir=log_dir, args=args)
+    _ACTIVE_SHUTDOWN_DIAGNOSTICS = shutdown
+    shutdown.install_signal_handlers()
+    atexit.register(shutdown.atexit)
     sqlite_store = None if args.disable_sqlite else open_sqlite_store(args.sqlite_path)
     setattr(recorder, "sqlite_store", sqlite_store)
     disk = shutil.disk_usage(str(Path(args.recorder_dir).parent if Path(args.recorder_dir).parent else Path(".")))
@@ -4292,6 +4444,11 @@ def main() -> int:
         "partial_fill_states": {},
         "delayed_fill_after_cancel_count": 0,
         "cancel_but_position_exists_count": 0,
+        "process_start_monotonic": shutdown.start_monotonic,
+        "shutdown_reason": "",
+        "ibkr_disconnect_source": "",
+        "ibkr_disconnect_reason": "",
+        "ibkr_disconnect_at": "",
     }
     load_pending_eod_flatten(recorder, runtime_state)
     apply_pending_eod_entry_block(runtime_state)
@@ -4996,6 +5153,7 @@ def main() -> int:
             last_eod_retry_age_text = "" if last_eod_retry_age is None else f"{last_eod_retry_age:.1f}"
             oldest_ready_age = runtime_state.get("oldest_ready_candidate_age_seconds")
             oldest_ready_age_text = "" if oldest_ready_age is None else f"{float(oldest_ready_age):.1f}"
+            process_uptime_seconds = shutdown.uptime_seconds()
             heartbeat_line = (
                 f"{now_utc()} heartbeat scanned={len(contracts)} with_data={data_count} ready_new={ready_count} "
                 f"ready_candidates={int(runtime_state.get('ready_candidates') or 0)} "
@@ -5012,13 +5170,27 @@ def main() -> int:
                 f"risk_guard_block={int(risk_guard_block)} risk_guard_reason={risk_guard_reason} "
                 f"open_price_ok={open_price_ok} open_price_missing={open_price_missing} "
                 f"subscriptions_active={len(tickers)} subscriptions_cap={subscriptions_cap} subscription_cap_block={int(subscription_cap_block)} "
+                f"process_uptime_seconds={process_uptime_seconds:.1f} "
                 f"best={best_symbol}:{best_score:.2f} top5=[{top5_str}] rejects=[{rejection_summary}]"
                 f"{portfolio_part}"
             )
             emit_heartbeat(heartbeat_line, runtime_state, log_dir)
         normal_exit = True
+        shutdown.log_main_loop_exit(reason="duration_elapsed", exit_code=0)
 
+    except SystemExit:
+        if shutdown.reason == "unknown":
+            shutdown.set_reason("system_exit", exit_code=0)
+        raise
+    except KeyboardInterrupt:
+        shutdown.set_reason("keyboard_interrupt", exit_code=130)
+        raise
+    except Exception:
+        shutdown.set_reason("exception", exit_code=1)
+        raise
     finally:
+        if not normal_exit and shutdown.reason == "unknown":
+            shutdown.set_reason("main_loop_interrupted")
         persist_managed_positions(recorder, managed_positions)
         if sqlite_store is not None:
             sqlite_store.close()
@@ -5027,10 +5199,20 @@ def main() -> int:
                 ib.cancelMktData(ticker.contract)
             except Exception:
                 pass
+        log_ibkr_disconnect_source(
+            runtime_state,
+            source="shutdown",
+            reason=shutdown.reason or ("normal_exit" if normal_exit else "shutdown"),
+            log_dir=log_dir,
+            connected_before=int(ibkr_connection_alive(ib)),
+        )
         ib.disconnect()
         print("Disconnected", flush=True)
-        if normal_exit:
-            log_event("BOT", "BOT_STOP", log_dir=log_dir, recorder_dir=recorder.session_dir)
+        shutdown.log_exit(
+            reason=shutdown.reason or ("duration_elapsed" if normal_exit else "shutdown"),
+            exit_code=0 if shutdown.exit_code is None else shutdown.exit_code,
+            recorder_dir=recorder.session_dir,
+        )
     return 0
 
 
@@ -5038,8 +5220,13 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        log_event("BOT", "BOT_STOP", reason="keyboard_interrupt")
+        if _ACTIVE_SHUTDOWN_DIAGNOSTICS is not None:
+            _ACTIVE_SHUTDOWN_DIAGNOSTICS.log_exit(reason="keyboard_interrupt", exit_code=130)
+        else:
+            log_event("BOT", "BOT_STOP", reason="keyboard_interrupt", exit_code=130)
         raise
     except Exception as exc:
+        if _ACTIVE_SHUTDOWN_DIAGNOSTICS is not None:
+            _ACTIVE_SHUTDOWN_DIAGNOSTICS.log_exit(reason="exception", exit_code=1)
         log_event("BOT", "BOT_CRASH", "CRITICAL", exception=repr(exc), traceback=format_traceback(exc))
         raise

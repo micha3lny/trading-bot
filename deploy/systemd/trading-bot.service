@@ -9,6 +9,7 @@ User=pi
 WorkingDirectory=/home/pi/trading-bot
 ExecStartPre=/home/pi/trading-bot/.venv/bin/python -m src.live_trading.v64_wait_for_ibkr_api --host 127.0.0.1 --port 4002
 ExecStart=/home/pi/trading-bot/.venv/bin/python -m src.live_trading.run_live_bot
+ExecStopPost=/bin/sh -c 'echo "v67-trader ExecStopPost SERVICE_RESULT=$SERVICE_RESULT EXIT_CODE=$EXIT_CODE EXIT_STATUS=$EXIT_STATUS"'
 Restart=always
 RestartSec=15
 TimeoutStartSec=360
