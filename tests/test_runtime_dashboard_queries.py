@@ -130,6 +130,230 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertAlmostEqual(closed["ibkr_commission"], 0.75)
             self.assertAlmostEqual(closed["net_actual"], 9.25)
             self.assertAlmostEqual(closed["net_pct"], 9.25)
+            self.assertEqual(closed["commission_status"], "OK")
+            self.assertEqual(closed["data_quality"], "OK")
+
+    def test_closed_trade_peak_zero_remains_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "T0",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "FLAT",
+                "status": "CLOSED",
+                "entry_fill_time": "2026-05-27T13:30:00+00:00",
+                "exit_fill_time": "2026-05-27T13:40:00+00:00",
+                "entry_price": 10,
+                "exit_price": 9.9,
+                "quantity": 10,
+                "gross_pnl": -1,
+                "mfe_pct": 0,
+            })
+            for execution_id, side, price, ts in [
+                ("B0", "BOT", 10, "2026-05-27T13:30:00+00:00"),
+                ("S0", "SLD", 9.9, "2026-05-27T13:40:00+00:00"),
+            ]:
+                store.upsert_execution({
+                    "execution_id": execution_id,
+                    "trade_id": "T0",
+                    "session_date": "2026-05-27",
+                    "strategy_name": "v67",
+                    "symbol": "FLAT",
+                    "side": side,
+                    "quantity": 10,
+                    "price": price,
+                    "commission": 0.0,
+                    "commission_source": "ibkr",
+                    "recorded_at": ts,
+                })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertEqual(closed["peak_pct"], 0)
+            self.assertEqual(closed["commission_status"], "OK")
+            self.assertEqual(closed["data_quality"], "OK")
+
+    def test_missing_entry_time_does_not_reuse_exit_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "T_MISSING_ENTRY",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "TIME",
+                "status": "CLOSED",
+                "exit_fill_time": "2026-05-27T13:40:00+00:00",
+                "entry_price": 10,
+                "exit_price": 11,
+                "quantity": 1,
+                "gross_pnl": 1,
+                "mfe_pct": 10,
+            })
+            store.upsert_execution({
+                "execution_id": "S_MISSING_ENTRY",
+                "trade_id": "T_MISSING_ENTRY",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "TIME",
+                "side": "SLD",
+                "quantity": 1,
+                "price": 11,
+                "commission": 0.2,
+                "commission_source": "ibkr",
+                "recorded_at": "2026-05-27T13:40:00+00:00",
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertIsNone(closed["entry_time"])
+            self.assertEqual(closed["exit_time"], "2026-05-27T13:40:00+00:00")
+            self.assertNotEqual(closed["entry_time"], closed["exit_time"])
+            self.assertIn("MISSING_ENTRY", closed["data_quality"])
+
+    def test_missing_commission_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "T_NO_COMM",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "NOCOMM",
+                "status": "CLOSED",
+                "entry_fill_time": "2026-05-27T13:30:00+00:00",
+                "exit_fill_time": "2026-05-27T13:40:00+00:00",
+                "entry_price": 10,
+                "exit_price": 11,
+                "quantity": 1,
+                "gross_pnl": 1,
+                "mfe_pct": 10,
+            })
+            for execution_id, side, price, ts in [
+                ("B_NO_COMM", "BOT", 10, "2026-05-27T13:30:00+00:00"),
+                ("S_NO_COMM", "SLD", 11, "2026-05-27T13:40:00+00:00"),
+            ]:
+                store.upsert_execution({
+                    "execution_id": execution_id,
+                    "trade_id": "T_NO_COMM",
+                    "session_date": "2026-05-27",
+                    "strategy_name": "v67",
+                    "symbol": "NOCOMM",
+                    "side": side,
+                    "quantity": 1,
+                    "price": price,
+                    "recorded_at": ts,
+                })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertEqual(closed["ibkr_commission"], 0)
+            self.assertEqual(closed["commission_status"], "MISSING")
+            self.assertIn("COMMISSION_MISSING", closed["data_quality"])
+
+    def test_partial_commission_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "T_PARTIAL_COMM",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "PART",
+                "status": "CLOSED",
+                "entry_fill_time": "2026-05-27T13:30:00+00:00",
+                "exit_fill_time": "2026-05-27T13:40:00+00:00",
+                "entry_price": 10,
+                "exit_price": 11,
+                "quantity": 1,
+                "gross_pnl": 1,
+                "mfe_pct": 10,
+            })
+            store.upsert_execution({
+                "execution_id": "B_PARTIAL_COMM",
+                "trade_id": "T_PARTIAL_COMM",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "PART",
+                "side": "BOT",
+                "quantity": 1,
+                "price": 10,
+                "commission": 0.3,
+                "commission_source": "ibkr",
+                "recorded_at": "2026-05-27T13:30:00+00:00",
+            })
+            store.upsert_execution({
+                "execution_id": "S_PARTIAL_COMM",
+                "trade_id": "T_PARTIAL_COMM",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "PART",
+                "side": "SLD",
+                "quantity": 1,
+                "price": 11,
+                "recorded_at": "2026-05-27T13:40:00+00:00",
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertAlmostEqual(closed["ibkr_commission"], 0.3)
+            self.assertEqual(closed["commission_status"], "PARTIAL")
+            self.assertIn("COMMISSION_PARTIAL", closed["data_quality"])
+
+    def test_same_second_true_roundtrip_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            same_second = "2026-05-27T13:30:00+00:00"
+            store.upsert_trade({
+                "trade_id": "T_FAST",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "FAST",
+                "status": "CLOSED",
+                "entry_fill_time": same_second,
+                "exit_fill_time": same_second,
+                "entry_price": 10,
+                "exit_price": 10.1,
+                "quantity": 1,
+                "gross_pnl": 0.1,
+                "mfe_pct": 1,
+            })
+            for execution_id, side, price in [
+                ("B_FAST", "BOT", 10),
+                ("S_FAST", "SLD", 10.1),
+            ]:
+                store.upsert_execution({
+                    "execution_id": execution_id,
+                    "trade_id": "T_FAST",
+                    "session_date": "2026-05-27",
+                    "strategy_name": "v67",
+                    "symbol": "FAST",
+                    "side": side,
+                    "quantity": 1,
+                    "price": price,
+                    "commission": 0.1,
+                    "commission_source": "ibkr",
+                    "recorded_at": same_second,
+                })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertEqual(closed["entry_time"], same_second)
+            self.assertEqual(closed["exit_time"], same_second)
+            self.assertNotIn("SUSPECT_TIME_MATCH", closed["data_quality"])
 
     def test_sessions_and_strategy_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -10,7 +10,6 @@ from typing import Any
 import pandas as pd
 
 from src.live_trading.analytics.v67_daily_report import (
-    primary_net,
     reconstruct_closed_trades_from_fills,
     simulate_exit_strategies,
 )
@@ -68,6 +67,15 @@ def parse_dt(value: Any) -> datetime | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
     except Exception:
         return None
+
+
+def is_missing_value(value: Any) -> bool:
+    if value in (None, ""):
+        return True
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
 
 
 def hold_minutes(start: Any, end: Any = None) -> float:
@@ -189,6 +197,106 @@ def confirmed_commission_maps(executions: pd.DataFrame) -> tuple[dict[str, float
     return by_trade, by_symbol
 
 
+def execution_time_value(row: dict[str, Any]) -> Any:
+    return row.get("executed_at") or row.get("recorded_at")
+
+
+def execution_time_sort_key(row: dict[str, Any]) -> datetime:
+    return parse_dt(execution_time_value(row)) or datetime.min.replace(tzinfo=timezone.utc)
+
+
+def side_rows(executions: pd.DataFrame, *, action_values: set[str]) -> list[dict[str, Any]]:
+    if executions.empty:
+        return []
+    action_series = executions.get("action", pd.Series(dtype=str)).fillna("").astype(str).str.upper()
+    rows = executions[action_series.isin(action_values)].to_dict("records")
+    return sorted(rows, key=execution_time_sort_key)
+
+
+def execution_matches_for_trade(row: dict[str, Any], executions: pd.DataFrame) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if executions.empty:
+        return [], []
+    trade_id = str(row.get("trade_id") or "")
+    matched = pd.DataFrame()
+    if trade_id and "trade_id" in executions.columns:
+        matched = executions[executions["trade_id"].fillna("").astype(str) == trade_id]
+    if matched.empty:
+        same = executions[
+            (executions["session_date"].fillna("").astype(str) == str(row.get("session_date") or ""))
+            & (executions["strategy"].fillna("unknown").astype(str) == str(row.get("strategy") or "unknown"))
+            & (executions["symbol"].fillna("").astype(str).str.upper() == str(row.get("symbol") or "").upper())
+        ]
+        buy_count = len(side_rows(same, action_values={"BOT", "BUY"}))
+        sell_count = len(side_rows(same, action_values={"SLD", "SELL"}))
+        if buy_count == 1 and sell_count == 1:
+            matched = same
+    return side_rows(matched, action_values={"BOT", "BUY"}), side_rows(matched, action_values={"SLD", "SELL"})
+
+
+def infer_entry_exit_times(row: dict[str, Any], buy_rows: list[dict[str, Any]], sell_rows: list[dict[str, Any]]) -> tuple[Any, Any, set[str]]:
+    flags: set[str] = set()
+    entry_time = row.get("entry_time")
+    if is_missing_value(entry_time) and buy_rows:
+        entry_time = execution_time_value(buy_rows[0])
+    if is_missing_value(entry_time):
+        entry_time = None
+        flags.add("MISSING_ENTRY")
+
+    exit_time = row.get("exit_time")
+    if is_missing_value(exit_time):
+        exit_time = row.get("closed_at")
+    if is_missing_value(exit_time) and sell_rows:
+        exit_time = execution_time_value(sell_rows[-1])
+    if is_missing_value(exit_time):
+        exit_time = None
+        flags.add("MISSING_EXIT")
+
+    entry_dt = parse_dt(entry_time)
+    exit_dt = parse_dt(exit_time)
+    if entry_dt and exit_dt and entry_dt.replace(microsecond=0) == exit_dt.replace(microsecond=0):
+        true_same_second = False
+        if buy_rows and sell_rows:
+            buy_dt = parse_dt(execution_time_value(buy_rows[0]))
+            sell_dt = parse_dt(execution_time_value(sell_rows[-1]))
+            true_same_second = bool(buy_dt and sell_dt and buy_dt.replace(microsecond=0) == sell_dt.replace(microsecond=0))
+        if not true_same_second:
+            flags.add("SUSPECT_TIME_MATCH")
+    return entry_time, exit_time, flags
+
+
+def confirmed_commission_for_execution_rows(buy_rows: list[dict[str, Any]], sell_rows: list[dict[str, Any]]) -> tuple[float, str]:
+    def side_commission(rows: list[dict[str, Any]]) -> tuple[float, bool]:
+        total = 0.0
+        present = False
+        for row in rows:
+            if str(row.get("commission_source") or "").lower() != "ibkr":
+                continue
+            value = to_float(row.get("commission"), None)
+            if value is None:
+                continue
+            total += abs(float(value))
+            present = True
+        return total, present
+
+    buy_commission, buy_present = side_commission(buy_rows)
+    sell_commission, sell_present = side_commission(sell_rows)
+    total = buy_commission + sell_commission
+    if buy_present and sell_present:
+        return total, "OK"
+    if buy_present or sell_present:
+        return total, "PARTIAL"
+    return 0.0, "MISSING"
+
+
+def quality_label(flags: set[str], commission_status: str) -> str:
+    out = set(flags)
+    if commission_status == "PARTIAL":
+        out.add("COMMISSION_PARTIAL")
+    elif commission_status == "MISSING":
+        out.add("COMMISSION_MISSING")
+    return "; ".join(sorted(out)) if out else "OK"
+
+
 def closed_from_trades(
     conn: sqlite3.Connection,
     window: DateWindow,
@@ -225,32 +333,41 @@ def closed_from_trades(
     if rows.empty:
         return rows
     out = rows.copy()
-    by_trade, by_symbol = confirmed_commission_maps(executions)
     commissions: list[float] = []
+    commission_statuses: list[str] = []
+    data_quality: list[str] = []
+    entry_times: list[Any] = []
+    exit_times: list[Any] = []
     for row in out.to_dict("records"):
-        trade_id = str(row.get("trade_id") or "")
-        key = (
-            str(row.get("session_date") or ""),
-            str(row.get("strategy") or "unknown"),
-            str(row.get("symbol") or "").upper(),
-        )
-        commissions.append(float(by_trade.get(trade_id, by_symbol.get(key, 0.0))))
+        buy_rows, sell_rows = execution_matches_for_trade(row, executions)
+        entry_time, exit_time, flags = infer_entry_exit_times(row, buy_rows, sell_rows)
+        commission, commission_status = confirmed_commission_for_execution_rows(buy_rows, sell_rows)
+        commissions.append(commission)
+        commission_statuses.append(commission_status)
+        data_quality.append(quality_label(flags, commission_status))
+        entry_times.append(entry_time)
+        exit_times.append(exit_time)
     out["ibkr_commission"] = commissions
+    out["commission_status"] = commission_statuses
+    out["data_quality"] = data_quality
+    out["entry_time"] = entry_times
+    out["exit_time"] = exit_times
     out["gross"] = pd.to_numeric(out["gross"], errors="coerce").fillna(0.0)
     out["buy"] = pd.to_numeric(out["buy"], errors="coerce").fillna(0.0)
     out["sell"] = pd.to_numeric(out["sell"], errors="coerce").fillna(0.0)
     out["qty"] = pd.to_numeric(out["qty"], errors="coerce").fillna(0.0)
+    out["peak_pct"] = pd.to_numeric(out["peak_pct"], errors="coerce")
     out["net_actual"] = out["gross"] - out["ibkr_commission"]
     denominator = (out["buy"] * out["qty"].abs()).replace(0, pd.NA)
     out["net_pct"] = ((out["net_actual"] / denominator) * 100.0).fillna(0.0)
     out["pnl_pct"] = out["net_pct"]
-    out["drop_from_peak_pct"] = out["net_pct"].fillna(0.0) - out["peak_pct"].fillna(0.0)
+    out["drop_from_peak_pct"] = out["net_pct"].fillna(0.0) - out["peak_pct"]
     out["hold_minutes"] = [hold_minutes(a, b or c) for a, b, c in zip(out["entry_time"], out["exit_time"], out["closed_at"])]
     return out[
         [
             "symbol", "qty", "ibkr_commission", "buy", "sell", "gross", "net_actual", "net_pct", "pnl_pct", "peak_pct",
             "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
-            "entry_time", "exit_time", "session_date",
+            "entry_time", "exit_time", "commission_status", "data_quality", "session_date",
         ]
     ]
 
@@ -265,7 +382,8 @@ def closed_from_executions(executions: pd.DataFrame) -> pd.DataFrame:
             buy = to_float(row.get("buy"), 0.0) or 0.0
             sell = to_float(row.get("sell"), 0.0) or 0.0
             pnl_pct = ((sell / buy - 1.0) * 100.0) if buy and sell else 0.0
-            peak_pct = to_float(row.get("peak_gain_pct"), max(pnl_pct, 0.0)) or 0.0
+            raw_peak = row.get("peak_gain_pct")
+            peak_pct = to_float(raw_peak, None)
             qty = to_float(row.get("qty"), 0.0) or 0.0
             gross = to_float(row.get("gross"), 0.0) or 0.0
             commission = abs(to_float(row.get("actual_commission"), 0.0) or 0.0)
@@ -276,16 +394,18 @@ def closed_from_executions(executions: pd.DataFrame) -> pd.DataFrame:
                 "symbol": row.get("symbol"),
                 "gross": gross,
                 "ibkr_commission": commission,
+                "commission_status": "OK" if commission else "MISSING",
                 "net_actual": net,
                 "net_pct": net_pct,
                 "pnl_pct": net_pct,
                 "peak_pct": peak_pct,
-                "drop_from_peak_pct": to_float(row.get("drop_from_peak_pct"), net_pct - peak_pct),
+                "drop_from_peak_pct": to_float(row.get("drop_from_peak_pct"), net_pct - peak_pct if peak_pct is not None else None),
                 "hold_minutes": hold_minutes(row.get("buy_time"), row.get("sell_time")),
                 "exit_reason": row.get("reason") or "",
                 "strategy": strategy or "unknown",
                 "entry_time": row.get("buy_time"),
                 "exit_time": row.get("sell_time"),
+                "data_quality": quality_label(set(), "OK" if commission else "MISSING"),
                 "qty": qty,
                 "buy": buy,
                 "sell": sell,
@@ -482,14 +602,16 @@ def build_summary(open_positions: pd.DataFrame, closed_positions: pd.DataFrame) 
     open_upnl = float(open_positions["upnl"].fillna(0).sum()) if not open_positions.empty else 0.0
     wins = closed_positions[closed_positions["gross"].fillna(0) > 0] if not closed_positions.empty else closed_positions
     win_rate = (len(wins) / len(closed_positions) * 100.0) if len(closed_positions) else 0.0
+    peak_values = pd.to_numeric(closed_positions["peak_pct"], errors="coerce") if not closed_positions.empty else pd.Series(dtype=float)
+    giveback_values = pd.to_numeric(closed_positions["drop_from_peak_pct"], errors="coerce") if not closed_positions.empty else pd.Series(dtype=float)
     return {
         "gross_pnl": gross,
         "net_actual_pnl": net,
         "open_upnl": open_upnl,
         "total_pnl": net + open_upnl,
         "win_rate": win_rate,
-        "avg_peak": float(closed_positions["peak_pct"].fillna(0).mean()) if not closed_positions.empty else 0.0,
-        "avg_giveback": float(closed_positions["drop_from_peak_pct"].fillna(0).mean()) if not closed_positions.empty else 0.0,
+        "avg_peak": float(peak_values.fillna(0).mean()) if not closed_positions.empty else 0.0,
+        "avg_giveback": float(giveback_values.fillna(0).mean()) if not closed_positions.empty else 0.0,
         "commissions": commissions,
         "expectancy": gross / len(closed_positions) if len(closed_positions) else 0.0,
         "closed_trades": float(len(closed_positions)),

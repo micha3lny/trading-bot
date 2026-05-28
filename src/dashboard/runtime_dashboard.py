@@ -101,10 +101,10 @@ def pct(value: float) -> str:
 
 def display_time(value) -> str:
     if value in (None, ""):
-        return ""
+        return "MISSING"
     ts = pd.to_datetime(value, errors="coerce", utc=True)
     if pd.isna(ts):
-        return ""
+        return "MISSING"
     return ts.strftime("%d-%m-%Y %H:%M:%S")
 
 
@@ -199,18 +199,21 @@ def render_closed_positions(df: pd.DataFrame) -> None:
         st.info("No closed positions in the selected window.")
         return
     cols = [
-        "symbol", "qty", "ibkr_commission", "buy", "sell", "gross", "net_actual", "net_pct", "peak_pct",
+        "symbol", "qty", "ibkr_commission", "commission_status", "buy", "sell", "gross", "net_actual", "net_pct", "peak_pct",
         "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
-        "entry_time", "exit_time",
+        "entry_time", "exit_time", "data_quality",
     ]
     out = filter_table(df[cols].copy(), "closed").sort_values(["net_actual", "symbol"], na_position="last")
     out["entry_time"] = out["entry_time"].map(display_time)
     out["exit_time"] = out["exit_time"].map(display_time)
+    out["peak_pct"] = out["peak_pct"].where(out["peak_pct"].notna(), "MISSING")
+    out["drop_from_peak_pct"] = out["drop_from_peak_pct"].where(out["drop_from_peak_pct"].notna(), "MISSING")
     out = out.rename(
         columns={
             "symbol": "Symbol",
             "qty": "Quantity",
             "ibkr_commission": "IBKR Comm",
+            "commission_status": "Commission Status",
             "buy": "Buy",
             "sell": "Sell",
             "gross": "Gross",
@@ -222,13 +225,15 @@ def render_closed_positions(df: pd.DataFrame) -> None:
             "exit_reason": "Exit Reason",
             "entry_time": "Entry Time",
             "exit_time": "Exit Time",
+            "data_quality": "Data Quality",
             "strategy": "Strategy",
         }
     )
     out = out[
         [
-            "Symbol", "Quantity", "IBKR Comm", "Buy", "Sell", "Gross", "Net", "Net %",
+            "Symbol", "Quantity", "IBKR Comm", "Commission Status", "Buy", "Sell", "Gross", "Net", "Net %",
             "Peak %", "Drop from Peak %", "Min", "Exit Reason", "Entry Time", "Exit Time", "Strategy",
+            "Data Quality",
         ]
     ]
     st.dataframe(
