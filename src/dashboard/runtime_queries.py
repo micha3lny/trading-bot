@@ -139,6 +139,7 @@ def load_executions(conn: sqlite3.Connection, window: DateWindow, strategy: str 
         f"""
         SELECT
             execution_id,
+            trade_id,
             COALESCE(strategy_name, 'unknown') AS strategy,
             session_date,
             symbol,
@@ -164,12 +165,42 @@ def load_executions(conn: sqlite3.Connection, window: DateWindow, strategy: str 
     )
 
 
-def closed_from_trades(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> pd.DataFrame:
+def confirmed_commission_maps(executions: pd.DataFrame) -> tuple[dict[str, float], dict[tuple[str, str, str], float]]:
+    if executions.empty or "commission" not in executions.columns:
+        return {}, {}
+    rows = executions.copy()
+    rows["commission_source"] = rows.get("commission_source", "").fillna("").astype(str).str.lower()
+    rows["commission"] = pd.to_numeric(rows["commission"], errors="coerce")
+    rows = rows[(rows["commission_source"] == "ibkr") & rows["commission"].notna()]
+    if rows.empty:
+        return {}, {}
+    rows["confirmed_commission"] = rows["commission"].abs()
+    by_trade: dict[str, float] = {}
+    if "trade_id" in rows.columns:
+        trade_rows = rows[rows["trade_id"].fillna("").astype(str) != ""]
+        by_trade = {
+            str(trade_id): float(value)
+            for trade_id, value in trade_rows.groupby("trade_id")["confirmed_commission"].sum().items()
+        }
+    by_symbol = {
+        (str(session_date), str(strategy), str(symbol).upper()): float(value)
+        for (session_date, strategy, symbol), value in rows.groupby(["session_date", "strategy", "symbol"])["confirmed_commission"].sum().items()
+    }
+    return by_trade, by_symbol
+
+
+def closed_from_trades(
+    conn: sqlite3.Connection,
+    window: DateWindow,
+    strategy: str | None,
+    executions: pd.DataFrame,
+) -> pd.DataFrame:
     clause, params = strategy_clause("t", strategy)
     rows = read_sql(
         conn,
         f"""
         SELECT
+            trade_id,
             COALESCE(strategy_name, 'unknown') AS strategy,
             session_date,
             symbol,
@@ -181,8 +212,6 @@ def closed_from_trades(conn: sqlite3.Connection, window: DateWindow, strategy: s
             exit_price AS sell,
             quantity AS qty,
             gross_pnl AS gross,
-            commission AS ibkr_commission,
-            net_pnl AS net_actual,
             mfe_pct AS peak_pct,
             exit_reason,
             raw_json
@@ -196,16 +225,32 @@ def closed_from_trades(conn: sqlite3.Connection, window: DateWindow, strategy: s
     if rows.empty:
         return rows
     out = rows.copy()
-    out["pnl_pct"] = ((out["sell"] / out["buy"] - 1.0) * 100.0).where(out["buy"].fillna(0) != 0, 0.0)
-    out["drop_from_peak_pct"] = out["pnl_pct"].fillna(0.0) - out["peak_pct"].fillna(0.0)
+    by_trade, by_symbol = confirmed_commission_maps(executions)
+    commissions: list[float] = []
+    for row in out.to_dict("records"):
+        trade_id = str(row.get("trade_id") or "")
+        key = (
+            str(row.get("session_date") or ""),
+            str(row.get("strategy") or "unknown"),
+            str(row.get("symbol") or "").upper(),
+        )
+        commissions.append(float(by_trade.get(trade_id, by_symbol.get(key, 0.0))))
+    out["ibkr_commission"] = commissions
+    out["gross"] = pd.to_numeric(out["gross"], errors="coerce").fillna(0.0)
+    out["buy"] = pd.to_numeric(out["buy"], errors="coerce").fillna(0.0)
+    out["sell"] = pd.to_numeric(out["sell"], errors="coerce").fillna(0.0)
+    out["qty"] = pd.to_numeric(out["qty"], errors="coerce").fillna(0.0)
+    out["net_actual"] = out["gross"] - out["ibkr_commission"]
+    denominator = (out["buy"] * out["qty"].abs()).replace(0, pd.NA)
+    out["net_pct"] = ((out["net_actual"] / denominator) * 100.0).fillna(0.0)
+    out["pnl_pct"] = out["net_pct"]
+    out["drop_from_peak_pct"] = out["net_pct"].fillna(0.0) - out["peak_pct"].fillna(0.0)
     out["hold_minutes"] = [hold_minutes(a, b or c) for a, b, c in zip(out["entry_time"], out["exit_time"], out["closed_at"])]
-    out["ibkr_commission"] = out["ibkr_commission"].fillna(0.0)
-    out["net_actual"] = out["net_actual"].fillna(out["gross"].fillna(0.0) - out["ibkr_commission"])
     return out[
         [
-            "symbol", "gross", "ibkr_commission", "net_actual", "pnl_pct", "peak_pct",
+            "symbol", "qty", "ibkr_commission", "buy", "sell", "gross", "net_actual", "net_pct", "pnl_pct", "peak_pct",
             "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
-            "entry_time", "exit_time", "qty", "buy", "sell", "session_date",
+            "entry_time", "exit_time", "session_date",
         ]
     ]
 
@@ -221,20 +266,27 @@ def closed_from_executions(executions: pd.DataFrame) -> pd.DataFrame:
             sell = to_float(row.get("sell"), 0.0) or 0.0
             pnl_pct = ((sell / buy - 1.0) * 100.0) if buy and sell else 0.0
             peak_pct = to_float(row.get("peak_gain_pct"), max(pnl_pct, 0.0)) or 0.0
+            qty = to_float(row.get("qty"), 0.0) or 0.0
+            gross = to_float(row.get("gross"), 0.0) or 0.0
+            commission = abs(to_float(row.get("actual_commission"), 0.0) or 0.0)
+            net = gross - commission
+            denominator = abs(buy * qty)
+            net_pct = (net / denominator * 100.0) if denominator else 0.0
             rows.append({
                 "symbol": row.get("symbol"),
-                "gross": to_float(row.get("gross"), 0.0),
-                "ibkr_commission": to_float(row.get("actual_commission"), 0.0),
-                "net_actual": primary_net(row),
-                "pnl_pct": pnl_pct,
+                "gross": gross,
+                "ibkr_commission": commission,
+                "net_actual": net,
+                "net_pct": net_pct,
+                "pnl_pct": net_pct,
                 "peak_pct": peak_pct,
-                "drop_from_peak_pct": to_float(row.get("drop_from_peak_pct"), pnl_pct - peak_pct),
+                "drop_from_peak_pct": to_float(row.get("drop_from_peak_pct"), net_pct - peak_pct),
                 "hold_minutes": hold_minutes(row.get("buy_time"), row.get("sell_time")),
                 "exit_reason": row.get("reason") or "",
                 "strategy": strategy or "unknown",
                 "entry_time": row.get("buy_time"),
                 "exit_time": row.get("sell_time"),
-                "qty": to_float(row.get("qty"), 0.0),
+                "qty": qty,
                 "buy": buy,
                 "sell": sell,
                 "session_date": session_date,
@@ -243,13 +295,13 @@ def closed_from_executions(executions: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_closed_positions(conn: sqlite3.Connection, window: DateWindow, strategy: str | None, executions: pd.DataFrame) -> pd.DataFrame:
-    trades = closed_from_trades(conn, window, strategy)
+    trades = closed_from_trades(conn, window, strategy, executions)
     if not trades.empty:
-        return trades.sort_values(["exit_time", "symbol"], na_position="last").reset_index(drop=True)
+        return trades.sort_values(["net_actual", "symbol"], na_position="last").reset_index(drop=True)
     closed = closed_from_executions(executions)
     if closed.empty:
         return closed
-    return closed.sort_values(["exit_time", "symbol"], na_position="last").reset_index(drop=True)
+    return closed.sort_values(["net_actual", "symbol"], na_position="last").reset_index(drop=True)
 
 
 def execution_net_positions(executions: pd.DataFrame | None) -> dict[tuple[str, str, str], float]:

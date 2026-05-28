@@ -76,6 +76,61 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["diagnostics"]["delayed_fills"], 1)
             self.assertEqual(snapshot["diagnostics"]["risk_guard_blocks"], 1)
 
+    def test_closed_trade_commission_uses_confirmed_executions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "T1",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "AAA",
+                "status": "CLOSED",
+                "entry_fill_time": "2026-05-27T13:30:00+00:00",
+                "exit_fill_time": "2026-05-27T13:40:00+00:00",
+                "entry_price": 10,
+                "exit_price": 11,
+                "quantity": 10,
+                "gross_pnl": 10,
+                "commission": 99,
+                "net_pnl": -89,
+                "mfe_pct": 12,
+            })
+            store.upsert_execution({
+                "execution_id": "B1",
+                "trade_id": "T1",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "AAA",
+                "side": "BOT",
+                "quantity": 10,
+                "price": 10,
+                "commission": 0.35,
+                "commission_source": "ibkr",
+                "recorded_at": "2026-05-27T13:30:00+00:00",
+            })
+            store.upsert_execution({
+                "execution_id": "S1",
+                "trade_id": "T1",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "AAA",
+                "side": "SLD",
+                "quantity": 10,
+                "price": 11,
+                "commission": 0.40,
+                "commission_source": "ibkr",
+                "recorded_at": "2026-05-27T13:40:00+00:00",
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertAlmostEqual(closed["ibkr_commission"], 0.75)
+            self.assertAlmostEqual(closed["net_actual"], 9.25)
+            self.assertAlmostEqual(closed["net_pct"], 9.25)
+
     def test_sessions_and_strategy_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"

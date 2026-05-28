@@ -99,6 +99,15 @@ def pct(value: float) -> str:
     return f"{value:,.1f}%"
 
 
+def display_time(value) -> str:
+    if value in (None, ""):
+        return ""
+    ts = pd.to_datetime(value, errors="coerce", utc=True)
+    if pd.isna(ts):
+        return ""
+    return ts.strftime("%d-%m-%Y %H:%M:%S")
+
+
 def style_pnl(df: pd.DataFrame, pnl_columns: list[str]):
     def color(value):
         try:
@@ -158,11 +167,27 @@ def render_open_positions(df: pd.DataFrame) -> None:
         return
     cols = [
         "symbol", "qty", "buy", "now", "upnl", "now_pct", "peak_pct", "giveback_pct",
-        "hold_minutes", "ibkr_commission", "status", "strategy",
+        "hold_minutes", "status", "strategy",
     ]
-    out = filter_table(df[cols].copy(), "open")
+    out = filter_table(df[cols].copy(), "open").sort_values(["upnl", "symbol"], na_position="last")
+    out = out.rename(
+        columns={
+            "symbol": "Symbol",
+            "qty": "Qty",
+            "buy": "Buy",
+            "now": "Now",
+            "upnl": "UPNL",
+            "now_pct": "Now %",
+            "peak_pct": "Peak %",
+            "giveback_pct": "Drop from Peak %",
+            "hold_minutes": "Min",
+            "status": "Status",
+            "strategy": "Strategy",
+        }
+    )
+    out = out[["Symbol", "Qty", "Buy", "Now", "UPNL", "Now %", "Peak %", "Drop from Peak %", "Min", "Status", "Strategy"]]
     st.dataframe(
-        style_pnl(out, ["upnl", "now_pct", "peak_pct", "giveback_pct"]),
+        style_pnl(out, ["UPNL", "Now %"]),
         use_container_width=True,
         hide_index=True,
     )
@@ -174,13 +199,40 @@ def render_closed_positions(df: pd.DataFrame) -> None:
         st.info("No closed positions in the selected window.")
         return
     cols = [
-        "symbol", "gross", "ibkr_commission", "net_actual", "pnl_pct", "peak_pct",
+        "symbol", "qty", "ibkr_commission", "buy", "sell", "gross", "net_actual", "net_pct", "peak_pct",
         "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
         "entry_time", "exit_time",
     ]
-    out = filter_table(df[cols].copy(), "closed")
+    out = filter_table(df[cols].copy(), "closed").sort_values(["net_actual", "symbol"], na_position="last")
+    out["entry_time"] = out["entry_time"].map(display_time)
+    out["exit_time"] = out["exit_time"].map(display_time)
+    out = out.rename(
+        columns={
+            "symbol": "Symbol",
+            "qty": "Quantity",
+            "ibkr_commission": "IBKR Comm",
+            "buy": "Buy",
+            "sell": "Sell",
+            "gross": "Gross",
+            "net_actual": "Net",
+            "net_pct": "Net %",
+            "peak_pct": "Peak %",
+            "drop_from_peak_pct": "Drop from Peak %",
+            "hold_minutes": "Min",
+            "exit_reason": "Exit Reason",
+            "entry_time": "Entry Time",
+            "exit_time": "Exit Time",
+            "strategy": "Strategy",
+        }
+    )
+    out = out[
+        [
+            "Symbol", "Quantity", "IBKR Comm", "Buy", "Sell", "Gross", "Net", "Net %",
+            "Peak %", "Drop from Peak %", "Min", "Exit Reason", "Entry Time", "Exit Time", "Strategy",
+        ]
+    ]
     st.dataframe(
-        style_pnl(out, ["gross", "net_actual", "pnl_pct", "peak_pct", "drop_from_peak_pct"]),
+        style_pnl(out, ["Gross", "Net", "Net %"]),
         use_container_width=True,
         hide_index=True,
     )
