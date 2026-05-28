@@ -1081,7 +1081,14 @@ def runtime_entry_event_map(conn: sqlite3.Connection, window: DateWindow, strate
 
 
 def raw_now_price(raw: dict[str, Any]) -> tuple[float | None, str, Any]:
-    live_keys = ("market_price", "current_price", "last_price", "last", "bid_ask_mid", "mid_price")
+    market_price = to_float(raw.get("market_price"), None)
+    if market_price is not None:
+        return (
+            market_price,
+            str(raw.get("market_price_source") or "live_quote"),
+            raw.get("market_price_at") or raw.get("price_time") or raw.get("quote_time") or raw.get("updated_at"),
+        )
+    live_keys = ("current_price", "last_price", "last", "bid_ask_mid", "mid_price")
     for key in live_keys:
         value = to_float(raw.get(key), None)
         if value is not None:
@@ -1118,6 +1125,17 @@ def lookup_by_position_key(mapping: dict[tuple[str, str, str], Any], session_dat
         return None
     matches.sort(key=lambda item: item[0])
     return matches[0][1]
+
+
+def price_status_for(now: float | None, price_time: Any, window: DateWindow, stale_seconds: int = 900) -> str:
+    if now is None:
+        return "MISSING_PRICE"
+    price_dt = parse_dt(price_time)
+    if window.end_date == utc_today() and price_dt is not None:
+        age_seconds = (datetime.now(timezone.utc) - price_dt).total_seconds()
+        if age_seconds > stale_seconds:
+            return "STALE"
+    return "OK"
 
 
 def load_open_positions(
@@ -1176,7 +1194,7 @@ def load_open_positions(
             qty = to_float(row.get("ibkr_quantity"), 0.0)
         buy = to_float(row.get("avg_price") or raw.get("entry_price"), 0.0) or 0.0
         now, now_price_source, price_time = raw_now_price(raw)
-        price_status = "OK" if now is not None else "MISSING_PRICE"
+        price_status = price_status_for(now, price_time, window)
         entry_key = (session_date, row_strategy, symbol)
         entry_lookup = lookup_by_position_key(entry_by_execution, session_date, row_strategy, symbol) or {}
         entry_commission = to_float(raw.get("ibkr_commission"), None)
@@ -1234,7 +1252,7 @@ def load_open_positions(
             "session_date": session_date,
             "price_status": price_status,
             "now_price_source": now_price_source,
-            "price_time": price_time,
+            "market_price_at": price_time,
         })
     return pd.DataFrame(out)
 

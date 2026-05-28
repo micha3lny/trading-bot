@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import tempfile
 import time
 import unittest
@@ -12,8 +13,11 @@ from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.v67_live_top100_expansion_paper_trader import (
     ManagedPosition,
     evaluate_risk_guard,
+    open_position_price_diagnostics,
+    persist_managed_positions,
     process_fill_lifecycle_diagnostics,
 )
+from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
 
 def write_csv(path: Path, rows: list[dict], fields: list[str]) -> None:
@@ -228,6 +232,37 @@ class PreSqliteHardeningTests(unittest.TestCase):
             self.assertTrue(pos.active)
             self.assertEqual(pos.quantity, 5)
             self.assertEqual(state["partial_fill_states"]["8"]["state"], "EXIT_PARTIAL")
+
+    def test_persist_managed_positions_writes_market_price_to_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(tmp, session_date="2026-05-28")
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            recorder.sqlite_store = store
+            pos = ManagedPosition("CRBP", object(), 3, 10.0, "2026-05-28T13:31:00+00:00", 10.0, active=True)
+
+            persist_managed_positions(
+                recorder,
+                {"CRBP": pos},
+                latest_snapshots={"CRBP": {"price": 10.5, "observed_at": "2026-05-28T13:40:00+00:00"}},
+            )
+
+            row = store.get_latest_position("CRBP", "v67_top100_live_safe_expansion_v46_wide_trail")
+            store.close()
+            raw = json.loads(row["raw_json"])
+            file_payload = json.loads(recorder.path("managed_positions.json").read_text())
+
+            self.assertEqual(raw["market_price"], 10.5)
+            self.assertEqual(raw["market_price_at"], "2026-05-28T13:40:00+00:00")
+            self.assertEqual(raw["market_price_source"], "live_ticker")
+            self.assertEqual(file_payload["positions"]["CRBP"]["market_price"], 10.5)
+
+    def test_open_position_price_diagnostics_counts_missing_prices(self) -> None:
+        pos = ManagedPosition("CRBP", object(), 3, 10.0, "2026-05-28T13:31:00+00:00", 10.0, active=True)
+
+        ok, missing = open_position_price_diagnostics({"CRBP": pos}, latest_snapshots={})
+
+        self.assertEqual(ok, 0)
+        self.assertEqual(missing, 1)
 
 
 if __name__ == "__main__":

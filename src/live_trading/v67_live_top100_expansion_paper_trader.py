@@ -172,6 +172,7 @@ def snapshot_from_ticker(symbol: str, ticker: Any) -> dict[str, Any]:
     return {
         "symbol": symbol,
         "price": price,
+        "observed_at": now_utc(),
         "bid": bid,
         "ask": ask,
         "last": last,
@@ -544,8 +545,8 @@ def load_exit_sent_symbols(recorder: LiveDataRecorder) -> set[str]:
     return symbols
 
 
-def managed_position_payload(pos: ManagedPosition) -> dict[str, Any]:
-    return {
+def managed_position_payload(pos: ManagedPosition, market_price_info: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = {
         "symbol": pos.symbol,
         "quantity": pos.quantity,
         "entry_price": pos.entry_price,
@@ -559,17 +560,95 @@ def managed_position_payload(pos: ManagedPosition) -> dict[str, Any]:
         "eod_retry_count": pos.eod_retry_count,
         "entry_fill_verified": pos.entry_fill_verified,
     }
+    if market_price_info:
+        payload.update({k: v for k, v in market_price_info.items() if v is not None})
+    return payload
 
 
-def persist_managed_positions(recorder: LiveDataRecorder, positions: dict[str, ManagedPosition]) -> None:
+def managed_position_market_price_info(
+    pos: ManagedPosition,
+    latest_snapshots: dict[str, dict[str, Any]] | None = None,
+    portfolio_rows: list[dict[str, Any]] | None = None,
+    *,
+    recorded_at: str | None = None,
+) -> dict[str, Any]:
+    symbol = str(pos.symbol).upper()
+    recorded_at = recorded_at or now_utc()
+    snap = (latest_snapshots or {}).get(symbol) or {}
+    snap_price = safe_float(snap.get("price") or snap.get("last") or snap.get("mid_price") or snap.get("close"))
+    if snap_price is not None and snap_price > 0:
+        return {
+            "market_price": snap_price,
+            "market_price_at": snap.get("observed_at") or snap.get("latest_seen_utc") or recorded_at,
+            "market_price_source": "live_ticker",
+        }
+    for row in portfolio_rows or []:
+        if str(row.get("symbol") or "").upper() != symbol:
+            continue
+        portfolio_price = safe_float(row.get("market_price"))
+        if portfolio_price is None:
+            qty = safe_float(row.get("quantity"))
+            market_value = safe_float(row.get("market_value"))
+            if qty and abs(qty) > 0 and market_value is not None:
+                portfolio_price = abs(market_value / qty)
+        if portfolio_price is not None and portfolio_price > 0:
+            return {
+                "market_price": portfolio_price,
+                "market_price_at": recorded_at,
+                "market_price_source": "portfolio_snapshot",
+            }
+    return {
+        "market_price": None,
+        "market_price_at": None,
+        "market_price_source": "missing",
+    }
+
+
+def open_position_price_diagnostics(
+    positions: dict[str, ManagedPosition],
+    latest_snapshots: dict[str, dict[str, Any]] | None = None,
+    portfolio_rows: list[dict[str, Any]] | None = None,
+) -> tuple[int, int]:
+    ok = 0
+    missing = 0
+    for pos in positions.values():
+        if not pos.active:
+            continue
+        info = managed_position_market_price_info(pos, latest_snapshots, portfolio_rows)
+        if safe_float(info.get("market_price")) is not None:
+            ok += 1
+        else:
+            missing += 1
+    return ok, missing
+
+
+def persist_managed_positions(
+    recorder: LiveDataRecorder,
+    positions: dict[str, ManagedPosition],
+    latest_snapshots: dict[str, dict[str, Any]] | None = None,
+    portfolio_rows: list[dict[str, Any]] | None = None,
+) -> None:
+    recorded_at = now_utc()
+    active_payloads = {
+        symbol: managed_position_payload(
+            pos,
+            managed_position_market_price_info(pos, latest_snapshots, portfolio_rows, recorded_at=recorded_at),
+        )
+        for symbol, pos in positions.items()
+        if pos.active
+    }
     payload = {
-        "recorded_at": now_utc(),
+        "recorded_at": recorded_at,
         "strategy": STRATEGY_NAME,
-        "positions": {symbol: managed_position_payload(pos) for symbol, pos in positions.items() if pos.active},
+        "positions": active_payloads,
     }
     recorder.path("managed_positions.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     store = getattr(recorder, "sqlite_store", None)
     for symbol, pos in positions.items():
+        raw_payload = managed_position_payload(
+            pos,
+            managed_position_market_price_info(pos, latest_snapshots, portfolio_rows, recorded_at=recorded_at),
+        )
         safe_sqlite_call(
             store,
             "upsert_position",
@@ -584,7 +663,7 @@ def persist_managed_positions(recorder: LiveDataRecorder, positions: dict[str, M
                 "active": pos.active,
                 "exit_sent": pos.exit_sent,
                 "updated_at": payload["recorded_at"],
-                "raw_json": managed_position_payload(pos),
+                "raw_json": raw_payload,
             },
         )
 
@@ -4401,8 +4480,10 @@ def main() -> int:
                 persist_managed_positions(recorder, managed_positions)
 
             new_fills = None
+            latest_portfolio_rows: list[dict[str, Any]] = []
             if loop_now - last_portfolio_record >= args.portfolio_interval_seconds:
                 try:
+                    latest_portfolio_rows = ibkr_portfolio_position_rows(ib)
                     record_account_snapshot(ib, recorder)
                     new_fills = record_recent_fills(ib, recorder, seen_fills)
                     lifecycle_fills_updated = enrich_lifecycle_with_fills(recorder)
@@ -4435,7 +4516,7 @@ def main() -> int:
                         reason="periodic_portfolio_record",
                     )
                     record_strategy_equity(recorder, managed_positions, latest_snapshots)
-                    persist_managed_positions(recorder, managed_positions)
+                    persist_managed_positions(recorder, managed_positions, latest_snapshots, latest_portfolio_rows)
                     last_portfolio_record = loop_now
                     if runtime_state.get("pending_eod_flatten"):
                         process_portfolio_sync_pending_eod_retry(
@@ -4504,6 +4585,13 @@ def main() -> int:
             rejection_summary = ", ".join([f"{k}={v}" for k, v in rejection_counter.most_common(5)])
             portfolio_part = f" portfolio_recorded=1 new_fills={new_fills}" if new_fills is not None else ""
             active_managed = sum(1 for p in managed_positions.values() if p.active)
+            open_price_ok, open_price_missing = open_position_price_diagnostics(
+                managed_positions,
+                latest_snapshots,
+                latest_portfolio_rows,
+            )
+            if active_managed:
+                persist_managed_positions(recorder, managed_positions, latest_snapshots, latest_portfolio_rows)
             time_entries_blocked = (
                 market_closed_today
                 or not is_after_utc(args.new_entries_start_utc)
@@ -4533,6 +4621,7 @@ def main() -> int:
                 f"pending_eod_flatten={int(pending_eod_entries_blocked)} eod_recovery_active={int(bool(runtime_state.get('eod_recovery_active')))} "
                 f"last_eod_retry_age_seconds={last_eod_retry_age_text} eod_active={int(eod_active)} "
                 f"risk_guard_block={int(risk_guard_block)} risk_guard_reason={risk_guard_reason} "
+                f"open_price_ok={open_price_ok} open_price_missing={open_price_missing} "
                 f"subscriptions_active={len(tickers)} subscriptions_cap={subscriptions_cap} subscription_cap_block={int(subscription_cap_block)} "
                 f"best={best_symbol}:{best_score:.2f} top5=[{top5_str}] rejects=[{rejection_summary}]"
                 f"{portfolio_part}",
