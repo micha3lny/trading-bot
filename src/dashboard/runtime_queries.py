@@ -378,7 +378,13 @@ def load_runtime_peak_map(conn: sqlite3.Connection, window: DateWindow, strategy
     rows = read_sql(
         conn,
         f"""
-        SELECT trade_id, COALESCE(strategy_name, 'unknown') AS strategy, session_date, symbol, event_type, raw_json
+        SELECT
+            trade_id,
+            COALESCE(strategy_name, 'unknown') AS strategy,
+            COALESCE(r.session_date, substr(r.event_time, 1, 10)) AS session_date,
+            symbol,
+            event_type,
+            raw_json
         FROM runtime_events r
         WHERE COALESCE(r.session_date, substr(r.event_time, 1, 10)) BETWEEN ? AND ? {clause}
         ORDER BY r.event_time
@@ -439,7 +445,12 @@ def load_runtime_symbol_peak_map(conn: sqlite3.Connection, window: DateWindow, s
     rows = read_sql(
         conn,
         f"""
-        SELECT COALESCE(strategy_name, 'unknown') AS strategy, session_date, symbol, event_type, raw_json
+        SELECT
+            COALESCE(strategy_name, 'unknown') AS strategy,
+            COALESCE(r.session_date, substr(r.event_time, 1, 10)) AS session_date,
+            symbol,
+            event_type,
+            raw_json
         FROM runtime_events r
         WHERE COALESCE(r.session_date, substr(r.event_time, 1, 10)) BETWEEN ? AND ? {clause}
         ORDER BY r.event_time

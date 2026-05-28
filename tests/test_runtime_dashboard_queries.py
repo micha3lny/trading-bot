@@ -218,6 +218,48 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(closed["peak_source"], "runtime_events_symbol_session")
             self.assertEqual(closed["peak_match_quality"], "symbol_session_unique")
 
+    def test_runtime_peak_event_with_null_session_date_matches_event_time_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "reconstructed:2026-05-27:AKTX:B:S",
+                "session_date": "2026-05-27",
+                "strategy_name": "unknown",
+                "symbol": "AKTX",
+                "status": "CLOSED",
+                "entry_price": 17.0,
+                "exit_price": 17.3778,
+                "quantity": 1,
+                "gross_pnl": 0.3778,
+                "raw_json": {"reconstruction_source": "executions_pair"},
+            })
+            store.execute(
+                """
+                INSERT INTO runtime_events (
+                    event_time, severity, event_type, strategy_name, session_date, symbol, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "2026-05-27T13:39:00+00:00",
+                    "INFO",
+                    "PEAK_UPDATED",
+                    "unknown",
+                    None,
+                    "AKTX",
+                    '{"entry_price": 17.0, "peak_price": 17.97}',
+                ),
+            )
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "All")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertAlmostEqual(closed["peak_pct"], 5.7059, places=3)
+            self.assertAlmostEqual(closed["drop_from_peak_pct"], -3.2955, places=3)
+            self.assertEqual(closed["peak_source"], "runtime_events_symbol_session")
+            self.assertEqual(closed["peak_match_quality"], "symbol_session_unique")
+
     def test_closed_trade_commission_uses_confirmed_executions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
