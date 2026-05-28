@@ -74,6 +74,9 @@ class SymbolState:
     latest_seen_utc: str | None = None
     latest_volume: float | None = None
     signal_sent: bool = False
+    ready_since_ts: float | None = None
+    ready_since_utc: str | None = None
+    stale_ready_logged: bool = False
     bars: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -328,6 +331,100 @@ def features_are_all_zeroish(features: dict[str, Any]) -> bool:
         and _feature_value_is_zeroish(features.get("or_range_pct"))
         and _feature_value_is_zeroish(features.get("score"))
     )
+
+
+def mark_entry_block_state(runtime_state: dict[str, Any], entries_blocked: bool, now_ts: float | None = None) -> None:
+    """Track the moment entries move from blocked to unblocked."""
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    previous = runtime_state.get("entry_previous_entries_blocked")
+    if previous is None:
+        runtime_state["entry_previous_entries_blocked"] = bool(entries_blocked)
+        if not entries_blocked:
+            runtime_state.setdefault("last_unblock_timestamp", now_ts)
+            runtime_state.setdefault("last_unblock_utc", now_utc())
+        return
+    if bool(previous) and not entries_blocked:
+        runtime_state["last_unblock_timestamp"] = now_ts
+        runtime_state["last_unblock_utc"] = now_utc()
+    runtime_state["entry_previous_entries_blocked"] = bool(entries_blocked)
+
+
+def ready_candidate_age_seconds(state: SymbolState, now_ts: float | None = None) -> float | None:
+    if state.ready_since_ts is None:
+        return None
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    return max(0.0, now_ts - float(state.ready_since_ts))
+
+
+def is_stale_ready_candidate(
+    state: SymbolState,
+    runtime_state: dict[str, Any],
+    *,
+    max_age_seconds: float,
+    now_ts: float | None = None,
+) -> bool:
+    if state.ready_since_ts is None:
+        return False
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    age = ready_candidate_age_seconds(state, now_ts) or 0.0
+    last_unblock = float(runtime_state.get("last_unblock_timestamp") or 0.0)
+    return float(state.ready_since_ts) < last_unblock and age > float(max_age_seconds)
+
+
+def prune_entry_submit_timestamps(
+    runtime_state: dict[str, Any],
+    now_ts: float | None = None,
+    *,
+    window_seconds: float = 60.0,
+) -> list[float]:
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    kept: list[float] = []
+    for value in runtime_state.get("entry_submit_timestamps") or []:
+        try:
+            ts = float(value)
+        except Exception:
+            continue
+        if now_ts - ts <= float(window_seconds):
+            kept.append(ts)
+    runtime_state["entry_submit_timestamps"] = kept
+    return kept
+
+
+def entry_minute_capacity(runtime_state: dict[str, Any], max_entries_per_minute: int, now_ts: float | None = None) -> int:
+    if int(max_entries_per_minute or 0) <= 0:
+        return 10**9
+    recent = prune_entry_submit_timestamps(runtime_state, now_ts, window_seconds=60.0)
+    return max(0, int(max_entries_per_minute) - len(recent))
+
+
+def record_entry_submission(runtime_state: dict[str, Any], now_ts: float | None = None) -> int:
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    recent = prune_entry_submit_timestamps(runtime_state, now_ts, window_seconds=60.0)
+    recent.append(now_ts)
+    runtime_state["entry_submit_timestamps"] = recent
+    return len(recent)
+
+
+def ready_candidate_diagnostics(
+    state: SymbolState,
+    features: dict[str, Any],
+    runtime_state: dict[str, Any],
+    *,
+    now_ts: float,
+    ranking_position: int | None = None,
+) -> dict[str, Any]:
+    age = ready_candidate_age_seconds(state, now_ts)
+    last_unblock = float(runtime_state.get("last_unblock_timestamp") or 0.0)
+    return {
+        "signal_time": state.ready_since_utc,
+        "ready_since": state.ready_since_utc,
+        "candidate_age_seconds": None if age is None else round(age, 3),
+        "entry_decision_time": now_utc(),
+        "score": features.get("score"),
+        "ranking_position": ranking_position,
+        "last_unblock_time": runtime_state.get("last_unblock_utc"),
+        "ready_before_last_unblock": bool(state.ready_since_ts is not None and float(state.ready_since_ts) < last_unblock),
+    }
 
 
 def log_live_feature_debug(
@@ -3940,6 +4037,11 @@ def main() -> int:
     parser.add_argument("--max-open-positions", type=int, default=0)
     parser.add_argument("--max-gross-exposure-usd", type=float, default=0.0)
     parser.add_argument("--max-single-position-usd", type=float, default=0.0)
+    parser.add_argument("--max-entry-candidate-age-seconds", type=float, default=60.0)
+    parser.add_argument("--max-entries-per-cycle", type=int, default=5)
+    parser.add_argument("--max-entries-per-minute", type=int, default=5)
+    parser.add_argument("--entry-backlog-window-seconds", type=float, default=60.0)
+    parser.add_argument("--entry-backlog-threshold", type=int, default=5)
     parser.add_argument("--exit-stop-loss-pct", type=float, default=8.0)
     parser.add_argument("--exit-trailing-activation-pct", type=float, default=3.0)
     parser.add_argument("--exit-trailing-stop-pct", type=float, default=3.0)
@@ -4041,6 +4143,13 @@ def main() -> int:
         "entries_blocked": False,
         "entries_blocked_until": time.time() + max(0.0, args.restart_cooldown_seconds),
         "entries_blocked_reason": "restart_cooldown" if args.restart_cooldown_seconds > 0 else "",
+        "entry_previous_entries_blocked": None,
+        "last_unblock_timestamp": 0.0,
+        "last_unblock_utc": "",
+        "entry_submit_timestamps": [],
+        "ready_candidates": 0,
+        "stale_ready_candidates": 0,
+        "oldest_ready_candidate_age_seconds": None,
         "control_api_commands": [],
         "history_collector_start_utc": "20:15",
         "history_collector_end_utc": str(args.market_open_utc),
@@ -4349,6 +4458,9 @@ def main() -> int:
                     or pending_eod_entries_blocked
                 )
 
+            mark_entry_block_state(runtime_state, entries_blocked, loop_now)
+            entry_candidates: list[dict[str, Any]] = []
+
             for symbol, q in contracts:
                 snap = snapshot_from_ticker(symbol, tickers[symbol])
                 if snap.get("price") is None:
@@ -4369,9 +4481,28 @@ def main() -> int:
                 if not features["ready"]:
                     for reason in features["reason"].split(";"):
                         rejection_counter[reason] += 1
+                    state.ready_since_ts = None
+                    state.ready_since_utc = None
+                    state.stale_ready_logged = False
 
                 has_active_position = symbol in managed_positions and managed_positions[symbol].active and not managed_positions[symbol].exit_sent
                 entry_symbol_allowed = symbol in _runtime_set(runtime_state, "entry_symbols")
+                if features["ready"] and not state.signal_sent and not has_active_position and entry_symbol_allowed:
+                    if state.ready_since_ts is None:
+                        state.ready_since_ts = loop_now
+                        state.ready_since_utc = now_utc()
+                        state.stale_ready_logged = False
+                    candidate_age = ready_candidate_age_seconds(state, loop_now)
+                    entry_candidates.append(
+                        {
+                            "symbol": symbol,
+                            "contract": q,
+                            "state": state,
+                            "snap": snap,
+                            "features": features,
+                            "candidate_age_seconds": candidate_age,
+                        }
+                    )
                 if features["ready"] and not state.signal_sent and not has_active_position and entry_symbol_allowed and entries_blocked:
                     record_lifecycle_with_formal(
                         recorder,
@@ -4382,6 +4513,8 @@ def main() -> int:
                         reason="entries_blocked_manual_or_time_window",
                         raw_json={
                             **features,
+                            "ready_since": state.ready_since_utc,
+                            "candidate_age_seconds": candidate_age,
                             "manual_entries_blocked": manual_entries_blocked,
                             "time_entries_blocked": time_entries_blocked,
                             "restart_entries_blocked": restart_entries_blocked,
@@ -4389,11 +4522,95 @@ def main() -> int:
                             "entries_blocked_reason": runtime_state.get("entries_blocked_reason"),
                         },
                     )
-                if features["ready"] and not state.signal_sent and not has_active_position and entry_symbol_allowed and not entries_blocked:
+
+            ranking_position_by_symbol = {
+                symbol: idx + 1 for idx, (symbol, _score, _features) in enumerate(sorted(ranked, key=lambda item: item[1], reverse=True))
+            }
+            ready_candidates_total = len(entry_candidates)
+            stale_ready_candidates = sum(
+                1
+                for candidate in entry_candidates
+                if is_stale_ready_candidate(
+                    candidate["state"],
+                    runtime_state,
+                    max_age_seconds=float(args.max_entry_candidate_age_seconds),
+                    now_ts=loop_now,
+                )
+            )
+            candidate_ages = [age for age in (candidate.get("candidate_age_seconds") for candidate in entry_candidates) if age is not None]
+            oldest_ready_candidate_age = max(candidate_ages) if candidate_ages else None
+            runtime_state["ready_candidates"] = ready_candidates_total
+            runtime_state["stale_ready_candidates"] = stale_ready_candidates
+            runtime_state["oldest_ready_candidate_age_seconds"] = oldest_ready_candidate_age
+
+            entries_submitted_this_cycle = 0
+            if not entries_blocked:
+                ordered_entry_candidates = sorted(
+                    entry_candidates,
+                    key=lambda candidate: float(candidate["features"].get("score") or 0.0),
+                    reverse=True,
+                )
+                for candidate in ordered_entry_candidates:
+                    symbol = candidate["symbol"]
+                    q = candidate["contract"]
+                    state = candidate["state"]
+                    snap = candidate["snap"]
+                    features = candidate["features"]
+                    ranking_position = ranking_position_by_symbol.get(symbol)
+                    diagnostics = ready_candidate_diagnostics(
+                        state,
+                        features,
+                        runtime_state,
+                        now_ts=loop_now,
+                        ranking_position=ranking_position,
+                    )
+                    if is_stale_ready_candidate(
+                        state,
+                        runtime_state,
+                        max_age_seconds=float(args.max_entry_candidate_age_seconds),
+                        now_ts=loop_now,
+                    ):
+                        if not state.stale_ready_logged:
+                            record_lifecycle_with_formal(
+                                recorder,
+                                "STALE_READY_CANDIDATE_SKIPPED",
+                                symbol,
+                                action="BUY",
+                                price=features.get("entry_price"),
+                                reason="ready_before_unblock_candidate_too_old",
+                                raw_json={**features, **diagnostics},
+                            )
+                            state.stale_ready_logged = True
+                        continue
+                    max_per_cycle = int(args.max_entries_per_cycle or 0)
+                    if max_per_cycle > 0 and entries_submitted_this_cycle >= max_per_cycle:
+                        break
+                    minute_capacity = entry_minute_capacity(runtime_state, int(args.max_entries_per_minute or 0), loop_now)
+                    if minute_capacity <= 0:
+                        runtime_rate_limited_log(
+                            runtime_state,
+                            "ENTRY_RATE_LIMIT_BLOCK",
+                            f"{now_utc()} ENTRY_RATE_LIMIT_BLOCK reason=max_entries_per_minute "
+                            f"max_entries_per_minute={int(args.max_entries_per_minute or 0)} ready_candidates={ready_candidates_total}",
+                            key="max_entries_per_minute",
+                            max_unique=1,
+                            window_seconds=60.0,
+                        )
+                        break
                     ready_count += 1
                     price = features.get("entry_price")
                     qty = max(1, int(args.position_usd // price)) if price and price > 0 else 0
-                    record_lifecycle_with_formal(recorder, "SIGNAL_READY", symbol, action="BUY", quantity=qty, price=price, reason=features["reason"], raw_json=features)
+                    signal_payload = {**features, **diagnostics}
+                    record_lifecycle_with_formal(
+                        recorder,
+                        "SIGNAL_READY",
+                        symbol,
+                        action="BUY",
+                        quantity=qty,
+                        price=price,
+                        reason=features["reason"],
+                        raw_json=signal_payload,
+                    )
                     candidate_notional = float(qty) * float(price) if qty and price else 0.0
                     risk_status = evaluate_risk_guard(
                         recorder,
@@ -4425,7 +4642,7 @@ def main() -> int:
                             quantity=qty,
                             price=price,
                             reason=reason,
-                            raw_json=risk_status,
+                            raw_json={**risk_status, **diagnostics},
                         )
                         safe_sqlite_call(
                             getattr(recorder, "sqlite_store", None),
@@ -4442,13 +4659,46 @@ def main() -> int:
                             gross_exposure=risk_status.get("gross_exposure"),
                             active_positions=risk_status.get("active_positions"),
                             trades_today=risk_status.get("trades_today"),
-                            raw_json=risk_status,
+                            raw_json={**risk_status, **diagnostics},
                         )
                         continue
                     order = MarketOrder("BUY", qty)
                     order.tif = "DAY"
                     order.outsideRth = False
                     trade = ib.placeOrder(q, order)
+                    submission_count = record_entry_submission(runtime_state, loop_now)
+                    entries_submitted_this_cycle += 1
+                    backlog_window = float(args.entry_backlog_window_seconds or 60.0)
+                    backlog_threshold = int(args.entry_backlog_threshold or 0)
+                    if backlog_threshold > 0:
+                        recent_for_backlog = prune_entry_submit_timestamps(runtime_state, loop_now, window_seconds=backlog_window)
+                        if len(recent_for_backlog) > backlog_threshold:
+                            backlog_key = int(loop_now // max(1.0, backlog_window))
+                            if runtime_state.get("entry_backlog_last_key") != backlog_key:
+                                runtime_state["entry_backlog_last_key"] = backlog_key
+                                print(
+                                    f"{now_utc()} ENTRY_BACKLOG_DETECTED count={len(recent_for_backlog)} "
+                                    f"window_seconds={backlog_window:.1f} threshold={backlog_threshold} "
+                                    f"latest_symbol={symbol}",
+                                    flush=True,
+                                )
+                                safe_sqlite_call(
+                                    getattr(recorder, "sqlite_store", None),
+                                    "record_runtime_event",
+                                    event_type="ENTRY_BACKLOG_DETECTED",
+                                    severity="WARN",
+                                    strategy_name=STRATEGY_NAME,
+                                    session_date=getattr(recorder, "session_date", None),
+                                    symbol=symbol,
+                                    source="v67_live_runtime",
+                                    reason="entry_rate_burst",
+                                    raw_json={
+                                        "count": len(recent_for_backlog),
+                                        "window_seconds": backlog_window,
+                                        "threshold": backlog_threshold,
+                                        "latest_symbol": symbol,
+                                    },
+                                )
                     if qty > 0 and price and price > 0:
                         managed_positions[symbol] = ManagedPosition(
                             symbol=symbol,
@@ -4460,6 +4710,12 @@ def main() -> int:
                             entry_fill_verified=False,
                         )
                         persist_managed_positions(recorder, managed_positions)
+                    order_payload = {
+                        **diagnostics,
+                        "entries_submitted_last_minute": submission_count,
+                        "max_entries_per_cycle": int(args.max_entries_per_cycle or 0),
+                        "max_entries_per_minute": int(args.max_entries_per_minute or 0),
+                    }
                     record_lifecycle_with_formal(
                         recorder,
                         "BUY_ORDER_SENT",
@@ -4476,8 +4732,17 @@ def main() -> int:
                         decision_last=snap.get("last"),
                         spread_pct=((snap.get("spread") / snap.get("mid_price") * 100.0) if snap.get("spread") and snap.get("mid_price") else None),
                         entry_fill_verified="false",
+                        raw_json=order_payload,
                     )
-                    print(f"PAPER BUY SENT symbol={symbol} qty={qty} price={price:.2f} score={features['score']:.2f} orderId={trade.order.orderId} tif={order.tif} outsideRth={order.outsideRth}", flush=True)
+                    print(
+                        f"PAPER BUY SENT symbol={symbol} qty={qty} price={price:.2f} "
+                        f"score={features['score']:.2f} ranking_position={ranking_position or ''} "
+                        f"signal_time={diagnostics.get('signal_time') or ''} ready_since={diagnostics.get('ready_since') or ''} "
+                        f"candidate_age_seconds={diagnostics.get('candidate_age_seconds')} "
+                        f"entry_decision_time={diagnostics.get('entry_decision_time')} "
+                        f"orderId={trade.order.orderId} tif={order.tif} outsideRth={order.outsideRth}",
+                        flush=True,
+                    )
                     state.signal_sent = True
 
             adopted_count = 0
@@ -4628,8 +4893,13 @@ def main() -> int:
             subscription_cap_block = bool(subscription_diag.get("skipped_due_to_subscription_cap")) or (subscriptions_cap > 0 and len(tickers) >= subscriptions_cap)
             last_eod_retry_age = pending_eod_retry_age_seconds(runtime_state, loop_now)
             last_eod_retry_age_text = "" if last_eod_retry_age is None else f"{last_eod_retry_age:.1f}"
+            oldest_ready_age = runtime_state.get("oldest_ready_candidate_age_seconds")
+            oldest_ready_age_text = "" if oldest_ready_age is None else f"{float(oldest_ready_age):.1f}"
             heartbeat_line = (
                 f"{now_utc()} heartbeat scanned={len(contracts)} with_data={data_count} ready_new={ready_count} "
+                f"ready_candidates={int(runtime_state.get('ready_candidates') or 0)} "
+                f"stale_ready_candidates={int(runtime_state.get('stale_ready_candidates') or 0)} "
+                f"oldest_ready_candidate_age_seconds={oldest_ready_age_text} "
                 f"adopted={adopted_count} exits_sent={exit_count} managed_open={active_managed} entries_blocked={int(entries_blocked)} "
                 f"entries_blocked_reason={runtime_state.get('entries_blocked_reason') or ''} "
                 f"manual_block={int(manual_entries_blocked)} restart_block={int(restart_entries_blocked)} reconnect_block={int(reconnect_entries_blocked)} disk_block={int(disk_entries_blocked)} "
