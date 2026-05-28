@@ -391,6 +391,8 @@ def enrich_trades_from_runtime_events(store: SQLiteRuntimeStore, session_date: s
         elif trade_counts.get(symbol, 0) > 1:
             continue
 
+        entry_event_time = trade.get("entry_fill_time")
+        exit_event_time = trade.get("exit_fill_time") or trade.get("closed_at")
         best_peak_pct: float | None = None
         best_peak_price: float | None = None
         entry_price = as_optional_float(trade.get("entry_price"))
@@ -398,6 +400,8 @@ def enrich_trades_from_runtime_events(store: SQLiteRuntimeStore, session_date: s
         for event in scoped:
             raw = event.get("raw") or {}
             event_type = str(event.get("event_type") or "").upper()
+            if not entry_event_time and event_type in {"BUY_ORDER_SENT", "ENTRY_ORDER_SUBMITTED", "ENTRY_ORDER_FILLED", "POSITION_OPENED"}:
+                entry_event_time = event.get("event_time")
             entry_price = entry_price or raw_float(raw, "entry_price", "buy", "buy_price")
             peak_price = raw_float(raw, "peak_price", "high_watermark", "mfe_price")
             peak_pct = raw_peak_pct(raw)
@@ -409,8 +413,9 @@ def enrich_trades_from_runtime_events(store: SQLiteRuntimeStore, session_date: s
                 best_peak_pct = peak_pct
                 best_peak_price = peak_price
             if event_type in {"SELL_ORDER_SENT", "POSITION_VERIFIED_CLOSED", "POSITION_CLOSED"}:
+                exit_event_time = exit_event_time or event.get("event_time")
                 exit_price = exit_price or raw_float(raw, "exit_price", "sell_price", "decision_price", "price")
-        if best_peak_pct is None:
+        if best_peak_pct is None and entry_event_time == trade.get("entry_fill_time") and exit_event_time == (trade.get("exit_fill_time") or trade.get("closed_at")):
             continue
         drop_from_peak_pct = pct_from_prices(exit_price, best_peak_price)
         raw = parse_raw_json(trade.get("raw_json"))
@@ -420,15 +425,19 @@ def enrich_trades_from_runtime_events(store: SQLiteRuntimeStore, session_date: s
             "peak_price": best_peak_price,
             "peak_gain_pct": best_peak_pct,
             "drop_from_peak_pct": drop_from_peak_pct,
+            "time_source": "runtime_events",
         })
         store.conn.execute(
             """
             UPDATE trades
-            SET mfe_pct = ?,
+            SET entry_fill_time = COALESCE(entry_fill_time, ?),
+                exit_fill_time = COALESCE(exit_fill_time, ?),
+                closed_at = COALESCE(closed_at, ?),
+                mfe_pct = COALESCE(?, mfe_pct),
                 raw_json = ?
             WHERE trade_id = ?
             """,
-            [best_peak_pct, safe_json(raw), trade.get("trade_id")],
+            [entry_event_time, exit_event_time, exit_event_time, best_peak_pct, safe_json(raw), trade.get("trade_id")],
         )
         updated += 1
     if updated:

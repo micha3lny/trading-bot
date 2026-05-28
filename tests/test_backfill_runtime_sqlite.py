@@ -200,6 +200,45 @@ class BackfillRuntimeSQLiteTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_backfill_enriches_missing_trade_times_from_runtime_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_trade({
+                    "trade_id": "TTIME",
+                    "session_date": "2026-05-27",
+                    "strategy_name": "unknown",
+                    "symbol": "MRAM",
+                    "status": "CLOSED",
+                    "entry_price": 31.65,
+                    "exit_price": 28.99,
+                    "quantity": 3,
+                    "gross_pnl": -7.98,
+                })
+                for event_time, event_type, raw_json in [
+                    ("2026-05-27T13:35:39+00:00", "BUY_ORDER_SENT", '{"price": 31.65}'),
+                    ("2026-05-27T20:22:02+00:00", "SELL_ORDER_SENT", '{"price": 28.99, "entry_price": 31.65, "peak_price": 31.7424}'),
+                ]:
+                    store.conn.execute(
+                        """
+                        INSERT INTO runtime_events (
+                            event_time, severity, event_type, strategy_name, session_date, symbol, raw_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (event_time, "INFO", event_type, "unknown", None, "MRAM", raw_json),
+                    )
+                updated = enrich_trades_from_runtime_events(store, "2026-05-27")
+                trades = store.query("SELECT entry_fill_time, exit_fill_time, closed_at, mfe_pct, raw_json FROM trades WHERE trade_id = 'TTIME'")
+
+                self.assertEqual(updated, 1)
+                self.assertEqual(trades[0]["entry_fill_time"], "2026-05-27T13:35:39+00:00")
+                self.assertEqual(trades[0]["exit_fill_time"], "2026-05-27T20:22:02+00:00")
+                self.assertEqual(trades[0]["closed_at"], "2026-05-27T20:22:02+00:00")
+                self.assertIsNotNone(trades[0]["mfe_pct"])
+                self.assertIn("time_source", trades[0]["raw_json"])
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
