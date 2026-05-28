@@ -108,6 +108,17 @@ def display_time(value) -> str:
     return ts.strftime("%d-%m-%Y %H:%M:%S")
 
 
+def display_optional_number(value) -> object:
+    if value in (None, ""):
+        return "MISSING"
+    try:
+        if pd.isna(value):
+            return "MISSING"
+    except Exception:
+        pass
+    return value
+
+
 def style_pnl(df: pd.DataFrame, pnl_columns: list[str]):
     def color(value):
         try:
@@ -178,10 +189,15 @@ def render_open_positions(df: pd.DataFrame) -> None:
         return
     cols = [
         "symbol", "qty", "buy", "now", "upnl", "now_pct", "peak_pct", "giveback_pct",
-        "hold_minutes", "entry_time", "status", "strategy",
+        "hold_minutes", "entry_time", "entry_source", "status", "strategy",
     ]
     out = filter_table(df[cols].copy(), "open").sort_values(["upnl", "symbol"], na_position="last")
-    out["entry_time"] = out["entry_time"].map(display_time)
+    out["entry_time"] = out.apply(
+        lambda row: f"ADOPTED {display_time(row['entry_time'])}" if str(row.get("entry_source") or "").upper() == "ADOPTED" else display_time(row["entry_time"]),
+        axis=1,
+    )
+    for col in ("now", "upnl", "now_pct"):
+        out[col] = out[col].map(display_optional_number)
     out = out.rename(
         columns={
             "symbol": "Symbol",

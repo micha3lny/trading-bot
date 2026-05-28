@@ -1084,6 +1084,154 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["open_positions"].iloc[0]["symbol"], "OPENX")
             self.assertEqual(snapshot["open_positions"].iloc[0]["entry_time"], "2026-05-28T13:31:00+00:00")
 
+    def test_open_position_calculates_upnl_and_now_pct_from_current_price(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_execution({
+                "execution_id": "B_OPEN",
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "OPENX",
+                "side": "BOT",
+                "quantity": 5,
+                "price": 10,
+                "commission": 0.25,
+                "commission_source": "ibkr",
+                "executed_at": "2026-05-28T13:31:00+00:00",
+            })
+            store.upsert_position({
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "OPENX",
+                "quantity": 5,
+                "avg_price": 10,
+                "active": 1,
+                "status": "OPEN",
+                "updated_at": "2026-05-28T13:40:00+00:00",
+                "raw_json": {"entry_time": "2026-05-28T13:31:00+00:00", "market_price": 10.5},
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-28", "2026-05-28"), "v67")
+            open_row = snapshot["open_positions"].iloc[0]
+
+            self.assertEqual(open_row["now"], 10.5)
+            self.assertAlmostEqual(open_row["upnl"], 2.25)
+            self.assertAlmostEqual(open_row["now_pct"], 5.0)
+            self.assertEqual(open_row["price_status"], "OK")
+            self.assertEqual(open_row["now_price_source"], "live_quote")
+
+    def test_open_position_missing_current_price_does_not_fake_now_as_buy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_execution({
+                "execution_id": "B_OPEN",
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "MISSX",
+                "side": "BOT",
+                "quantity": 5,
+                "price": 10,
+            })
+            store.upsert_position({
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "MISSX",
+                "quantity": 5,
+                "avg_price": 10,
+                "active": 1,
+                "status": "OPEN",
+                "updated_at": "2026-05-28T13:40:00+00:00",
+                "raw_json": {"entry_time": "2026-05-28T13:31:00+00:00"},
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-28", "2026-05-28"), "v67")
+            open_row = snapshot["open_positions"].iloc[0]
+
+            self.assertIsNone(open_row["now"])
+            self.assertIsNone(open_row["upnl"])
+            self.assertIsNone(open_row["now_pct"])
+            self.assertEqual(open_row["price_status"], "MISSING_PRICE")
+            self.assertEqual(open_row["now_price_source"], "missing")
+
+    def test_adopted_position_entry_time_uses_adopted_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_execution({
+                "execution_id": "B_ADOPT",
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "ADOPT",
+                "side": "BOT",
+                "quantity": 2,
+                "price": 10,
+            })
+            store.upsert_position({
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "ADOPT",
+                "quantity": 2,
+                "avg_price": 10,
+                "active": 1,
+                "status": "OPEN",
+                "updated_at": "2026-05-28T06:30:00+00:00",
+                "raw_json": {"entry_time": "adopted_on_restart:2026-05-28T06:20:06+00:00", "market_price": 10.2},
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-28", "2026-05-28"), "v67")
+            open_row = snapshot["open_positions"].iloc[0]
+
+            self.assertEqual(open_row["entry_time"], "2026-05-28T06:20:06+00:00")
+            self.assertEqual(open_row["entry_source"], "ADOPTED")
+            self.assertGreater(open_row["hold_minutes"], 0)
+
+    def test_carried_open_position_entry_time_falls_back_to_prior_trade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "T_CARRY_OPEN",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "CARRY",
+                "status": "OPEN",
+                "entry_fill_time": "2026-05-27T19:55:00+00:00",
+                "entry_price": 10,
+                "quantity": 2,
+            })
+            store.upsert_position({
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "CARRY",
+                "quantity": 2,
+                "avg_price": 10,
+                "active": 1,
+                "status": "OPEN",
+                "updated_at": "2026-05-28T06:30:00+00:00",
+                "raw_json": {"market_price": 10.4},
+            })
+            store.upsert_execution({
+                "execution_id": "B_CARRY",
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "CARRY",
+                "side": "BOT",
+                "quantity": 2,
+                "price": 10,
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-28", "2026-05-28"), "v67")
+            open_row = snapshot["open_positions"].iloc[0]
+
+            self.assertEqual(open_row["entry_time"], "2026-05-27T19:55:00+00:00")
+            self.assertEqual(open_row["entry_source"], "trade")
+
 
 if __name__ == "__main__":
     unittest.main()

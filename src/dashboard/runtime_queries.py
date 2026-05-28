@@ -140,6 +140,18 @@ def hold_minutes(start: Any, end: Any = None) -> float:
     return max(0.0, (end_dt - start_dt).total_seconds() / 60.0)
 
 
+def adopted_timestamp_value(value: Any) -> str | None:
+    text = str(value or "")
+    if text.startswith("adopted_on_restart:"):
+        return text.split(":", 1)[1]
+    return None
+
+
+def displayable_entry_time(value: Any) -> Any:
+    adopted = adopted_timestamp_value(value)
+    return adopted or value
+
+
 def list_sessions(sqlite_path: str | Path | None = None) -> list[str]:
     if not Path(resolve_sqlite_path(sqlite_path)).exists():
         return []
@@ -993,11 +1005,127 @@ def execution_net_positions(executions: pd.DataFrame | None) -> dict[tuple[str, 
     return net
 
 
+def entry_execution_map(executions: pd.DataFrame | None) -> dict[tuple[str, str, str], dict[str, Any]]:
+    if executions is None or executions.empty:
+        return {}
+    rows = executions.copy()
+    rows["action"] = rows.get("action", "").fillna("").astype(str).str.upper()
+    rows = rows[rows["action"].isin({"BOT", "BUY"})]
+    if rows.empty:
+        return {}
+    rows["_time"] = rows.apply(lambda row: execution_time_value(row.to_dict()) or row.get("recorded_at"), axis=1)
+    rows["_commission"] = pd.to_numeric(rows.get("commission"), errors="coerce")
+    rows["_commission_source"] = rows.get("commission_source", "").fillna("").astype(str).str.lower()
+    out: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for (session_date, strategy, symbol), group in rows.groupby(["session_date", "strategy", "symbol"], dropna=False):
+        sorted_group = group.sort_values("_time", na_position="last")
+        first = sorted_group.iloc[0].to_dict()
+        commissions = sorted_group[
+            (sorted_group["_commission_source"] == "ibkr")
+            & sorted_group["_commission"].notna()
+        ]["_commission"].abs().sum()
+        out[(str(session_date), str(strategy or "unknown"), str(symbol).upper())] = {
+            "entry_time": first.get("_time"),
+            "entry_commission": float(commissions or 0.0),
+        }
+    return out
+
+
+def trade_entry_map(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> dict[tuple[str, str, str], Any]:
+    clause, params = strategy_clause("t", strategy)
+    rows = read_sql(
+        conn,
+        f"""
+        SELECT
+            session_date,
+            COALESCE(strategy_name, 'unknown') AS strategy,
+            symbol,
+            entry_fill_time,
+            entry_signal_time,
+            entry_order_time
+        FROM trades t
+        WHERE t.session_date BETWEEN ? AND ? {clause}
+        ORDER BY COALESCE(t.entry_fill_time, t.entry_order_time, t.entry_signal_time)
+        """,
+        [window.start_date, window.end_date, *params],
+    )
+    out: dict[tuple[str, str, str], Any] = {}
+    for row in rows.to_dict("records"):
+        key = (str(row.get("session_date") or ""), str(row.get("strategy") or "unknown"), str(row.get("symbol") or "").upper())
+        out.setdefault(key, row.get("entry_fill_time") or row.get("entry_order_time") or row.get("entry_signal_time"))
+    return out
+
+
+def runtime_entry_event_map(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> dict[tuple[str, str, str], Any]:
+    clause, params = strategy_clause("r", strategy)
+    rows = read_sql(
+        conn,
+        f"""
+        SELECT
+            COALESCE(r.session_date, substr(r.event_time, 1, 10)) AS session_date,
+            COALESCE(r.strategy_name, 'unknown') AS strategy,
+            r.symbol,
+            r.event_time
+        FROM runtime_events r
+        WHERE COALESCE(r.session_date, substr(r.event_time, 1, 10)) BETWEEN ? AND ? {clause}
+          AND r.event_type IN ('BUY_ORDER_SENT', 'ENTRY_ORDER_SUBMITTED', 'ENTRY_ORDER_FILLED', 'POSITION_OPENED')
+        ORDER BY r.event_time
+        """,
+        [window.start_date, window.end_date, *params],
+    )
+    out: dict[tuple[str, str, str], Any] = {}
+    for row in rows.to_dict("records"):
+        key = (str(row.get("session_date") or ""), str(row.get("strategy") or "unknown"), str(row.get("symbol") or "").upper())
+        out.setdefault(key, row.get("event_time"))
+    return out
+
+
+def raw_now_price(raw: dict[str, Any]) -> tuple[float | None, str, Any]:
+    live_keys = ("market_price", "current_price", "last_price", "last", "bid_ask_mid", "mid_price")
+    for key in live_keys:
+        value = to_float(raw.get(key), None)
+        if value is not None:
+            return value, "live_quote", raw.get("price_time") or raw.get("quote_time") or raw.get("updated_at")
+    portfolio_keys = ("portfolio_market_price", "portfolio_last_price", "ibkr_market_price")
+    for key in portfolio_keys:
+        value = to_float(raw.get(key), None)
+        if value is not None:
+            return value, "portfolio_snapshot", raw.get("portfolio_time") or raw.get("updated_at")
+    candle_keys = ("latest_candle_close", "last_candle_close")
+    for key in candle_keys:
+        value = to_float(raw.get(key), None)
+        if value is not None:
+            return value, "latest_candle", raw.get("latest_candle_time") or raw.get("updated_at")
+    return None, "missing", None
+
+
+def lookup_by_position_key(mapping: dict[tuple[str, str, str], Any], session_date: str, strategy: str, symbol: str) -> Any:
+    exact = mapping.get((session_date, strategy, symbol))
+    if exact is not None:
+        return exact
+    matches = [
+        (date_value, value)
+        for (date_value, strategy_value, symbol_value), value in mapping.items()
+        if strategy_value == strategy and symbol_value == symbol
+    ]
+    if not matches:
+        matches = [
+            (date_value, value)
+            for (date_value, _strategy_value, symbol_value), value in mapping.items()
+            if symbol_value == symbol
+        ]
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[0])
+    return matches[0][1]
+
+
 def load_open_positions(
     conn: sqlite3.Connection,
     window: DateWindow,
     strategy: str | None,
     executions: pd.DataFrame | None = None,
+    execution_lookup: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     clause, params = strategy_clause("p", strategy)
     rows = read_sql(
@@ -1026,6 +1154,10 @@ def load_open_positions(
     if rows.empty:
         return rows
     net_by_execution = execution_net_positions(executions)
+    lookup_window = expanded_lookup_window(window)
+    entry_by_execution = entry_execution_map(execution_lookup if execution_lookup is not None else executions)
+    entry_by_trade = trade_entry_map(conn, lookup_window, strategy)
+    entry_by_event = runtime_entry_event_map(conn, lookup_window, strategy)
     historical_window = window.end_date < utc_today()
     out: list[dict[str, Any]] = []
     for row in rows.to_dict("records"):
@@ -1043,16 +1175,47 @@ def load_open_positions(
         if qty is None:
             qty = to_float(row.get("ibkr_quantity"), 0.0)
         buy = to_float(row.get("avg_price") or raw.get("entry_price"), 0.0) or 0.0
-        now = to_float(raw.get("market_price") or raw.get("current_price") or raw.get("last_price"), None)
-        if now is None:
-            now = buy if buy else to_float(row.get("ibkr_avg_cost"), 0.0) or 0.0
-        upnl = to_float(raw.get("unrealized_pnl") or raw.get("unrealizedPNL"), None)
-        if upnl is None:
-            upnl = (now - buy) * (qty or 0.0) if buy and now else 0.0
-        now_pct = ((now / buy - 1.0) * 100.0) if buy and now else 0.0
-        peak_price = to_float(raw.get("peak_price"), max(buy, now))
+        now, now_price_source, price_time = raw_now_price(raw)
+        price_status = "OK" if now is not None else "MISSING_PRICE"
+        entry_key = (session_date, row_strategy, symbol)
+        entry_lookup = lookup_by_position_key(entry_by_execution, session_date, row_strategy, symbol) or {}
+        entry_commission = to_float(raw.get("ibkr_commission"), None)
+        if entry_commission is None:
+            entry_commission = to_float(entry_lookup.get("entry_commission"), 0.0) or 0.0
+        if now is None or not buy:
+            upnl = None
+            now_pct = None
+        else:
+            upnl = (now - buy) * (qty or 0.0) - (entry_commission or 0.0)
+            now_pct = ((now - buy) / buy) * 100.0
+        peak_price_default = max(value for value in (buy, now) if value is not None) if buy or now is not None else None
+        peak_price = to_float(raw.get("peak_price"), peak_price_default)
         peak_pct = to_float(raw.get("peak_gain_pct"), ((peak_price / buy - 1.0) * 100.0 if buy and peak_price else 0.0))
-        entry_time = raw.get("entry_time") or raw.get("buy_time") or row.get("updated_at")
+        raw_entry_time = raw.get("entry_time") or raw.get("buy_time")
+        adopted_time = adopted_timestamp_value(raw_entry_time)
+        trade_entry_time = lookup_by_position_key(entry_by_trade, session_date, row_strategy, symbol)
+        event_entry_time = lookup_by_position_key(entry_by_event, session_date, row_strategy, symbol)
+        entry_time = (
+            trade_entry_time
+            or displayable_entry_time(raw_entry_time)
+            or event_entry_time
+            or entry_lookup.get("entry_time")
+            or row.get("updated_at")
+        )
+        entry_source = (
+            "trade"
+            if trade_entry_time
+            else "ADOPTED"
+            if adopted_time
+            else "position_raw"
+            if raw_entry_time
+            else "runtime_event"
+            if event_entry_time
+            else "execution"
+            if entry_lookup.get("entry_time")
+            else "position_updated_at"
+        )
+        hold_base = entry_time
         out.append({
             "symbol": row.get("symbol"),
             "qty": qty or 0.0,
@@ -1061,13 +1224,17 @@ def load_open_positions(
             "upnl": upnl,
             "now_pct": now_pct,
             "peak_pct": peak_pct,
-            "giveback_pct": now_pct - peak_pct,
-            "hold_minutes": hold_minutes(entry_time),
-            "ibkr_commission": to_float(raw.get("ibkr_commission"), 0.0) or 0.0,
+            "giveback_pct": (now_pct - peak_pct) if now_pct is not None and peak_pct is not None else None,
+            "hold_minutes": hold_minutes(hold_base),
+            "ibkr_commission": entry_commission or 0.0,
             "status": row.get("status") or ("EXIT_SENT" if row.get("exit_sent") else "OPEN"),
             "strategy": row_strategy,
             "entry_time": entry_time,
+            "entry_source": entry_source,
             "session_date": session_date,
+            "price_status": price_status,
+            "now_price_source": now_price_source,
+            "price_time": price_time,
         })
     return pd.DataFrame(out)
 
@@ -1145,7 +1312,7 @@ def build_summary(open_positions: pd.DataFrame, closed_positions: pd.DataFrame) 
     gross = float(closed_positions["gross"].fillna(0).sum()) if not closed_positions.empty else 0.0
     commissions = float(closed_positions["ibkr_commission"].fillna(0).sum()) if not closed_positions.empty else 0.0
     net = float(closed_positions["net_actual"].fillna(0).sum()) if not closed_positions.empty else 0.0
-    open_upnl = float(open_positions["upnl"].fillna(0).sum()) if not open_positions.empty else 0.0
+    open_upnl = float(pd.to_numeric(open_positions["upnl"], errors="coerce").fillna(0).sum()) if not open_positions.empty else 0.0
     wins = closed_positions[closed_positions["gross"].fillna(0) > 0] if not closed_positions.empty else closed_positions
     win_rate = (len(wins) / len(closed_positions) * 100.0) if len(closed_positions) else 0.0
     peak_values = pd.to_numeric(closed_positions["peak_pct"], errors="coerce") if not closed_positions.empty else pd.Series(dtype=float)
@@ -1230,7 +1397,7 @@ def load_dashboard_snapshot(sqlite_path: str | Path | None, window: DateWindow, 
         executions = load_executions(conn, window, strategy)
         execution_lookup = load_executions(conn, expanded_lookup_window(window), strategy)
         closed = load_closed_positions(conn, window, strategy, execution_lookup)
-        open_positions = load_open_positions(conn, window, strategy, executions)
+        open_positions = load_open_positions(conn, window, strategy, executions, execution_lookup)
         return {
             "summary": build_summary(open_positions, closed),
             "data_quality_summary": build_data_quality_summary(closed),
