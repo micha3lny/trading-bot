@@ -17,6 +17,7 @@ from src.live_trading.unified_logger import (
     normalize_log_line,
     run_log_retention,
 )
+from src.live_trading.v67_live_top100_expansion_paper_trader import emit_heartbeat
 
 
 class UnifiedLoggerTests(unittest.TestCase):
@@ -45,6 +46,26 @@ class UnifiedLoggerTests(unittest.TestCase):
             self.assertIn("heartbeat scanned=100", out.getvalue())
             content = daily_log_path(tmp).read_text(encoding="utf-8")
             self.assertIn("INFO RUNTIME heartbeat scanned=100", content)
+
+    def test_heartbeat_gap_warning_does_not_raise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_state = {"unified_log_last_heartbeat_monotonic": 100.0}
+            out = io.StringIO()
+            with patch("time.monotonic", return_value=131.5), patch("sys.stdout", out):
+                emit_heartbeat("2026-05-28T12:00:31+00:00 heartbeat scanned=100", runtime_state, log_dir=tmp)
+
+            content = daily_log_path(tmp).read_text(encoding="utf-8")
+            self.assertIn("LOG_GAP_WARNING", content)
+            self.assertIn("monitored_event=heartbeat", content)
+            self.assertIn("heartbeat scanned=100", content)
+
+    def test_heartbeat_gap_warning_logging_failure_does_not_raise(self) -> None:
+        runtime_state = {"unified_log_last_heartbeat_monotonic": 100.0}
+        with patch("time.monotonic", return_value=131.5), patch(
+            "src.live_trading.v67_live_top100_expansion_paper_trader.log_event",
+            side_effect=TypeError("logger boom"),
+        ):
+            emit_heartbeat("2026-05-28T12:00:31+00:00 heartbeat scanned=100", runtime_state, log_dir=tempfile.mkdtemp())
 
     def test_retention_compresses_old_logs_and_deletes_old_gz(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

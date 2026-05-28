@@ -259,7 +259,17 @@ def emit_heartbeat(line: str, runtime_state: dict[str, Any], log_dir: str | Path
         except Exception:
             gap = 0.0
         if gap > 30.0:
-            log_event("LOG", "LOG_GAP_WARNING", "WARN", log_dir=log_dir, event="heartbeat", gap_seconds=round(gap, 3))
+            try:
+                log_event(
+                    "LOG",
+                    "LOG_GAP_WARNING",
+                    "WARN",
+                    log_dir=log_dir,
+                    monitored_event="heartbeat",
+                    gap_seconds=round(gap, 3),
+                )
+            except Exception:
+                pass
     runtime_state["unified_log_last_heartbeat_monotonic"] = now_ts
     emit_unified_log_line(line, log_dir=log_dir)
 
