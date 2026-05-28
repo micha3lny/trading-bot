@@ -121,7 +121,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(closed["commission_status"], "OK")
             self.assertIn("RECONSTRUCTED_FROM_EXECUTIONS", closed["data_quality"])
 
-    def test_execution_pair_without_executed_at_keeps_missing_times(self) -> None:
+    def test_execution_pair_without_executed_at_uses_recorded_at_times(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
             store = SQLiteRuntimeStore(db)
@@ -149,11 +149,11 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             closed = snapshot["closed_positions"].iloc[0]
 
             self.assertEqual(closed["symbol"], "GRRR")
-            self.assertIsNone(closed["entry_time"])
-            self.assertIsNone(closed["exit_time"])
-            self.assertTrue(closed["hold_minutes"] is None)
+            self.assertEqual(closed["entry_time"], "2026-05-27T13:32:00+00:00")
+            self.assertEqual(closed["exit_time"], "2026-05-27T13:42:00+00:00")
+            self.assertAlmostEqual(closed["hold_minutes"], 10.0)
             self.assertEqual(closed["commission_status"], "MISSING")
-            self.assertIn("MISSING_EXECUTION_TIME", closed["data_quality"])
+            self.assertNotIn("MISSING_EXECUTION_TIME", closed["data_quality"])
             self.assertIn("RECONSTRUCTED_FROM_EXECUTIONS", closed["data_quality"])
             self.assertIn("COMMISSION_MISSING", closed["data_quality"])
 
@@ -373,6 +373,58 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(closed["commission_status"], "OK")
             self.assertEqual(closed["entry_execution_count"], 1)
             self.assertEqual(closed["exit_execution_count"], 1)
+
+    def test_closed_trade_times_fall_back_to_execution_recorded_at(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "T_RECORDED_AT",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "TIMEFB",
+                "status": "CLOSED",
+                "entry_price": 10,
+                "exit_price": 11,
+                "quantity": 1,
+                "gross_pnl": 1,
+                "mfe_pct": 10,
+            })
+            store.upsert_execution({
+                "execution_id": "B_RECORDED_AT",
+                "trade_id": "T_RECORDED_AT",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "TIMEFB",
+                "side": "BOT",
+                "quantity": 1,
+                "price": 10,
+                "commission": 0.11,
+                "commission_source": "ibkr",
+                "recorded_at": "2026-05-27T13:31:00+00:00",
+            })
+            store.upsert_execution({
+                "execution_id": "S_RECORDED_AT",
+                "trade_id": "T_RECORDED_AT",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "TIMEFB",
+                "side": "SLD",
+                "quantity": 1,
+                "price": 11,
+                "commission": 0.12,
+                "commission_source": "ibkr",
+                "recorded_at": "2026-05-27T13:39:00+00:00",
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertEqual(closed["entry_time"], "2026-05-27T13:31:00+00:00")
+            self.assertEqual(closed["exit_time"], "2026-05-27T13:39:00+00:00")
+            self.assertNotIn("MISSING_ENTRY", closed["data_quality"])
+            self.assertNotIn("MISSING_EXIT", closed["data_quality"])
 
     def test_closed_trade_peak_zero_remains_valid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

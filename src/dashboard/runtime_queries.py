@@ -237,7 +237,7 @@ def confirmed_commission_maps(executions: pd.DataFrame) -> tuple[dict[str, float
 
 
 def execution_time_value(row: dict[str, Any]) -> Any:
-    return row.get("executed_at") or raw_execution_time_value(row.get("raw_json"))
+    return row.get("executed_at") or raw_execution_time_value(row.get("raw_json")) or row.get("recorded_at")
 
 
 def execution_time_sort_key(row: dict[str, Any]) -> datetime:
