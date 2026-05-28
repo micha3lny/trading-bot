@@ -623,6 +623,87 @@ class SQLiteRuntimeStore:
         self._upsert("positions", data, ["position_key"], list(data.keys()))
         return position_key
 
+    def mark_position_flat(
+        self,
+        *,
+        symbol: str,
+        strategy_name: str | None = None,
+        session_date: str | None = None,
+        reason: str = "reconciliation_clean",
+        status: str = "CLOSED",
+        updated_at: str | None = None,
+    ) -> int:
+        updated_at = updated_at or utc_now_iso()
+        clauses = ["UPPER(symbol) = ?", "COALESCE(active, 0) = 1"]
+        params: list[Any] = [str(symbol).upper()]
+        if strategy_name:
+            clauses.append("strategy_name = ?")
+            params.append(strategy_name)
+        if session_date:
+            clauses.append("session_date = ?")
+            params.append(session_date)
+        rows = self.query(f"SELECT position_key, raw_json FROM positions WHERE {' AND '.join(clauses)}", params)
+        for row in rows:
+            raw = parse_jsonish(row.get("raw_json"))
+            raw.update({
+                "ibkr_position_flat_confirmed": True,
+                "flat_confirmed_reason": reason,
+                "flat_confirmed_at": updated_at,
+            })
+            self.execute(
+                """
+                UPDATE positions
+                SET active = 0,
+                    status = ?,
+                    exit_sent = 0,
+                    updated_at = ?,
+                    raw_json = ?
+                WHERE position_key = ?
+                """,
+                (status, updated_at, safe_json(raw), row["position_key"]),
+            )
+        return len(rows)
+
+    def mark_all_positions_flat(
+        self,
+        *,
+        reason: str = "reconciliation_clean",
+        strategy_name: str | None = None,
+        session_date: str | None = None,
+        status: str = "FLAT_CONFIRMED",
+        updated_at: str | None = None,
+    ) -> int:
+        updated_at = updated_at or utc_now_iso()
+        clauses = ["COALESCE(active, 0) = 1"]
+        params: list[Any] = []
+        if strategy_name:
+            clauses.append("strategy_name = ?")
+            params.append(strategy_name)
+        if session_date:
+            clauses.append("session_date = ?")
+            params.append(session_date)
+        rows = self.query(f"SELECT position_key, raw_json FROM positions WHERE {' AND '.join(clauses)}", params)
+        for row in rows:
+            raw = parse_jsonish(row.get("raw_json"))
+            raw.update({
+                "ibkr_position_flat_confirmed": True,
+                "flat_confirmed_reason": reason,
+                "flat_confirmed_at": updated_at,
+            })
+            self.execute(
+                """
+                UPDATE positions
+                SET active = 0,
+                    status = ?,
+                    exit_sent = 0,
+                    updated_at = ?,
+                    raw_json = ?
+                WHERE position_key = ?
+                """,
+                (status, updated_at, safe_json(raw), row["position_key"]),
+            )
+        return len(rows)
+
     def record_reconciliation_run(self, **kwargs: Any) -> str:
         run_id = str(kwargs.get("run_id") or uuid.uuid4().hex)
         data = {

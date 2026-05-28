@@ -995,6 +995,43 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["summary"]["open_trades"], 0)
             self.assertTrue(snapshot["open_positions"].empty)
 
+    def test_dashboard_uses_latest_position_row_and_ignores_stale_active_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_position({
+                "position_key": "v67:2026-05-26:STALE:old",
+                "session_date": "2026-05-26",
+                "strategy_name": "v67",
+                "symbol": "STALE",
+                "quantity": 4,
+                "avg_price": 10,
+                "active": 1,
+                "status": "OPEN",
+                "updated_at": "2026-05-26T14:00:00+00:00",
+                "raw_json": {"market_price": 11},
+            })
+            store.upsert_position({
+                "position_key": "v67:2026-05-26:STALE:new",
+                "session_date": "2026-05-26",
+                "strategy_name": "v67",
+                "symbol": "STALE",
+                "quantity": 4,
+                "avg_price": 10,
+                "active": 0,
+                "status": "FLAT_CONFIRMED",
+                "updated_at": "2026-05-26T20:00:00+00:00",
+                "raw_json": {"ibkr_position_flat_confirmed": True},
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-26", "2026-05-26"), "v67")
+
+            self.assertTrue(snapshot["open_positions"].empty)
+            self.assertEqual(snapshot["diagnostics"]["sqlite_active_positions_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["latest_active_positions_count"], 0)
+            self.assertEqual(snapshot["diagnostics"]["stale_active_positions_count"], 1)
+
     def test_carried_trade_closed_next_day_appears_on_exit_date(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"

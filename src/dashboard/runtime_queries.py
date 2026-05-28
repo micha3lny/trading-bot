@@ -18,6 +18,7 @@ from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, resolve_s
 
 
 CLOSED_STATUSES = {"CLOSED", "DONE", "EXIT_FILLED", "FLAT"}
+OPEN_POSITION_STATUSES = {"OPEN", "EXIT_ORDER", "EXIT_PENDING", "EXIT_SENT", "RECONCILING"}
 DEFAULT_RECORDER_ROOT = Path("data/live/recorder")
 
 
@@ -1149,6 +1150,16 @@ def load_open_positions(
     rows = read_sql(
         conn,
         f"""
+        WITH latest_positions AS (
+            SELECT
+                p.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY COALESCE(p.strategy_name, 'unknown'), UPPER(p.symbol)
+                    ORDER BY COALESCE(p.updated_at, '') DESC, COALESCE(p.session_date, '') DESC, p.position_key DESC
+                ) AS rn
+            FROM positions p
+            WHERE p.session_date BETWEEN ? AND ? {clause}
+        )
         SELECT
             COALESCE(strategy_name, 'unknown') AS strategy,
             session_date,
@@ -1162,8 +1173,8 @@ def load_open_positions(
             exit_sent,
             updated_at,
             raw_json
-        FROM positions p
-        WHERE p.session_date BETWEEN ? AND ? {clause}
+        FROM latest_positions p
+        WHERE p.rn = 1
           AND COALESCE(p.active, 0) = 1
         ORDER BY p.symbol
         """,
@@ -1189,9 +1200,19 @@ def load_open_positions(
         if execution_net is not None and abs(execution_net) < 1e-9:
             continue
         raw = parse_raw_json(row.get("raw_json"))
+        status = str(row.get("status") or "").upper()
+        if status not in OPEN_POSITION_STATUSES:
+            continue
+        if bool(raw.get("ibkr_position_flat_confirmed")):
+            continue
+        ibkr_qty = to_float(row.get("ibkr_quantity"), None)
+        if ibkr_qty is not None and abs(ibkr_qty) <= 1e-9:
+            continue
         qty = to_float(row.get("quantity"), None)
         if qty is None:
             qty = to_float(row.get("ibkr_quantity"), 0.0)
+        if qty is None or abs(qty) <= 1e-9:
+            continue
         buy = to_float(row.get("avg_price") or raw.get("entry_price"), 0.0) or 0.0
         now, now_price_source, price_time = raw_now_price(raw)
         price_status = price_status_for(now, price_time, window)
@@ -1326,6 +1347,69 @@ def load_diagnostics(conn: sqlite3.Connection, window: DateWindow, strategy: str
     return out
 
 
+def load_position_row_diagnostics(
+    conn: sqlite3.Connection,
+    window: DateWindow,
+    strategy: str | None,
+    latest_open_count: int,
+) -> dict[str, int]:
+    clause, params = strategy_clause("p", strategy)
+    active_rows = read_sql(
+        conn,
+        f"""
+        SELECT COUNT(*) AS count
+        FROM positions p
+        WHERE p.session_date BETWEEN ? AND ? {clause}
+          AND COALESCE(p.active, 0) = 1
+        """,
+        [window.start_date, window.end_date, *params],
+    )
+    latest_candidate_rows = read_sql(
+        conn,
+        f"""
+        WITH latest_positions AS (
+            SELECT
+                p.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY COALESCE(p.strategy_name, 'unknown'), UPPER(p.symbol)
+                    ORDER BY COALESCE(p.updated_at, '') DESC, COALESCE(p.session_date, '') DESC, p.position_key DESC
+                ) AS rn
+            FROM positions p
+            WHERE p.session_date BETWEEN ? AND ? {clause}
+        )
+        SELECT COUNT(*) AS count
+        FROM latest_positions p
+        WHERE p.rn = 1
+          AND COALESCE(p.active, 0) = 1
+          AND UPPER(COALESCE(p.status, 'OPEN')) IN ('OPEN', 'EXIT_ORDER', 'EXIT_PENDING', 'EXIT_SENT', 'RECONCILING')
+          AND COALESCE(p.ibkr_quantity, p.quantity, 0) != 0
+        """,
+        [window.start_date, window.end_date, *params],
+    )
+    ibkr_rows = read_sql(
+        conn,
+        """
+        SELECT ibkr_positions_count
+        FROM reconciliation_runs
+        WHERE COALESCE(substr(finished_at, 1, 10), substr(started_at, 1, 10)) BETWEEN ? AND ?
+        ORDER BY COALESCE(finished_at, started_at) DESC
+        LIMIT 1
+        """,
+        [window.start_date, window.end_date],
+    )
+    sqlite_active = int(active_rows.iloc[0]["count"] or 0) if not active_rows.empty else 0
+    latest_candidates = int(latest_candidate_rows.iloc[0]["count"] or 0) if not latest_candidate_rows.empty else 0
+    ibkr_positions = int(ibkr_rows.iloc[0]["ibkr_positions_count"] or 0) if not ibkr_rows.empty else 0
+    stale = max(0, sqlite_active - int(latest_open_count))
+    return {
+        "sqlite_active_positions_count": sqlite_active,
+        "latest_active_positions_count": int(latest_open_count),
+        "latest_active_position_candidates_count": latest_candidates,
+        "ibkr_positions_count": ibkr_positions,
+        "stale_active_positions_count": stale,
+    }
+
+
 def build_summary(open_positions: pd.DataFrame, closed_positions: pd.DataFrame) -> dict[str, float]:
     gross = float(closed_positions["gross"].fillna(0).sum()) if not closed_positions.empty else 0.0
     commissions = float(closed_positions["ibkr_commission"].fillna(0).sum()) if not closed_positions.empty else 0.0
@@ -1416,13 +1500,15 @@ def load_dashboard_snapshot(sqlite_path: str | Path | None, window: DateWindow, 
         execution_lookup = load_executions(conn, expanded_lookup_window(window), strategy)
         closed = load_closed_positions(conn, window, strategy, execution_lookup)
         open_positions = load_open_positions(conn, window, strategy, executions, execution_lookup)
+        diagnostics = load_diagnostics(conn, window, strategy)
+        diagnostics.update(load_position_row_diagnostics(conn, window, strategy, len(open_positions)))
         return {
             "summary": build_summary(open_positions, closed),
             "data_quality_summary": build_data_quality_summary(closed),
             "open_positions": open_positions,
             "closed_positions": closed,
             "exit_simulation": exit_simulation(closed),
-            "diagnostics": load_diagnostics(conn, window, strategy),
+            "diagnostics": diagnostics,
             "executions": executions,
             "loaded_at": datetime.now(timezone.utc).isoformat(),
             "source": str(path),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -104,6 +105,54 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 self.assertEqual(store.query("SELECT COUNT(*) AS n FROM reconciliation_runs")[0]["n"], 1)
                 self.assertEqual(store.query("SELECT rows FROM market_data_sessions")[0]["rows"], 390)
                 self.assertEqual(store.query("SELECT rank FROM symbol_daily_features")[0]["rank"], 1)
+            finally:
+                store.close()
+
+    def test_eod_success_marks_active_positions_inactive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_position({
+                    "session_date": "2026-05-28",
+                    "strategy_name": "v67",
+                    "symbol": "RKLB",
+                    "quantity": 10,
+                    "avg_price": 10,
+                    "active": 1,
+                    "status": "OPEN",
+                    "raw_json": {"entry_price": 10},
+                })
+
+                updated = store.mark_all_positions_flat(reason="eod_success", status="FLAT_CONFIRMED")
+
+                row = store.query("SELECT active, status, raw_json FROM positions WHERE symbol = 'RKLB'")[0]
+                self.assertEqual(updated, 1)
+                self.assertEqual(row["active"], 0)
+                self.assertEqual(row["status"], "FLAT_CONFIRMED")
+                self.assertTrue(json.loads(row["raw_json"])["ibkr_position_flat_confirmed"])
+            finally:
+                store.close()
+
+    def test_reconciliation_clean_with_ibkr_flat_clears_active_positions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_position({
+                    "session_date": "2026-05-28",
+                    "strategy_name": "v67",
+                    "symbol": "CRSR",
+                    "quantity": 3,
+                    "avg_price": 20,
+                    "active": 1,
+                    "status": "OPEN",
+                })
+
+                store.mark_all_positions_flat(reason="reconciliation_clean", status="FLAT_CONFIRMED")
+
+                row = store.query("SELECT active, status, raw_json FROM positions WHERE symbol = 'CRSR'")[0]
+                self.assertEqual(row["active"], 0)
+                self.assertEqual(row["status"], "FLAT_CONFIRMED")
+                self.assertEqual(json.loads(row["raw_json"])["flat_confirmed_reason"], "reconciliation_clean")
             finally:
                 store.close()
 

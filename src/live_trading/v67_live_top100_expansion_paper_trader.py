@@ -1262,6 +1262,14 @@ def startup_reconcile_runtime_state(
                     "close_fill_verified": True,
                 },
             )
+            safe_sqlite_call(
+                getattr(recorder, "sqlite_store", None),
+                "mark_position_flat",
+                symbol=symbol,
+                strategy_name=STRATEGY_NAME,
+                reason=f"{reason_prefix}_ibkr_flat",
+                status="CLOSED",
+            )
             print(f"{now_utc()} {log_prefix}_LOCAL_CLOSED symbol={symbol}", flush=True)
             continue
         if pos is not None and pos.active and abs(ibkr_qty) > 0 and abs(float(pos.quantity) - abs(ibkr_qty)) > 1e-9:
@@ -1420,6 +1428,14 @@ def startup_reconcile_runtime_state(
         f"pending_orders={len(pending_orders)} anomalies={len(reducer_snapshot.anomalies)}",
         flush=True,
     )
+    if not ibkr_rows:
+        safe_sqlite_call(
+            getattr(recorder, "sqlite_store", None),
+            "mark_all_positions_flat",
+            reason="reconciliation_clean" if clean else "reconciliation_ibkr_flat",
+            status="FLAT_CONFIRMED",
+            updated_at=now_utc(),
+        )
     safe_sqlite_call(
         getattr(recorder, "sqlite_store", None),
         "record_reconciliation_run",
@@ -1582,6 +1598,14 @@ def write_eod_final_status(
     }
     runtime_state["eod_final_status"] = summary
     recorder.path("eod_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    if summary["clean"]:
+        safe_sqlite_call(
+            getattr(recorder, "sqlite_store", None),
+            "mark_all_positions_flat",
+            reason="eod_success",
+            status="FLAT_CONFIRMED",
+            updated_at=summary["recorded_at"],
+        )
     safe_sqlite_call(
         getattr(recorder, "sqlite_store", None),
         "record_runtime_event",
@@ -2213,6 +2237,14 @@ def verify_managed_positions_against_ibkr(
                 entry_fill_verified="true",
                 close_fill_verified="true",
                 raw_json={"managed_quantity": pos.quantity, "ibkr_quantity": ib_qty, "fill_verified": True, "entry_fill_verified": True, "close_fill_verified": True, "close_source": "fill"},
+            )
+            safe_sqlite_call(
+                getattr(recorder, "sqlite_store", None),
+                "mark_position_flat",
+                symbol=symbol,
+                strategy_name=STRATEGY_NAME,
+                reason=reason,
+                status="CLOSED",
             )
             continue
         open_symbols.append(symbol)

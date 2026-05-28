@@ -327,6 +327,9 @@ def render_peak_charts(closed: pd.DataFrame) -> None:
 
 def render_diagnostics(diag: dict) -> None:
     st.subheader("Diagnostics / Risk")
+    stale_count = int(diag.get("stale_active_positions_count", 0) or 0)
+    if stale_count > 0:
+        st.warning(f"STALE_POSITION_ROWS_PRESENT stale_active_positions_count={stale_count}")
     cols = st.columns(7)
     labels = [
         ("Orphans", "orphans"),
@@ -338,6 +341,15 @@ def render_diagnostics(diag: dict) -> None:
         ("Reconnects", "reconnect_events"),
     ]
     for col, (label, key) in zip(cols, labels):
+        col.metric(label, int(diag.get(key, 0)))
+    pos_cols = st.columns(4)
+    position_labels = [
+        ("SQLite Active Rows", "sqlite_active_positions_count"),
+        ("Latest Active", "latest_active_positions_count"),
+        ("IBKR Positions", "ibkr_positions_count"),
+        ("Stale Active Rows", "stale_active_positions_count"),
+    ]
+    for col, (label, key) in zip(pos_cols, position_labels):
         col.metric(label, int(diag.get(key, 0)))
 
 
