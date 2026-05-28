@@ -160,6 +160,17 @@ def render_summary(summary: dict) -> None:
     row2[4].metric("Open Trades", int(summary.get("open_trades", 0)))
 
 
+def render_data_quality_summary(summary: dict) -> None:
+    st.subheader("Closed Trade Data Quality")
+    cols = st.columns(6)
+    cols[0].metric("Closed", int(summary.get("closed_trades_count", 0)))
+    cols[1].metric("Comm OK", int(summary.get("commission_ok", 0)))
+    cols[2].metric("Comm Partial", int(summary.get("commission_partial", 0)))
+    cols[3].metric("Comm Missing", int(summary.get("commission_missing", 0)))
+    cols[4].metric("Peak Missing", int(summary.get("peak_missing", 0)))
+    cols[5].metric("Warnings", int(summary.get("data_quality_warning_count", 0)))
+
+
 def render_open_positions(df: pd.DataFrame) -> None:
     st.subheader("Open Positions")
     if df.empty:
@@ -241,6 +252,28 @@ def render_closed_positions(df: pd.DataFrame) -> None:
         use_container_width=True,
         hide_index=True,
     )
+    debug_cols = [
+        "trade_id", "symbol", "entry_execution_count", "exit_execution_count",
+        "confirmed_commission_execution_count", "expected_commission_execution_count",
+        "peak_source", "commission_source_detail", "data_quality",
+    ]
+    available_debug_cols = [col for col in debug_cols if col in df.columns]
+    if available_debug_cols:
+        with st.expander("Closed trade source diagnostics", expanded=False):
+            debug = df[available_debug_cols].copy().rename(
+                columns={
+                    "trade_id": "Trade ID",
+                    "symbol": "Symbol",
+                    "entry_execution_count": "Entry Execs",
+                    "exit_execution_count": "Exit Execs",
+                    "confirmed_commission_execution_count": "Confirmed Comm Execs",
+                    "expected_commission_execution_count": "Expected Comm Execs",
+                    "peak_source": "Peak Source",
+                    "commission_source_detail": "Commission Source Detail",
+                    "data_quality": "Data Quality",
+                }
+            )
+            st.dataframe(debug, use_container_width=True, hide_index=True)
 
 
 def render_exit_simulation(df: pd.DataFrame) -> None:
@@ -322,6 +355,8 @@ def main() -> None:
     st.caption(f"SQLite: `{snapshot.get('source')}` | window: {start_date} to {end_date} | strategy: {strategy} | loaded_at: {loaded_at}")
 
     render_summary(snapshot["summary"])
+    st.divider()
+    render_data_quality_summary(snapshot.get("data_quality_summary", {}))
     st.divider()
     render_open_positions(snapshot["open_positions"])
     st.divider()

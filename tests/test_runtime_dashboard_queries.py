@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -132,6 +134,65 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertAlmostEqual(closed["net_pct"], 9.25)
             self.assertEqual(closed["commission_status"], "OK")
             self.assertEqual(closed["data_quality"], "OK")
+            self.assertEqual(closed["entry_execution_count"], 1)
+            self.assertEqual(closed["exit_execution_count"], 1)
+            self.assertEqual(closed["confirmed_commission_execution_count"], 2)
+            self.assertEqual(closed["expected_commission_execution_count"], 2)
+            self.assertEqual(closed["peak_source"], "trades.mfe_pct")
+            self.assertEqual(snapshot["data_quality_summary"]["commission_ok"], 1)
+            self.assertEqual(snapshot["data_quality_summary"]["peak_ok"], 1)
+
+    def test_closed_trade_commission_matches_symbol_time_without_trade_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "T_NO_EXEC_ID",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "MATCH",
+                "status": "CLOSED",
+                "entry_fill_time": "2026-05-27T13:30:00+00:00",
+                "exit_fill_time": "2026-05-27T13:40:00+00:00",
+                "entry_price": 10,
+                "exit_price": 11,
+                "quantity": 1,
+                "gross_pnl": 1,
+                "mfe_pct": 10,
+            })
+            store.upsert_execution({
+                "execution_id": "B_SYMBOL_TIME",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "MATCH",
+                "side": "BOT",
+                "quantity": 1,
+                "price": 10,
+                "commission": 0.11,
+                "commission_source": "ibkr",
+                "recorded_at": "2026-05-27T13:31:00+00:00",
+            })
+            store.upsert_execution({
+                "execution_id": "S_SYMBOL_TIME",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "MATCH",
+                "side": "SLD",
+                "quantity": 1,
+                "price": 11,
+                "commission": 0.12,
+                "commission_source": "ibkr",
+                "recorded_at": "2026-05-27T13:39:00+00:00",
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertAlmostEqual(closed["ibkr_commission"], 0.23)
+            self.assertEqual(closed["commission_status"], "OK")
+            self.assertEqual(closed["entry_execution_count"], 1)
+            self.assertEqual(closed["exit_execution_count"], 1)
 
     def test_closed_trade_peak_zero_remains_valid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -174,8 +235,158 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             closed = snapshot["closed_positions"].iloc[0]
 
             self.assertEqual(closed["peak_pct"], 0)
+            self.assertEqual(closed["peak_source"], "trades.mfe_pct")
             self.assertEqual(closed["commission_status"], "OK")
             self.assertEqual(closed["data_quality"], "OK")
+
+    def test_peak_from_trade_raw_json_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "T_RAW_PEAK",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "RAWPK",
+                "status": "CLOSED",
+                "entry_fill_time": "2026-05-27T13:30:00+00:00",
+                "exit_fill_time": "2026-05-27T13:40:00+00:00",
+                "entry_price": 10,
+                "exit_price": 10.5,
+                "quantity": 1,
+                "gross_pnl": 0.5,
+                "raw_json": {"peak_gain_pct": 8.5},
+            })
+            for execution_id, side, price, ts in [
+                ("B_RAW_PEAK", "BOT", 10, "2026-05-27T13:30:00+00:00"),
+                ("S_RAW_PEAK", "SLD", 10.5, "2026-05-27T13:40:00+00:00"),
+            ]:
+                store.upsert_execution({
+                    "execution_id": execution_id,
+                    "trade_id": "T_RAW_PEAK",
+                    "session_date": "2026-05-27",
+                    "strategy_name": "v67",
+                    "symbol": "RAWPK",
+                    "side": side,
+                    "quantity": 1,
+                    "price": price,
+                    "commission": 0.1,
+                    "commission_source": "ibkr",
+                    "recorded_at": ts,
+                })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertAlmostEqual(closed["peak_pct"], 8.5)
+            self.assertEqual(closed["peak_source"], "trades.raw_json")
+
+    def test_peak_from_lifecycle_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            recorder_root = Path(tmp) / "recorder"
+            session_dir = recorder_root / "2026-05-27"
+            session_dir.mkdir(parents=True)
+            lifecycle_path = session_dir / "trade_lifecycle.csv"
+            with lifecycle_path.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["event", "symbol", "peak_gain_pct", "recorded_at"])
+                writer.writeheader()
+                writer.writerow({
+                    "event": "SELL_ORDER_SENT",
+                    "symbol": "LIFE",
+                    "peak_gain_pct": "6.25",
+                    "recorded_at": "2026-05-27T13:40:00+00:00",
+                })
+            previous = os.environ.get("TRADING_BOT_RECORDER_DIR")
+            os.environ["TRADING_BOT_RECORDER_DIR"] = str(recorder_root)
+            try:
+                store = SQLiteRuntimeStore(db)
+                store.upsert_trade({
+                    "trade_id": "T_LIFECYCLE_PEAK",
+                    "session_date": "2026-05-27",
+                    "strategy_name": "v67",
+                    "symbol": "LIFE",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-05-27T13:30:00+00:00",
+                    "exit_fill_time": "2026-05-27T13:40:00+00:00",
+                    "entry_price": 10,
+                    "exit_price": 10.5,
+                    "quantity": 1,
+                    "gross_pnl": 0.5,
+                })
+                for execution_id, side, price, ts in [
+                    ("B_LIFECYCLE_PEAK", "BOT", 10, "2026-05-27T13:30:00+00:00"),
+                    ("S_LIFECYCLE_PEAK", "SLD", 10.5, "2026-05-27T13:40:00+00:00"),
+                ]:
+                    store.upsert_execution({
+                        "execution_id": execution_id,
+                        "trade_id": "T_LIFECYCLE_PEAK",
+                        "session_date": "2026-05-27",
+                        "strategy_name": "v67",
+                        "symbol": "LIFE",
+                        "side": side,
+                        "quantity": 1,
+                        "price": price,
+                        "commission": 0.1,
+                        "commission_source": "ibkr",
+                        "recorded_at": ts,
+                    })
+                store.close()
+
+                snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
+                closed = snapshot["closed_positions"].iloc[0]
+
+                self.assertAlmostEqual(closed["peak_pct"], 6.25)
+                self.assertEqual(closed["peak_source"], "trade_lifecycle.csv")
+            finally:
+                if previous is None:
+                    os.environ.pop("TRADING_BOT_RECORDER_DIR", None)
+                else:
+                    os.environ["TRADING_BOT_RECORDER_DIR"] = previous
+
+    def test_no_peak_source_remains_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "T_NO_PEAK",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "NOPEAK",
+                "status": "CLOSED",
+                "entry_fill_time": "2026-05-27T13:30:00+00:00",
+                "exit_fill_time": "2026-05-27T13:40:00+00:00",
+                "entry_price": 10,
+                "exit_price": 10.5,
+                "quantity": 1,
+                "gross_pnl": 0.5,
+            })
+            for execution_id, side, price, ts in [
+                ("B_NO_PEAK", "BOT", 10, "2026-05-27T13:30:00+00:00"),
+                ("S_NO_PEAK", "SLD", 10.5, "2026-05-27T13:40:00+00:00"),
+            ]:
+                store.upsert_execution({
+                    "execution_id": execution_id,
+                    "trade_id": "T_NO_PEAK",
+                    "session_date": "2026-05-27",
+                    "strategy_name": "v67",
+                    "symbol": "NOPEAK",
+                    "side": side,
+                    "quantity": 1,
+                    "price": price,
+                    "commission": 0.1,
+                    "commission_source": "ibkr",
+                    "recorded_at": ts,
+                })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertTrue(closed["peak_pct"] != closed["peak_pct"])
+            self.assertEqual(closed["peak_source"], "missing")
+            self.assertEqual(snapshot["data_quality_summary"]["peak_missing"], 1)
 
     def test_missing_entry_time_does_not_reuse_exit_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -309,6 +520,54 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertAlmostEqual(closed["ibkr_commission"], 0.3)
             self.assertEqual(closed["commission_status"], "PARTIAL")
             self.assertIn("COMMISSION_PARTIAL", closed["data_quality"])
+
+    def test_partial_fill_missing_one_execution_commission_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "T_MULTI_PARTIAL_COMM",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "MULTI",
+                "status": "CLOSED",
+                "entry_fill_time": "2026-05-27T13:30:00+00:00",
+                "exit_fill_time": "2026-05-27T13:40:00+00:00",
+                "entry_price": 10,
+                "exit_price": 11,
+                "quantity": 2,
+                "gross_pnl": 2,
+                "mfe_pct": 10,
+            })
+            for execution_id, side, qty, price, commission in [
+                ("B_MULTI_1", "BOT", 1, 10, 0.1),
+                ("B_MULTI_2", "BOT", 1, 10, None),
+                ("S_MULTI_1", "SLD", 2, 11, 0.2),
+            ]:
+                row = {
+                    "execution_id": execution_id,
+                    "trade_id": "T_MULTI_PARTIAL_COMM",
+                    "session_date": "2026-05-27",
+                    "strategy_name": "v67",
+                    "symbol": "MULTI",
+                    "side": side,
+                    "quantity": qty,
+                    "price": price,
+                    "recorded_at": "2026-05-27T13:35:00+00:00",
+                }
+                if commission is not None:
+                    row["commission"] = commission
+                    row["commission_source"] = "ibkr"
+                store.upsert_execution(row)
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertAlmostEqual(closed["ibkr_commission"], 0.3)
+            self.assertEqual(closed["commission_status"], "PARTIAL")
+            self.assertEqual(closed["expected_commission_execution_count"], 3)
+            self.assertEqual(closed["confirmed_commission_execution_count"], 2)
 
     def test_same_second_true_roundtrip_is_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, resolve_s
 
 
 CLOSED_STATUSES = {"CLOSED", "DONE", "EXIT_FILLED", "FLAT"}
+DEFAULT_RECORDER_ROOT = Path("data/live/recorder")
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,18 @@ def parse_raw_json(value: Any) -> dict[str, Any]:
         return json.loads(value)
     except Exception:
         return {}
+
+
+def raw_json_peak_value(raw: dict[str, Any]) -> float | None:
+    for key in ("mfe_pct", "peak_pct", "peak_gain_pct", "max_gain_pct"):
+        value = to_float(raw.get(key), None)
+        if value is not None:
+            return value
+    entry_price = to_float(raw.get("entry_price") or raw.get("buy") or raw.get("buy_price"), None)
+    peak_price = to_float(raw.get("peak_price") or raw.get("high_watermark") or raw.get("mfe_price"), None)
+    if entry_price and peak_price is not None:
+        return ((peak_price / entry_price) - 1.0) * 100.0
+    return None
 
 
 def to_float(value: Any, default: float | None = 0.0) -> float | None:
@@ -213,6 +227,25 @@ def side_rows(executions: pd.DataFrame, *, action_values: set[str]) -> list[dict
     return sorted(rows, key=execution_time_sort_key)
 
 
+def time_window_rows(rows: pd.DataFrame, start: Any, end: Any) -> pd.DataFrame:
+    if rows.empty:
+        return rows
+    start_dt = parse_dt(start)
+    end_dt = parse_dt(end)
+    if start_dt is None and end_dt is None:
+        return rows
+    mask = []
+    for row in rows.to_dict("records"):
+        ts = execution_time_sort_key(row)
+        keep = True
+        if start_dt is not None:
+            keep = keep and ts >= start_dt
+        if end_dt is not None:
+            keep = keep and ts <= end_dt
+        mask.append(keep)
+    return rows[pd.Series(mask, index=rows.index)]
+
+
 def execution_matches_for_trade(row: dict[str, Any], executions: pd.DataFrame) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if executions.empty:
         return [], []
@@ -226,9 +259,13 @@ def execution_matches_for_trade(row: dict[str, Any], executions: pd.DataFrame) -
             & (executions["strategy"].fillna("unknown").astype(str) == str(row.get("strategy") or "unknown"))
             & (executions["symbol"].fillna("").astype(str).str.upper() == str(row.get("symbol") or "").upper())
         ]
+        has_time_window = parse_dt(row.get("entry_time")) is not None or parse_dt(row.get("exit_time") or row.get("closed_at")) is not None
+        same = time_window_rows(same, row.get("entry_time"), row.get("exit_time") or row.get("closed_at"))
         buy_count = len(side_rows(same, action_values={"BOT", "BUY"}))
         sell_count = len(side_rows(same, action_values={"SLD", "SELL"}))
-        if buy_count == 1 and sell_count == 1:
+        if has_time_window and buy_count >= 1 and sell_count >= 1:
+            matched = same
+        elif buy_count == 1 and sell_count == 1:
             matched = same
     return side_rows(matched, action_values={"BOT", "BUY"}), side_rows(matched, action_values={"SLD", "SELL"})
 
@@ -265,9 +302,9 @@ def infer_entry_exit_times(row: dict[str, Any], buy_rows: list[dict[str, Any]], 
 
 
 def confirmed_commission_for_execution_rows(buy_rows: list[dict[str, Any]], sell_rows: list[dict[str, Any]]) -> tuple[float, str]:
-    def side_commission(rows: list[dict[str, Any]]) -> tuple[float, bool]:
+    def side_commission(rows: list[dict[str, Any]]) -> tuple[float, int]:
         total = 0.0
-        present = False
+        present = 0
         for row in rows:
             if str(row.get("commission_source") or "").lower() != "ibkr":
                 continue
@@ -275,17 +312,28 @@ def confirmed_commission_for_execution_rows(buy_rows: list[dict[str, Any]], sell
             if value is None:
                 continue
             total += abs(float(value))
-            present = True
+            present += 1
         return total, present
 
-    buy_commission, buy_present = side_commission(buy_rows)
-    sell_commission, sell_present = side_commission(sell_rows)
+    buy_commission, buy_confirmed = side_commission(buy_rows)
+    sell_commission, sell_confirmed = side_commission(sell_rows)
     total = buy_commission + sell_commission
-    if buy_present and sell_present:
+    matched_count = len(buy_rows) + len(sell_rows)
+    confirmed_count = buy_confirmed + sell_confirmed
+    both_sides_matched = bool(buy_rows and sell_rows)
+    if matched_count and both_sides_matched and confirmed_count == matched_count:
         return total, "OK"
-    if buy_present or sell_present:
+    if confirmed_count:
         return total, "PARTIAL"
     return 0.0, "MISSING"
+
+
+def confirmed_commission_execution_count(buy_rows: list[dict[str, Any]], sell_rows: list[dict[str, Any]]) -> int:
+    count = 0
+    for row in [*buy_rows, *sell_rows]:
+        if str(row.get("commission_source") or "").lower() == "ibkr" and to_float(row.get("commission"), None) is not None:
+            count += 1
+    return count
 
 
 def quality_label(flags: set[str], commission_status: str) -> str:
@@ -297,11 +345,171 @@ def quality_label(flags: set[str], commission_status: str) -> str:
     return "; ".join(sorted(out)) if out else "OK"
 
 
+def load_runtime_peak_map(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> dict[tuple[str, str, str, str], tuple[float, str]]:
+    clause, params = strategy_clause("r", strategy)
+    rows = read_sql(
+        conn,
+        f"""
+        SELECT trade_id, COALESCE(strategy_name, 'unknown') AS strategy, session_date, symbol, event_type, raw_json
+        FROM runtime_events r
+        WHERE COALESCE(r.session_date, substr(r.event_time, 1, 10)) BETWEEN ? AND ? {clause}
+        ORDER BY r.event_time
+        """,
+        [window.start_date, window.end_date, *params],
+    )
+    peak_map: dict[tuple[str, str, str, str], tuple[float, str]] = {}
+    for row in rows.to_dict("records"):
+        raw = parse_raw_json(row.get("raw_json"))
+        peak = raw_json_peak_value(raw)
+        if peak is None:
+            peak = to_float(raw.get("peak_gain_pct") or raw.get("mfe_pct"), None)
+        if peak is None:
+            continue
+        key = (
+            str(row.get("trade_id") or ""),
+            str(row.get("session_date") or ""),
+            str(row.get("strategy") or "unknown"),
+            str(row.get("symbol") or "").upper(),
+        )
+        previous = peak_map.get(key)
+        if previous is None or peak > previous[0]:
+            peak_map[key] = (peak, "runtime_events")
+    return peak_map
+
+
+def recorder_root() -> Path:
+    return Path(os.environ.get("TRADING_BOT_RECORDER_DIR") or os.environ.get("DASHBOARD_RECORDER_DIR") or DEFAULT_RECORDER_ROOT)
+
+
+def load_lifecycle_peak_map(window: DateWindow, root: Path | None = None) -> dict[tuple[str, str], tuple[float, str]]:
+    base = root or recorder_root()
+    peak_map: dict[tuple[str, str], tuple[float, str]] = {}
+    for session_dir in sorted(base.glob("*")):
+        if not session_dir.is_dir():
+            continue
+        session_date = session_dir.name
+        if session_date < window.start_date or session_date > window.end_date:
+            continue
+        path = session_dir / "trade_lifecycle.csv"
+        if not path.exists():
+            continue
+        try:
+            rows = pd.read_csv(path)
+        except Exception:
+            continue
+        if rows.empty or "symbol" not in rows.columns:
+            continue
+        for row in rows.to_dict("records"):
+            peak = to_float(row.get("peak_gain_pct") or row.get("mfe_pct") or row.get("peak_pct"), None)
+            if peak is None:
+                entry_price = to_float(row.get("entry_price"), None)
+                peak_price = to_float(row.get("peak_price"), None)
+                if entry_price and peak_price is not None:
+                    peak = ((peak_price / entry_price) - 1.0) * 100.0
+            if peak is None:
+                continue
+            key = (session_date, str(row.get("symbol") or "").upper())
+            previous = peak_map.get(key)
+            if previous is None or peak > previous[0]:
+                peak_map[key] = (peak, "trade_lifecycle.csv")
+    return peak_map
+
+
+def load_candle_rows(window: DateWindow, root: Path | None = None) -> dict[tuple[str, str], pd.DataFrame]:
+    base = root or recorder_root()
+    out: dict[tuple[str, str], pd.DataFrame] = {}
+    for session_dir in sorted(base.glob("*")):
+        if not session_dir.is_dir():
+            continue
+        session_date = session_dir.name
+        if session_date < window.start_date or session_date > window.end_date:
+            continue
+        path = session_dir / "candles_1m.csv"
+        if not path.exists():
+            continue
+        try:
+            candles = pd.read_csv(path)
+        except Exception:
+            continue
+        if candles.empty or not {"symbol", "high"}.issubset(candles.columns):
+            continue
+        for symbol, group in candles.groupby(candles["symbol"].fillna("").astype(str).str.upper()):
+            if not symbol:
+                continue
+            out[(session_date, symbol)] = group.copy()
+    return out
+
+
+def candle_peak_for_trade(row: dict[str, Any], candle_rows: dict[tuple[str, str], pd.DataFrame]) -> tuple[float | None, str]:
+    buy = to_float(row.get("buy"), None)
+    if not buy:
+        return None, "missing"
+    candles = candle_rows.get((str(row.get("session_date") or ""), str(row.get("symbol") or "").upper()))
+    if candles is None or candles.empty:
+        return None, "missing"
+    time_col = "bar_time" if "bar_time" in candles.columns else ("timestamp" if "timestamp" in candles.columns else None)
+    scoped = candles
+    if time_col:
+        start_dt = parse_dt(row.get("entry_time"))
+        end_dt = parse_dt(row.get("exit_time") or row.get("closed_at"))
+        if start_dt or end_dt:
+            times = pd.to_datetime(scoped[time_col], errors="coerce", utc=True)
+            mask = pd.Series(True, index=scoped.index)
+            if start_dt:
+                mask &= times >= start_dt
+            if end_dt:
+                mask &= times <= end_dt
+            scoped = scoped[mask]
+    highs = pd.to_numeric(scoped["high"], errors="coerce")
+    peak_price = highs.max()
+    if pd.isna(peak_price):
+        return None, "missing"
+    return ((float(peak_price) / buy) - 1.0) * 100.0, "candles_1m.csv"
+
+
+def peak_from_sources(
+    row: dict[str, Any],
+    runtime_peak_map: dict[tuple[str, str, str, str], tuple[float, str]],
+    lifecycle_peak_map: dict[tuple[str, str], tuple[float, str]],
+    candle_rows: dict[tuple[str, str], pd.DataFrame],
+) -> tuple[float | None, str]:
+    direct = to_float(row.get("peak_pct"), None)
+    if direct is not None:
+        return direct, "trades.mfe_pct"
+    raw = parse_raw_json(row.get("raw_json"))
+    raw_peak = raw_json_peak_value(raw)
+    if raw_peak is not None:
+        return raw_peak, "trades.raw_json"
+    trade_key = (
+        str(row.get("trade_id") or ""),
+        str(row.get("session_date") or ""),
+        str(row.get("strategy") or "unknown"),
+        str(row.get("symbol") or "").upper(),
+    )
+    runtime_peak = runtime_peak_map.get(trade_key)
+    if runtime_peak:
+        return runtime_peak
+    runtime_symbol_peak = runtime_peak_map.get(("", trade_key[1], trade_key[2], trade_key[3]))
+    if runtime_symbol_peak:
+        return runtime_symbol_peak
+    symbol_key = (str(row.get("session_date") or ""), str(row.get("symbol") or "").upper())
+    lifecycle_peak = lifecycle_peak_map.get(symbol_key)
+    if lifecycle_peak:
+        return lifecycle_peak
+    candle_peak = candle_peak_for_trade(row, candle_rows)
+    if candle_peak[0] is not None:
+        return candle_peak
+    return None, "missing"
+
+
 def closed_from_trades(
     conn: sqlite3.Connection,
     window: DateWindow,
     strategy: str | None,
     executions: pd.DataFrame,
+    runtime_peak_map: dict[tuple[str, str, str, str], tuple[float, str]],
+    lifecycle_peak_map: dict[tuple[str, str], tuple[float, str]],
+    candle_rows: dict[tuple[str, str], pd.DataFrame],
 ) -> pd.DataFrame:
     clause, params = strategy_clause("t", strategy)
     rows = read_sql(
@@ -338,20 +546,45 @@ def closed_from_trades(
     data_quality: list[str] = []
     entry_times: list[Any] = []
     exit_times: list[Any] = []
+    peak_values: list[float | None] = []
+    peak_sources: list[str] = []
+    entry_execution_counts: list[int] = []
+    exit_execution_counts: list[int] = []
+    confirmed_commission_counts: list[int] = []
+    expected_commission_counts: list[int] = []
+    commission_source_details: list[str] = []
     for row in out.to_dict("records"):
         buy_rows, sell_rows = execution_matches_for_trade(row, executions)
         entry_time, exit_time, flags = infer_entry_exit_times(row, buy_rows, sell_rows)
+        enriched_row = {**row, "entry_time": entry_time, "exit_time": exit_time}
         commission, commission_status = confirmed_commission_for_execution_rows(buy_rows, sell_rows)
+        peak_pct, peak_source = peak_from_sources(enriched_row, runtime_peak_map, lifecycle_peak_map, candle_rows)
         commissions.append(commission)
         commission_statuses.append(commission_status)
         data_quality.append(quality_label(flags, commission_status))
         entry_times.append(entry_time)
         exit_times.append(exit_time)
+        peak_values.append(peak_pct)
+        peak_sources.append(peak_source)
+        entry_execution_counts.append(len(buy_rows))
+        exit_execution_counts.append(len(sell_rows))
+        confirmed_count = confirmed_commission_execution_count(buy_rows, sell_rows)
+        confirmed_commission_counts.append(confirmed_count)
+        expected_count = len(buy_rows) + len(sell_rows)
+        expected_commission_counts.append(expected_count)
+        commission_source_details.append(f"matched={len(buy_rows) + len(sell_rows)} ibkr={confirmed_count}")
     out["ibkr_commission"] = commissions
     out["commission_status"] = commission_statuses
     out["data_quality"] = data_quality
     out["entry_time"] = entry_times
     out["exit_time"] = exit_times
+    out["peak_pct"] = peak_values
+    out["peak_source"] = peak_sources
+    out["entry_execution_count"] = entry_execution_counts
+    out["exit_execution_count"] = exit_execution_counts
+    out["confirmed_commission_execution_count"] = confirmed_commission_counts
+    out["expected_commission_execution_count"] = expected_commission_counts
+    out["commission_source_detail"] = commission_source_details
     out["gross"] = pd.to_numeric(out["gross"], errors="coerce").fillna(0.0)
     out["buy"] = pd.to_numeric(out["buy"], errors="coerce").fillna(0.0)
     out["sell"] = pd.to_numeric(out["sell"], errors="coerce").fillna(0.0)
@@ -365,9 +598,11 @@ def closed_from_trades(
     out["hold_minutes"] = [hold_minutes(a, b or c) for a, b, c in zip(out["entry_time"], out["exit_time"], out["closed_at"])]
     return out[
         [
-            "symbol", "qty", "ibkr_commission", "buy", "sell", "gross", "net_actual", "net_pct", "pnl_pct", "peak_pct",
+            "trade_id", "symbol", "qty", "ibkr_commission", "buy", "sell", "gross", "net_actual", "net_pct", "pnl_pct", "peak_pct",
             "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
             "entry_time", "exit_time", "commission_status", "data_quality", "session_date",
+            "entry_execution_count", "exit_execution_count", "confirmed_commission_execution_count",
+            "expected_commission_execution_count", "peak_source", "commission_source_detail",
         ]
     ]
 
@@ -392,6 +627,7 @@ def closed_from_executions(executions: pd.DataFrame) -> pd.DataFrame:
             net_pct = (net / denominator * 100.0) if denominator else 0.0
             rows.append({
                 "symbol": row.get("symbol"),
+                "trade_id": row.get("trade_id") or "",
                 "gross": gross,
                 "ibkr_commission": commission,
                 "commission_status": "OK" if commission else "MISSING",
@@ -406,6 +642,12 @@ def closed_from_executions(executions: pd.DataFrame) -> pd.DataFrame:
                 "entry_time": row.get("buy_time"),
                 "exit_time": row.get("sell_time"),
                 "data_quality": quality_label(set(), "OK" if commission else "MISSING"),
+                "entry_execution_count": 1,
+                "exit_execution_count": 1,
+                "confirmed_commission_execution_count": 2 if commission else 0,
+                "expected_commission_execution_count": 2,
+                "peak_source": "fills_reconstruction" if raw_peak is not None else "missing",
+                "commission_source_detail": "reconstructed",
                 "qty": qty,
                 "buy": buy,
                 "sell": sell,
@@ -415,7 +657,10 @@ def closed_from_executions(executions: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_closed_positions(conn: sqlite3.Connection, window: DateWindow, strategy: str | None, executions: pd.DataFrame) -> pd.DataFrame:
-    trades = closed_from_trades(conn, window, strategy, executions)
+    runtime_peak_map = load_runtime_peak_map(conn, window, strategy)
+    lifecycle_peak_map = load_lifecycle_peak_map(window)
+    candle_rows = load_candle_rows(window)
+    trades = closed_from_trades(conn, window, strategy, executions, runtime_peak_map, lifecycle_peak_map, candle_rows)
     if not trades.empty:
         return trades.sort_values(["net_actual", "symbol"], na_position="last").reset_index(drop=True)
     closed = closed_from_executions(executions)
@@ -619,6 +864,31 @@ def build_summary(open_positions: pd.DataFrame, closed_positions: pd.DataFrame) 
     }
 
 
+def build_data_quality_summary(closed_positions: pd.DataFrame) -> dict[str, int]:
+    if closed_positions.empty:
+        return {
+            "closed_trades_count": 0,
+            "commission_ok": 0,
+            "commission_partial": 0,
+            "commission_missing": 0,
+            "peak_ok": 0,
+            "peak_missing": 0,
+            "data_quality_warning_count": 0,
+        }
+    commission_status = closed_positions.get("commission_status", pd.Series(dtype=str)).fillna("").astype(str)
+    peak_source = closed_positions.get("peak_source", pd.Series(dtype=str)).fillna("").astype(str)
+    data_quality = closed_positions.get("data_quality", pd.Series(dtype=str)).fillna("OK").astype(str)
+    return {
+        "closed_trades_count": int(len(closed_positions)),
+        "commission_ok": int((commission_status == "OK").sum()),
+        "commission_partial": int((commission_status == "PARTIAL").sum()),
+        "commission_missing": int((commission_status == "MISSING").sum()),
+        "peak_ok": int((peak_source != "missing").sum()),
+        "peak_missing": int((peak_source == "missing").sum()),
+        "data_quality_warning_count": int((data_quality != "OK").sum()),
+    }
+
+
 def exit_simulation(closed_positions: pd.DataFrame) -> pd.DataFrame:
     if closed_positions.empty:
         return pd.DataFrame(columns=["scenario", "trades", "captured", "gross", "net"])
@@ -645,6 +915,7 @@ def load_dashboard_snapshot(sqlite_path: str | Path | None, window: DateWindow, 
         empty = pd.DataFrame()
         return {
             "summary": build_summary(empty, empty),
+            "data_quality_summary": build_data_quality_summary(empty),
             "open_positions": empty,
             "closed_positions": empty,
             "exit_simulation": empty,
@@ -660,6 +931,7 @@ def load_dashboard_snapshot(sqlite_path: str | Path | None, window: DateWindow, 
         open_positions = load_open_positions(conn, window, strategy, executions)
         return {
             "summary": build_summary(open_positions, closed),
+            "data_quality_summary": build_data_quality_summary(closed),
             "open_positions": open_positions,
             "closed_positions": closed,
             "exit_simulation": exit_simulation(closed),
