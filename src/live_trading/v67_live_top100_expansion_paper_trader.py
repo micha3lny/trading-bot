@@ -2775,10 +2775,29 @@ def reload_top100_universe_if_requested(
             raise RuntimeError(f"top100_reload_too_few_symbols rows={len(entry_symbols)} required={int(args.top_n)}")
 
         active_symbols = sorted(symbol for symbol, pos in managed_positions.items() if pos.active)
-        subscription_symbols = list(dict.fromkeys(entry_symbols + [s for s in active_symbols if s not in set(entry_symbols)]))
+        max_subscriptions = max(0, int(getattr(args, "max_market_data_subscriptions", 100) or 0))
+        active_symbol_set = set(active_symbols)
+        selected_symbols: list[str] = []
+        for symbol in active_symbols:
+            if symbol not in selected_symbols:
+                selected_symbols.append(symbol)
+        top100_slots = max(0, max_subscriptions - len(selected_symbols)) if max_subscriptions > 0 else len(entry_symbols)
+        subscribed_top100_candidates: list[str] = []
+        skipped_symbols_due_to_cap: list[str] = []
+        for symbol in entry_symbols:
+            if symbol in selected_symbols:
+                subscribed_top100_candidates.append(symbol)
+                continue
+            if max_subscriptions > 0 and len([s for s in selected_symbols if s not in active_symbol_set]) >= top100_slots:
+                skipped_symbols_due_to_cap.append(symbol)
+                continue
+            selected_symbols.append(symbol)
+            subscribed_top100_candidates.append(symbol)
+        subscription_symbols = selected_symbols
         previous_symbols = [symbol for symbol, _ in contracts]
         previous_symbol_set = set(previous_symbols)
         subscription_symbol_set = set(subscription_symbols)
+        skipped_due_to_subscription_cap = len(skipped_symbols_due_to_cap)
 
         for symbol in sorted(previous_symbol_set - subscription_symbol_set):
             ticker = tickers.pop(symbol, None)
@@ -2794,6 +2813,7 @@ def reload_top100_universe_if_requested(
         new_contract_by_symbol: dict[str, Any] = {}
         subscribed = 0
         reused = 0
+        ibkr_error_101_count = 0
         failed_symbols: list[str] = []
         for symbol in subscription_symbols:
             contract = contract_by_symbol.get(symbol)
@@ -2811,21 +2831,36 @@ def reload_top100_universe_if_requested(
                     print(f"{now_utc()} TOP100_RELOAD_CONTRACT_FAILED symbol={symbol} error={exc!r}", flush=True)
                     continue
 
-            new_contracts.append((symbol, contract))
-            new_contract_by_symbol[symbol] = contract
             states.setdefault(symbol, SymbolState(symbol=symbol))
             if symbol not in tickers:
-                tickers[symbol] = ib.reqMktData(contract, "", False, False)
-                subscribed += 1
-                print(f"{now_utc()} TOP100_RELOAD_SUBSCRIBED symbol={symbol} conId={getattr(contract, 'conId', '')}", flush=True)
+                print(f"{now_utc()} TOP100_RELOAD_REQUESTED symbol={symbol} conId={getattr(contract, 'conId', '')}", flush=True)
+                try:
+                    tickers[symbol] = ib.reqMktData(contract, "", False, False)
+                    subscribed += 1
+                    print(f"{now_utc()} TOP100_RELOAD_SUBSCRIBED symbol={symbol} conId={getattr(contract, 'conId', '')}", flush=True)
+                except Exception as exc:
+                    failed_symbols.append(symbol)
+                    error_text = repr(exc)
+                    if "101" in error_text or "Max number of tickers" in error_text:
+                        ibkr_error_101_count += 1
+                        safe_sqlite_call(
+                            getattr(recorder, "sqlite_store", None),
+                            "record_runtime_event",
+                            event_type="TOP100_RELOAD_SUBSCRIBE_ERROR",
+                            severity="WARN",
+                            strategy_name=STRATEGY_NAME,
+                            session_date=getattr(recorder, "session_date", None),
+                            symbol=symbol,
+                            source="v67_live_runtime",
+                            reason="ibkr_error_101",
+                            raw_json={"error": error_text},
+                        )
+                    print(f"{now_utc()} TOP100_RELOAD_SUBSCRIBE_ERROR symbol={symbol} error={exc!r}", flush=True)
+                    continue
             else:
                 reused += 1
-
-        if len([s for s, _ in new_contracts if s in set(entry_symbols)]) < int(args.top_n):
-            raise RuntimeError(
-                f"top100_reload_qualified_too_few_entry_symbols "
-                f"qualified={len([s for s, _ in new_contracts if s in set(entry_symbols)])} required={int(args.top_n)}"
-            )
+            new_contracts.append((symbol, contract))
+            new_contract_by_symbol[symbol] = contract
 
         for symbol in list(states):
             if symbol not in subscription_symbol_set and symbol not in active_symbols:
@@ -2839,6 +2874,18 @@ def reload_top100_universe_if_requested(
         runtime_state["top100_reload_done_at"] = now_utc()
         runtime_state["top100_reload_last_error"] = ""
         runtime_state["top100_reload_symbols"] = list(entry_symbols)
+        runtime_state["top100_reload_diagnostics"] = {
+            "max_subscriptions": max_subscriptions,
+            "active_carried": len(active_symbols),
+            "active_position_symbols_count": len(active_symbols),
+            "top100_requested": len(entry_symbols),
+            "subscribed_total": len(contracts),
+            "subscribed_top100": len([s for s, _ in contracts if s in set(entry_symbols)]),
+            "subscribed_active": len([s for s, _ in contracts if s in active_symbol_set]),
+            "skipped_due_to_subscription_cap": skipped_due_to_subscription_cap,
+            "skipped_symbols_due_to_cap": skipped_symbols_due_to_cap,
+            "ibkr_error_101_count": ibkr_error_101_count,
+        }
 
         traded_symbols_today = load_traded_symbols_today(recorder)
         if traded_symbols_today and args.max_one_trade_per_symbol_per_day:
@@ -2850,7 +2897,13 @@ def reload_top100_universe_if_requested(
         print(
             f"{now_utc()} TOP100_RELOAD_DONE ranking_date={ranking_date} entry_symbols={len(entry_symbols)} "
             f"subscriptions={len(contracts)} added={subscribed} reused={reused} removed={len(previous_symbol_set - subscription_symbol_set)} "
-            f"active_carried={len(active_symbols)} failed={len(failed_symbols)} state_rebuilt={rebuilt}",
+            f"max_subscriptions={max_subscriptions} active_carried={len(active_symbols)} "
+            f"active_position_symbols_count={len(active_symbols)} top100_requested={len(entry_symbols)} "
+            f"subscribed_total={len(contracts)} subscribed_top100={len([s for s, _ in contracts if s in set(entry_symbols)])} "
+            f"subscribed_active={len([s for s, _ in contracts if s in active_symbol_set])} "
+            f"skipped_due_to_subscription_cap={skipped_due_to_subscription_cap} "
+            f"skipped_symbols_due_to_cap={','.join(skipped_symbols_due_to_cap[:20])} "
+            f"ibkr_error_101_count={ibkr_error_101_count} failed={len(failed_symbols)} state_rebuilt={rebuilt}",
             flush=True,
         )
         return True
@@ -3771,6 +3824,7 @@ def main() -> int:
     parser.add_argument("--client-id", type=int, default=DEFAULT_CLIENT_ID)
     parser.add_argument("--alpha-rank-csv", default=DEFAULT_ALPHA_RANK)
     parser.add_argument("--top-n", type=int, default=100)
+    parser.add_argument("--max-market-data-subscriptions", type=int, default=100)
     parser.add_argument("--recorder-dir", default=DEFAULT_RECORDER_DIR)
     parser.add_argument("--sqlite-path", default=None)
     parser.add_argument("--disable-sqlite", action="store_true")
@@ -3935,6 +3989,7 @@ def main() -> int:
         "top100_reload_ranking_date": "",
         "top100_reload_last_error": "",
         "top100_reload_symbols": list(symbols),
+        "top100_reload_diagnostics": {},
         "market_closed_logged_dates": set(),
         "risk_guard_last_status": {
             "enabled": bool(args.risk_guard_enabled),
@@ -4465,6 +4520,9 @@ def main() -> int:
             risk_status = runtime_state.get("risk_guard_last_status") if isinstance(runtime_state.get("risk_guard_last_status"), dict) else {}
             risk_guard_block = bool((risk_status or {}).get("blocked"))
             risk_guard_reason = str((risk_status or {}).get("reason") or "")
+            subscriptions_cap = max(0, int(getattr(args, "max_market_data_subscriptions", 100) or 0))
+            subscription_diag = runtime_state.get("top100_reload_diagnostics") if isinstance(runtime_state.get("top100_reload_diagnostics"), dict) else {}
+            subscription_cap_block = bool(subscription_diag.get("skipped_due_to_subscription_cap")) or (subscriptions_cap > 0 and len(tickers) >= subscriptions_cap)
             last_eod_retry_age = pending_eod_retry_age_seconds(runtime_state, loop_now)
             last_eod_retry_age_text = "" if last_eod_retry_age is None else f"{last_eod_retry_age:.1f}"
             print(
@@ -4475,6 +4533,7 @@ def main() -> int:
                 f"pending_eod_flatten={int(pending_eod_entries_blocked)} eod_recovery_active={int(bool(runtime_state.get('eod_recovery_active')))} "
                 f"last_eod_retry_age_seconds={last_eod_retry_age_text} eod_active={int(eod_active)} "
                 f"risk_guard_block={int(risk_guard_block)} risk_guard_reason={risk_guard_reason} "
+                f"subscriptions_active={len(tickers)} subscriptions_cap={subscriptions_cap} subscription_cap_block={int(subscription_cap_block)} "
                 f"best={best_symbol}:{best_score:.2f} top5=[{top5_str}] rejects=[{rejection_summary}]"
                 f"{portfolio_part}",
                 flush=True,

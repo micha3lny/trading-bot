@@ -21,14 +21,17 @@ class FakeContract:
 
 
 class FakeIB:
-    def __init__(self) -> None:
+    def __init__(self, fail_symbols: set[str] | None = None) -> None:
         self.subscribed: list[str] = []
         self.cancelled: list[str] = []
+        self.fail_symbols = fail_symbols or set()
 
     def qualifyContracts(self, contract):
         return [FakeContract(contract.symbol)]
 
     def reqMktData(self, contract, *_args):
+        if contract.symbol in self.fail_symbols:
+            raise RuntimeError("Error 101: Max number of tickers has been reached")
         self.subscribed.append(contract.symbol)
         return SimpleNamespace(contract=contract)
 
@@ -37,6 +40,23 @@ class FakeIB:
 
 
 class Top100ReloadTests(unittest.TestCase):
+    def write_latest(self, path: Path, symbols: list[str]) -> None:
+        rows = ["symbol,alpha_score,last_close"]
+        for idx, symbol in enumerate(symbols):
+            rows.append(f"{symbol},{1000 - idx},10")
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    def args_for(self, latest: Path, *, top_n: int, cap: int = 100) -> SimpleNamespace:
+        return SimpleNamespace(
+            top_n=top_n,
+            min_price=5.0,
+            max_one_trade_per_symbol_per_day=True,
+            market_open_utc="13:30",
+            alpha_rank_csv=str(latest),
+            daily_top100_latest_output=str(latest),
+            max_market_data_subscriptions=cap,
+        )
+
     def test_reload_subscribes_new_top100_and_carries_active_positions_for_exits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -67,14 +87,7 @@ class Top100ReloadTests(unittest.TestCase):
                 "top100_reload_path": str(latest),
                 "top100_reload_ranking_date": "2026-05-21",
             }
-            args = SimpleNamespace(
-                top_n=3,
-                min_price=5.0,
-                max_one_trade_per_symbol_per_day=True,
-                market_open_utc="13:30",
-                alpha_rank_csv=str(latest),
-                daily_top100_latest_output=str(latest),
-            )
+            args = self.args_for(latest, top_n=3)
 
             changed = reload_top100_universe_if_requested(
                 ib,
@@ -90,7 +103,7 @@ class Top100ReloadTests(unittest.TestCase):
             )
 
             self.assertTrue(changed)
-            self.assertEqual([symbol for symbol, _ in contracts], ["BBB", "CCC", "EEE", "DDD"])
+            self.assertEqual([symbol for symbol, _ in contracts], ["DDD", "BBB", "CCC", "EEE"])
             self.assertEqual(runtime_state["entry_symbols"], {"BBB", "CCC", "EEE"})
             self.assertIn("AAA", ib.cancelled)
             self.assertNotIn("DDD", ib.cancelled)
@@ -99,6 +112,88 @@ class Top100ReloadTests(unittest.TestCase):
             self.assertNotIn("AAA", tickers)
             self.assertFalse(runtime_state["top100_reload_requested"])
             self.assertFalse(runtime_state["entries_blocked"])
+
+    def test_reload_caps_top100_after_active_positions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            latest = root / "daily_top100_latest.csv"
+            top_symbols = [f"T{i:03d}" for i in range(100)]
+            active_symbols = [f"A{i:03d}" for i in range(14)]
+            self.write_latest(latest, top_symbols)
+            recorder = LiveDataRecorder(root / "recorder", session_date="2026-05-22")
+            ib = FakeIB()
+            active_contracts = {symbol: FakeContract(symbol) for symbol in active_symbols}
+            contracts = [(symbol, contract) for symbol, contract in active_contracts.items()]
+            contract_by_symbol = dict(contracts)
+            tickers = {symbol: SimpleNamespace(contract=contract) for symbol, contract in active_contracts.items()}
+            states = {symbol: SymbolState(symbol) for symbol in active_symbols}
+            managed_positions = {
+                symbol: ManagedPosition(symbol, contract, 1, 10.0, "2026-05-22T12:00:00+00:00", 10.0)
+                for symbol, contract in active_contracts.items()
+            }
+            runtime_state = {"top100_reload_requested": True, "top100_reload_path": str(latest), "top100_reload_ranking_date": "2026-05-21"}
+
+            changed = reload_top100_universe_if_requested(
+                ib, recorder, states, contracts, contract_by_symbol, tickers, {}, managed_positions, runtime_state, self.args_for(latest, top_n=100, cap=100)
+            )
+
+            self.assertTrue(changed)
+            self.assertEqual(len(contracts), 100)
+            self.assertTrue(set(active_symbols).issubset({symbol for symbol, _ in contracts}))
+            self.assertEqual(len([symbol for symbol, _ in contracts if symbol.startswith("T")]), 86)
+            self.assertEqual(runtime_state["top100_reload_diagnostics"]["skipped_due_to_subscription_cap"], 14)
+            self.assertEqual(runtime_state["top100_reload_diagnostics"]["skipped_symbols_due_to_cap"], top_symbols[86:])
+            self.assertEqual(len(ib.subscribed), 86)
+
+    def test_reload_counts_active_top100_overlap_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            latest = root / "daily_top100_latest.csv"
+            top_symbols = [f"T{i:03d}" for i in range(5)]
+            self.write_latest(latest, top_symbols)
+            recorder = LiveDataRecorder(root / "recorder", session_date="2026-05-22")
+            ib = FakeIB()
+            active_contracts = {"T000": FakeContract("T000"), "ACTIVE": FakeContract("ACTIVE")}
+            contracts = list(active_contracts.items())
+            contract_by_symbol = dict(contracts)
+            tickers = {symbol: SimpleNamespace(contract=contract) for symbol, contract in active_contracts.items()}
+            managed_positions = {
+                symbol: ManagedPosition(symbol, contract, 1, 10.0, "2026-05-22T12:00:00+00:00", 10.0)
+                for symbol, contract in active_contracts.items()
+            }
+            runtime_state = {"top100_reload_requested": True, "top100_reload_path": str(latest), "top100_reload_ranking_date": "2026-05-21"}
+
+            changed = reload_top100_universe_if_requested(
+                ib, recorder, {}, contracts, contract_by_symbol, tickers, {}, managed_positions, runtime_state, self.args_for(latest, top_n=5, cap=5)
+            )
+
+            self.assertTrue(changed)
+            self.assertEqual([symbol for symbol, _ in contracts], ["ACTIVE", "T000", "T001", "T002", "T003"])
+            self.assertEqual(runtime_state["top100_reload_diagnostics"]["subscribed_total"], 5)
+            self.assertEqual(runtime_state["top100_reload_diagnostics"]["subscribed_active"], 2)
+            self.assertEqual(runtime_state["top100_reload_diagnostics"]["subscribed_top100"], 4)
+            self.assertEqual(runtime_state["top100_reload_diagnostics"]["skipped_symbols_due_to_cap"], ["T004"])
+
+    def test_reload_records_error_101_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            latest = root / "daily_top100_latest.csv"
+            self.write_latest(latest, ["AAA", "ERR", "BBB"])
+            recorder = LiveDataRecorder(root / "recorder", session_date="2026-05-22")
+            ib = FakeIB(fail_symbols={"ERR"})
+            runtime_state = {"top100_reload_requested": True, "top100_reload_path": str(latest), "top100_reload_ranking_date": "2026-05-21"}
+            contracts: list[tuple[str, FakeContract]] = []
+            contract_by_symbol: dict[str, FakeContract] = {}
+            tickers = {}
+
+            changed = reload_top100_universe_if_requested(
+                ib, recorder, {}, contracts, contract_by_symbol, tickers, {}, {}, runtime_state, self.args_for(latest, top_n=3, cap=100)
+            )
+
+            self.assertTrue(changed)
+            self.assertEqual(runtime_state["top100_reload_diagnostics"]["ibkr_error_101_count"], 1)
+            self.assertNotIn("ERR", tickers)
+            self.assertEqual([symbol for symbol, _ in contracts], ["AAA", "BBB"])
 
 
 if __name__ == "__main__":
