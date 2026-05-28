@@ -271,13 +271,26 @@ def time_window_rows(rows: pd.DataFrame, start: Any, end: Any) -> pd.DataFrame:
     return rows[pd.Series(mask, index=rows.index)]
 
 
-def execution_matches_for_trade(row: dict[str, Any], executions: pd.DataFrame) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def execution_matches_for_trade(row: dict[str, Any], executions: pd.DataFrame) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
     if executions.empty:
-        return [], []
+        return [], [], "missing"
     trade_id = str(row.get("trade_id") or "")
     matched = pd.DataFrame()
+    matched_by = "missing"
     if trade_id and "trade_id" in executions.columns:
         matched = executions[executions["trade_id"].fillna("").astype(str) == trade_id]
+        if not matched.empty:
+            matched_by = "trade_id"
+    if matched.empty and "execution_id" in executions.columns:
+        raw = parse_raw_json(row.get("raw_json"))
+        execution_ids = {
+            str(raw.get("buy_execution_id") or ""),
+            str(raw.get("sell_execution_id") or ""),
+        } - {""}
+        if execution_ids:
+            matched = executions[executions["execution_id"].fillna("").astype(str).isin(execution_ids)]
+            if not matched.empty:
+                matched_by = "reconstructed_pair"
     if matched.empty:
         same = executions[
             (executions["session_date"].fillna("").astype(str) == str(row.get("session_date") or ""))
@@ -289,9 +302,11 @@ def execution_matches_for_trade(row: dict[str, Any], executions: pd.DataFrame) -
         sell_count = len(side_rows(same, action_values={"SLD", "SELL"}))
         if has_time_window and buy_count >= 1 and sell_count >= 1:
             matched = same
+            matched_by = "symbol_session"
         elif buy_count == 1 and sell_count == 1:
             matched = same
-    return side_rows(matched, action_values={"BOT", "BUY"}), side_rows(matched, action_values={"SLD", "SELL"})
+            matched_by = "symbol_session"
+    return side_rows(matched, action_values={"BOT", "BUY"}), side_rows(matched, action_values={"SLD", "SELL"}), matched_by
 
 
 def infer_entry_exit_times(row: dict[str, Any], buy_rows: list[dict[str, Any]], sell_rows: list[dict[str, Any]]) -> tuple[Any, Any, set[str]]:
@@ -704,7 +719,7 @@ def closed_from_trades(
     expected_commission_counts: list[int] = []
     commission_source_details: list[str] = []
     for row in out.to_dict("records"):
-        buy_rows, sell_rows = execution_matches_for_trade(row, executions)
+        buy_rows, sell_rows, matched_by = execution_matches_for_trade(row, executions)
         entry_time, exit_time, flags = infer_entry_exit_times(row, buy_rows, sell_rows)
         enriched_row = {**row, "entry_time": entry_time, "exit_time": exit_time}
         commission, commission_status = confirmed_commission_for_execution_rows(buy_rows, sell_rows)
@@ -728,7 +743,7 @@ def closed_from_trades(
         confirmed_commission_counts.append(confirmed_count)
         expected_count = len(buy_rows) + len(sell_rows)
         expected_commission_counts.append(expected_count)
-        commission_source_details.append(f"matched={len(buy_rows) + len(sell_rows)} ibkr={confirmed_count}")
+        commission_source_details.append(f"matched_by={matched_by} matched={len(buy_rows) + len(sell_rows)} ibkr={confirmed_count}")
     out["ibkr_commission"] = commissions
     out["commission_status"] = commission_statuses
     out["data_quality"] = data_quality

@@ -374,6 +374,61 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(closed["entry_execution_count"], 1)
             self.assertEqual(closed["exit_execution_count"], 1)
 
+    def test_reconstructed_trade_commission_matches_execution_ids_without_trade_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "reconstructed:2026-05-27:AKTX:B_AKTX:S_AKTX",
+                "session_date": "2026-05-27",
+                "strategy_name": "unknown",
+                "symbol": "AKTX",
+                "status": "CLOSED",
+                "entry_price": 17.01,
+                "exit_price": 17.26,
+                "quantity": 5,
+                "gross_pnl": 1.25,
+                "mfe_pct": 5.0,
+                "raw_json": {
+                    "reconstruction_source": "executions_pair",
+                    "buy_execution_id": "B_AKTX",
+                    "sell_execution_id": "S_AKTX",
+                },
+            })
+            store.upsert_execution({
+                "execution_id": "B_AKTX",
+                "session_date": "2026-05-27",
+                "strategy_name": "unknown",
+                "symbol": "AKTX",
+                "side": "BOT",
+                "quantity": 5,
+                "price": 17.01,
+                "commission": 0.865515,
+                "commission_source": "ibkr",
+                "recorded_at": "2026-05-27T13:37:14+00:00",
+            })
+            store.upsert_execution({
+                "execution_id": "S_AKTX",
+                "session_date": "2026-05-27",
+                "strategy_name": "unknown",
+                "symbol": "AKTX",
+                "side": "SLD",
+                "quantity": 5,
+                "price": 17.26,
+                "commission": 0.880768,
+                "commission_source": "ibkr",
+                "recorded_at": "2026-05-27T13:44:07+00:00",
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "All")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertAlmostEqual(closed["ibkr_commission"], 1.746283)
+            self.assertEqual(closed["commission_status"], "OK")
+            self.assertEqual(closed["confirmed_commission_execution_count"], 2)
+            self.assertIn("matched_by=reconstructed_pair", closed["commission_source_detail"])
+
     def test_closed_trade_times_fall_back_to_execution_recorded_at(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
