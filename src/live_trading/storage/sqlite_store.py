@@ -48,6 +48,26 @@ def safe_json(value: Any) -> str:
         return str(value)
 
 
+def parse_jsonish(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def raw_execution_time(value: Any) -> Any:
+    raw = parse_jsonish(value)
+    execution = raw.get("execution") if isinstance(raw.get("execution"), dict) else {}
+    if execution:
+        return execution.get("time") or execution.get("executionTime") or execution.get("executed_at")
+    return raw.get("executed_at") or raw.get("execution_time") or raw.get("time")
+
+
 def safe_float(value: Any) -> float | None:
     try:
         if value in (None, ""):
@@ -501,7 +521,7 @@ class SQLiteRuntimeStore:
             "price": safe_float(row.get("price") or row.get("fill_price")),
             "exchange": row.get("exchange"),
             "liquidity": row.get("liquidity"),
-            "executed_at": row.get("executed_at") or row.get("execution_time"),
+            "executed_at": row.get("executed_at") or row.get("execution_time") or raw_execution_time(row.get("raw_json")),
             "recorded_at": row.get("recorded_at") or utc_now_iso(),
             "commission": safe_float(row.get("commission")),
             "commission_currency": row.get("commission_currency"),

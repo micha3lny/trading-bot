@@ -65,6 +65,14 @@ def raw_json_peak_value(raw: dict[str, Any]) -> float | None:
     return None
 
 
+def raw_execution_time_value(raw_value: Any) -> Any:
+    raw = parse_raw_json(raw_value)
+    execution = raw.get("execution") if isinstance(raw.get("execution"), dict) else {}
+    if execution:
+        return execution.get("time") or execution.get("executionTime") or execution.get("executed_at")
+    return raw.get("executed_at") or raw.get("execution_time") or raw.get("time")
+
+
 def to_float(value: Any, default: float | None = 0.0) -> float | None:
     try:
         if value in (None, ""):
@@ -155,7 +163,10 @@ def strategy_clause(alias: str, strategy: str | None) -> tuple[str, list[Any]]:
 
 
 def load_executions(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> pd.DataFrame:
-    clause, params = strategy_clause("e", strategy)
+    if not strategy or strategy == "All":
+        clause, params = "", []
+    else:
+        clause, params = " AND (COALESCE(e.strategy_name, 'unknown') = ? OR COALESCE(e.strategy_name, 'unknown') = 'unknown')", [strategy]
     return read_sql(
         conn,
         f"""
@@ -212,11 +223,11 @@ def confirmed_commission_maps(executions: pd.DataFrame) -> tuple[dict[str, float
 
 
 def execution_time_value(row: dict[str, Any]) -> Any:
-    return row.get("executed_at") or row.get("recorded_at")
+    return row.get("executed_at") or raw_execution_time_value(row.get("raw_json"))
 
 
 def execution_time_sort_key(row: dict[str, Any]) -> datetime:
-    return parse_dt(execution_time_value(row)) or datetime.min.replace(tzinfo=timezone.utc)
+    return parse_dt(execution_time_value(row)) or parse_dt(row.get("recorded_at")) or datetime.min.replace(tzinfo=timezone.utc)
 
 
 def side_rows(executions: pd.DataFrame, *, action_values: set[str]) -> list[dict[str, Any]]:
@@ -256,7 +267,6 @@ def execution_matches_for_trade(row: dict[str, Any], executions: pd.DataFrame) -
     if matched.empty:
         same = executions[
             (executions["session_date"].fillna("").astype(str) == str(row.get("session_date") or ""))
-            & (executions["strategy"].fillna("unknown").astype(str) == str(row.get("strategy") or "unknown"))
             & (executions["symbol"].fillna("").astype(str).str.upper() == str(row.get("symbol") or "").upper())
         ]
         has_time_window = parse_dt(row.get("entry_time")) is not None or parse_dt(row.get("exit_time") or row.get("closed_at")) is not None
@@ -343,6 +353,10 @@ def quality_label(flags: set[str], commission_status: str) -> str:
     elif commission_status == "MISSING":
         out.add("COMMISSION_MISSING")
     return "; ".join(sorted(out)) if out else "OK"
+
+
+def quality_label_from_flags(flags: set[str]) -> str:
+    return "; ".join(sorted(flags)) if flags else "OK"
 
 
 def load_runtime_peak_map(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> dict[tuple[str, str, str, str], tuple[float, str]]:
@@ -614,6 +628,10 @@ def closed_from_executions(executions: pd.DataFrame) -> pd.DataFrame:
     for (session_date, strategy), group in executions.groupby(["session_date", "strategy"], dropna=False):
         fill_rows = group.to_dict("records")
         for row in reconstruct_closed_trades_from_fills(fill_rows):
+            buy_execution = next((x for x in fill_rows if str(x.get("execution_id") or "") == str(row.get("buy_execution_id") or "")), {})
+            sell_execution = next((x for x in fill_rows if str(x.get("execution_id") or "") == str(row.get("sell_execution_id") or "")), {})
+            buy_time = execution_time_value(buy_execution) if buy_execution else None
+            sell_time = execution_time_value(sell_execution) if sell_execution else None
             buy = to_float(row.get("buy"), 0.0) or 0.0
             sell = to_float(row.get("sell"), 0.0) or 0.0
             pnl_pct = ((sell / buy - 1.0) * 100.0) if buy and sell else 0.0
@@ -625,26 +643,34 @@ def closed_from_executions(executions: pd.DataFrame) -> pd.DataFrame:
             net = gross - commission
             denominator = abs(buy * qty)
             net_pct = (net / denominator * 100.0) if denominator else 0.0
+            flags = {"RECONSTRUCTED_FROM_EXECUTIONS"}
+            if not buy_time or not sell_time:
+                flags.add("MISSING_EXECUTION_TIME")
+            commission_status = "OK" if str(row.get("commission_source") or "").lower() == "ibkr" else ("PARTIAL" if commission else "MISSING")
+            if commission_status == "PARTIAL":
+                flags.add("COMMISSION_PARTIAL")
+            elif commission_status == "MISSING":
+                flags.add("COMMISSION_MISSING")
             rows.append({
                 "symbol": row.get("symbol"),
                 "trade_id": row.get("trade_id") or "",
                 "gross": gross,
                 "ibkr_commission": commission,
-                "commission_status": "OK" if commission else "MISSING",
+                "commission_status": commission_status,
                 "net_actual": net,
                 "net_pct": net_pct,
                 "pnl_pct": net_pct,
                 "peak_pct": peak_pct,
                 "drop_from_peak_pct": to_float(row.get("drop_from_peak_pct"), net_pct - peak_pct if peak_pct is not None else None),
-                "hold_minutes": hold_minutes(row.get("buy_time"), row.get("sell_time")),
+                "hold_minutes": hold_minutes(buy_time, sell_time) if buy_time and sell_time else None,
                 "exit_reason": row.get("reason") or "",
                 "strategy": strategy or "unknown",
-                "entry_time": row.get("buy_time"),
-                "exit_time": row.get("sell_time"),
-                "data_quality": quality_label(set(), "OK" if commission else "MISSING"),
+                "entry_time": buy_time,
+                "exit_time": sell_time,
+                "data_quality": quality_label_from_flags(flags),
                 "entry_execution_count": 1,
                 "exit_execution_count": 1,
-                "confirmed_commission_execution_count": 2 if commission else 0,
+                "confirmed_commission_execution_count": 2 if commission_status == "OK" else (1 if commission_status == "PARTIAL" else 0),
                 "expected_commission_execution_count": 2,
                 "peak_source": "fills_reconstruction" if raw_peak is not None else "missing",
                 "commission_source_detail": "reconstructed",
@@ -661,11 +687,22 @@ def load_closed_positions(conn: sqlite3.Connection, window: DateWindow, strategy
     lifecycle_peak_map = load_lifecycle_peak_map(window)
     candle_rows = load_candle_rows(window)
     trades = closed_from_trades(conn, window, strategy, executions, runtime_peak_map, lifecycle_peak_map, candle_rows)
-    if not trades.empty:
-        return trades.sort_values(["net_actual", "symbol"], na_position="last").reset_index(drop=True)
-    closed = closed_from_executions(executions)
-    if closed.empty:
-        return closed
+    reconstructed = closed_from_executions(executions)
+    if not trades.empty and not reconstructed.empty:
+        trade_keys = {
+            (str(row.get("session_date") or ""), str(row.get("symbol") or "").upper())
+            for row in trades.to_dict("records")
+        }
+        reconstructed = reconstructed[
+            ~reconstructed.apply(
+                lambda row: (str(row.get("session_date") or ""), str(row.get("symbol") or "").upper()) in trade_keys,
+                axis=1,
+            )
+        ]
+    frames = [df for df in (trades, reconstructed) if not df.empty]
+    if not frames:
+        return pd.DataFrame()
+    closed = pd.concat(frames, ignore_index=True, sort=False)
     return closed.sort_values(["net_actual", "symbol"], na_position="last").reset_index(drop=True)
 
 

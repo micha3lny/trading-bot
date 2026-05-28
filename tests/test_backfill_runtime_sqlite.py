@@ -84,6 +84,53 @@ class BackfillRuntimeSQLiteTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_backfill_reconstructs_closed_trade_from_execution_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "recorder"
+            session_dir = root / "2026-05-27"
+            session_dir.mkdir(parents=True)
+            write_csv(
+                session_dir / "fills.csv",
+                [
+                    {
+                        "execution_id": "B1",
+                        "symbol": "MRAM",
+                        "action": "BOT",
+                        "quantity": "2",
+                        "fill_price": "10",
+                        "commission": "",
+                        "commission_source": "missing",
+                        "raw_json": json.dumps({"execution": {"time": "2026-05-27T13:31:00+00:00"}}),
+                    },
+                    {
+                        "execution_id": "S1",
+                        "symbol": "MRAM",
+                        "action": "SLD",
+                        "quantity": "2",
+                        "fill_price": "11",
+                        "commission": "",
+                        "commission_source": "missing",
+                        "raw_json": json.dumps({"execution": {"time": "2026-05-27T13:41:00+00:00"}}),
+                    },
+                ],
+            )
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                import_session(store, session_dir)
+                trades = store.query("SELECT * FROM trades WHERE symbol = 'MRAM'")
+                executions = store.query("SELECT execution_id, executed_at FROM executions ORDER BY execution_id")
+
+                self.assertEqual(len(trades), 1)
+                self.assertEqual(trades[0]["status"], "CLOSED")
+                self.assertEqual(trades[0]["entry_fill_time"], "2026-05-27T13:31:00+00:00")
+                self.assertEqual(trades[0]["exit_fill_time"], "2026-05-27T13:41:00+00:00")
+                self.assertAlmostEqual(trades[0]["gross_pnl"], 2.0)
+                self.assertIn("executions_pair", trades[0]["raw_json"])
+                self.assertEqual(executions[0]["executed_at"], "2026-05-27T13:31:00+00:00")
+                self.assertEqual(executions[1]["executed_at"], "2026-05-27T13:41:00+00:00")
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

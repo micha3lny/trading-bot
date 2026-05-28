@@ -219,6 +219,7 @@ def render_closed_positions(df: pd.DataFrame) -> None:
     out["exit_time"] = out["exit_time"].map(display_time)
     out["peak_pct"] = out["peak_pct"].where(out["peak_pct"].notna(), "MISSING")
     out["drop_from_peak_pct"] = out["drop_from_peak_pct"].where(out["drop_from_peak_pct"].notna(), "MISSING")
+    out["hold_minutes"] = out["hold_minutes"].where(out["hold_minutes"].notna(), "MISSING")
     out = out.rename(
         columns={
             "symbol": "Symbol",

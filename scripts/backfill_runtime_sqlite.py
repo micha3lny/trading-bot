@@ -181,6 +181,106 @@ def row_event_time(row: dict[str, Any], session_date: str) -> str:
     )
 
 
+def normalized_side(value: Any) -> str:
+    text = str(value or "").upper()
+    if text in {"BOT", "BUY"}:
+        return "BUY"
+    if text in {"SLD", "SELL"}:
+        return "SELL"
+    return text
+
+
+def as_float(value: Any) -> float:
+    try:
+        if value in (None, ""):
+            return 0.0
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def reconstruct_trades_from_execution_pairs(store: SQLiteRuntimeStore, session_date: str) -> int:
+    executions = store.query(
+        """
+        SELECT execution_id, trade_id, COALESCE(strategy_name, 'unknown') AS strategy_name,
+               session_date, symbol, side, quantity, price, executed_at, recorded_at,
+               commission, commission_source, raw_json
+        FROM executions
+        WHERE session_date = ?
+        ORDER BY COALESCE(executed_at, recorded_at), execution_id
+        """,
+        [session_date],
+    )
+    existing = store.query(
+        "SELECT symbol, trade_id FROM trades WHERE session_date = ?",
+        [session_date],
+    )
+    existing_symbols = {str(row.get("symbol") or "").upper() for row in existing}
+    open_lots: dict[str, list[dict[str, Any]]] = {}
+    created = 0
+    for row in executions:
+        symbol = str(row.get("symbol") or "").upper()
+        if not symbol or symbol in existing_symbols:
+            continue
+        side = normalized_side(row.get("side"))
+        qty = as_float(row.get("quantity"))
+        price = as_float(row.get("price"))
+        if qty <= 0 or price <= 0:
+            continue
+        if side == "BUY":
+            lot = dict(row)
+            lot["remaining_qty"] = qty
+            lot["original_qty"] = qty
+            open_lots.setdefault(symbol, []).append(lot)
+            continue
+        if side != "SELL":
+            continue
+        remaining = qty
+        while remaining > 1e-9 and open_lots.get(symbol):
+            lot = open_lots[symbol][0]
+            matched_qty = min(remaining, as_float(lot.get("remaining_qty")))
+            buy_price = as_float(lot.get("price"))
+            sell_price = price
+            gross = (sell_price - buy_price) * matched_qty
+            buy_exec = str(lot.get("execution_id") or "")
+            sell_exec = str(row.get("execution_id") or "")
+            trade_id = f"reconstructed:{session_date}:{symbol}:{buy_exec}:{sell_exec}"
+            store.upsert_trade({
+                "trade_id": trade_id,
+                "strategy_name": row.get("strategy_name") or lot.get("strategy_name") or "unknown",
+                "session_date": session_date,
+                "symbol": symbol,
+                "status": "CLOSED",
+                "entry_fill_time": lot.get("executed_at"),
+                "exit_fill_time": row.get("executed_at"),
+                "closed_at": row.get("executed_at"),
+                "entry_price": buy_price,
+                "exit_price": sell_price,
+                "quantity": matched_qty,
+                "gross_pnl": gross,
+                "commission": as_float(lot.get("commission")) + as_float(row.get("commission")),
+                "net_pnl": gross - as_float(lot.get("commission")) - as_float(row.get("commission")),
+                "ibkr_entry_confirmed": True,
+                "ibkr_exit_confirmed": True,
+                "ibkr_position_flat_confirmed": True,
+                "raw_json": {
+                    "reconstruction_source": "executions_pair",
+                    "buy_execution_id": buy_exec,
+                    "sell_execution_id": sell_exec,
+                    "entry_executed_at": lot.get("executed_at"),
+                    "exit_executed_at": row.get("executed_at"),
+                },
+            })
+            created += 1
+            lot["remaining_qty"] = as_float(lot.get("remaining_qty")) - matched_qty
+            remaining -= matched_qty
+            if as_float(lot.get("remaining_qty")) <= 1e-9:
+                open_lots[symbol].pop(0)
+    if created:
+        store.conn.commit()
+    return created
+
+
 def import_session(store: SQLiteRuntimeStore, session: Path, *, progress_interval: int = 500) -> dict[str, int]:
     session_date = session.name
     counts = {"executions": 0, "events": 0, "positions": 0, "reconciliation": 0}
@@ -194,6 +294,9 @@ def import_session(store: SQLiteRuntimeStore, session: Path, *, progress_interva
         if progress_interval > 0 and counts["executions"] % progress_interval == 0:
             print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=fills executions={counts['executions']}", flush=True)
     print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=fills executions={counts['executions']}", flush=True)
+    reconstructed_trades = reconstruct_trades_from_execution_pairs(store, session_date)
+    if reconstructed_trades:
+        print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=reconstructed_trades trades={reconstructed_trades}", flush=True)
 
     trade_lifecycle_rows = 0
     for row in iter_csv_rows(session / "trade_lifecycle.csv"):

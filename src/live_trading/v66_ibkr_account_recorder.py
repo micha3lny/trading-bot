@@ -204,6 +204,7 @@ def fill_row_from_ibkr_fill(fill: Any) -> dict[str, Any]:
         "client_order_id": "",
         "slippage_bps": "",
         "raw_json": json.dumps(raw, default=str, ensure_ascii=False),
+        "executed_at": str(getattr(execution, "time", "") or ""),
         "recorded_at": now_utc(),
     }
 

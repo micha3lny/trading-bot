@@ -74,9 +74,116 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertAlmostEqual(snapshot["summary"]["gross_pnl"], 5.0)
             self.assertAlmostEqual(snapshot["summary"]["net_actual_pnl"], 4.5)
             self.assertEqual(snapshot["closed_positions"].iloc[0]["symbol"], "AAA")
+            self.assertIn("RECONSTRUCTED_FROM_EXECUTIONS", snapshot["closed_positions"].iloc[0]["data_quality"])
             self.assertEqual(snapshot["open_positions"].iloc[0]["symbol"], "BBB")
             self.assertEqual(snapshot["diagnostics"]["delayed_fills"], 1)
             self.assertEqual(snapshot["diagnostics"]["risk_guard_blocks"], 1)
+
+    def test_execution_pair_without_trade_row_reconstructs_closed_trade_with_times(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_execution({
+                "execution_id": "B_RECON",
+                "session_date": "2026-05-27",
+                "strategy_name": "unknown",
+                "symbol": "MRAM",
+                "side": "BOT",
+                "quantity": 2,
+                "price": 10,
+                "commission": 0.2,
+                "commission_source": "ibkr",
+                "executed_at": "2026-05-27T13:31:00+00:00",
+                "recorded_at": "2026-05-27T13:32:00+00:00",
+            })
+            store.upsert_execution({
+                "execution_id": "S_RECON",
+                "session_date": "2026-05-27",
+                "strategy_name": "unknown",
+                "symbol": "MRAM",
+                "side": "SLD",
+                "quantity": 2,
+                "price": 11,
+                "commission": 0.2,
+                "commission_source": "ibkr",
+                "executed_at": "2026-05-27T13:41:00+00:00",
+                "recorded_at": "2026-05-27T13:42:00+00:00",
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "All")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertEqual(closed["symbol"], "MRAM")
+            self.assertAlmostEqual(closed["gross"], 2.0)
+            self.assertEqual(closed["entry_time"], "2026-05-27T13:31:00+00:00")
+            self.assertEqual(closed["exit_time"], "2026-05-27T13:41:00+00:00")
+            self.assertEqual(closed["commission_status"], "OK")
+            self.assertIn("RECONSTRUCTED_FROM_EXECUTIONS", closed["data_quality"])
+
+    def test_execution_pair_without_executed_at_keeps_missing_times(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_execution({
+                "execution_id": "B_MISSING_TIME",
+                "session_date": "2026-05-27",
+                "symbol": "GRRR",
+                "side": "BOT",
+                "quantity": 1,
+                "price": 10,
+                "recorded_at": "2026-05-27T13:32:00+00:00",
+            })
+            store.upsert_execution({
+                "execution_id": "S_MISSING_TIME",
+                "session_date": "2026-05-27",
+                "symbol": "GRRR",
+                "side": "SLD",
+                "quantity": 1,
+                "price": 11,
+                "recorded_at": "2026-05-27T13:42:00+00:00",
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "All")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertEqual(closed["symbol"], "GRRR")
+            self.assertIsNone(closed["entry_time"])
+            self.assertIsNone(closed["exit_time"])
+            self.assertTrue(closed["hold_minutes"] is None)
+            self.assertEqual(closed["commission_status"], "MISSING")
+            self.assertIn("MISSING_EXECUTION_TIME", closed["data_quality"])
+            self.assertIn("RECONSTRUCTED_FROM_EXECUTIONS", closed["data_quality"])
+            self.assertIn("COMMISSION_MISSING", closed["data_quality"])
+
+    def test_execution_pair_raw_json_execution_time_is_used(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_execution({
+                "execution_id": "B_RAW_TIME",
+                "session_date": "2026-05-27",
+                "symbol": "RAWTS",
+                "side": "BOT",
+                "quantity": 1,
+                "price": 10,
+                "raw_json": {"execution": {"time": "2026-05-27T13:31:00+00:00"}},
+            })
+            store.upsert_execution({
+                "execution_id": "S_RAW_TIME",
+                "session_date": "2026-05-27",
+                "symbol": "RAWTS",
+                "side": "SLD",
+                "quantity": 1,
+                "price": 11,
+                "raw_json": {"execution": {"time": "2026-05-27T13:41:00+00:00"}},
+            })
+            rows = store.query("SELECT execution_id, executed_at FROM executions ORDER BY execution_id")
+            store.close()
+
+            self.assertEqual(rows[0]["executed_at"], "2026-05-27T13:31:00+00:00")
+            self.assertEqual(rows[1]["executed_at"], "2026-05-27T13:41:00+00:00")
 
     def test_closed_trade_commission_uses_confirmed_executions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -163,7 +270,6 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             store.upsert_execution({
                 "execution_id": "B_SYMBOL_TIME",
                 "session_date": "2026-05-27",
-                "strategy_name": "v67",
                 "symbol": "MATCH",
                 "side": "BOT",
                 "quantity": 1,
@@ -175,7 +281,6 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             store.upsert_execution({
                 "execution_id": "S_SYMBOL_TIME",
                 "session_date": "2026-05-27",
-                "strategy_name": "v67",
                 "symbol": "MATCH",
                 "side": "SLD",
                 "quantity": 1,
@@ -603,6 +708,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                     "price": price,
                     "commission": 0.1,
                     "commission_source": "ibkr",
+                    "executed_at": same_second,
                     "recorded_at": same_second,
                 })
             store.close()
