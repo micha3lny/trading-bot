@@ -119,6 +119,21 @@ def append_unified_log(line: str, *, log_dir: str | Path | None = None, stream_l
         return
 
 
+def emit_unified_log_line(line: str, *, log_dir: str | Path | None = None, stream_level: str = "INFO") -> None:
+    """Emit one runtime line to stdout/stderr and the unified log without tee duplication."""
+    stream = sys.stderr if stream_level == "ERROR" else sys.stdout
+    if isinstance(stream, _UnifiedLogTee):
+        try:
+            stream.wrapped.write(line + "\n")
+            stream.wrapped.flush()
+        except Exception:
+            pass
+        append_unified_log(line, log_dir=log_dir or stream.log_dir, stream_level=stream_level)
+        return
+    print(line, file=stream, flush=True)
+    append_unified_log(line, log_dir=log_dir, stream_level=stream_level)
+
+
 def _format_value(value: Any) -> str:
     if value is None:
         return ""
@@ -213,6 +228,7 @@ def install_unified_logger(log_dir: str | Path | None = None) -> Path:
         sys.stderr = _UnifiedLogTee(sys.stderr, log_dir=resolved, stream_level="ERROR")  # type: ignore[assignment]
         _INSTALLED = True
     _LOG_DIR = resolved
+    log_event("LOG", "UNIFIED_LOGGER_ACTIVE", log_dir=resolved, path=daily_log_path(resolved))
     return resolved
 
 

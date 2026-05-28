@@ -40,6 +40,7 @@ from src.live_trading.order_lifecycle.reconciliation import build_reconciliation
 from src.live_trading.storage.sqlite_store import open_sqlite_store, safe_sqlite_call
 from src.live_trading.unified_logger import (
     current_git_commit,
+    emit_unified_log_line,
     format_traceback,
     install_unified_logger,
     log_event,
@@ -95,6 +96,20 @@ class ManagedPosition:
 
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def emit_heartbeat(line: str, runtime_state: dict[str, Any], log_dir: str | Path | None = None) -> None:
+    now_ts = time.monotonic()
+    previous_ts = runtime_state.get("unified_log_last_heartbeat_monotonic")
+    if previous_ts is not None:
+        try:
+            gap = now_ts - float(previous_ts)
+        except Exception:
+            gap = 0.0
+        if gap > 30.0:
+            log_event("LOG", "LOG_GAP_WARNING", "WARN", log_dir=log_dir, event="heartbeat", gap_seconds=round(gap, 3))
+    runtime_state["unified_log_last_heartbeat_monotonic"] = now_ts
+    emit_unified_log_line(line, log_dir=log_dir)
 
 
 def safe_float(value: Any) -> float | None:
@@ -4613,7 +4628,7 @@ def main() -> int:
             subscription_cap_block = bool(subscription_diag.get("skipped_due_to_subscription_cap")) or (subscriptions_cap > 0 and len(tickers) >= subscriptions_cap)
             last_eod_retry_age = pending_eod_retry_age_seconds(runtime_state, loop_now)
             last_eod_retry_age_text = "" if last_eod_retry_age is None else f"{last_eod_retry_age:.1f}"
-            print(
+            heartbeat_line = (
                 f"{now_utc()} heartbeat scanned={len(contracts)} with_data={data_count} ready_new={ready_count} "
                 f"adopted={adopted_count} exits_sent={exit_count} managed_open={active_managed} entries_blocked={int(entries_blocked)} "
                 f"entries_blocked_reason={runtime_state.get('entries_blocked_reason') or ''} "
@@ -4624,9 +4639,9 @@ def main() -> int:
                 f"open_price_ok={open_price_ok} open_price_missing={open_price_missing} "
                 f"subscriptions_active={len(tickers)} subscriptions_cap={subscriptions_cap} subscription_cap_block={int(subscription_cap_block)} "
                 f"best={best_symbol}:{best_score:.2f} top5=[{top5_str}] rejects=[{rejection_summary}]"
-                f"{portfolio_part}",
-                flush=True,
+                f"{portfolio_part}"
             )
+            emit_heartbeat(heartbeat_line, runtime_state, log_dir)
         normal_exit = True
 
     finally:

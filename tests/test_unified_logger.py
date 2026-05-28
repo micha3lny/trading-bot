@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import io
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -10,8 +11,10 @@ from unittest.mock import patch
 from src.live_trading.unified_logger import (
     append_unified_log,
     daily_log_path,
+    emit_unified_log_line,
     log_event,
     monitor_disk_usage,
+    normalize_log_line,
     run_log_retention,
 )
 
@@ -21,10 +24,27 @@ class UnifiedLoggerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             append_unified_log("2026-05-27T19:45:01+00:00 EOD_FLATTEN_START positions=12", log_dir=tmp)
             log_event("ORDER", "EOD_FLATTEN_SENT", log_dir=tmp, symbol="AKAN", qty=4)
+            log_event("LOG", "UNIFIED_LOGGER_ACTIVE", log_dir=tmp, path=daily_log_path(tmp))
 
             content = daily_log_path(tmp).read_text(encoding="utf-8")
             self.assertIn("INFO EOD EOD_FLATTEN_START positions=12", content)
             self.assertIn("INFO ORDER EOD_FLATTEN_SENT symbol=AKAN qty=4", content)
+            self.assertIn("INFO LOG UNIFIED_LOGGER_ACTIVE path=", content)
+
+    def test_heartbeat_line_normalizes_for_unified_log(self) -> None:
+        normalized = normalize_log_line("2026-05-28T12:00:00+00:00 heartbeat scanned=100")
+
+        self.assertIn("INFO RUNTIME heartbeat scanned=100", normalized)
+
+    def test_emit_unified_log_line_writes_stdout_and_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = io.StringIO()
+            with patch("sys.stdout", out):
+                emit_unified_log_line("2026-05-28T12:00:00+00:00 heartbeat scanned=100", log_dir=tmp)
+
+            self.assertIn("heartbeat scanned=100", out.getvalue())
+            content = daily_log_path(tmp).read_text(encoding="utf-8")
+            self.assertIn("INFO RUNTIME heartbeat scanned=100", content)
 
     def test_retention_compresses_old_logs_and_deletes_old_gz(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
