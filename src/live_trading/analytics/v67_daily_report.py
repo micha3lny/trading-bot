@@ -705,6 +705,131 @@ def build_position_diagnostics(latest_portfolio: dict, managed_summary: dict, op
     }
 
 
+def _df_records(df) -> list[dict]:
+    if df is None or getattr(df, "empty", True):
+        return []
+    return df.to_dict("records")
+
+
+def render_sqlite_watch(args: argparse.Namespace, session: Path, sqlite_path: str) -> None:
+    from src.dashboard.runtime_queries import DateWindow, load_dashboard_snapshot
+
+    snapshot = load_dashboard_snapshot(sqlite_path, DateWindow(args.date, args.date), "All", include_reconstructed=False)
+    summary = snapshot.get("summary", {})
+    diagnostics = snapshot.get("diagnostics", {})
+    open_positions = _df_records(snapshot.get("open_positions"))
+    closed_positions = _df_records(snapshot.get("closed_positions"))
+    rejected_entries = _df_records(snapshot.get("rejected_entries"))
+    exit_sim = _df_records(snapshot.get("exit_simulation"))
+    managed_summary = load_managed_positions_summary(session)
+    managed_symbols = set(managed_summary.get("active_symbols", []))
+    sqlite_open_symbols = {str(row.get("symbol") or "").upper() for row in open_positions}
+    stale_managed_ignored = sorted(managed_symbols - sqlite_open_symbols)
+
+    print(f"SESSION SUMMARY {args.date}")
+    print(f"closed trades:        {int(summary.get('closed_trades') or 0)}")
+    print(f"open trades:          {int(summary.get('open_trades') or 0)}")
+    print(f"win rate:             {f(summary.get('win_rate'), 0.0):.1f}%")
+    print(f"gross closed pnl:     ${f(summary.get('gross_pnl'), 0.0):.2f}")
+    print(f"ibkr commissions:     ${f(summary.get('commissions'), 0.0):.2f}")
+    print(f"net actual pnl:       ${f(summary.get('net_actual_pnl'), 0.0):.2f}")
+    print(f"open unrealized pnl:  ${f(summary.get('open_upnl'), 0.0):.2f}")
+    print(f"total actual pnl:     ${f(summary.get('total_pnl'), 0.0):.2f}")
+    print(f"expectancy:           ${f(summary.get('expectancy'), 0.0):.2f}/trade")
+    print(f"average peak:         {f(summary.get('avg_peak'), 0.0):.1f}%")
+    print(f"average giveback:     {f(summary.get('avg_giveback'), 0.0):.1f}%")
+    print("watch_source:         sqlite")
+    print(f"snapshot_loaded_at:   {snapshot.get('loaded_at') or ''}")
+    print()
+
+    if open_positions:
+        print("OPEN POSITIONS")
+        print(f"{'SYM':<6} {'QTY':>5} {'BUY':>8} {'NOW':>8} {'UPNL':>8} {'NOW%':>7} {'PEAK%':>7} {'FROM_PEAK':>10} {'IBKR_COMM':>9} {'BUY_TIME':>8} STATUS")
+        open_limit = max(0, args.watch_open_limit)
+        open_rows = sorted(open_positions, key=lambda x: open_sort_key({"symbol": x.get("symbol"), "unrealized": x.get("upnl"), "peak_gain_pct": x.get("peak_pct")}, args.sort_open))
+        open_rows = open_rows if open_limit == 0 else open_rows[:open_limit]
+        for row in open_rows:
+            print(
+                f"{str(row.get('symbol') or ''):<6} {f(row.get('qty'), 0.0):>5.0f} "
+                f"{fmt(row.get('buy'), 8, 3)} {fmt(row.get('now'), 8, 3)} {fmt(row.get('upnl'), 8, 2)} "
+                f"{fmt_pct(row.get('now_pct'), 6, 1)} {fmt_pct(row.get('peak_pct'), 6, 1)} "
+                f"{fmt_pct(row.get('giveback_pct'), 9, 1)} {fmt(row.get('ibkr_commission'), 9, 2)} "
+                f"{utc_hhmm(row.get('entry_time')):>8} {row.get('status') or 'OPEN'}"
+            )
+        print()
+
+    if rejected_entries:
+        print("REJECTED ENTRIES")
+        print(f"{'SYM':<6} {'QTY':>5} {'PRICE':>8} {'ORDER':>8} {'ERR':>5} {'TIME':>8} REASON")
+        for row in rejected_entries[:20]:
+            print(
+                f"{str(row.get('symbol') or ''):<6} {f(row.get('qty'), 0.0):>5.0f} "
+                f"{fmt(row.get('price'), 8, 2)} {str(row.get('order_id') or ''):>8} "
+                f"{str(row.get('ibkr_error_code') or ''):>5} {utc_hhmm(row.get('rejected_at')):>8} "
+                f"{row.get('reason') or ''}"
+            )
+        print()
+
+    closed_limit = max(0, args.watch_closed_limit)
+    closed_rows = sorted(
+        closed_positions,
+        key=lambda row: closed_report_sort_key(
+            {
+                "symbol": row.get("symbol"),
+                "net_actual": row.get("net_actual"),
+                "net": row.get("net_actual"),
+                "sell_time": row.get("exit_time"),
+                "peak_gain_pct": row.get("peak_pct"),
+            },
+            args.sort_closed,
+        ),
+    )
+    closed_rows = closed_rows if closed_limit == 0 else closed_rows[:closed_limit]
+    if closed_rows:
+        print("CLOSED POSITIONS")
+        print(f"{'SYM':<6} {'QTY':>5} {'BUY':>8} {'SELL':>8} {'GROSS':>8} {'IBKR_COMM':>9} {'NET_ACTUAL':>11} {'PNL%':>7} {'PEAK%':>7} {'DROP_FROM_PEAK':>14} {'HOLD_MIN':>8} EXIT_REASON")
+        for row in closed_rows:
+            print(
+                f"{str(row.get('symbol') or ''):<6} {f(row.get('qty'), 0.0):>5.0f} "
+                f"{f(row.get('buy'), 0.0):>8.3f} {f(row.get('sell'), 0.0):>8.3f} "
+                f"{f(row.get('gross'), 0.0):>8.2f} {f(row.get('ibkr_commission'), 0.0):>9.2f} "
+                f"{f(row.get('net_actual'), 0.0):>11.2f} {f(row.get('net_pct'), 0.0):>6.1f}% "
+                f"{f(row.get('peak_pct'), 0.0):>6.1f}% {f(row.get('drop_from_peak_pct'), 0.0):>13.1f}% "
+                f"{f(row.get('hold_minutes'), 0.0):>7.0f}m {str(row.get('exit_reason') or '')[:18]}"
+            )
+        print()
+
+    print("EXIT SIMULATION")
+    for name in ["actual trailing", "fixed TP +2.5%", "fixed TP +3%", "partial 50%@+3%"]:
+        row = next((x for x in exit_sim if x.get("scenario") == name), None)
+        if row:
+            print(
+                f"{row.get('scenario'):<17} gross={f(row.get('gross'), 0.0):.2f} "
+                f"net_est={f(row.get('net'), 0.0):.2f} captured={int(row.get('captured') or 0)}/{int(row.get('trades') or 0)}"
+            )
+    print()
+
+    print("CURRENT POSITION DIAGNOSTICS")
+    print(
+        f"watch_source=sqlite sqlite_open_count={len(open_positions)} "
+        f"managed_json_open_count={managed_summary.get('active_count', 0)} "
+        f"stale_managed_ignored_count={len(stale_managed_ignored)} "
+        f"entry_rejected_count={len(rejected_entries)} "
+        f"exit_order_stale_count={int(diagnostics.get('exit_order_stale_count') or 0)} "
+        f"reconstructed_closed_count_debug_only={int(diagnostics.get('reconstructed_execution_pairs_count') or 0)}"
+    )
+    print(
+        f"sqlite_active_positions_count={int(diagnostics.get('sqlite_active_positions_count') or 0)} "
+        f"latest_active_positions_count={int(diagnostics.get('latest_active_positions_count') or 0)} "
+        f"ibkr_positions_count={int(diagnostics.get('ibkr_positions_count') or 0)} "
+        f"stale_active_positions_count={int(diagnostics.get('stale_active_positions_count') or 0)} "
+        f"persisted_closed_trades_count={int(diagnostics.get('persisted_closed_trades_count') or 0)} "
+        f"displayed_closed_trades_count={int(diagnostics.get('displayed_closed_trades_count') or len(closed_positions))}"
+    )
+    if stale_managed_ignored:
+        print(f"stale_managed_ignored={','.join(stale_managed_ignored[:20])}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=datetime.now(timezone.utc).strftime("%F"))
@@ -724,6 +849,10 @@ def main():
     session = Path(args.recorder_dir) / args.date
     lifecycle = session / "trade_lifecycle.csv"
     sqlite_path = None if args.disable_sqlite else args.sqlite_path
+    if (args.watch_summary or args.watch_full) and sqlite_path and Path(sqlite_path).exists():
+        session = Path(args.recorder_dir) / args.date
+        render_sqlite_watch(args, session, sqlite_path)
+        return
     sqlite_fills = load_sqlite_executions(sqlite_path, args.date)
     if not lifecycle.exists() and not sqlite_fills:
         raise SystemExit(f"Missing {lifecycle}")

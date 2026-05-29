@@ -336,6 +336,23 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
             store = SQLiteRuntimeStore(sqlite_path)
             store.upsert_execution({"execution_id": "B1", "session_date": "2026-05-22", "symbol": "RKLB", "side": "BOT", "quantity": 10, "price": 10, "commission": 0.35, "commission_source": "ibkr", "recorded_at": "2026-05-22T13:30:00+00:00"})
             store.upsert_execution({"execution_id": "S1", "session_date": "2026-05-22", "symbol": "RKLB", "side": "SLD", "quantity": 10, "price": 10.5, "commission": 0.35, "commission_source": "ibkr", "recorded_at": "2026-05-22T13:40:00+00:00"})
+            store.upsert_trade({
+                "trade_id": "RKLB-1",
+                "session_date": "2026-05-22",
+                "strategy_name": "v67",
+                "symbol": "RKLB",
+                "status": "CLOSED",
+                "entry_fill_time": "2026-05-22T13:30:00+00:00",
+                "exit_fill_time": "2026-05-22T13:40:00+00:00",
+                "entry_price": 10,
+                "exit_price": 10.5,
+                "quantity": 10,
+                "gross_pnl": 5.0,
+                "commission": 0.70,
+                "net_pnl": 4.30,
+                "mfe_pct": 4.0,
+                "exit_reason": "trail",
+            })
             store.close()
 
             out = io.StringIO()
@@ -539,6 +556,119 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
             closed_rows = [line for line in lines if line.startswith(("CLSL", "CLSW"))]
             self.assertEqual([row[:4].strip() for row in open_rows], ["OPNA", "OPNB"])
             self.assertEqual([row[:4].strip() for row in closed_rows], ["CLSL", "CLSW"])
+
+    def test_watch_sqlite_ignores_managed_json_when_latest_position_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "2026-05-28"
+            session.mkdir(parents=True)
+            (session / "managed_positions.json").write_text(
+                json.dumps({"positions": {"CONL": {"symbol": "CONL", "active": True, "quantity": 2, "entry_price": 50}}}),
+                encoding="utf-8",
+            )
+            sqlite_path = root / "runtime.sqlite"
+            store = SQLiteRuntimeStore(sqlite_path)
+            store.upsert_position({
+                "position_key": "v67:2026-05-28:CONL",
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "CONL",
+                "quantity": 2,
+                "avg_price": 50,
+                "active": 0,
+                "status": "ENTRY_REJECTED",
+                "updated_at": "2026-05-28T14:00:00+00:00",
+                "raw_json": {"active": False, "reject_reason": "no_trading_permission_kid", "ibkr_error_code": 201},
+            })
+            store.record_runtime_event(
+                event_time="2026-05-28T14:00:00+00:00",
+                event_type="ENTRY_ORDER_REJECTED",
+                severity="WARN",
+                strategy_name="v67",
+                session_date="2026-05-28",
+                symbol="CONL",
+                order_id="123",
+                reason="no_trading_permission_kid",
+                raw_json={"quantity": 2, "price": 50, "ibkr_error_code": 201},
+            )
+            store.close()
+
+            out = io.StringIO()
+            with patch("sys.argv", ["v67_daily_report", "--date", "2026-05-28", "--recorder-dir", str(root), "--sqlite-path", str(sqlite_path), "--watch-full"]), contextlib.redirect_stdout(out):
+                v67_daily_report.main()
+
+            text = out.getvalue()
+            self.assertIn("open trades:          0", text)
+            self.assertNotIn("OPEN POSITIONS", text)
+            self.assertIn("REJECTED ENTRIES", text)
+            self.assertIn("CONL", text)
+            self.assertIn("stale_managed_ignored_count=1", text)
+
+    def test_watch_sqlite_exit_order_without_ibkr_quantity_is_not_open_forever(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "2026-05-28"
+            session.mkdir(parents=True)
+            sqlite_path = root / "runtime.sqlite"
+            store = SQLiteRuntimeStore(sqlite_path)
+            store.upsert_position({
+                "position_key": "v67:2026-05-28:EXITING",
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "EXITING",
+                "quantity": 3,
+                "avg_price": 10,
+                "ibkr_quantity": 0,
+                "active": 1,
+                "status": "EXIT_ORDER",
+                "updated_at": "2026-05-28T20:05:00+00:00",
+                "raw_json": {},
+            })
+            store.close()
+
+            out = io.StringIO()
+            with patch("sys.argv", ["v67_daily_report", "--date", "2026-05-28", "--recorder-dir", str(root), "--sqlite-path", str(sqlite_path), "--watch-full"]), contextlib.redirect_stdout(out):
+                v67_daily_report.main()
+
+            text = out.getvalue()
+            self.assertIn("open trades:          0", text)
+            self.assertNotIn("OPEN POSITIONS", text)
+            self.assertIn("exit_order_stale_count=1", text)
+
+    def test_watch_sqlite_counts_are_stable_for_unchanged_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "2026-05-28"
+            session.mkdir(parents=True)
+            sqlite_path = root / "runtime.sqlite"
+            store = SQLiteRuntimeStore(sqlite_path)
+            store.upsert_trade({
+                "trade_id": "T1",
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "AKTX",
+                "status": "CLOSED",
+                "entry_fill_time": "2026-05-28T13:35:00+00:00",
+                "exit_fill_time": "2026-05-28T13:50:00+00:00",
+                "entry_price": 10,
+                "exit_price": 11,
+                "quantity": 2,
+                "gross_pnl": 2,
+                "commission": 0.5,
+                "net_pnl": 1.5,
+            })
+            store.close()
+
+            outputs = []
+            for _ in range(2):
+                out = io.StringIO()
+                with patch("sys.argv", ["v67_daily_report", "--date", "2026-05-28", "--recorder-dir", str(root), "--sqlite-path", str(sqlite_path), "--watch-full"]), contextlib.redirect_stdout(out):
+                    v67_daily_report.main()
+                outputs.append([line for line in out.getvalue().splitlines() if "snapshot_loaded_at" not in line])
+
+            self.assertEqual(outputs[0], outputs[1])
+            self.assertIn("closed trades:        1", "\n".join(outputs[0]))
+            self.assertIn("open trades:          0", "\n".join(outputs[0]))
 
     def test_tp_three_simulation_captures_trades_with_mfe_at_least_three(self) -> None:
         closed = [

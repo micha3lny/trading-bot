@@ -1541,6 +1541,28 @@ def load_position_row_diagnostics(
         """,
         [window.start_date, window.end_date, *params],
     )
+    exit_order_stale_rows = read_sql(
+        conn,
+        f"""
+        WITH latest_positions AS (
+            SELECT
+                p.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY COALESCE(p.strategy_name, 'unknown'), UPPER(p.symbol)
+                    ORDER BY COALESCE(p.updated_at, '') DESC, COALESCE(p.session_date, '') DESC, p.position_key DESC
+                ) AS rn
+            FROM positions p
+            WHERE p.session_date BETWEEN ? AND ? {clause}
+        )
+        SELECT COUNT(*) AS count
+        FROM latest_positions p
+        WHERE p.rn = 1
+          AND COALESCE(p.active, 0) = 1
+          AND UPPER(COALESCE(p.status, '')) IN ('EXIT_ORDER', 'EXIT_PENDING', 'EXIT_SENT')
+          AND COALESCE(p.ibkr_quantity, 0) = 0
+        """,
+        [window.start_date, window.end_date, *params],
+    )
     ibkr_rows = read_sql(
         conn,
         """
@@ -1562,6 +1584,7 @@ def load_position_row_diagnostics(
         "latest_active_position_candidates_count": latest_candidates,
         "ibkr_positions_count": ibkr_positions,
         "stale_active_positions_count": stale,
+        "exit_order_stale_count": int(exit_order_stale_rows.iloc[0]["count"] or 0) if not exit_order_stale_rows.empty else 0,
     }
 
 
