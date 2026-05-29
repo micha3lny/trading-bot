@@ -238,19 +238,20 @@ def render_rejected_entries(df: pd.DataFrame) -> None:
     if df.empty:
         st.info("No rejected entries in the selected window.")
         return
-    cols = ["symbol", "qty", "order_id", "reason", "ibkr_error_code", "time", "strategy"]
+    cols = ["symbol", "qty", "price", "order_id", "reason", "ibkr_error_code", "rejected_at", "strategy"]
     available = [col for col in cols if col in df.columns]
-    out = filter_table(df[available].copy(), "rejected").sort_values(["time", "symbol"], ascending=[False, True], na_position="last")
-    if "time" in out.columns:
-        out["time"] = out["time"].map(display_time)
+    out = filter_table(df[available].copy(), "rejected").sort_values(["rejected_at", "symbol"], ascending=[False, True], na_position="last")
+    if "rejected_at" in out.columns:
+        out["rejected_at"] = out["rejected_at"].map(display_time)
     out = out.rename(
         columns={
             "symbol": "Symbol",
             "qty": "Qty",
+            "price": "Price",
             "order_id": "Order ID",
             "reason": "Reason",
             "ibkr_error_code": "IBKR Error",
-            "time": "Time",
+            "rejected_at": "Rejected At",
             "strategy": "Strategy",
         }
     )

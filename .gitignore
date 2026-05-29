@@ -216,5 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-data/
+data/*
+!data/config/
+!data/config/symbol_denylist.csv
 .env

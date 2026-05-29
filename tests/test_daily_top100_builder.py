@@ -94,6 +94,42 @@ class DailyTop100BuilderTests(unittest.TestCase):
             self.assertIn("components_json", loaded.columns)
             self.assertEqual(loaded["symbol"].tolist(), ["AAA", "BBB"])
 
+    def test_denylisted_symbol_is_excluded_from_top100_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            universe = root / "universe.csv"
+            history = root / "history"
+            denylist = root / "denylist.csv"
+            runtime_ineligible = root / "ineligible.json"
+            write_universe(universe, ["CONL", "AAA", "BBB"])
+            write_session(history, "CONL", date(2026, 5, 15), session_frame("CONL", 10.0, 20.0, 10_000))
+            write_session(history, "AAA", date(2026, 5, 15), session_frame("AAA", 10.0, 13.0, 5_000))
+            write_session(history, "BBB", date(2026, 5, 15), session_frame("BBB", 20.0, 21.0, 5_000))
+            denylist.write_text(
+                "symbol,reason,source,first_seen_at,last_seen_at,notes\n"
+                "CONL,kid_priip_ineligible,ibkr_error_201,2026-05-29T00:00:00+00:00,2026-05-29T00:00:00+00:00,\n",
+                encoding="utf-8",
+            )
+
+            rows, stats = build_daily_top(
+                ranking_date=date(2026, 5, 15),
+                universe_path=universe,
+                history_dir=history,
+                top_n=2,
+                session_type="RTH",
+                min_price=5.0,
+                min_bars=180,
+                min_volume=100_000,
+                min_dollar_volume=500_000,
+                prior_sessions=5,
+                symbol_denylist_path=denylist,
+                runtime_ineligible_path=runtime_ineligible,
+            )
+
+            self.assertEqual([row["symbol"] for row in rows], ["AAA", "BBB"])
+            self.assertEqual(stats["excluded_ineligible"], 1)
+            self.assertEqual(stats["_excluded_ineligible_rows"][0]["symbol"], "CONL")
+
     def test_diagnostics_report_contains_missing_and_rejected_symbols(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

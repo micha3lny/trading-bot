@@ -1397,6 +1397,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 reason="no_trading_permission_kid",
                 raw_json={
                     "quantity": 2,
+                    "price": 42.5,
                     "ibkr_error_code": 201,
                     "reject_reason": "no_trading_permission_kid",
                 },
@@ -1409,6 +1410,8 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(len(snapshot["rejected_entries"]), 1)
             self.assertEqual(snapshot["rejected_entries"].iloc[0]["symbol"], "CONL")
             self.assertEqual(snapshot["rejected_entries"].iloc[0]["reason"], "no_trading_permission_kid")
+            self.assertEqual(snapshot["rejected_entries"].iloc[0]["price"], 42.5)
+            self.assertEqual(snapshot["rejected_entries"].iloc[0]["rejected_at"], "2026-05-28T13:36:00+00:00")
 
 
 if __name__ == "__main__":

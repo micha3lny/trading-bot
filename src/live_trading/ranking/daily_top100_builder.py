@@ -11,6 +11,11 @@ from typing import Any
 import pandas as pd
 
 from src.live_trading.market_calendar import get_us_equity_session, previous_us_equity_trading_day
+from src.live_trading.ineligible_symbols import (
+    DEFAULT_RUNTIME_INELIGIBLE,
+    DEFAULT_SYMBOL_DENYLIST,
+    combined_ineligible_symbols,
+)
 from src.live_trading.ranking.ranking_store import RankingStore
 from src.live_trading.storage.sqlite_store import open_sqlite_store, safe_sqlite_call
 from src.live_trading.unified_logger import install_unified_logger
@@ -319,19 +324,40 @@ def build_daily_top(
     prior_sessions: int,
     max_missing_log: int = DEFAULT_MAX_MISSING_LOG,
     max_reject_log: int = DEFAULT_MAX_REJECT_LOG,
+    symbol_denylist_path: str | Path | None = DEFAULT_SYMBOL_DENYLIST,
+    runtime_ineligible_path: str | Path | None = DEFAULT_RUNTIME_INELIGIBLE,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     symbols = load_universe(universe_path)
+    ineligible = combined_ineligible_symbols(symbol_denylist_path, runtime_ineligible_path)
+    excluded_rows: list[dict[str, str]] = []
+    tradeable_symbols: list[str] = []
+    for symbol in symbols:
+        info = ineligible.get(symbol)
+        if info:
+            reason = str(info.get("reason") or "ineligible")
+            excluded_rows.append({"symbol": symbol, "reason": reason})
+            print(f"TOP100_SYMBOL_EXCLUDED symbol={symbol} reason={reason}", flush=True)
+            continue
+        tradeable_symbols.append(symbol)
     print(
         f"DAILY_TOP100_START date={ranking_date.isoformat()} symbols={len(symbols)} "
+        f"tradeable_symbols={len(tradeable_symbols)} excluded_ineligible={len(excluded_rows)} "
         f"history_dir={history_dir} session_type={session_type}",
         flush=True,
     )
     ranked: list[SymbolRanking] = []
-    stats: dict[str, int] = {"symbols": len(symbols), "valid": 0, "missing": 0, "rejected": 0, "errors": 0}
+    stats: dict[str, int] = {
+        "symbols": len(symbols),
+        "valid": 0,
+        "missing": 0,
+        "rejected": 0,
+        "errors": 0,
+        "excluded_ineligible": len(excluded_rows),
+    }
     missing_symbols: list[str] = []
     rejected_rows: list[dict[str, str]] = []
     error_rows: list[dict[str, str]] = []
-    for idx, symbol in enumerate(symbols, 1):
+    for idx, symbol in enumerate(tradeable_symbols, 1):
         try:
             df = read_session(history_dir, symbol, ranking_date, session_type)
             if df.empty:
@@ -370,6 +396,7 @@ def build_daily_top(
     stats["_missing_symbols"] = missing_symbols  # type: ignore[assignment]
     stats["_rejected_rows"] = rejected_rows  # type: ignore[assignment]
     stats["_error_rows"] = error_rows  # type: ignore[assignment]
+    stats["_excluded_ineligible_rows"] = excluded_rows  # type: ignore[assignment]
     if stats["missing"] > max(0, max_missing_log):
         print(
             f"DAILY_TOP100_MISSING_DATA_SUPPRESSED count={stats['missing'] - max(0, max_missing_log)}",
@@ -433,6 +460,8 @@ def write_diagnostics_csv(path: str | Path, ranking_date: date, stats: dict[str,
         rows.append({"date": ranking_date.isoformat(), "symbol": row.get("symbol"), "status": "rejected", "reason": row.get("reason")})
     for row in stats.get("_error_rows", []):
         rows.append({"date": ranking_date.isoformat(), "symbol": row.get("symbol"), "status": "error", "reason": row.get("reason")})
+    for row in stats.get("_excluded_ineligible_rows", []):
+        rows.append({"date": ranking_date.isoformat(), "symbol": row.get("symbol"), "status": "excluded_ineligible", "reason": row.get("reason")})
     write_text_atomic(output, pd.DataFrame(rows, columns=["date", "symbol", "status", "reason"]).to_csv(index=False))
     return len(rows)
 
@@ -477,6 +506,8 @@ def main() -> int:
     parser.add_argument("--diagnostics-output", default=None)
     parser.add_argument("--max-missing-log", type=int, default=DEFAULT_MAX_MISSING_LOG)
     parser.add_argument("--max-reject-log", type=int, default=DEFAULT_MAX_REJECT_LOG)
+    parser.add_argument("--symbol-denylist", default=DEFAULT_SYMBOL_DENYLIST)
+    parser.add_argument("--runtime-ineligible-path", default=DEFAULT_RUNTIME_INELIGIBLE)
     parser.add_argument("--no-sqlite", action="store_true")
     parser.add_argument("--log-dir", default=None)
     args = parser.parse_args()
@@ -505,6 +536,8 @@ def main() -> int:
         prior_sessions=int(args.prior_sessions),
         max_missing_log=int(args.max_missing_log),
         max_reject_log=int(args.max_reject_log),
+        symbol_denylist_path=args.symbol_denylist,
+        runtime_ineligible_path=args.runtime_ineligible_path,
     )
     write_output_csv(args.output, rows)
     diagnostics_rows = 0
@@ -555,7 +588,9 @@ def main() -> int:
     print(
         f"DAILY_TOP100_DONE date={ranking_date.isoformat()} output={args.output} rows={len(rows)} "
         f"valid={stats['valid']} missing={stats['missing']} rejected={stats['rejected']} "
-        f"errors={stats['errors']} diagnostics_rows={diagnostics_rows} sqlite_rows={stored}",
+        f"errors={stats['errors']} excluded_ineligible_count={stats.get('excluded_ineligible', 0)} "
+        f"excluded_ineligible_symbols={','.join([r.get('symbol', '') for r in stats.get('_excluded_ineligible_rows', [])][:20])} "
+        f"diagnostics_rows={diagnostics_rows} sqlite_rows={stored}",
         flush=True,
     )
     if len(rows) < int(args.top_n):

@@ -182,9 +182,11 @@ def load_rejected_entries(session: Path) -> list[dict]:
                     "recorded_at": row.get("recorded_at"),
                     "symbol": str(row.get("symbol") or "").upper(),
                     "quantity": row.get("quantity") or raw.get("quantity"),
+                    "price": row.get("price") or raw.get("price"),
                     "order_id": row.get("order_id") or raw.get("order_id"),
                     "reason": row.get("reason") or raw.get("reject_reason") or raw.get("reason"),
                     "ibkr_error_code": raw.get("ibkr_error_code"),
+                    "rejected_at": row.get("recorded_at"),
                 }
             )
     rows.sort(key=lambda item: str(item.get("recorded_at") or ""), reverse=True)
@@ -947,12 +949,13 @@ def main():
             print()
         if rejected_entries:
             print("REJECTED ENTRIES")
-            print(f"{'SYM':<6} {'QTY':>5} {'ORDER':>8} {'ERR':>5} {'TIME':>8} REASON")
+            print(f"{'SYM':<6} {'QTY':>5} {'PRICE':>8} {'ORDER':>8} {'ERR':>5} {'TIME':>8} REASON")
             for row in rejected_entries[:20]:
                 print(
                     f"{row.get('symbol', ''):<6} {f(row.get('quantity'), 0.0):>5.0f} "
+                    f"{fmt(row.get('price'), 8, 2)} "
                     f"{str(row.get('order_id') or ''):>8} {str(row.get('ibkr_error_code') or ''):>5} "
-                    f"{utc_hhmm(row.get('recorded_at')):>8} {row.get('reason') or ''}"
+                    f"{utc_hhmm(row.get('rejected_at') or row.get('recorded_at')):>8} {row.get('reason') or ''}"
                 )
             print()
         closed_limit = max(0, args.watch_closed_limit)
@@ -1042,12 +1045,13 @@ def main():
     print()
 
     print("=== REJECTED ENTRIES ===")
-    print(f"{'SYM':<7} {'QTY':>6} {'ORDER_ID':>10} {'IBKR_ERR':>8} {'TIME':>8}  REASON")
-    print("-" * 82)
+    print(f"{'SYM':<7} {'QTY':>6} {'PRICE':>9} {'ORDER_ID':>10} {'IBKR_ERR':>8} {'REJECTED':>8}  REASON")
+    print("-" * 94)
     for row in rejected_entries:
         print(
-            f"{row.get('symbol', ''):<7} {f(row.get('quantity'), 0.0):>6.0f} {str(row.get('order_id') or ''):>10} "
-            f"{str(row.get('ibkr_error_code') or ''):>8} {utc_hhmm(row.get('recorded_at')):>8}  {row.get('reason') or ''}"
+            f"{row.get('symbol', ''):<7} {f(row.get('quantity'), 0.0):>6.0f} {fmt(row.get('price'), 9, 2)} "
+            f"{str(row.get('order_id') or ''):>10} {str(row.get('ibkr_error_code') or ''):>8} "
+            f"{utc_hhmm(row.get('rejected_at') or row.get('recorded_at')):>8}  {row.get('reason') or ''}"
         )
     print()
 

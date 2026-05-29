@@ -1411,7 +1411,7 @@ def load_rejected_entries(conn: sqlite3.Connection, window: DateWindow, strategy
         [window.start_date, window.end_date, *params],
     )
     if rows.empty:
-        return pd.DataFrame(columns=["symbol", "qty", "order_id", "reason", "ibkr_error_code", "time", "strategy"])
+        return pd.DataFrame(columns=["symbol", "qty", "price", "order_id", "reason", "ibkr_error_code", "rejected_at", "strategy"])
     out: list[dict[str, Any]] = []
     for row in rows.to_dict("records"):
         raw = parse_raw_json(row.get("raw_json"))
@@ -1419,10 +1419,11 @@ def load_rejected_entries(conn: sqlite3.Connection, window: DateWindow, strategy
             {
                 "symbol": str(row.get("symbol") or "").upper(),
                 "qty": to_float(raw.get("quantity"), None),
+                "price": to_float(raw.get("price"), None),
                 "order_id": row.get("order_id") or raw.get("order_id"),
                 "reason": row.get("reason") or raw.get("reject_reason") or raw.get("reason"),
                 "ibkr_error_code": raw.get("ibkr_error_code"),
-                "time": row.get("event_time"),
+                "rejected_at": row.get("event_time"),
                 "strategy": row.get("strategy"),
             }
         )

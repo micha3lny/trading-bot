@@ -22,6 +22,14 @@ from ib_insync import IB, Stock, MarketOrder
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.control.control_api import process_control_api_commands, process_history_collector_commands, start_control_api
 from src.live_trading.market_calendar import get_us_equity_session, is_us_equity_trading_day, previous_us_equity_trading_day
+from src.live_trading.ineligible_symbols import (
+    DEFAULT_RUNTIME_INELIGIBLE,
+    DEFAULT_SYMBOL_DENYLIST,
+    combined_ineligible_symbols,
+    contract_ineligible_reason,
+    contract_metadata,
+    record_runtime_ineligible,
+)
 from src.live_trading.v66_ibkr_account_recorder import (
     install_commission_report_handler,
     record_account_snapshot,
@@ -311,6 +319,28 @@ def append_dict_csv(path: Path, row: dict[str, Any], fieldnames: list[str]) -> N
         writer.writerow({k: row.get(k, "") for k in fieldnames})
 
 
+def record_contract_metadata(recorder: LiveDataRecorder, contract: Any, *, source: str) -> None:
+    metadata = contract_metadata(contract)
+    metadata["recorded_at"] = now_utc()
+    metadata["source"] = source
+    append_dict_csv(
+        recorder.path("contract_metadata.csv"),
+        metadata,
+        [
+            "recorded_at",
+            "source",
+            "symbol",
+            "conId",
+            "secType",
+            "longName",
+            "category",
+            "industry",
+            "primaryExchange",
+            "tradingClass",
+        ],
+    )
+
+
 def load_top_symbols(alpha_rank_csv: str, top_n: int, min_price: float | None = None) -> list[str]:
     p = Path(alpha_rank_csv)
     if not p.exists():
@@ -326,6 +356,76 @@ def load_top_symbols(alpha_rank_csv: str, top_n: int, min_price: float | None = 
         df["last_close"] = pd.to_numeric(df["last_close"], errors="coerce")
         df = df[df["last_close"] >= min_price]
     return df["symbol"].dropna().drop_duplicates().head(top_n).tolist()
+
+
+def load_tradeable_top_symbols(
+    alpha_rank_csv: str,
+    top_n: int,
+    *,
+    min_price: float | None = None,
+    symbol_denylist_path: str | Path | None = DEFAULT_SYMBOL_DENYLIST,
+    runtime_ineligible_path: str | Path | None = DEFAULT_RUNTIME_INELIGIBLE,
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    symbols = load_top_symbols(alpha_rank_csv, top_n, min_price=min_price)
+    ineligible = combined_ineligible_symbols(symbol_denylist_path, runtime_ineligible_path)
+    selected: list[str] = []
+    skipped: dict[str, dict[str, Any]] = {}
+    for symbol in symbols:
+        info = ineligible.get(symbol)
+        if info:
+            skipped[symbol] = info
+            continue
+        selected.append(symbol)
+    return selected, skipped
+
+
+def runtime_ineligible_info(runtime_state: dict[str, Any], symbol: str) -> dict[str, Any]:
+    symbol = str(symbol or "").upper().strip()
+    reasons = _runtime_dict(runtime_state, "ineligible_symbol_reasons")
+    if symbol in reasons and isinstance(reasons[symbol], dict):
+        return reasons[symbol]
+    if symbol in _runtime_set(runtime_state, "ineligible_symbols"):
+        return {"reason": "kid_priip_ineligible", "source": "runtime_cache"}
+    return {}
+
+
+def mark_runtime_symbol_ineligible(
+    runtime_state: dict[str, Any],
+    symbol: str,
+    *,
+    reason: str,
+    source: str,
+    con_id: Any = None,
+    ibkr_error_code: Any = None,
+    raw_message: str = "",
+    persist: bool = True,
+) -> None:
+    symbol = str(symbol or "").upper().strip()
+    if not symbol:
+        return
+    _runtime_set(runtime_state, "ineligible_symbols").add(symbol)
+    info = {
+        "symbol": symbol,
+        "reason": reason,
+        "source": source,
+        "conId": con_id,
+        "ibkr_error_code": ibkr_error_code,
+        "raw_message": raw_message,
+    }
+    _runtime_dict(runtime_state, "ineligible_symbol_reasons")[symbol] = info
+    if persist:
+        try:
+            record_runtime_ineligible(
+                symbol,
+                con_id=con_id,
+                reason=reason,
+                ibkr_error_code=ibkr_error_code,
+                raw_message=raw_message,
+                source=source,
+                path=runtime_state.get("runtime_ineligible_path") or DEFAULT_RUNTIME_INELIGIBLE,
+            )
+        except Exception as exc:
+            print(f"{now_utc()} RUNTIME_INELIGIBLE_PERSIST_FAILED symbol={symbol} error={exc!r}", flush=True)
 
 
 def snapshot_from_ticker(symbol: str, ticker: Any) -> dict[str, Any]:
@@ -3196,9 +3296,31 @@ def reload_top100_universe_if_requested(
     runtime_state["entries_blocked_reason"] = "top100_reload"
 
     try:
-        entry_symbols = load_top_symbols(reload_path, int(args.top_n), min_price=args.min_price)
+        entry_symbols, skipped_ineligible = load_tradeable_top_symbols(
+            reload_path,
+            int(args.top_n),
+            min_price=args.min_price,
+            symbol_denylist_path=getattr(args, "symbol_denylist", DEFAULT_SYMBOL_DENYLIST),
+            runtime_ineligible_path=getattr(args, "runtime_ineligible_path", DEFAULT_RUNTIME_INELIGIBLE),
+        )
+        for symbol, info in skipped_ineligible.items():
+            reason = str(info.get("reason") or "ineligible")
+            mark_runtime_symbol_ineligible(
+                runtime_state,
+                symbol,
+                reason=reason,
+                source=str(info.get("source") or "top100_reload_filter"),
+                persist=False,
+            )
+            print(f"{now_utc()} ENTRY_SYMBOL_INELIGIBLE_SKIPPED symbol={symbol} reason={reason} source=top100_reload", flush=True)
+        if not entry_symbols:
+            raise RuntimeError("top100_reload_no_tradeable_symbols")
         if len(entry_symbols) < int(args.top_n):
-            raise RuntimeError(f"top100_reload_too_few_symbols rows={len(entry_symbols)} required={int(args.top_n)}")
+            print(
+                f"{now_utc()} TOP100_RELOAD_WARNING reason=fewer_tradeable_symbols_after_ineligible_filter "
+                f"rows={len(entry_symbols)} requested={int(args.top_n)} excluded_ineligible={len(skipped_ineligible)}",
+                flush=True,
+            )
 
         active_symbols = sorted(symbol for symbol, pos in managed_positions.items() if pos.active)
         max_subscriptions = max(0, int(getattr(args, "max_market_data_subscriptions", 100) or 0))
@@ -3252,6 +3374,24 @@ def reload_top100_universe_if_requested(
                         print(f"{now_utc()} TOP100_RELOAD_CONTRACT_FAILED symbol={symbol} reason=not_qualified", flush=True)
                         continue
                     contract = qualified[0]
+                    record_contract_metadata(recorder, contract, source="top100_reload")
+                    metadata_reason = None if symbol in active_symbol_set else contract_ineligible_reason(contract)
+                    if metadata_reason:
+                        failed_symbols.append(symbol)
+                        mark_runtime_symbol_ineligible(
+                            runtime_state,
+                            symbol,
+                            reason=metadata_reason,
+                            source="contract_metadata",
+                            con_id=getattr(contract, "conId", None),
+                            raw_message=json.dumps(contract_metadata(contract), sort_keys=True),
+                        )
+                        print(
+                            f"{now_utc()} ENTRY_SYMBOL_INELIGIBLE_SKIPPED symbol={symbol} "
+                            f"reason={metadata_reason} source=contract_metadata",
+                            flush=True,
+                        )
+                        continue
                 except Exception as exc:
                     failed_symbols.append(symbol)
                     print(f"{now_utc()} TOP100_RELOAD_CONTRACT_FAILED symbol={symbol} error={exc!r}", flush=True)
@@ -3310,6 +3450,8 @@ def reload_top100_universe_if_requested(
             "subscribed_active": len([s for s, _ in contracts if s in active_symbol_set]),
             "skipped_due_to_subscription_cap": skipped_due_to_subscription_cap,
             "skipped_symbols_due_to_cap": skipped_symbols_due_to_cap,
+            "excluded_ineligible_count": len(skipped_ineligible),
+            "excluded_ineligible_symbols": list(skipped_ineligible),
             "ibkr_error_101_count": ibkr_error_101_count,
         }
 
@@ -3329,6 +3471,8 @@ def reload_top100_universe_if_requested(
             f"subscribed_active={len([s for s, _ in contracts if s in active_symbol_set])} "
             f"skipped_due_to_subscription_cap={skipped_due_to_subscription_cap} "
             f"skipped_symbols_due_to_cap={','.join(skipped_symbols_due_to_cap[:20])} "
+            f"excluded_ineligible_count={len(skipped_ineligible)} "
+            f"excluded_ineligible_symbols={','.join(list(skipped_ineligible)[:20])} "
             f"ibkr_error_101_count={ibkr_error_101_count} failed={len(failed_symbols)} state_rebuilt={rebuilt}",
             flush=True,
         )
@@ -3861,8 +4005,15 @@ def record_entry_order_rejected(
         managed_positions.pop(symbol, None)
         persist_managed_positions(recorder, managed_positions)
 
-    ineligible = _runtime_set(runtime_state, "ineligible_symbols")
-    ineligible.add(symbol)
+    mark_runtime_symbol_ineligible(
+        runtime_state,
+        symbol,
+        reason=reason,
+        source="ibkr_error_201",
+        con_id=order_meta.get("conId") or order_meta.get("con_id"),
+        ibkr_error_code=ibkr_error_code,
+        raw_message=str(message or ""),
+    )
     rejected_entries = _runtime_dict(runtime_state, "rejected_entries")
     rejected_entries[symbol] = {
         "symbol": symbol,
@@ -4568,10 +4719,18 @@ def main() -> int:
     parser.add_argument("--daily-top100-latest-output", default="data/universe/daily_top100_latest.csv")
     parser.add_argument("--daily-top100-sqlite-path", default="data/runtime/rankings.sqlite")
     parser.add_argument("--daily-top100-top-n", type=int, default=100)
+    parser.add_argument("--symbol-denylist", default=DEFAULT_SYMBOL_DENYLIST)
+    parser.add_argument("--runtime-ineligible-path", default=DEFAULT_RUNTIME_INELIGIBLE)
     parser.add_argument("--log-dir", default=None)
     args = parser.parse_args()
 
-    symbols = load_top_symbols(args.alpha_rank_csv, args.top_n, min_price=args.min_price)
+    symbols, startup_skipped_ineligible = load_tradeable_top_symbols(
+        args.alpha_rank_csv,
+        args.top_n,
+        min_price=args.min_price,
+        symbol_denylist_path=args.symbol_denylist,
+        runtime_ineligible_path=args.runtime_ineligible_path,
+    )
     recorder = LiveDataRecorder(args.recorder_dir)
     log_dir = install_unified_logger(args.log_dir)
     shutdown = ShutdownDiagnostics(log_dir=log_dir, args=args)
@@ -4594,6 +4753,18 @@ def main() -> int:
 
     print("=== v67 live top100 expansion paper trader ===", flush=True)
     print(f"Symbols loaded: {len(symbols)}", flush=True)
+    if startup_skipped_ineligible:
+        for symbol, info in startup_skipped_ineligible.items():
+            print(
+                f"{now_utc()} ENTRY_SYMBOL_INELIGIBLE_SKIPPED symbol={symbol} "
+                f"reason={info.get('reason') or 'ineligible'} source=startup_filter",
+                flush=True,
+            )
+        print(
+            f"{now_utc()} STARTUP_INELIGIBLE_SYMBOLS_SKIPPED count={len(startup_skipped_ineligible)} "
+            f"symbols={','.join(list(startup_skipped_ineligible)[:20])}",
+            flush=True,
+        )
     print(f"Recorder dir: {recorder.session_dir}", flush=True)
     print(f"Portfolio/fills recorder: integrated every {args.portfolio_interval_seconds}s", flush=True)
     print(
@@ -4638,7 +4809,9 @@ def main() -> int:
         "entry_order_by_order_id": {},
         "entry_rejection_processed": set(),
         "rejected_entries": {},
-        "ineligible_symbols": set(),
+        "ineligible_symbols": set(startup_skipped_ineligible),
+        "ineligible_symbol_reasons": dict(startup_skipped_ineligible),
+        "runtime_ineligible_path": args.runtime_ineligible_path,
         "entry_rejected_count": 0,
         "ready_candidates": 0,
         "live_ready_candidates": 0,
@@ -4723,6 +4896,23 @@ def main() -> int:
             if not qualified:
                 continue
             q = qualified[0]
+            record_contract_metadata(recorder, q, source="startup")
+            metadata_reason = contract_ineligible_reason(q)
+            if metadata_reason:
+                mark_runtime_symbol_ineligible(
+                    runtime_state,
+                    symbol,
+                    reason=metadata_reason,
+                    source="contract_metadata",
+                    con_id=getattr(q, "conId", None),
+                    raw_message=json.dumps(contract_metadata(q), sort_keys=True),
+                )
+                print(
+                    f"{now_utc()} ENTRY_SYMBOL_INELIGIBLE_SKIPPED symbol={symbol} "
+                    f"reason={metadata_reason} source=contract_metadata",
+                    flush=True,
+                )
+                continue
             contracts.append((symbol, q))
             contract_by_symbol[symbol] = q
             tickers[symbol] = ib.reqMktData(q, "", False, False)
@@ -4991,16 +5181,23 @@ def main() -> int:
                 entry_symbol_allowed = symbol in _runtime_set(runtime_state, "entry_symbols")
                 symbol_ineligible = symbol in _runtime_set(runtime_state, "ineligible_symbols")
                 if symbol_ineligible and features["ready"]:
-                    rejection_counter["ineligible_no_trading_permission_kid"] += 1
+                    info = runtime_ineligible_info(runtime_state, symbol)
+                    reason = str(info.get("reason") or "ineligible_no_trading_permission_kid")
+                    rejection_counter[reason] += 1
                     if not state.stale_ready_logged:
+                        print(
+                            f"{now_utc()} ENTRY_SYMBOL_INELIGIBLE_SKIPPED symbol={symbol} "
+                            f"reason={reason} source={info.get('source') or 'runtime_cache'}",
+                            flush=True,
+                        )
                         record_lifecycle_with_formal(
                             recorder,
-                            "BUY_BLOCKED",
+                            "ENTRY_SYMBOL_INELIGIBLE_SKIPPED",
                             symbol,
                             action="BUY",
                             price=features.get("entry_price"),
-                            reason="ineligible_no_trading_permission_kid",
-                            raw_json={**features, "blocked_by": "ibkr_error_201_cache"},
+                            reason=reason,
+                            raw_json={**features, "blocked_by": info.get("source") or "ineligible_cache"},
                         )
                         state.stale_ready_logged = True
                     continue
@@ -5203,6 +5400,7 @@ def main() -> int:
                         "submitted_at": now_utc(),
                         "ranking_position": ranking_position,
                         "score": features.get("score"),
+                        "conId": getattr(q, "conId", None),
                     }
                     submission_count = record_entry_submission(runtime_state, loop_now)
                     entries_submitted_this_cycle += 1

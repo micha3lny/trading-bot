@@ -285,7 +285,8 @@ class PreSqliteHardeningTests(unittest.TestCase):
             runtime_state = {
                 "entry_order_by_order_id": {
                     "123": {"symbol": "CONL", "quantity": 2, "price": 50.0}
-                }
+                },
+                "runtime_ineligible_path": str(Path(tmp) / "runtime" / "ineligible_symbols.json"),
             }
 
             handled = handle_ibkr_order_rejection_event(
@@ -309,6 +310,9 @@ class PreSqliteHardeningTests(unittest.TestCase):
             self.assertIn("no_trading_permission_kid", rows[0]["raw_json"])
             stored_positions = json.loads(recorder.path("managed_positions.json").read_text())["positions"]
             self.assertEqual(stored_positions, {})
+            ineligible_payload = json.loads((Path(tmp) / "runtime" / "ineligible_symbols.json").read_text())
+            self.assertEqual(ineligible_payload["symbols"]["CONL"]["reason"], "no_trading_permission_kid")
+            self.assertEqual(ineligible_payload["symbols"]["CONL"]["ibkr_error_code"], 201)
 
     def test_rejected_symbol_is_blocked_from_reentry_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

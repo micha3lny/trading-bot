@@ -47,6 +47,7 @@ class Top100ReloadTests(unittest.TestCase):
         path.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
     def args_for(self, latest: Path, *, top_n: int, cap: int = 100) -> SimpleNamespace:
+        root = latest.parent
         return SimpleNamespace(
             top_n=top_n,
             min_price=5.0,
@@ -55,6 +56,8 @@ class Top100ReloadTests(unittest.TestCase):
             alpha_rank_csv=str(latest),
             daily_top100_latest_output=str(latest),
             max_market_data_subscriptions=cap,
+            symbol_denylist=str(root / "symbol_denylist.csv"),
+            runtime_ineligible_path=str(root / "ineligible_symbols.json"),
         )
 
     def test_reload_subscribes_new_top100_and_carries_active_positions_for_exits(self) -> None:
@@ -194,6 +197,34 @@ class Top100ReloadTests(unittest.TestCase):
             self.assertEqual(runtime_state["top100_reload_diagnostics"]["ibkr_error_101_count"], 1)
             self.assertNotIn("ERR", tickers)
             self.assertEqual([symbol for symbol, _ in contracts], ["AAA", "BBB"])
+
+    def test_reload_skips_denylisted_symbol_in_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            latest = root / "daily_top100_latest.csv"
+            self.write_latest(latest, ["CONL", "AAA", "BBB"])
+            denylist = root / "symbol_denylist.csv"
+            denylist.write_text(
+                "symbol,reason,source,first_seen_at,last_seen_at,notes\n"
+                "CONL,kid_priip_ineligible,ibkr_error_201,2026-05-29T00:00:00+00:00,2026-05-29T00:00:00+00:00,\n",
+                encoding="utf-8",
+            )
+            recorder = LiveDataRecorder(root / "recorder", session_date="2026-05-22")
+            ib = FakeIB()
+            runtime_state = {"top100_reload_requested": True, "top100_reload_path": str(latest), "top100_reload_ranking_date": "2026-05-21"}
+            contracts: list[tuple[str, FakeContract]] = []
+            contract_by_symbol: dict[str, FakeContract] = {}
+            tickers = {}
+
+            changed = reload_top100_universe_if_requested(
+                ib, recorder, {}, contracts, contract_by_symbol, tickers, {}, {}, runtime_state, self.args_for(latest, top_n=3, cap=100)
+            )
+
+            self.assertTrue(changed)
+            self.assertNotIn("CONL", runtime_state["entry_symbols"])
+            self.assertIn("CONL", runtime_state["ineligible_symbols"])
+            self.assertEqual([symbol for symbol, _ in contracts], ["AAA", "BBB"])
+            self.assertEqual(runtime_state["top100_reload_diagnostics"]["excluded_ineligible_count"], 1)
 
 
 if __name__ == "__main__":
