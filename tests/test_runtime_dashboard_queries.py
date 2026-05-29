@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import sqlite3
 import tempfile
@@ -12,6 +13,34 @@ from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
 
 class RuntimeDashboardQueriesTests(unittest.TestCase):
+    def insert_execution_direct(self, store: SQLiteRuntimeStore, row: dict) -> None:
+        payload = dict(row)
+        store.conn.execute(
+            """
+            INSERT INTO executions (
+                execution_id, trade_id, strategy_name, session_date, symbol, side, quantity, price,
+                executed_at, recorded_at, commission, commission_currency, commission_source, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.get("execution_id"),
+                payload.get("trade_id"),
+                payload.get("strategy_name"),
+                payload.get("session_date"),
+                payload.get("symbol"),
+                payload.get("side"),
+                payload.get("quantity"),
+                payload.get("price") or payload.get("fill_price"),
+                payload.get("executed_at"),
+                payload.get("recorded_at"),
+                payload.get("commission"),
+                payload.get("commission_currency"),
+                payload.get("commission_source"),
+                json.dumps(payload.get("raw_json") or payload),
+            ),
+        )
+        store.conn.commit()
+
     def test_snapshot_reconstructs_closed_open_summary_and_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             session_date = utc_today()
@@ -289,7 +318,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 "net_pnl": -89,
                 "mfe_pct": 12,
             })
-            store.upsert_execution({
+            self.insert_execution_direct(store, {
                 "execution_id": "B1",
                 "trade_id": "T1",
                 "session_date": "2026-05-27",
@@ -302,7 +331,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 "commission_source": "ibkr",
                 "recorded_at": "2026-05-27T13:30:00+00:00",
             })
-            store.upsert_execution({
+            self.insert_execution_direct(store, {
                 "execution_id": "S1",
                 "trade_id": "T1",
                 "session_date": "2026-05-27",
@@ -404,7 +433,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                     "sell_execution_id": "S_AKTX",
                 },
             })
-            store.upsert_execution({
+            self.insert_execution_direct(store, {
                 "execution_id": "B_AKTX",
                 "session_date": "2026-05-27",
                 "strategy_name": "unknown",
@@ -416,7 +445,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 "commission_source": "ibkr",
                 "recorded_at": "2026-05-27T13:37:14+00:00",
             })
-            store.upsert_execution({
+            self.insert_execution_direct(store, {
                 "execution_id": "S_AKTX",
                 "session_date": "2026-05-27",
                 "strategy_name": "unknown",
@@ -662,7 +691,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 ("B_NO_PEAK", "BOT", 10, "2026-05-27T13:30:00+00:00"),
                 ("S_NO_PEAK", "SLD", 10.5, "2026-05-27T13:40:00+00:00"),
             ]:
-                store.upsert_execution({
+                self.insert_execution_direct(store, {
                     "execution_id": execution_id,
                     "trade_id": "T_NO_PEAK",
                     "session_date": "2026-05-27",
@@ -854,7 +883,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 if commission is not None:
                     row["commission"] = commission
                     row["commission_source"] = "ibkr"
-                store.upsert_execution(row)
+                self.insert_execution_direct(store, row)
             store.close()
 
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")

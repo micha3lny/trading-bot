@@ -625,29 +625,74 @@ class SQLiteRuntimeStore:
         exit_date = iso_date_part(sell_time or sell.get("session_date"))
         buy_exec_id = str(buy.get("execution_id") or "")
         sell_exec_id = str(sell.get("execution_id") or "")
-        existing_trade_id = str(buy.get("trade_id") or sell.get("trade_id") or "").strip()
-        if existing_trade_id:
-            return existing_trade_id
+        return reconstructed_trade_id(entry_date, exit_date, symbol, buy_exec_id, sell_exec_id)
+
+    def _clear_reconstructed_trades_for_symbol(self, symbol: str) -> int:
+        symbol = str(symbol or "").upper().strip()
+        if not symbol:
+            return 0
         rows = self.query(
             """
             SELECT trade_id
             FROM trades
             WHERE UPPER(symbol) = ?
-              AND COALESCE(entry_fill_time, '') = ?
-              AND COALESCE(exit_fill_time, '') = ?
-              AND ABS(COALESCE(quantity, 0) - ?) < 0.000001
-              AND ABS(COALESCE(entry_price, 0) - ?) < 0.000001
-              AND ABS(COALESCE(exit_price, 0) - ?) < 0.000001
-            ORDER BY trade_id
-            LIMIT 1
+              AND (
+                trade_id LIKE 'reconstructed:%'
+                OR raw_json LIKE '%sqlite_execution_reducer%'
+                OR raw_json LIKE '%executions_pair_repair%'
+              )
             """,
-            [symbol, buy_time, sell_time, matched_qty, safe_float(buy.get("price")) or 0.0, safe_float(sell.get("price")) or 0.0],
+            [symbol],
         )
-        if rows:
-            return str(rows[0]["trade_id"])
-        return reconstructed_trade_id(entry_date, exit_date, symbol, buy_exec_id, sell_exec_id)
+        trade_ids = [str(row.get("trade_id") or "") for row in rows if row.get("trade_id")]
+        if not trade_ids:
+            return 0
+        placeholders = ",".join("?" for _ in trade_ids)
+        self.execute(f"UPDATE executions SET trade_id = NULL WHERE trade_id IN ({placeholders})", trade_ids)
+        self.execute(f"DELETE FROM trades WHERE trade_id IN ({placeholders})", trade_ids)
+        return len(trade_ids)
+
+    def _delete_duplicate_reconstructed_execution_pair(self, trade_id: str, symbol: str, raw_json: Any, quantity: float | None) -> int:
+        raw = parse_jsonish(raw_json)
+        buy_exec = str(raw.get("buy_execution_id") or "")
+        sell_exec = str(raw.get("sell_execution_id") or "")
+        if not buy_exec or not sell_exec:
+            return 0
+        rows = self.query(
+            """
+            SELECT trade_id, quantity, raw_json
+            FROM trades
+            WHERE trade_id != ?
+              AND UPPER(symbol) = ?
+              AND UPPER(COALESCE(status, '')) IN ('CLOSED', 'DONE', 'EXIT_FILLED', 'FLAT')
+            """,
+            [trade_id, str(symbol or "").upper()],
+        )
+        duplicate_ids: list[str] = []
+        qty = safe_float(quantity) or 0.0
+        for row in rows:
+            other_raw = parse_jsonish(row.get("raw_json"))
+            if str(other_raw.get("buy_execution_id") or "") != buy_exec:
+                continue
+            if str(other_raw.get("sell_execution_id") or "") != sell_exec:
+                continue
+            other_qty = safe_float(row.get("quantity")) or 0.0
+            if abs(other_qty - qty) > 1e-9:
+                continue
+            other_trade_id = str(row.get("trade_id") or "")
+            if other_trade_id.startswith("reconstructed:"):
+                duplicate_ids.append(other_trade_id)
+        if not duplicate_ids:
+            return 0
+        placeholders = ",".join("?" for _ in duplicate_ids)
+        self.execute(f"UPDATE executions SET trade_id = NULL WHERE trade_id IN ({placeholders})", duplicate_ids)
+        self.execute(f"DELETE FROM trades WHERE trade_id IN ({placeholders})", duplicate_ids)
+        return len(duplicate_ids)
 
     def rebuild_symbol_trade_state(self, symbol: str, strategy_name: str | None = None) -> dict[str, Any]:
+        if self._transaction_depth == 0:
+            with self.transaction():
+                return self.rebuild_symbol_trade_state(symbol, strategy_name)
         symbol = str(symbol or "").upper().strip()
         if not symbol:
             return {"symbol": symbol, "closed_trades": 0, "open_quantity": 0.0}
@@ -670,6 +715,7 @@ class SQLiteRuntimeStore:
             params,
         )
         reducer_started_at = utc_now_iso()
+        self._clear_reconstructed_trades_for_symbol(symbol)
         open_lots: list[dict[str, Any]] = []
         closed_count = 0
         last_event_time = utc_now_iso()
@@ -721,6 +767,9 @@ class SQLiteRuntimeStore:
                     "reconstruction_source": "sqlite_execution_reducer",
                     "buy_execution_id": lot.get("execution_id"),
                     "sell_execution_id": row.get("execution_id"),
+                    "matched_quantity": matched_qty,
+                    "buy_original_quantity": safe_float(lot.get("original_qty")) or matched_qty,
+                    "sell_original_quantity": qty,
                     "entry_executed_at": buy_time,
                     "exit_executed_at": sell_time,
                     "entry_date": entry_date,
@@ -765,10 +814,13 @@ class SQLiteRuntimeStore:
                         **preserved,
                     }
                 )
-                self.execute(
-                    "UPDATE executions SET trade_id = COALESCE(trade_id, ?) WHERE execution_id IN (?, ?)",
-                    (trade_id, lot.get("execution_id"), row.get("execution_id")),
-                )
+                buy_fully_consumed_by_trade = abs(matched_qty - (safe_float(lot.get("original_qty")) or matched_qty)) <= 1e-9
+                sell_fully_consumed_by_trade = abs(matched_qty - qty) <= 1e-9
+                if buy_fully_consumed_by_trade and sell_fully_consumed_by_trade:
+                    self.execute(
+                        "UPDATE executions SET trade_id = ? WHERE execution_id IN (?, ?)",
+                        (trade_id, lot.get("execution_id"), row.get("execution_id")),
+                    )
                 closed_count += 1
                 lot["remaining_qty"] = lot_remaining - matched_qty
                 remaining -= matched_qty
@@ -872,6 +924,9 @@ class SQLiteRuntimeStore:
         return order_key
 
     def upsert_trade(self, row: dict[str, Any]) -> str:
+        if self._transaction_depth == 0:
+            with self.transaction():
+                return self.upsert_trade(row)
         trade_id = str(row.get("trade_id") or uuid.uuid4().hex)
         previous = self.query("SELECT trade_reduction_version FROM trades WHERE trade_id = ?", [trade_id])
         previous_version = safe_int(previous[0].get("trade_reduction_version")) if previous else None
@@ -910,6 +965,7 @@ class SQLiteRuntimeStore:
         }
         status = str(data.get("status") or "").upper()
         if status in {"CLOSED", "DONE", "EXIT_FILLED", "FLAT"}:
+            self._delete_duplicate_reconstructed_execution_pair(trade_id, data["symbol"], data.get("raw_json"), data.get("quantity"))
             duplicates = self.query(
                 """
                 SELECT trade_id, raw_json

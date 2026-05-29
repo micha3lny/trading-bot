@@ -259,6 +259,88 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_fifo_one_buy_two_sells_consumes_quantity_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B100", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "FIFO", "side": "BOT", "quantity": 100, "price": 10, "executed_at": "2026-05-29T13:30:00+00:00"})
+                store.upsert_execution({"execution_id": "S40", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "FIFO", "side": "SLD", "quantity": 40, "price": 11, "executed_at": "2026-05-29T13:40:00+00:00"})
+                store.upsert_execution({"execution_id": "S60", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "FIFO", "side": "SLD", "quantity": 60, "price": 12, "executed_at": "2026-05-29T13:50:00+00:00"})
+
+                rows = store.query("SELECT trade_id, quantity, gross_pnl, raw_json FROM trades WHERE symbol = 'FIFO' ORDER BY exit_fill_time")
+
+                self.assertEqual(len(rows), 2)
+                self.assertAlmostEqual(sum(row["quantity"] for row in rows), 100)
+                self.assertAlmostEqual(rows[0]["quantity"], 40)
+                self.assertAlmostEqual(rows[0]["gross_pnl"], 40)
+                self.assertAlmostEqual(rows[1]["quantity"], 60)
+                self.assertAlmostEqual(rows[1]["gross_pnl"], 120)
+                self.assertEqual(len({row["trade_id"] for row in rows}), 2)
+                for row in rows:
+                    raw = json.loads(row["raw_json"])
+                    self.assertEqual(raw["buy_execution_id"], "B100")
+                    self.assertIn(raw["sell_execution_id"], {"S40", "S60"})
+                    self.assertEqual(raw["buy_original_quantity"], 100)
+            finally:
+                store.close()
+
+    def test_fifo_two_buys_one_sell_consumes_lots_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B15", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "LOTX", "side": "BOT", "quantity": 15, "price": 10, "executed_at": "2026-05-29T13:30:00+00:00"})
+                store.upsert_execution({"execution_id": "B101", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "LOTX", "side": "BOT", "quantity": 101, "price": 11, "executed_at": "2026-05-29T13:35:00+00:00"})
+                store.upsert_execution({"execution_id": "S116", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "LOTX", "side": "SLD", "quantity": 116, "price": 12, "executed_at": "2026-05-29T13:40:00+00:00"})
+
+                rows = store.query("SELECT quantity, entry_price, exit_price, gross_pnl, raw_json FROM trades WHERE symbol = 'LOTX' ORDER BY entry_fill_time")
+
+                self.assertEqual(len(rows), 2)
+                self.assertAlmostEqual(sum(row["quantity"] for row in rows), 116)
+                self.assertAlmostEqual(rows[0]["quantity"], 15)
+                self.assertAlmostEqual(rows[0]["gross_pnl"], 30)
+                self.assertAlmostEqual(rows[1]["quantity"], 101)
+                self.assertAlmostEqual(rows[1]["gross_pnl"], 101)
+                self.assertEqual(json.loads(rows[0]["raw_json"])["buy_execution_id"], "B15")
+                self.assertEqual(json.loads(rows[1]["raw_json"])["buy_execution_id"], "B101")
+            finally:
+                store.close()
+
+    def test_reducer_rerun_rebuilds_same_trades_without_reusing_execution_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B_RERUN", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "RERUN", "side": "BOT", "quantity": 100, "price": 10, "executed_at": "2026-05-29T13:30:00+00:00"})
+                store.upsert_execution({"execution_id": "S_RERUN_1", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "RERUN", "side": "SLD", "quantity": 40, "price": 11, "executed_at": "2026-05-29T13:40:00+00:00"})
+                store.upsert_execution({"execution_id": "S_RERUN_2", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "RERUN", "side": "SLD", "quantity": 60, "price": 12, "executed_at": "2026-05-29T13:50:00+00:00"})
+                before = store.query("SELECT trade_id, quantity, gross_pnl FROM trades WHERE symbol = 'RERUN' ORDER BY trade_id")
+
+                store.rebuild_symbol_trade_state("RERUN")
+                after = store.query("SELECT trade_id, quantity, gross_pnl FROM trades WHERE symbol = 'RERUN' ORDER BY trade_id")
+
+                self.assertEqual(before, after)
+                self.assertEqual(len(after), 2)
+                self.assertAlmostEqual(sum(row["quantity"] for row in after), 100)
+            finally:
+                store.close()
+
+    def test_old_carried_buy_today_sell_is_consumed_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B_CARRY", "strategy_name": "v67", "session_date": "2026-05-28", "symbol": "CARRY", "side": "BOT", "quantity": 3, "price": 20, "executed_at": "2026-05-28T18:00:00+00:00"})
+                store.upsert_execution({"execution_id": "S_CARRY", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "CARRY", "side": "SLD", "quantity": 3, "price": 21, "executed_at": "2026-05-29T13:40:00+00:00"})
+                store.rebuild_symbol_trade_state("CARRY")
+
+                rows = store.query("SELECT trade_id, session_date, entry_fill_time, exit_fill_time, quantity FROM trades WHERE symbol = 'CARRY'")
+
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["session_date"], "2026-05-28")
+                self.assertEqual(rows[0]["entry_fill_time"], "2026-05-28T18:00:00+00:00")
+                self.assertEqual(rows[0]["exit_fill_time"], "2026-05-29T13:40:00+00:00")
+                self.assertAlmostEqual(rows[0]["quantity"], 3)
+            finally:
+                store.close()
+
     def test_runtime_event_append_works(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")

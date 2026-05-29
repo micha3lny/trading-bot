@@ -70,12 +70,18 @@ def trade_id_for(entry_date: str, exit_date: str, symbol: str, buy_exec_id: str,
     return f"reconstructed:{entry_date}:{exit_date}:{symbol}:{buy_exec_id}:{sell_exec_id}"
 
 
-def existing_trade_fingerprints(store: SQLiteRuntimeStore) -> tuple[set[str], set[tuple[str, str, str, str, str, str]]]:
+def existing_trade_fingerprints(store: SQLiteRuntimeStore, *, include_reconstructed: bool = False) -> tuple[set[str], set[tuple[str, str, str, str, str, str]]]:
+    reconstructed_filter = "" if include_reconstructed else """
+          AND trade_id NOT LIKE 'reconstructed:%'
+          AND COALESCE(raw_json, '') NOT LIKE '%executions_pair_repair%'
+          AND COALESCE(raw_json, '') NOT LIKE '%sqlite_execution_reducer%'
+    """
     rows = store.query(
-        """
+        f"""
         SELECT trade_id, symbol, entry_fill_time, exit_fill_time, entry_price, exit_price, quantity, raw_json
         FROM trades
         WHERE UPPER(COALESCE(status, '')) IN ('CLOSED', 'DONE', 'EXIT_FILLED', 'FLAT')
+        {reconstructed_filter}
         """
     )
     trade_ids: set[str] = set()
@@ -102,6 +108,33 @@ def existing_trade_fingerprints(store: SQLiteRuntimeStore) -> tuple[set[str], se
     return trade_ids, fingerprints
 
 
+def delete_reconstructed_for_exit_date(store: SQLiteRuntimeStore, target_date: str) -> int:
+    rows = store.query(
+        """
+        SELECT trade_id
+        FROM trades
+        WHERE (
+            trade_id LIKE 'reconstructed:%'
+            OR COALESCE(raw_json, '') LIKE '%executions_pair_repair%'
+            OR COALESCE(raw_json, '') LIKE '%sqlite_execution_reducer%'
+        )
+          AND (
+            substr(exit_fill_time, 1, 10) = ?
+            OR substr(closed_at, 1, 10) = ?
+            OR COALESCE(raw_json, '') LIKE ?
+          )
+        """,
+        [target_date, target_date, f'%"exit_date": "{target_date}"%'],
+    )
+    trade_ids = [str(row.get("trade_id") or "") for row in rows if row.get("trade_id")]
+    if not trade_ids:
+        return 0
+    placeholders = ",".join("?" for _ in trade_ids)
+    store.execute(f"UPDATE executions SET trade_id = NULL WHERE trade_id IN ({placeholders})", trade_ids)
+    store.execute(f"DELETE FROM trades WHERE trade_id IN ({placeholders})", trade_ids)
+    return len(trade_ids)
+
+
 def load_execution_rows(store: SQLiteRuntimeStore, target_date: str, lookback_days: int) -> list[dict[str, Any]]:
     start_date = (datetime.fromisoformat(target_date).date() - timedelta(days=max(0, lookback_days))).isoformat()
     rows = store.query(
@@ -126,11 +159,12 @@ def reconstruct_closed_trades_from_executions(
     apply: bool = False,
 ) -> dict[str, Any]:
     rows = load_execution_rows(store, target_date, lookback_days)
-    existing_ids, existing_fingerprints = existing_trade_fingerprints(store)
+    existing_ids, existing_fingerprints = existing_trade_fingerprints(store, include_reconstructed=False)
     open_lots: dict[tuple[str, str], list[dict[str, Any]]] = {}
     planned: list[dict[str, Any]] = []
     skipped_sell_only = 0
     skipped_existing = 0
+    deleted_reconstructed = 0
 
     for row in rows:
         symbol = str(row.get("symbol") or "").upper()
@@ -219,6 +253,9 @@ def reconstruct_closed_trades_from_executions(
                             "reconstruction_source": "executions_pair_repair",
                             "buy_execution_id": buy_exec,
                             "sell_execution_id": sell_exec,
+                            "matched_quantity": matched_qty,
+                            "buy_original_quantity": as_float(lot.get("original_qty")),
+                            "sell_original_quantity": qty,
                             "entry_executed_at": buy_time,
                             "exit_executed_at": sell_time,
                             "exit_date": exit_date,
@@ -234,15 +271,17 @@ def reconstruct_closed_trades_from_executions(
                 open_lots[key].pop(0)
 
     if apply:
-        for trade in planned:
-            store.upsert_trade(trade)
-        store.conn.commit()
+        with store.transaction():
+            deleted_reconstructed = delete_reconstructed_for_exit_date(store, target_date)
+            for trade in planned:
+                store.upsert_trade(trade)
 
     return {
         "date": target_date,
         "apply": bool(apply),
         "planned": len(planned),
         "created": len(planned) if apply else 0,
+        "deleted_reconstructed": deleted_reconstructed,
         "skipped_existing": skipped_existing,
         "skipped_sell_only": skipped_sell_only,
         "trades": planned,
