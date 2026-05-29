@@ -263,6 +263,9 @@ def load_sqlite_executions(sqlite_path: str | None, session_date: str) -> list[d
     if not path.exists():
         return []
     try:
+        from src.live_trading.storage.sqlite_store import migrate_runtime_schema
+
+        migrate_runtime_schema(path)
         conn = sqlite3.connect(str(path))
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -295,6 +298,9 @@ def load_sqlite_positions(sqlite_path: str | None, session_date: str) -> list[di
     if not path.exists():
         return []
     try:
+        from src.live_trading.storage.sqlite_store import migrate_runtime_schema
+
+        migrate_runtime_schema(path)
         conn = sqlite3.connect(str(path))
         conn.row_factory = sqlite3.Row
         rows = conn.execute(

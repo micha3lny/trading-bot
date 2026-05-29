@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import csv
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-from src.dashboard.runtime_queries import DateWindow, list_sessions, list_strategies, load_dashboard_snapshot, utc_today
+from src.dashboard.runtime_queries import DateWindow, list_sessions, list_strategies, load_dashboard_snapshot, load_diagnostics, utc_today
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
 
@@ -1476,6 +1477,90 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             first = metrics()
             second = metrics()
             self.assertEqual(first, second)
+
+    def test_diagnostics_tolerates_legacy_trades_schema_without_updated_at(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE runtime_events (
+                event_time TEXT,
+                event_type TEXT,
+                reason TEXT,
+                session_date TEXT,
+                strategy_name TEXT
+            );
+            CREATE TABLE risk_events (
+                event_time TEXT,
+                event_type TEXT,
+                reason TEXT,
+                session_date TEXT,
+                strategy_name TEXT,
+                repeat_count INTEGER
+            );
+            CREATE TABLE reconciliation_runs (
+                started_at TEXT,
+                finished_at TEXT,
+                orphan_count INTEGER,
+                drift_count INTEGER
+            );
+            CREATE TABLE trades (
+                trade_id TEXT PRIMARY KEY,
+                strategy_name TEXT,
+                session_date TEXT,
+                exit_fill_time TEXT,
+                closed_at TEXT,
+                raw_json TEXT
+            );
+            INSERT INTO trades (trade_id, strategy_name, session_date, exit_fill_time, closed_at, raw_json)
+            VALUES ('T1', 'v67', '2026-05-29', '2026-05-29T13:45:00+00:00', '2026-05-29T13:45:00+00:00', '{}');
+            """
+        )
+        try:
+            diagnostics = load_diagnostics(conn, DateWindow("2026-05-29", "2026-05-29"), "v67")
+        finally:
+            conn.close()
+
+        self.assertEqual(diagnostics["trades_count"], 1)
+        self.assertEqual(diagnostics["trades_updated_last_60s"], 0)
+        self.assertEqual(diagnostics["last_reducer_run_at"], "")
+
+    def test_dashboard_snapshot_migrates_existing_db_before_query(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.close()
+
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            try:
+                cols = [
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(trades)").fetchall()
+                    if row["name"] not in {"updated_at", "trade_reduction_version"}
+                ]
+                col_sql = ", ".join(cols)
+                conn.execute(f"CREATE TABLE trades_legacy AS SELECT {col_sql} FROM trades")
+                conn.execute("DROP TABLE trades")
+                conn.execute("ALTER TABLE trades_legacy RENAME TO trades")
+                conn.commit()
+                before = {row["name"] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+                self.assertNotIn("updated_at", before)
+                self.assertNotIn("trade_reduction_version", before)
+            finally:
+                conn.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-29", "2026-05-29"), "All")
+            self.assertEqual(snapshot["diagnostics"]["trades_count"], 0)
+
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            try:
+                after = {row["name"] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+            finally:
+                conn.close()
+            self.assertIn("updated_at", after)
+            self.assertIn("trade_reduction_version", after)
 
 
 if __name__ == "__main__":

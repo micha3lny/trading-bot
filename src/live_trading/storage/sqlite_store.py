@@ -38,6 +38,11 @@ def open_sqlite_store(path: str | Path | None = None) -> SQLiteRuntimeStore | No
         return None
 
 
+def migrate_runtime_schema(path: str | Path | None = None) -> None:
+    store = SQLiteRuntimeStore(resolve_sqlite_path(path))
+    store.close()
+
+
 def safe_json(value: Any) -> str:
     if value is None or value == "":
         return ""

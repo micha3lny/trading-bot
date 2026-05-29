@@ -14,7 +14,7 @@ from src.live_trading.analytics.v67_daily_report import (
     reconstruct_closed_trades_from_fills,
     simulate_exit_strategies,
 )
-from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, resolve_sqlite_path
+from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, migrate_runtime_schema, resolve_sqlite_path
 
 
 CLOSED_STATUSES = {"CLOSED", "DONE", "EXIT_FILLED", "FLAT"}
@@ -34,6 +34,7 @@ def utc_today() -> str:
 
 def connect(sqlite_path: str | Path | None = None) -> sqlite3.Connection:
     path = Path(resolve_sqlite_path(sqlite_path or DEFAULT_SQLITE_PATH))
+    migrate_runtime_schema(path)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     return conn
@@ -41,6 +42,13 @@ def connect(sqlite_path: str | Path | None = None) -> sqlite3.Connection:
 
 def read_sql(conn: sqlite3.Connection, sql: str, params: list[Any] | tuple[Any, ...] = ()) -> pd.DataFrame:
     return pd.read_sql_query(sql, conn, params=params)
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    except Exception:
+        return set()
 
 
 def parse_raw_json(value: Any) -> dict[str, Any]:
@@ -1434,6 +1442,13 @@ def load_diagnostics(conn: sqlite3.Connection, window: DateWindow, strategy: str
     event_clause, event_params = strategy_clause("r", strategy)
     risk_clause, risk_params = strategy_clause("q", strategy)
     trade_clause, trade_params = strategy_clause("t", strategy)
+    trade_cols = table_columns(conn, "trades")
+    trade_updated_at_expr = "t.updated_at" if "updated_at" in trade_cols else "NULL"
+    trades_updated_last_60s_expr = (
+        "SUM(CASE WHEN t.updated_at IS NOT NULL AND unixepoch('now') - unixepoch(t.updated_at) BETWEEN 0 AND 60 THEN 1 ELSE 0 END)"
+        if "updated_at" in trade_cols
+        else "0"
+    )
     events = read_sql(
         conn,
         f"""
@@ -1476,12 +1491,8 @@ def load_diagnostics(conn: sqlite3.Connection, window: DateWindow, strategy: str
                   OR raw_json LIKE '%executions_pair%'
                 THEN 1 ELSE 0 END
             ) AS reconstructed_trades_count,
-            SUM(CASE
-                WHEN updated_at IS NOT NULL
-                 AND unixepoch('now') - unixepoch(updated_at) BETWEEN 0 AND 60
-                THEN 1 ELSE 0 END
-            ) AS trades_updated_last_60s,
-            MAX(updated_at) AS last_reducer_run_at
+            {trades_updated_last_60s_expr} AS trades_updated_last_60s,
+            MAX({trade_updated_at_expr}) AS last_reducer_run_at
         FROM trades t
         WHERE (
             substr(t.exit_fill_time, 1, 10) BETWEEN ? AND ?
