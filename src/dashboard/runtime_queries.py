@@ -1433,6 +1433,7 @@ def load_rejected_entries(conn: sqlite3.Connection, window: DateWindow, strategy
 def load_diagnostics(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> dict[str, int]:
     event_clause, event_params = strategy_clause("r", strategy)
     risk_clause, risk_params = strategy_clause("q", strategy)
+    trade_clause, trade_params = strategy_clause("t", strategy)
     events = read_sql(
         conn,
         f"""
@@ -1464,6 +1465,35 @@ def load_diagnostics(conn: sqlite3.Connection, window: DateWindow, strategy: str
         """,
         [window.start_date, window.end_date],
     )
+    trade_diag = read_sql(
+        conn,
+        f"""
+        SELECT
+            COUNT(*) AS trades_count,
+            SUM(CASE
+                WHEN trade_id LIKE 'reconstructed:%'
+                  OR raw_json LIKE '%sqlite_execution_reducer%'
+                  OR raw_json LIKE '%executions_pair%'
+                THEN 1 ELSE 0 END
+            ) AS reconstructed_trades_count,
+            SUM(CASE
+                WHEN updated_at IS NOT NULL
+                 AND unixepoch('now') - unixepoch(updated_at) BETWEEN 0 AND 60
+                THEN 1 ELSE 0 END
+            ) AS trades_updated_last_60s,
+            MAX(updated_at) AS last_reducer_run_at
+        FROM trades t
+        WHERE (
+            substr(t.exit_fill_time, 1, 10) BETWEEN ? AND ?
+            OR substr(t.closed_at, 1, 10) BETWEEN ? AND ?
+            OR (
+                COALESCE(t.exit_fill_time, t.closed_at) IS NULL
+                AND t.session_date BETWEEN ? AND ?
+            )
+        ) {trade_clause}
+        """,
+        [window.start_date, window.end_date, window.start_date, window.end_date, window.start_date, window.end_date, *trade_params],
+    )
     out = {
         "orphans": 0,
         "missing_in_ibkr": 0,
@@ -1473,6 +1503,11 @@ def load_diagnostics(conn: sqlite3.Connection, window: DateWindow, strategy: str
         "rejected_entries": 0,
         "sqlite_failures": 0,
         "reconnect_events": 0,
+        "trades_count": 0,
+        "reconstructed_trades_count": 0,
+        "trades_updated_last_60s": 0,
+        "reducer_running": 0,
+        "last_reducer_run_at": "",
     }
     for row in events.to_dict("records"):
         event_type = str(row.get("event_type") or "")
@@ -1499,6 +1534,12 @@ def load_diagnostics(conn: sqlite3.Connection, window: DateWindow, strategy: str
         last = rec.iloc[0].to_dict()
         out["orphans"] = max(out["orphans"], int(last.get("orphan_count") or 0))
         out["missing_in_ibkr"] = max(out["missing_in_ibkr"], int(last.get("drift_count") or 0))
+    if not trade_diag.empty:
+        row = trade_diag.iloc[0].to_dict()
+        out["trades_count"] = int(row.get("trades_count") or 0)
+        out["reconstructed_trades_count"] = int(row.get("reconstructed_trades_count") or 0)
+        out["trades_updated_last_60s"] = int(row.get("trades_updated_last_60s") or 0)
+        out["last_reducer_run_at"] = str(row.get("last_reducer_run_at") or "")
     return out
 
 
@@ -1681,6 +1722,7 @@ def load_dashboard_snapshot(
         }
     conn = connect(path)
     try:
+        conn.execute("BEGIN")
         executions = load_executions(conn, window, strategy)
         execution_lookup = load_executions(conn, expanded_lookup_window(window), strategy)
         closed, closed_diag = load_closed_positions(
@@ -1695,7 +1737,7 @@ def load_dashboard_snapshot(
         diagnostics = load_diagnostics(conn, window, strategy)
         diagnostics.update(closed_diag)
         diagnostics.update(load_position_row_diagnostics(conn, window, strategy, len(open_positions)))
-        return {
+        snapshot = {
             "summary": build_summary(open_positions, closed),
             "data_quality_summary": build_data_quality_summary(closed),
             "open_positions": open_positions,
@@ -1707,5 +1749,10 @@ def load_dashboard_snapshot(
             "loaded_at": datetime.now(timezone.utc).isoformat(),
             "source": str(path),
         }
+        conn.commit()
+        return snapshot
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()

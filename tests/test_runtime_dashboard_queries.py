@@ -1425,6 +1425,58 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["rejected_entries"].iloc[0]["price"], 42.5)
             self.assertEqual(snapshot["rejected_entries"].iloc[0]["rejected_at"], "2026-05-28T13:36:00+00:00")
 
+    def test_repeated_dashboard_snapshot_metrics_are_stable_when_db_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_execution({
+                "execution_id": "B_STABLE_DASH",
+                "session_date": "2026-05-29",
+                "strategy_name": "v67",
+                "symbol": "DASH",
+                "side": "BOT",
+                "quantity": 2,
+                "price": 10,
+                "commission": 0.35,
+                "commission_source": "ibkr",
+                "executed_at": "2026-05-29T13:30:00+00:00",
+            })
+            store.upsert_execution({
+                "execution_id": "S_STABLE_DASH",
+                "session_date": "2026-05-29",
+                "strategy_name": "v67",
+                "symbol": "DASH",
+                "side": "SLD",
+                "quantity": 2,
+                "price": 11,
+                "commission": 0.36,
+                "commission_source": "ibkr",
+                "executed_at": "2026-05-29T13:40:00+00:00",
+            })
+            store.close()
+
+            def metrics() -> tuple:
+                snap = load_dashboard_snapshot(db, DateWindow("2026-05-29", "2026-05-29"), "v67")
+                summary = snap["summary"]
+                quality = snap["data_quality_summary"]
+                diagnostics = snap["diagnostics"]
+                return (
+                    summary["closed_trades"],
+                    round(summary["gross_pnl"], 6),
+                    round(summary["commissions"], 6),
+                    round(summary["net_actual_pnl"], 6),
+                    quality["commission_ok"],
+                    quality["commission_partial"],
+                    quality["commission_missing"],
+                    diagnostics["trades_count"],
+                    diagnostics["reconstructed_trades_count"],
+                    diagnostics["displayed_closed_trades_count"],
+                )
+
+            first = metrics()
+            second = metrics()
+            self.assertEqual(first, second)
+
 
 if __name__ == "__main__":
     unittest.main()

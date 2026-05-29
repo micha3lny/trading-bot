@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -148,6 +149,7 @@ class SQLiteRuntimeStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.path))
         self.conn.row_factory = sqlite3.Row
+        self._transaction_depth = 0
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
@@ -157,9 +159,28 @@ class SQLiteRuntimeStore:
     def close(self) -> None:
         self.conn.close()
 
+    @contextmanager
+    def transaction(self):
+        outermost = self._transaction_depth == 0
+        if outermost:
+            self.conn.execute("BEGIN IMMEDIATE")
+        self._transaction_depth += 1
+        try:
+            yield
+        except Exception:
+            self._transaction_depth -= 1
+            if outermost:
+                self.conn.rollback()
+            raise
+        else:
+            self._transaction_depth -= 1
+            if outermost:
+                self.conn.commit()
+
     def execute(self, sql: str, params: Iterable[Any] | dict[str, Any] = ()) -> sqlite3.Cursor:
         cur = self.conn.execute(sql, params)
-        self.conn.commit()
+        if self._transaction_depth == 0:
+            self.conn.commit()
         return cur
 
     def query(self, sql: str, params: Iterable[Any] | dict[str, Any] = ()) -> list[dict[str, Any]]:
@@ -227,7 +248,9 @@ class SQLiteRuntimeStore:
                 ibkr_exit_confirmed INTEGER DEFAULT 0,
                 ibkr_position_flat_confirmed INTEGER DEFAULT 0,
                 ibkr_position_flat_confirmed_at TEXT,
-                raw_json TEXT
+                raw_json TEXT,
+                updated_at TEXT,
+                trade_reduction_version INTEGER DEFAULT 1
             );
             CREATE INDEX IF NOT EXISTS idx_trades_session_date ON trades(session_date);
             CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
@@ -436,7 +459,14 @@ class SQLiteRuntimeStore:
             CREATE INDEX IF NOT EXISTS idx_collector_runs_end_date ON collector_runs(end_date);
             """
         )
+        self._ensure_column("trades", "updated_at", "TEXT")
+        self._ensure_column("trades", "trade_reduction_version", "INTEGER DEFAULT 1")
         self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        existing = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in existing:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _upsert(self, table: str, row: dict[str, Any], key_columns: list[str], columns: list[str]) -> None:
         clean = clean_row(row, columns)
@@ -566,8 +596,9 @@ class SQLiteRuntimeStore:
             "raw_json": row.get("raw_json") or row,
         }
         columns = list(data.keys())
-        self._upsert("executions", data, ["execution_id"], columns)
-        self._reconcile_trade_state_after_execution(data)
+        with self.transaction():
+            self._upsert("executions", data, ["execution_id"], columns)
+            self._reconcile_trade_state_after_execution(data)
 
     def _reconcile_trade_state_after_execution(self, execution: dict[str, Any]) -> None:
         try:
@@ -633,6 +664,7 @@ class SQLiteRuntimeStore:
             """,
             params,
         )
+        reducer_started_at = utc_now_iso()
         open_lots: list[dict[str, Any]] = []
         closed_count = 0
         last_event_time = utc_now_iso()
@@ -723,6 +755,7 @@ class SQLiteRuntimeStore:
                         "ibkr_exit_confirmed": True,
                         "ibkr_position_flat_confirmed": True,
                         "ibkr_position_flat_confirmed_at": sell_time,
+                        "updated_at": reducer_started_at,
                         "raw_json": raw,
                         **preserved,
                     }
@@ -835,6 +868,8 @@ class SQLiteRuntimeStore:
 
     def upsert_trade(self, row: dict[str, Any]) -> str:
         trade_id = str(row.get("trade_id") or uuid.uuid4().hex)
+        previous = self.query("SELECT trade_reduction_version FROM trades WHERE trade_id = ?", [trade_id])
+        previous_version = safe_int(previous[0].get("trade_reduction_version")) if previous else None
         data = {
             "trade_id": trade_id,
             "strategy_name": row.get("strategy_name") or "unknown",
@@ -865,6 +900,8 @@ class SQLiteRuntimeStore:
             "ibkr_position_flat_confirmed": bool_int(row.get("ibkr_position_flat_confirmed")),
             "ibkr_position_flat_confirmed_at": row.get("ibkr_position_flat_confirmed_at"),
             "raw_json": row.get("raw_json") or row,
+            "updated_at": row.get("updated_at") or utc_now_iso(),
+            "trade_reduction_version": safe_int(row.get("trade_reduction_version")) or ((previous_version or 0) + 1),
         }
         status = str(data.get("status") or "").upper()
         if status in {"CLOSED", "DONE", "EXIT_FILLED", "FLAT"}:

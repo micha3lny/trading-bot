@@ -171,6 +171,57 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_commission_update_keeps_trade_count_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B_STABLE", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "STBL", "side": "BOT", "quantity": 3, "price": 10, "executed_at": "2026-05-29T13:30:00+00:00", "commission_source": "missing"})
+                store.upsert_execution({"execution_id": "S_STABLE", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "STBL", "side": "SLD", "quantity": 3, "price": 11, "executed_at": "2026-05-29T13:40:00+00:00", "commission_source": "missing"})
+                before = store.query("SELECT COUNT(*) AS n, SUM(gross_pnl) AS gross, SUM(commission) AS commission, SUM(net_pnl) AS net FROM trades")[0]
+
+                store.upsert_execution({"execution_id": "B_STABLE", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "STBL", "side": "BOT", "quantity": 3, "price": 10, "executed_at": "2026-05-29T13:30:00+00:00", "commission": 0.35, "commission_source": "ibkr"})
+                store.upsert_execution({"execution_id": "S_STABLE", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "STBL", "side": "SLD", "quantity": 3, "price": 11, "executed_at": "2026-05-29T13:40:00+00:00", "commission": 0.36, "commission_source": "ibkr"})
+                after = store.query("SELECT COUNT(*) AS n, SUM(gross_pnl) AS gross, SUM(commission) AS commission, SUM(net_pnl) AS net FROM trades")[0]
+
+                self.assertEqual(before["n"], 1)
+                self.assertEqual(after["n"], 1)
+                self.assertAlmostEqual(before["gross"], after["gross"])
+                self.assertAlmostEqual(after["commission"], 0.71)
+                self.assertAlmostEqual(after["net"], (before["gross"] or 0) - 0.71)
+            finally:
+                store.close()
+
+    def test_persisted_trade_dedupe_is_atomic_to_final_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B_DEDUPE", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "DDUP", "side": "BOT", "quantity": 1, "price": 20, "executed_at": "2026-05-29T13:30:00+00:00"})
+                store.upsert_execution({"execution_id": "S_DEDUPE", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "DDUP", "side": "SLD", "quantity": 1, "price": 21, "executed_at": "2026-05-29T13:40:00+00:00"})
+                self.assertEqual(store.query("SELECT COUNT(*) AS n FROM trades")[0]["n"], 1)
+
+                store.upsert_trade({
+                    "trade_id": "PERSISTED-DDUP",
+                    "strategy_name": "v67",
+                    "session_date": "2026-05-29",
+                    "symbol": "DDUP",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-05-29T13:30:00+00:00",
+                    "exit_fill_time": "2026-05-29T13:40:00+00:00",
+                    "entry_price": 20,
+                    "exit_price": 21,
+                    "quantity": 1,
+                    "gross_pnl": 1,
+                    "net_pnl": 1,
+                    "raw_json": {"source": "persisted_test"},
+                })
+
+                rows = store.query("SELECT trade_id FROM trades WHERE symbol = 'DDUP'")
+                execution_links = store.query("SELECT DISTINCT trade_id FROM executions WHERE symbol = 'DDUP'")
+                self.assertEqual([row["trade_id"] for row in rows], ["PERSISTED-DDUP"])
+                self.assertEqual([row["trade_id"] for row in execution_links], ["PERSISTED-DDUP"])
+            finally:
+                store.close()
+
     def test_entry_rejected_position_creates_no_trade_or_open_position(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
