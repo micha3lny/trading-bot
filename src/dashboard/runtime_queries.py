@@ -807,6 +807,7 @@ def closed_from_trades(
     out["confirmed_commission_execution_count"] = confirmed_commission_counts
     out["expected_commission_execution_count"] = expected_commission_counts
     out["commission_source_detail"] = commission_source_details
+    out["closed_source"] = "trades"
     out["gross"] = pd.to_numeric(out["gross"], errors="coerce").fillna(0.0)
     out["buy"] = pd.to_numeric(out["buy"], errors="coerce").fillna(0.0)
     out["sell"] = pd.to_numeric(out["sell"], errors="coerce").fillna(0.0)
@@ -827,15 +828,26 @@ def closed_from_trades(
             "entry_date", "exit_date",
             "entry_execution_count", "exit_execution_count", "confirmed_commission_execution_count",
             "expected_commission_execution_count", "peak_source", "peak_match_quality", "commission_source_detail",
+            "closed_source",
         ]
     ]
 
 
-def closed_from_executions(executions: pd.DataFrame, window: DateWindow) -> pd.DataFrame:
+def closed_from_executions(
+    executions: pd.DataFrame,
+    window: DateWindow,
+    *,
+    trade_entry_times: dict[tuple[str, str, str], Any] | None = None,
+    position_entry_times: dict[tuple[str, str, str], Any] | None = None,
+    runtime_entry_times: dict[tuple[str, str, str], Any] | None = None,
+) -> pd.DataFrame:
     if executions.empty:
         return pd.DataFrame()
     rows: list[dict[str, Any]] = []
-    for (session_date, strategy), group in executions.groupby(["session_date", "strategy"], dropna=False):
+    trade_entry_times = trade_entry_times or {}
+    position_entry_times = position_entry_times or {}
+    runtime_entry_times = runtime_entry_times or {}
+    for (strategy, symbol_group), group in executions.groupby(["strategy", "symbol"], dropna=False):
         fill_rows = group.to_dict("records")
         for row in reconstruct_closed_trades_from_fills(fill_rows):
             buy_execution = next((x for x in fill_rows if str(x.get("execution_id") or "") == str(row.get("buy_execution_id") or "")), {})
@@ -845,8 +857,25 @@ def closed_from_executions(executions: pd.DataFrame, window: DateWindow) -> pd.D
             if sell_time:
                 if not window_contains_date(window, sell_time):
                     continue
-            elif not (window.start_date <= str(session_date or "") <= window.end_date):
+            elif not (window.start_date <= str(sell_execution.get("session_date") or buy_execution.get("session_date") or "") <= window.end_date):
                 continue
+            symbol = str(row.get("symbol") or symbol_group or "").upper()
+            strategy_name = str(strategy or "unknown")
+            buy_session_date = date_part(buy_time) or str(buy_execution.get("session_date") or "")
+            exit_date = date_part(sell_time) or str(sell_execution.get("session_date") or "")
+            recovered_entry_time = (
+                lookup_entry_time(trade_entry_times, session_date=buy_session_date, strategy=strategy_name, symbol=symbol, before_or_on=exit_date)
+                or lookup_entry_time(position_entry_times, session_date=buy_session_date, strategy=strategy_name, symbol=symbol, before_or_on=exit_date)
+                or lookup_entry_time(runtime_entry_times, session_date=buy_session_date, strategy=strategy_name, symbol=symbol, before_or_on=exit_date)
+            )
+            flags = {"RECONSTRUCTED_FROM_EXECUTIONS"}
+            closed_source = "reconstructed_executions"
+            if recovered_entry_time and date_part(recovered_entry_time) and exit_date and date_part(recovered_entry_time) < exit_date:
+                buy_time = recovered_entry_time
+                flags.add("CARRIED_ENTRY_TIME_RECOVERED")
+                closed_source = "carried_recovered"
+            elif not buy_time:
+                flags.add("CARRIED_ENTRY_TIME_MISSING")
             buy = to_float(row.get("buy"), 0.0) or 0.0
             sell = to_float(row.get("sell"), 0.0) or 0.0
             pnl_pct = ((sell / buy - 1.0) * 100.0) if buy and sell else 0.0
@@ -858,7 +887,6 @@ def closed_from_executions(executions: pd.DataFrame, window: DateWindow) -> pd.D
             net = gross - commission
             denominator = abs(buy * qty)
             net_pct = (net / denominator * 100.0) if denominator else 0.0
-            flags = {"RECONSTRUCTED_FROM_EXECUTIONS"}
             if not buy_time or not sell_time:
                 flags.add("MISSING_EXECUTION_TIME")
             commission_status = "OK" if str(row.get("commission_source") or "").lower() == "ibkr" else ("PARTIAL" if commission else "MISSING")
@@ -867,7 +895,7 @@ def closed_from_executions(executions: pd.DataFrame, window: DateWindow) -> pd.D
             elif commission_status == "MISSING":
                 flags.add("COMMISSION_MISSING")
             rows.append({
-                "symbol": row.get("symbol"),
+                "symbol": symbol,
                 "trade_id": row.get("trade_id") or "",
                 "gross": gross,
                 "ibkr_commission": commission,
@@ -879,11 +907,11 @@ def closed_from_executions(executions: pd.DataFrame, window: DateWindow) -> pd.D
                 "drop_from_peak_pct": to_float(row.get("drop_from_peak_pct"), net_pct - peak_pct if peak_pct is not None else None),
                 "hold_minutes": hold_minutes(buy_time, sell_time) if buy_time and sell_time else None,
                 "exit_reason": row.get("reason") or "",
-                "strategy": strategy or "unknown",
+                "strategy": strategy_name,
                 "entry_time": buy_time,
                 "exit_time": sell_time,
-                "entry_date": date_part(buy_time) or str(session_date or ""),
-                "exit_date": date_part(sell_time) or str(session_date or ""),
+                "entry_date": date_part(buy_time) or "",
+                "exit_date": exit_date,
                 "data_quality": quality_label_from_flags(flags),
                 "entry_execution_count": 1,
                 "exit_execution_count": 1,
@@ -892,10 +920,11 @@ def closed_from_executions(executions: pd.DataFrame, window: DateWindow) -> pd.D
                 "peak_source": "fills_reconstruction" if raw_peak is not None else "missing",
                 "peak_match_quality": "exact_trade_id" if raw_peak is not None else "missing",
                 "commission_source_detail": "reconstructed",
+                "closed_source": closed_source,
                 "qty": qty,
                 "buy": buy,
                 "sell": sell,
-                "session_date": session_date,
+                "session_date": buy_session_date or exit_date,
             })
     return pd.DataFrame(rows)
 
@@ -957,21 +986,28 @@ def apply_symbol_session_peak_fallbacks(
 
 
 def load_closed_positions(conn: sqlite3.Connection, window: DateWindow, strategy: str | None, executions: pd.DataFrame) -> pd.DataFrame:
+    lookup_window = expanded_lookup_window(window)
     runtime_peak_map = load_runtime_peak_map(conn, window, strategy)
     runtime_symbol_peak_map = load_runtime_symbol_peak_map(conn, window, strategy)
     lifecycle_peak_map = load_lifecycle_peak_map(window)
     lifecycle_symbol_peak_map = load_lifecycle_symbol_peak_map(window)
     candle_rows: dict[tuple[str, str], pd.DataFrame] = {}
     trades = closed_from_trades(conn, window, strategy, executions, runtime_peak_map, lifecycle_peak_map, candle_rows)
-    reconstructed = closed_from_executions(executions, window)
+    reconstructed = closed_from_executions(
+        executions,
+        window,
+        trade_entry_times=trade_entry_map(conn, lookup_window, strategy),
+        position_entry_times=position_entry_map(conn, lookup_window, strategy),
+        runtime_entry_times=runtime_entry_event_map(conn, lookup_window, strategy),
+    )
     if not trades.empty and not reconstructed.empty:
         trade_keys = {
-            (str(row.get("session_date") or ""), str(row.get("symbol") or "").upper())
+            (str(row.get("exit_date") or date_part(row.get("exit_time")) or row.get("session_date") or ""), str(row.get("symbol") or "").upper())
             for row in trades.to_dict("records")
         }
         reconstructed = reconstructed[
             ~reconstructed.apply(
-                lambda row: (str(row.get("session_date") or ""), str(row.get("symbol") or "").upper()) in trade_keys,
+                lambda row: (str(row.get("exit_date") or date_part(row.get("exit_time")) or row.get("session_date") or ""), str(row.get("symbol") or "").upper()) in trade_keys,
                 axis=1,
             )
         ]
@@ -1079,6 +1115,61 @@ def runtime_entry_event_map(conn: sqlite3.Connection, window: DateWindow, strate
         key = (str(row.get("session_date") or ""), str(row.get("strategy") or "unknown"), str(row.get("symbol") or "").upper())
         out.setdefault(key, row.get("event_time"))
     return out
+
+
+def position_entry_map(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> dict[tuple[str, str, str], Any]:
+    clause, params = strategy_clause("p", strategy)
+    rows = read_sql(
+        conn,
+        f"""
+        SELECT
+            p.session_date,
+            COALESCE(p.strategy_name, 'unknown') AS strategy,
+            p.symbol,
+            p.updated_at,
+            p.raw_json
+        FROM positions p
+        WHERE p.session_date BETWEEN ? AND ? {clause}
+        ORDER BY COALESCE(p.updated_at, '') ASC
+        """,
+        [window.start_date, window.end_date, *params],
+    )
+    out: dict[tuple[str, str, str], Any] = {}
+    for row in rows.to_dict("records"):
+        raw = parse_raw_json(row.get("raw_json"))
+        raw_entry = raw.get("entry_time") or raw.get("buy_time") or raw.get("adopted_on_restart")
+        entry_time = displayable_entry_time(raw_entry)
+        if not entry_time:
+            continue
+        key = (str(row.get("session_date") or ""), str(row.get("strategy") or "unknown"), str(row.get("symbol") or "").upper())
+        out.setdefault(key, entry_time)
+    return out
+
+
+def lookup_entry_time(
+    mapping: dict[tuple[str, str, str], Any],
+    *,
+    session_date: str,
+    strategy: str,
+    symbol: str,
+    before_or_on: str | None = None,
+) -> Any:
+    exact = mapping.get((session_date, strategy, symbol))
+    if exact is not None:
+        return exact
+    candidates: list[tuple[str, Any]] = []
+    for (date_value, strategy_value, symbol_value), value in mapping.items():
+        if symbol_value != symbol:
+            continue
+        if strategy_value not in {strategy, "unknown", ""} and strategy not in {"unknown", ""}:
+            continue
+        if before_or_on and date_value > before_or_on:
+            continue
+        candidates.append((date_value, value))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 
 
 def raw_now_price(raw: dict[str, Any]) -> tuple[float | None, str, Any]:

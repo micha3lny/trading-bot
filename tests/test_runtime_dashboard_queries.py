@@ -1089,6 +1089,95 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(combined["closed_positions"].iloc[0]["symbol"], "DUOT")
             self.assertIn("2026-05-28", list_sessions(db))
 
+    def test_carried_reconstructed_trade_uses_original_entry_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_position({
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "DUOT",
+                "quantity": 2,
+                "avg_price": 10,
+                "active": 0,
+                "status": "CLOSED",
+                "updated_at": "2026-05-28T13:36:00+00:00",
+                "raw_json": {"entry_time": "2026-05-27T19:55:00+00:00"},
+            })
+            store.upsert_execution({
+                "execution_id": "B_DUOT_RECON",
+                "trade_id": None,
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "DUOT",
+                "side": "BOT",
+                "quantity": 2,
+                "price": 10,
+                "commission": 0.5,
+                "commission_source": "ibkr",
+                "executed_at": "2026-05-27T19:55:00+00:00",
+                "recorded_at": "2026-05-27T19:55:00+00:00",
+            })
+            store.upsert_execution({
+                "execution_id": "S_DUOT_RECON",
+                "trade_id": None,
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "DUOT",
+                "side": "SLD",
+                "quantity": 2,
+                "price": 11,
+                "commission": 0.6,
+                "commission_source": "ibkr",
+                "executed_at": "2026-05-28T13:35:00+00:00",
+                "recorded_at": "2026-05-28T13:35:00+00:00",
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-28", "2026-05-28"), "v67")
+            closed = snapshot["closed_positions"]
+
+            self.assertEqual(len(closed), 1)
+            self.assertEqual(closed.iloc[0]["symbol"], "DUOT")
+            self.assertEqual(closed.iloc[0]["entry_date"], "2026-05-27")
+            self.assertEqual(closed.iloc[0]["exit_date"], "2026-05-28")
+            self.assertEqual(closed.iloc[0]["closed_source"], "carried_recovered")
+            self.assertIn("CARRIED_ENTRY_TIME_RECOVERED", closed.iloc[0]["data_quality"])
+
+    def test_sell_only_carried_execution_does_not_fake_same_day_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_position({
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "DUOT",
+                "quantity": 2,
+                "avg_price": 10,
+                "active": 0,
+                "status": "CLOSED",
+                "updated_at": "2026-05-28T13:36:00+00:00",
+                "raw_json": {"entry_time": "2026-05-27T19:55:00+00:00"},
+            })
+            store.upsert_execution({
+                "execution_id": "S_DUOT_ONLY",
+                "trade_id": None,
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "DUOT",
+                "side": "SLD",
+                "quantity": 2,
+                "price": 11,
+                "commission": 0.6,
+                "commission_source": "ibkr",
+                "executed_at": "2026-05-28T13:35:00+00:00",
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-28", "2026-05-28"), "v67")
+
+            self.assertTrue(snapshot["closed_positions"].empty)
+
     def test_open_positions_include_entry_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
