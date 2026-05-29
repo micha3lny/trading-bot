@@ -69,12 +69,12 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
 
             default_snapshot = load_dashboard_snapshot(db, DateWindow(session_date, session_date), "v67")
 
-            self.assertEqual(default_snapshot["summary"]["closed_trades"], 0)
-            self.assertTrue(default_snapshot["closed_positions"].empty)
-            self.assertEqual(default_snapshot["diagnostics"]["persisted_closed_trades_count"], 0)
+            self.assertEqual(default_snapshot["summary"]["closed_trades"], 1)
+            self.assertFalse(default_snapshot["closed_positions"].empty)
+            self.assertEqual(default_snapshot["diagnostics"]["persisted_closed_trades_count"], 1)
             self.assertEqual(default_snapshot["diagnostics"]["reconstructed_execution_pairs_count"], 1)
-            self.assertEqual(default_snapshot["diagnostics"]["displayed_closed_trades_count"], 0)
-            self.assertEqual(default_snapshot["diagnostics"]["execution_reconstruction_disabled"], 1)
+            self.assertEqual(default_snapshot["diagnostics"]["displayed_closed_trades_count"], 1)
+            self.assertEqual(default_snapshot["diagnostics"]["execution_reconstruction_disabled"], 0)
 
             snapshot = load_dashboard_snapshot(db, DateWindow(session_date, session_date), "v67", include_reconstructed=True)
 
@@ -83,7 +83,6 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertAlmostEqual(snapshot["summary"]["gross_pnl"], 5.0)
             self.assertAlmostEqual(snapshot["summary"]["net_actual_pnl"], 4.5)
             self.assertEqual(snapshot["closed_positions"].iloc[0]["symbol"], "AAA")
-            self.assertIn("RECONSTRUCTED_FROM_EXECUTIONS", snapshot["closed_positions"].iloc[0]["data_quality"])
             self.assertEqual(snapshot["open_positions"].iloc[0]["symbol"], "BBB")
             self.assertEqual(snapshot["diagnostics"]["delayed_fills"], 1)
             self.assertEqual(snapshot["diagnostics"]["risk_guard_blocks"], 1)
@@ -128,7 +127,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(closed["entry_time"], "2026-05-27T13:31:00+00:00")
             self.assertEqual(closed["exit_time"], "2026-05-27T13:41:00+00:00")
             self.assertEqual(closed["commission_status"], "OK")
-            self.assertIn("RECONSTRUCTED_FROM_EXECUTIONS", closed["data_quality"])
+            self.assertEqual(closed["closed_source"], "trades")
 
     def test_execution_pair_without_executed_at_uses_recorded_at_times(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -163,7 +162,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertAlmostEqual(closed["hold_minutes"], 10.0)
             self.assertEqual(closed["commission_status"], "MISSING")
             self.assertNotIn("MISSING_EXECUTION_TIME", closed["data_quality"])
-            self.assertIn("RECONSTRUCTED_FROM_EXECUTIONS", closed["data_quality"])
+            self.assertEqual(closed["closed_source"], "trades")
             self.assertIn("COMMISSION_MISSING", closed["data_quality"])
 
     def test_execution_pair_raw_json_execution_time_is_used(self) -> None:
@@ -1150,8 +1149,8 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(closed.iloc[0]["symbol"], "DUOT")
             self.assertEqual(closed.iloc[0]["entry_date"], "2026-05-27")
             self.assertEqual(closed.iloc[0]["exit_date"], "2026-05-28")
-            self.assertEqual(closed.iloc[0]["closed_source"], "carried_recovered")
-            self.assertIn("CARRIED_ENTRY_TIME_RECOVERED", closed.iloc[0]["data_quality"])
+            self.assertEqual(closed.iloc[0]["closed_source"], "trades")
+            self.assertNotIn("CARRIED_ENTRY_TIME_MISSING", closed.iloc[0]["data_quality"])
 
     def test_sell_only_carried_execution_does_not_fake_same_day_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1350,15 +1349,28 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 "updated_at": "2026-05-28T06:30:00+00:00",
                 "raw_json": {"market_price": 10.4},
             })
-            store.upsert_execution({
-                "execution_id": "B_CARRY",
-                "session_date": "2026-05-28",
-                "strategy_name": "v67",
-                "symbol": "CARRY",
-                "side": "BOT",
-                "quantity": 2,
-                "price": 10,
-            })
+            store.conn.execute(
+                """
+                INSERT INTO executions (
+                    execution_id, strategy_name, session_date, symbol, side, quantity, price,
+                    executed_at, recorded_at, commission_source, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "B_CARRY",
+                    "v67",
+                    "2026-05-28",
+                    "CARRY",
+                    "BOT",
+                    2,
+                    10,
+                    "2026-05-28T06:30:00+00:00",
+                    "2026-05-28T06:30:00+00:00",
+                    "missing",
+                    "{}",
+                ),
+            )
+            store.conn.commit()
             store.close()
 
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-28", "2026-05-28"), "v67")

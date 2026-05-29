@@ -152,7 +152,7 @@ class BackfillRuntimeSQLiteTests(unittest.TestCase):
                 self.assertAlmostEqual(trades[0]["gross_pnl"], 2.0)
                 self.assertAlmostEqual(trades[0]["mfe_pct"], 8.0)
                 self.assertIn("drop_from_peak_pct", trades[0]["raw_json"])
-                self.assertIn("executions_pair", trades[0]["raw_json"])
+                self.assertIn("execution_reducer", trades[0]["raw_json"])
                 self.assertEqual(executions[0]["executed_at"], "2026-05-27T13:31:00+00:00")
                 self.assertEqual(executions[1]["executed_at"], "2026-05-27T13:41:00+00:00")
             finally:

@@ -453,6 +453,7 @@ def import_session(store: SQLiteRuntimeStore, session: Path, *, progress_interva
 
     for row in iter_csv_rows(session / "fills.csv"):
         row["session_date"] = session_date
+        row.setdefault("strategy_name", "v67")
         store.upsert_execution(row)
         counts["executions"] += 1
         if progress_interval > 0 and counts["executions"] % progress_interval == 0:

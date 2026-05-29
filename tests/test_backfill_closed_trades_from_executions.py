@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -53,14 +54,42 @@ class ClosedTradeExecutionBackfillTests(unittest.TestCase):
     def make_store(self, tmp: str) -> SQLiteRuntimeStore:
         return SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
 
+    def insert_execution_direct(self, store: SQLiteRuntimeStore, row: dict) -> None:
+        store.conn.execute(
+            """
+            INSERT INTO executions (
+                execution_id, strategy_name, session_date, symbol, side, quantity, price,
+                executed_at, recorded_at, commission, commission_currency, commission_source, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row.get("execution_id"),
+                row.get("strategy_name"),
+                row.get("session_date"),
+                row.get("symbol"),
+                row.get("side"),
+                row.get("quantity"),
+                row.get("price"),
+                row.get("executed_at"),
+                row.get("recorded_at"),
+                row.get("commission"),
+                row.get("commission_currency"),
+                row.get("commission_source"),
+                json.dumps(row.get("raw_json")),
+            ),
+        )
+        store.conn.commit()
+
     def test_same_day_buy_sell_creates_one_closed_trade(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = self.make_store(tmp)
             try:
-                store.upsert_execution(
+                self.insert_execution_direct(
+                    store,
                     execution_row("B1", symbol="AKTX", side="BOT", quantity=5, price=17.0, executed_at="2026-05-28T13:35:00+00:00", commission=0.86)
                 )
-                store.upsert_execution(
+                self.insert_execution_direct(
+                    store,
                     execution_row("S1", symbol="AKTX", side="SLD", quantity=5, price=17.5, executed_at="2026-05-28T14:05:00+00:00", commission=0.88)
                 )
 
@@ -92,10 +121,12 @@ class ClosedTradeExecutionBackfillTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = self.make_store(tmp)
             try:
-                store.upsert_execution(
+                self.insert_execution_direct(
+                    store,
                     execution_row("B_DUOT", symbol="DUOT", side="BOT", quantity=2, price=6.0, executed_at="2026-05-27T18:00:00+00:00", commission=0.42)
                 )
-                store.upsert_execution(
+                self.insert_execution_direct(
+                    store,
                     execution_row("S_DUOT", symbol="DUOT", side="SLD", quantity=2, price=7.0, executed_at="2026-05-28T13:40:00+00:00", commission=0.44)
                 )
 
@@ -118,7 +149,8 @@ class ClosedTradeExecutionBackfillTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = self.make_store(tmp)
             try:
-                store.upsert_execution(
+                self.insert_execution_direct(
+                    store,
                     execution_row("S_ONLY", symbol="EOSE", side="SLD", quantity=4, price=3.2, executed_at="2026-05-28T13:45:00+00:00", commission=0.5)
                 )
 
@@ -135,10 +167,12 @@ class ClosedTradeExecutionBackfillTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = self.make_store(tmp)
             try:
-                store.upsert_execution(
+                self.insert_execution_direct(
+                    store,
                     execution_row("B1", symbol="MRAM", side="BOT", quantity=3, price=31.65, executed_at="2026-05-28T13:35:00+00:00", commission=0.91)
                 )
-                store.upsert_execution(
+                self.insert_execution_direct(
+                    store,
                     execution_row("S1", symbol="MRAM", side="SLD", quantity=3, price=28.99, executed_at="2026-05-28T20:22:02+00:00", commission=0.92)
                 )
 

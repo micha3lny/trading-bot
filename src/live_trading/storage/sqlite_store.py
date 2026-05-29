@@ -96,6 +96,42 @@ def bool_int(value: Any) -> int:
     return int(str(value).strip().lower() in {"1", "true", "yes", "y", "on"})
 
 
+def normalized_execution_side(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if text in {"BOT", "BUY"}:
+        return "BUY"
+    if text in {"SLD", "SELL"}:
+        return "SELL"
+    return text
+
+
+def iso_date_part(value: Any) -> str:
+    if not value:
+        return ""
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc).strftime("%F")
+    except Exception:
+        text = str(value or "")
+        return text[:10] if len(text) >= 10 else ""
+
+
+def execution_sort_time(row: dict[str, Any]) -> str:
+    return str(row.get("executed_at") or row.get("recorded_at") or "")
+
+
+def execution_commission(row: dict[str, Any], fraction: float = 1.0) -> float:
+    if str(row.get("commission_source") or "").strip().lower() != "ibkr":
+        return 0.0
+    value = safe_float(row.get("commission"))
+    if value is None:
+        return 0.0
+    return abs(value) * max(0.0, fraction)
+
+
+def reconstructed_trade_id(entry_date: str, exit_date: str, symbol: str, buy_exec_id: str, sell_exec_id: str) -> str:
+    return f"reconstructed:{entry_date}:{exit_date}:{str(symbol or '').upper()}:{buy_exec_id}:{sell_exec_id}"
+
+
 def clean_row(row: dict[str, Any], columns: Iterable[str]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for col in columns:
@@ -531,6 +567,240 @@ class SQLiteRuntimeStore:
         }
         columns = list(data.keys())
         self._upsert("executions", data, ["execution_id"], columns)
+        self._reconcile_trade_state_after_execution(data)
+
+    def _reconcile_trade_state_after_execution(self, execution: dict[str, Any]) -> None:
+        try:
+            symbol = str(execution.get("symbol") or "").upper().strip()
+            if not symbol:
+                return
+            self.rebuild_symbol_trade_state(symbol)
+        except Exception as exc:
+            line = f"{utc_now_iso()} SQLITE_WRITE_FAILED method=rebuild_symbol_trade_state error={exc!r}"
+            print(line, flush=True)
+            if not unified_logger_installed():
+                append_unified_log(line)
+
+    def _closed_trade_id_for_pair(self, buy: dict[str, Any], sell: dict[str, Any], matched_qty: float) -> str:
+        symbol = str(buy.get("symbol") or sell.get("symbol") or "").upper()
+        buy_time = execution_sort_time(buy)
+        sell_time = execution_sort_time(sell)
+        entry_date = iso_date_part(buy_time or buy.get("session_date"))
+        exit_date = iso_date_part(sell_time or sell.get("session_date"))
+        buy_exec_id = str(buy.get("execution_id") or "")
+        sell_exec_id = str(sell.get("execution_id") or "")
+        existing_trade_id = str(buy.get("trade_id") or sell.get("trade_id") or "").strip()
+        if existing_trade_id:
+            return existing_trade_id
+        rows = self.query(
+            """
+            SELECT trade_id
+            FROM trades
+            WHERE UPPER(symbol) = ?
+              AND COALESCE(entry_fill_time, '') = ?
+              AND COALESCE(exit_fill_time, '') = ?
+              AND ABS(COALESCE(quantity, 0) - ?) < 0.000001
+              AND ABS(COALESCE(entry_price, 0) - ?) < 0.000001
+              AND ABS(COALESCE(exit_price, 0) - ?) < 0.000001
+            ORDER BY trade_id
+            LIMIT 1
+            """,
+            [symbol, buy_time, sell_time, matched_qty, safe_float(buy.get("price")) or 0.0, safe_float(sell.get("price")) or 0.0],
+        )
+        if rows:
+            return str(rows[0]["trade_id"])
+        return reconstructed_trade_id(entry_date, exit_date, symbol, buy_exec_id, sell_exec_id)
+
+    def rebuild_symbol_trade_state(self, symbol: str, strategy_name: str | None = None) -> dict[str, Any]:
+        symbol = str(symbol or "").upper().strip()
+        if not symbol:
+            return {"symbol": symbol, "closed_trades": 0, "open_quantity": 0.0}
+        strategy_clause = ""
+        params: list[Any] = [symbol]
+        if strategy_name:
+            strategy_clause = "AND COALESCE(strategy_name, 'unknown') = ?"
+            params.append(strategy_name)
+        rows = self.query(
+            f"""
+            SELECT execution_id, trade_id, order_key, order_id, perm_id,
+                   COALESCE(strategy_name, 'unknown') AS strategy_name,
+                   session_date, symbol, side, quantity, price, exchange, liquidity,
+                   executed_at, recorded_at, commission, commission_currency,
+                   realized_pnl, commission_source, raw_json
+            FROM executions
+            WHERE UPPER(symbol) = ? {strategy_clause}
+            ORDER BY COALESCE(executed_at, recorded_at, ''), execution_id
+            """,
+            params,
+        )
+        open_lots: list[dict[str, Any]] = []
+        closed_count = 0
+        last_event_time = utc_now_iso()
+        latest_strategy = strategy_name or "unknown"
+        latest_session = session_date_utc()
+        latest_price: float | None = None
+
+        for row in rows:
+            side = normalized_execution_side(row.get("side"))
+            qty = safe_float(row.get("quantity")) or 0.0
+            price = safe_float(row.get("price")) or 0.0
+            if qty <= 0 or price <= 0:
+                continue
+            event_time = execution_sort_time(row) or utc_now_iso()
+            last_event_time = event_time
+            latest_strategy = str(row.get("strategy_name") or latest_strategy or "unknown")
+            latest_session = str(row.get("session_date") or "") or iso_date_part(event_time) or latest_session or session_date_utc()
+            latest_price = price
+            if side == "BUY":
+                lot = dict(row)
+                lot["remaining_qty"] = qty
+                lot["original_qty"] = qty
+                open_lots.append(lot)
+                continue
+            if side != "SELL":
+                continue
+
+            remaining = qty
+            while remaining > 1e-9 and open_lots:
+                lot = open_lots[0]
+                lot_remaining = safe_float(lot.get("remaining_qty")) or 0.0
+                if lot_remaining <= 1e-9:
+                    open_lots.pop(0)
+                    continue
+                matched_qty = min(remaining, lot_remaining)
+                buy_price = safe_float(lot.get("price")) or 0.0
+                sell_price = price
+                buy_time = execution_sort_time(lot)
+                sell_time = event_time
+                entry_date = str(lot.get("session_date") or "") or iso_date_part(buy_time) or latest_session
+                exit_date = str(row.get("session_date") or "") or iso_date_part(sell_time) or latest_session
+                buy_fraction = matched_qty / (safe_float(lot.get("original_qty")) or matched_qty or 1.0)
+                sell_fraction = matched_qty / qty if qty else 1.0
+                commission = execution_commission(lot, buy_fraction) + execution_commission(row, sell_fraction)
+                gross = (sell_price - buy_price) * matched_qty
+                trade_id = self._closed_trade_id_for_pair(lot, row, matched_qty)
+                strategy = str(lot.get("strategy_name") or row.get("strategy_name") or latest_strategy or "unknown")
+                raw = {
+                    "reconstruction_source": "sqlite_execution_reducer",
+                    "buy_execution_id": lot.get("execution_id"),
+                    "sell_execution_id": row.get("execution_id"),
+                    "entry_executed_at": buy_time,
+                    "exit_executed_at": sell_time,
+                    "entry_date": entry_date,
+                    "exit_date": exit_date,
+                    "buy_commission_confirmed": str(lot.get("commission_source") or "").lower() == "ibkr",
+                    "sell_commission_confirmed": str(row.get("commission_source") or "").lower() == "ibkr",
+                }
+                existing_trade = self.query("SELECT * FROM trades WHERE trade_id = ?", [trade_id])
+                existing_raw = parse_jsonish(existing_trade[0].get("raw_json")) if existing_trade else {}
+                if existing_raw:
+                    existing_raw.update(raw)
+                    raw = existing_raw
+                preserved: dict[str, Any] = {}
+                if existing_trade:
+                    current = existing_trade[0]
+                    for key in ("mfe_pct", "mae_pct", "exit_reason", "entry_signal_time", "entry_order_time", "exit_signal_time", "exit_order_time"):
+                        if current.get(key) not in (None, ""):
+                            preserved[key] = current.get(key)
+                self.upsert_trade(
+                    {
+                        "trade_id": trade_id,
+                        "strategy_name": strategy,
+                        "session_date": entry_date,
+                        "symbol": symbol,
+                        "status": "CLOSED",
+                        "entry_fill_time": buy_time,
+                        "exit_fill_time": sell_time,
+                        "closed_at": sell_time,
+                        "entry_price": buy_price,
+                        "exit_price": sell_price,
+                        "quantity": matched_qty,
+                        "remaining_quantity": 0,
+                        "gross_pnl": gross,
+                        "commission": commission,
+                        "net_pnl": gross - commission,
+                        "ibkr_entry_confirmed": True,
+                        "ibkr_exit_confirmed": True,
+                        "ibkr_position_flat_confirmed": True,
+                        "ibkr_position_flat_confirmed_at": sell_time,
+                        "raw_json": raw,
+                        **preserved,
+                    }
+                )
+                self.execute(
+                    "UPDATE executions SET trade_id = COALESCE(trade_id, ?) WHERE execution_id IN (?, ?)",
+                    (trade_id, lot.get("execution_id"), row.get("execution_id")),
+                )
+                closed_count += 1
+                lot["remaining_qty"] = lot_remaining - matched_qty
+                remaining -= matched_qty
+                if (safe_float(lot.get("remaining_qty")) or 0.0) <= 1e-9:
+                    open_lots.pop(0)
+
+        open_qty = sum(safe_float(lot.get("remaining_qty")) or 0.0 for lot in open_lots)
+        if open_qty > 1e-9:
+            weighted_cost = sum((safe_float(lot.get("remaining_qty")) or 0.0) * (safe_float(lot.get("price")) or 0.0) for lot in open_lots)
+            avg_price = weighted_cost / open_qty if open_qty else None
+            first_lot = open_lots[0]
+            entry_time = execution_sort_time(first_lot)
+            entry_date = str(first_lot.get("session_date") or "") or iso_date_part(entry_time) or latest_session
+            strategy = str(first_lot.get("strategy_name") or latest_strategy or "unknown")
+            self.mark_position_flat(symbol=symbol, strategy_name=strategy, reason="sqlite_execution_reducer_superseded_open_lot", status="CLOSED")
+            self.upsert_position(
+                {
+                    "position_key": f"{strategy}:{entry_date}:{symbol}",
+                    "strategy_name": strategy,
+                    "session_date": entry_date,
+                    "symbol": symbol,
+                    "status": "OPEN",
+                    "quantity": open_qty,
+                    "avg_price": avg_price,
+                    "source": "sqlite_execution_reducer",
+                    "ibkr_quantity": open_qty,
+                    "active": 1,
+                    "exit_sent": 0,
+                    "updated_at": last_event_time,
+                    "raw_json": {
+                        "active": True,
+                        "entry_fill_verified": True,
+                        "entry_time": entry_time,
+                        "entry_price": avg_price,
+                        "market_price": latest_price,
+                        "market_price_at": last_event_time,
+                        "market_price_source": "execution_reducer",
+                        "open_lot_execution_ids": [lot.get("execution_id") for lot in open_lots],
+                    },
+                }
+            )
+        else:
+            self.mark_position_flat(symbol=symbol, strategy_name=strategy_name, reason="sqlite_execution_reducer_flat", status="CLOSED", updated_at=last_event_time)
+            if rows:
+                self.upsert_position(
+                    {
+                        "position_key": f"{latest_strategy}:{latest_session}:{symbol}",
+                        "strategy_name": latest_strategy,
+                        "session_date": latest_session,
+                        "symbol": symbol,
+                        "status": "CLOSED",
+                        "quantity": 0,
+                        "avg_price": latest_price,
+                        "source": "sqlite_execution_reducer",
+                        "ibkr_quantity": 0,
+                        "active": 0,
+                        "exit_sent": 0,
+                        "updated_at": last_event_time,
+                        "raw_json": {
+                            "active": False,
+                            "ibkr_position_flat_confirmed": True,
+                            "flat_confirmed_reason": "sqlite_execution_reducer_flat",
+                            "flat_confirmed_at": last_event_time,
+                            "market_price": latest_price,
+                            "market_price_at": last_event_time,
+                            "market_price_source": "execution_reducer",
+                        },
+                    }
+                )
+        return {"symbol": symbol, "closed_trades": closed_count, "open_quantity": open_qty}
 
     def upsert_order(self, row: dict[str, Any]) -> str:
         order_key = str(
@@ -596,6 +866,38 @@ class SQLiteRuntimeStore:
             "ibkr_position_flat_confirmed_at": row.get("ibkr_position_flat_confirmed_at"),
             "raw_json": row.get("raw_json") or row,
         }
+        status = str(data.get("status") or "").upper()
+        if status in {"CLOSED", "DONE", "EXIT_FILLED", "FLAT"}:
+            duplicates = self.query(
+                """
+                SELECT trade_id, raw_json
+                FROM trades
+                WHERE trade_id != ?
+                  AND UPPER(symbol) = ?
+                  AND COALESCE(entry_fill_time, '') = COALESCE(?, '')
+                  AND COALESCE(exit_fill_time, '') = COALESCE(?, '')
+                  AND ABS(COALESCE(quantity, 0) - COALESCE(?, 0)) < 0.000001
+                  AND ABS(COALESCE(entry_price, 0) - COALESCE(?, 0)) < 0.000001
+                  AND ABS(COALESCE(exit_price, 0) - COALESCE(?, 0)) < 0.000001
+                """,
+                [
+                    trade_id,
+                    data["symbol"],
+                    data.get("entry_fill_time"),
+                    data.get("exit_fill_time"),
+                    data.get("quantity") or 0.0,
+                    data.get("entry_price") or 0.0,
+                    data.get("exit_price") or 0.0,
+                ],
+            )
+            for duplicate in duplicates:
+                duplicate_id = str(duplicate.get("trade_id") or "")
+                duplicate_raw = parse_jsonish(duplicate.get("raw_json"))
+                source = str(duplicate_raw.get("reconstruction_source") or "").lower()
+                if not duplicate_id.startswith("reconstructed:") and "execution" not in source:
+                    continue
+                self.execute("UPDATE executions SET trade_id = ? WHERE trade_id = ?", (trade_id, duplicate_id))
+                self.execute("DELETE FROM trades WHERE trade_id = ?", (duplicate_id,))
         self._upsert("trades", data, ["trade_id"], list(data.keys()))
         return trade_id
 

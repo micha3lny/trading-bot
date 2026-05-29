@@ -74,6 +74,140 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_bot_fill_creates_open_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({
+                    "execution_id": "B_OPEN",
+                    "strategy_name": "v67",
+                    "session_date": "2026-05-29",
+                    "symbol": "AKTX",
+                    "side": "BOT",
+                    "quantity": 5,
+                    "price": 10.0,
+                    "executed_at": "2026-05-29T13:35:00+00:00",
+                    "recorded_at": "2026-05-29T13:35:00+00:00",
+                    "commission": 0.35,
+                    "commission_source": "ibkr",
+                })
+
+                positions = store.query("SELECT * FROM positions WHERE symbol = 'AKTX'")
+                trades = store.query("SELECT * FROM trades")
+
+                self.assertEqual(len(positions), 1)
+                self.assertEqual(positions[0]["active"], 1)
+                self.assertEqual(positions[0]["status"], "OPEN")
+                self.assertEqual(positions[0]["ibkr_quantity"], 5)
+                self.assertEqual(len(trades), 0)
+            finally:
+                store.close()
+
+    def test_sld_fill_closes_position_and_creates_closed_trade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({
+                    "execution_id": "B1",
+                    "strategy_name": "v67",
+                    "session_date": "2026-05-29",
+                    "symbol": "AKTX",
+                    "side": "BOT",
+                    "quantity": 5,
+                    "price": 10.0,
+                    "executed_at": "2026-05-29T13:35:00+00:00",
+                    "recorded_at": "2026-05-29T13:35:00+00:00",
+                    "commission": 0.35,
+                    "commission_source": "ibkr",
+                })
+                store.upsert_execution({
+                    "execution_id": "S1",
+                    "strategy_name": "v67",
+                    "session_date": "2026-05-29",
+                    "symbol": "AKTX",
+                    "side": "SLD",
+                    "quantity": 5,
+                    "price": 11.0,
+                    "executed_at": "2026-05-29T14:05:00+00:00",
+                    "recorded_at": "2026-05-29T14:05:00+00:00",
+                    "commission": 0.36,
+                    "commission_source": "ibkr",
+                })
+
+                latest = store.get_latest_position("AKTX")
+                trades = store.query("SELECT * FROM trades WHERE symbol = 'AKTX'")
+
+                self.assertIsNotNone(latest)
+                self.assertEqual(latest["active"], 0)
+                self.assertEqual(latest["status"], "CLOSED")
+                self.assertEqual(len(trades), 1)
+                trade = trades[0]
+                self.assertEqual(trade["status"], "CLOSED")
+                self.assertEqual(trade["entry_fill_time"], "2026-05-29T13:35:00+00:00")
+                self.assertEqual(trade["exit_fill_time"], "2026-05-29T14:05:00+00:00")
+                self.assertAlmostEqual(trade["gross_pnl"], 5.0)
+                self.assertAlmostEqual(trade["commission"], 0.71)
+                self.assertAlmostEqual(trade["net_pnl"], 4.29)
+                self.assertEqual(trade["ibkr_entry_confirmed"], 1)
+                self.assertEqual(trade["ibkr_exit_confirmed"], 1)
+            finally:
+                store.close()
+
+    def test_commission_report_update_refreshes_closed_trade_commission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B1", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "RKLB", "side": "BOT", "quantity": 2, "price": 10, "executed_at": "2026-05-29T13:30:00+00:00", "commission_source": "missing"})
+                store.upsert_execution({"execution_id": "S1", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "RKLB", "side": "SLD", "quantity": 2, "price": 12, "executed_at": "2026-05-29T13:40:00+00:00", "commission_source": "missing"})
+                self.assertEqual(store.query("SELECT commission FROM trades")[0]["commission"], 0.0)
+
+                store.upsert_execution({"execution_id": "B1", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "RKLB", "side": "BOT", "quantity": 2, "price": 10, "executed_at": "2026-05-29T13:30:00+00:00", "commission": 0.35, "commission_source": "ibkr"})
+                store.upsert_execution({"execution_id": "S1", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "RKLB", "side": "SLD", "quantity": 2, "price": 12, "executed_at": "2026-05-29T13:40:00+00:00", "commission": 0.36, "commission_source": "ibkr"})
+
+                trade = store.query("SELECT gross_pnl, commission, net_pnl FROM trades")[0]
+                self.assertAlmostEqual(trade["gross_pnl"], 4.0)
+                self.assertAlmostEqual(trade["commission"], 0.71)
+                self.assertAlmostEqual(trade["net_pnl"], 3.29)
+            finally:
+                store.close()
+
+    def test_entry_rejected_position_creates_no_trade_or_open_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_position({
+                    "position_key": "v67:2026-05-29:CONL",
+                    "strategy_name": "v67",
+                    "session_date": "2026-05-29",
+                    "symbol": "CONL",
+                    "status": "ENTRY_REJECTED",
+                    "quantity": 3,
+                    "avg_price": 25,
+                    "active": 0,
+                    "raw_json": {"entry_fill_verified": False, "reject_reason": "no_trading_permission_kid"},
+                })
+
+                self.assertEqual(store.query("SELECT COUNT(*) AS n FROM trades")[0]["n"], 0)
+                self.assertEqual(store.query("SELECT COUNT(*) AS n FROM positions WHERE active = 1")[0]["n"], 0)
+            finally:
+                store.close()
+
+    def test_eod_sell_creates_closed_trade_from_existing_buy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B_EOD", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "EODX", "side": "BOT", "quantity": 4, "price": 8, "executed_at": "2026-05-29T13:35:00+00:00"})
+                store.upsert_execution({"execution_id": "S_EOD", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "EODX", "side": "SLD", "quantity": 4, "price": 7.5, "executed_at": "2026-05-29T19:59:00+00:00", "raw_json": {"reason": "eod_flatten"}})
+
+                trade = store.query("SELECT * FROM trades WHERE symbol = 'EODX'")[0]
+                position = store.get_latest_position("EODX")
+                self.assertEqual(trade["status"], "CLOSED")
+                self.assertEqual(trade["exit_fill_time"], "2026-05-29T19:59:00+00:00")
+                self.assertAlmostEqual(trade["gross_pnl"], -2.0)
+                self.assertEqual(position["active"], 0)
+            finally:
+                store.close()
+
     def test_runtime_event_append_works(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
