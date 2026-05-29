@@ -119,6 +119,17 @@ def display_optional_number(value) -> object:
     return value
 
 
+def display_number_or_missing(value, *, decimals: int = 6) -> str:
+    if value in (None, ""):
+        return "MISSING"
+    try:
+        if pd.isna(value):
+            return "MISSING"
+        return f"{float(value):.{decimals}f}"
+    except Exception:
+        return str(value)
+
+
 def style_pnl(df: pd.DataFrame, pnl_columns: list[str]):
     def color(value):
         try:
@@ -217,7 +228,7 @@ def render_open_positions(df: pd.DataFrame) -> None:
     out = out[["Symbol", "Qty", "Buy", "Now", "UPNL", "Now %", "Peak %", "Drop from Peak %", "Min", "Entry Time", "Status", "Strategy"]]
     st.dataframe(
         style_pnl(out, ["UPNL", "Now %"]),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -235,9 +246,9 @@ def render_closed_positions(df: pd.DataFrame) -> None:
     out = filter_table(df[cols].copy(), "closed").sort_values(["net_actual", "symbol"], na_position="last")
     out["entry_time"] = out["entry_time"].map(display_time)
     out["exit_time"] = out["exit_time"].map(display_time)
-    out["peak_pct"] = out["peak_pct"].where(out["peak_pct"].notna(), "MISSING")
-    out["drop_from_peak_pct"] = out["drop_from_peak_pct"].where(out["drop_from_peak_pct"].notna(), "MISSING")
-    out["hold_minutes"] = out["hold_minutes"].where(out["hold_minutes"].notna(), "MISSING")
+    out["peak_pct"] = out["peak_pct"].map(display_number_or_missing)
+    out["drop_from_peak_pct"] = out["drop_from_peak_pct"].map(display_number_or_missing)
+    out["hold_minutes"] = out["hold_minutes"].map(display_number_or_missing)
     out = out.rename(
         columns={
             "symbol": "Symbol",
@@ -270,7 +281,7 @@ def render_closed_positions(df: pd.DataFrame) -> None:
     ]
     st.dataframe(
         style_pnl(out, ["Gross", "Net", "Net %"]),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     debug_cols = [
@@ -296,7 +307,7 @@ def render_closed_positions(df: pd.DataFrame) -> None:
                     "data_quality": "Data Quality",
                 }
             )
-            st.dataframe(debug, use_container_width=True, hide_index=True)
+            st.dataframe(debug, width="stretch", hide_index=True)
 
 
 def render_exit_simulation(df: pd.DataFrame) -> None:
@@ -306,7 +317,7 @@ def render_exit_simulation(df: pd.DataFrame) -> None:
         return
     wanted = ["actual trailing", "fixed TP +2%", "fixed TP +2.5%", "fixed TP +3%", "fixed TP +4%", "partial 50%@+3%"]
     out = df[df["scenario"].isin(wanted)].copy()
-    st.dataframe(style_pnl(out, ["gross", "net"]), use_container_width=True, hide_index=True)
+    st.dataframe(style_pnl(out, ["gross", "net"]), width="stretch", hide_index=True)
 
 
 def render_peak_charts(closed: pd.DataFrame) -> None:
