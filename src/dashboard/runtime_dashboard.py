@@ -233,6 +233,30 @@ def render_open_positions(df: pd.DataFrame) -> None:
     )
 
 
+def render_rejected_entries(df: pd.DataFrame) -> None:
+    st.subheader("Rejected Entries")
+    if df.empty:
+        st.info("No rejected entries in the selected window.")
+        return
+    cols = ["symbol", "qty", "order_id", "reason", "ibkr_error_code", "time", "strategy"]
+    available = [col for col in cols if col in df.columns]
+    out = filter_table(df[available].copy(), "rejected").sort_values(["time", "symbol"], ascending=[False, True], na_position="last")
+    if "time" in out.columns:
+        out["time"] = out["time"].map(display_time)
+    out = out.rename(
+        columns={
+            "symbol": "Symbol",
+            "qty": "Qty",
+            "order_id": "Order ID",
+            "reason": "Reason",
+            "ibkr_error_code": "IBKR Error",
+            "time": "Time",
+            "strategy": "Strategy",
+        }
+    )
+    st.dataframe(out, width="stretch", hide_index=True)
+
+
 def render_closed_positions(df: pd.DataFrame) -> None:
     st.subheader("Closed Positions")
     if df.empty:
@@ -342,10 +366,11 @@ def render_diagnostics(diag: dict) -> None:
     stale_count = int(diag.get("stale_active_positions_count", 0) or 0)
     if stale_count > 0:
         st.warning(f"STALE_POSITION_ROWS_PRESENT stale_active_positions_count={stale_count}")
-    cols = st.columns(7)
+    cols = st.columns(8)
     labels = [
         ("Orphans", "orphans"),
         ("Missing IBKR", "missing_in_ibkr"),
+        ("Rejected Entries", "rejected_entries"),
         ("Partial Exits", "partial_exits"),
         ("Delayed Fills", "delayed_fills"),
         ("Risk Blocks", "risk_guard_blocks"),
@@ -416,6 +441,8 @@ def main() -> None:
         st.warning("EXECUTION_RECONSTRUCTION_DISABLED_IN_DASHBOARD: executions exist, but no persisted closed trades exist for this window.")
     st.divider()
     render_open_positions(snapshot["open_positions"])
+    st.divider()
+    render_rejected_entries(snapshot.get("rejected_entries", pd.DataFrame()))
     st.divider()
     render_closed_positions(snapshot["closed_positions"])
     st.divider()

@@ -1389,6 +1389,46 @@ def load_open_positions(
     return pd.DataFrame(out)
 
 
+def load_rejected_entries(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> pd.DataFrame:
+    clause, params = strategy_clause("r", strategy)
+    rows = read_sql(
+        conn,
+        f"""
+        SELECT
+            r.event_time,
+            COALESCE(r.strategy_name, 'unknown') AS strategy,
+            r.session_date,
+            r.symbol,
+            r.order_id,
+            r.reason,
+            r.raw_json
+        FROM runtime_events r
+        WHERE COALESCE(r.session_date, substr(r.event_time, 1, 10)) BETWEEN ? AND ?
+          AND r.event_type = 'ENTRY_ORDER_REJECTED'
+          {clause}
+        ORDER BY r.event_time DESC, r.symbol
+        """,
+        [window.start_date, window.end_date, *params],
+    )
+    if rows.empty:
+        return pd.DataFrame(columns=["symbol", "qty", "order_id", "reason", "ibkr_error_code", "time", "strategy"])
+    out: list[dict[str, Any]] = []
+    for row in rows.to_dict("records"):
+        raw = parse_raw_json(row.get("raw_json"))
+        out.append(
+            {
+                "symbol": str(row.get("symbol") or "").upper(),
+                "qty": to_float(raw.get("quantity"), None),
+                "order_id": row.get("order_id") or raw.get("order_id"),
+                "reason": row.get("reason") or raw.get("reject_reason") or raw.get("reason"),
+                "ibkr_error_code": raw.get("ibkr_error_code"),
+                "time": row.get("event_time"),
+                "strategy": row.get("strategy"),
+            }
+        )
+    return pd.DataFrame(out)
+
+
 def load_diagnostics(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> dict[str, int]:
     event_clause, event_params = strategy_clause("r", strategy)
     risk_clause, risk_params = strategy_clause("q", strategy)
@@ -1429,6 +1469,7 @@ def load_diagnostics(conn: sqlite3.Connection, window: DateWindow, strategy: str
         "partial_exits": 0,
         "delayed_fills": 0,
         "risk_guard_blocks": 0,
+        "rejected_entries": 0,
         "sqlite_failures": 0,
         "reconnect_events": 0,
     }
@@ -1447,6 +1488,8 @@ def load_diagnostics(conn: sqlite3.Connection, window: DateWindow, strategy: str
             out["delayed_fills"] += count
         if "SQLITE_WRITE_FAILED" in blob:
             out["sqlite_failures"] += count
+        if "ENTRY_ORDER_REJECTED" in blob:
+            out["rejected_entries"] += count
         if "RECONNECT" in blob:
             out["reconnect_events"] += count
     if not risks.empty:
@@ -1604,6 +1647,7 @@ def load_dashboard_snapshot(
             "summary": build_summary(empty, empty),
             "data_quality_summary": build_data_quality_summary(empty),
             "open_positions": empty,
+            "rejected_entries": empty,
             "closed_positions": empty,
             "exit_simulation": empty,
             "diagnostics": {},
@@ -1623,6 +1667,7 @@ def load_dashboard_snapshot(
             include_reconstructed=include_reconstructed,
         )
         open_positions = load_open_positions(conn, window, strategy, executions, execution_lookup)
+        rejected_entries = load_rejected_entries(conn, window, strategy)
         diagnostics = load_diagnostics(conn, window, strategy)
         diagnostics.update(closed_diag)
         diagnostics.update(load_position_row_diagnostics(conn, window, strategy, len(open_positions)))
@@ -1630,6 +1675,7 @@ def load_dashboard_snapshot(
             "summary": build_summary(open_positions, closed),
             "data_quality_summary": build_data_quality_summary(closed),
             "open_positions": open_positions,
+            "rejected_entries": rejected_entries,
             "closed_positions": closed,
             "exit_simulation": exit_simulation(closed),
             "diagnostics": diagnostics,

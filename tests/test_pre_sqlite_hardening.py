@@ -13,6 +13,7 @@ from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.v67_live_top100_expansion_paper_trader import (
     ManagedPosition,
     evaluate_risk_guard,
+    handle_ibkr_order_rejection_event,
     open_position_price_diagnostics,
     persist_managed_positions,
     process_fill_lifecycle_diagnostics,
@@ -263,6 +264,72 @@ class PreSqliteHardeningTests(unittest.TestCase):
 
         self.assertEqual(ok, 0)
         self.assertEqual(missing, 1)
+
+    def test_error_201_rejects_entry_and_removes_managed_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(tmp, session_date="2026-05-28")
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            recorder.sqlite_store = store
+            managed_positions = {
+                "CONL": ManagedPosition(
+                    "CONL",
+                    SimpleNamespace(symbol="CONL"),
+                    2,
+                    50.0,
+                    "2026-05-28T13:35:00+00:00",
+                    50.0,
+                    active=True,
+                    entry_fill_verified=False,
+                )
+            }
+            runtime_state = {
+                "entry_order_by_order_id": {
+                    "123": {"symbol": "CONL", "quantity": 2, "price": 50.0}
+                }
+            }
+
+            handled = handle_ibkr_order_rejection_event(
+                recorder,
+                managed_positions,
+                runtime_state,
+                order_id=123,
+                error_code=201,
+                message="Order rejected - No Trading Permission, Customer Ineligible. product does not have a KID in English",
+            )
+
+            self.assertTrue(handled)
+            self.assertNotIn("CONL", managed_positions)
+            self.assertIn("CONL", runtime_state["ineligible_symbols"])
+            lifecycle = recorder.path("trade_lifecycle.csv").read_text()
+            self.assertIn("ENTRY_ORDER_REJECTED", lifecycle)
+            rows = store.query("SELECT status, active, raw_json FROM positions WHERE symbol = 'CONL'")
+            store.close()
+            self.assertEqual(rows[0]["status"], "ENTRY_REJECTED")
+            self.assertEqual(rows[0]["active"], 0)
+            self.assertIn("no_trading_permission_kid", rows[0]["raw_json"])
+            stored_positions = json.loads(recorder.path("managed_positions.json").read_text())["positions"]
+            self.assertEqual(stored_positions, {})
+
+    def test_rejected_symbol_is_blocked_from_reentry_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(tmp, session_date="2026-05-28")
+            managed_positions: dict[str, ManagedPosition] = {}
+            runtime_state = {
+                "entry_order_by_order_id": {
+                    "201": {"symbol": "ARMG", "quantity": 1, "price": 30.0}
+                }
+            }
+
+            handle_ibkr_order_rejection_event(
+                recorder,
+                managed_positions,
+                runtime_state,
+                order_id=201,
+                error_code=201,
+                message="No Trading Permission, Customer Ineligible KID",
+            )
+
+            self.assertIn("ARMG", runtime_state["ineligible_symbols"])
 
 
 if __name__ == "__main__":

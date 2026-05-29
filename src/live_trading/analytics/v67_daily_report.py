@@ -167,6 +167,30 @@ def load_managed_positions_summary(session: Path) -> dict:
     return {"active_count": len(active), "active_symbols": sorted(str(x.get("symbol", "")).upper() for x in active if x.get("symbol"))}
 
 
+def load_rejected_entries(session: Path) -> list[dict]:
+    lifecycle = session / "trade_lifecycle.csv"
+    if not lifecycle.exists():
+        return []
+    rows: list[dict] = []
+    with lifecycle.open(errors="replace") as fh:
+        for row in csv.DictReader(fh):
+            if row.get("event") != "ENTRY_ORDER_REJECTED":
+                continue
+            raw = raw_json_dict(row)
+            rows.append(
+                {
+                    "recorded_at": row.get("recorded_at"),
+                    "symbol": str(row.get("symbol") or "").upper(),
+                    "quantity": row.get("quantity") or raw.get("quantity"),
+                    "order_id": row.get("order_id") or raw.get("order_id"),
+                    "reason": row.get("reason") or raw.get("reject_reason") or raw.get("reason"),
+                    "ibkr_error_code": raw.get("ibkr_error_code"),
+                }
+            )
+    rows.sort(key=lambda item: str(item.get("recorded_at") or ""), reverse=True)
+    return rows
+
+
 def load_signal_features(session: Path) -> dict[str, list[dict]]:
     lifecycle = session / "trade_lifecycle.csv"
     by_symbol: dict[str, list[dict]] = defaultdict(list)
@@ -703,6 +727,7 @@ def main():
         raise SystemExit(f"Missing {lifecycle}")
 
     latest_portfolio = load_latest_portfolio(session)
+    rejected_entries = load_rejected_entries(session)
     signal_features = load_signal_features(session)
     latest_lifecycle = latest_lifecycle_rows(session)
     open_status = lifecycle_open_status(session)
@@ -920,6 +945,16 @@ def main():
                     f"{fmt_pct(row.get('from_peak_pct'), 9, 1)} {fmt(row.get('ibkr_commission'), 9, 2)} {row['buy_utc']:>8} {effective_status(row)}"
                 )
             print()
+        if rejected_entries:
+            print("REJECTED ENTRIES")
+            print(f"{'SYM':<6} {'QTY':>5} {'ORDER':>8} {'ERR':>5} {'TIME':>8} REASON")
+            for row in rejected_entries[:20]:
+                print(
+                    f"{row.get('symbol', ''):<6} {f(row.get('quantity'), 0.0):>5.0f} "
+                    f"{str(row.get('order_id') or ''):>8} {str(row.get('ibkr_error_code') or ''):>5} "
+                    f"{utc_hhmm(row.get('recorded_at')):>8} {row.get('reason') or ''}"
+                )
+            print()
         closed_limit = max(0, args.watch_closed_limit)
         closed_rows = sorted(closed, key=lambda x: closed_report_sort_key(x, args.sort_closed))
         closed_rows = closed_rows if closed_limit == 0 else closed_rows[:closed_limit]
@@ -1003,6 +1038,16 @@ def main():
             f"{x['symbol']:<7} {f(x.get('qty'), 0.0):>6.0f} {fmt(x.get('buy'), 9, 4)} {fmt(x.get('current'), 9, 4)} {fmt(x.get('unrealized'), 9, 2)} "
             f"{fmt_pct(x.get('current_pct'), 6, 1)} {fmt_pct(x.get('peak_gain_pct'), 6, 1)} {fmt_pct(x.get('from_peak_pct'), 9, 1)} "
             f"{fmt(x.get('ibkr_commission'), 10, 2)} {x['buy_utc']:>8}  {effective_status(x)}"
+        )
+    print()
+
+    print("=== REJECTED ENTRIES ===")
+    print(f"{'SYM':<7} {'QTY':>6} {'ORDER_ID':>10} {'IBKR_ERR':>8} {'TIME':>8}  REASON")
+    print("-" * 82)
+    for row in rejected_entries:
+        print(
+            f"{row.get('symbol', ''):<7} {f(row.get('quantity'), 0.0):>6.0f} {str(row.get('order_id') or ''):>10} "
+            f"{str(row.get('ibkr_error_code') or ''):>8} {utc_hhmm(row.get('recorded_at')):>8}  {row.get('reason') or ''}"
         )
     print()
 

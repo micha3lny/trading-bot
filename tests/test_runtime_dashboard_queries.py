@@ -1367,6 +1367,49 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(open_row["entry_time"], "2026-05-27T19:55:00+00:00")
             self.assertEqual(open_row["entry_source"], "trade")
 
+    def test_rejected_entry_is_excluded_from_open_positions_and_listed_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_position({
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "CONL",
+                "quantity": 2,
+                "avg_price": 50,
+                "active": 0,
+                "status": "ENTRY_REJECTED",
+                "updated_at": "2026-05-28T13:36:00+00:00",
+                "raw_json": {
+                    "reject_reason": "no_trading_permission_kid",
+                    "ibkr_error_code": 201,
+                    "order_id": "123",
+                },
+            })
+            store.record_runtime_event(
+                event_time="2026-05-28T13:36:00+00:00",
+                event_type="ENTRY_ORDER_REJECTED",
+                severity="WARN",
+                strategy_name="v67",
+                session_date="2026-05-28",
+                symbol="CONL",
+                order_id="123",
+                reason="no_trading_permission_kid",
+                raw_json={
+                    "quantity": 2,
+                    "ibkr_error_code": 201,
+                    "reject_reason": "no_trading_permission_kid",
+                },
+            )
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-28", "2026-05-28"), "v67")
+
+            self.assertTrue(snapshot["open_positions"].empty)
+            self.assertEqual(len(snapshot["rejected_entries"]), 1)
+            self.assertEqual(snapshot["rejected_entries"].iloc[0]["symbol"], "CONL")
+            self.assertEqual(snapshot["rejected_entries"].iloc[0]["reason"], "no_trading_permission_kid")
+
 
 if __name__ == "__main__":
     unittest.main()

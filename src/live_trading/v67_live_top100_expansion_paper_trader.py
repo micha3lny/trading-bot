@@ -723,6 +723,7 @@ def formal_event_type_for_legacy_event(event: str) -> LifecycleEventType | None:
         "POSITION_MISSING_IN_IBKR": LifecycleEventType.POSITION_DRIFT_DETECTED,
         "ORPHAN_IBKR_POSITION_OBSERVED": LifecycleEventType.POSITION_DRIFT_DETECTED,
         "FRACTIONAL_ORPHAN_MANUAL_REQUIRED": LifecycleEventType.POSITION_DRIFT_DETECTED,
+        "ENTRY_ORDER_REJECTED": LifecycleEventType.ENTRY_ORDER_REJECTED,
     }
     return mapping.get(event)
 
@@ -785,6 +786,11 @@ def record_lifecycle_with_formal(recorder: LiveDataRecorder, event: str, symbol:
         state_before = PositionState.NONE
         state_after = PositionState.ENTRY_PENDING
         position_state = PositionState.ENTRY_PENDING
+    elif event_type == LifecycleEventType.ENTRY_ORDER_REJECTED:
+        order_state = OrderState.REJECTED
+        state_before = PositionState.ENTRY_PENDING
+        state_after = PositionState.CLOSED
+        position_state = PositionState.CLOSED
     elif event_type == LifecycleEventType.EXIT_ORDER_SUBMITTED:
         order_state = OrderState.SUBMITTED
         state_before = PositionState.OPEN
@@ -3761,6 +3767,243 @@ def record_entry_not_filled(
     )
 
 
+def ibkr_entry_reject_reason(error_code: Any, message: Any = "") -> str:
+    try:
+        code = int(error_code)
+    except Exception:
+        code = 0
+    msg = str(message or "").lower()
+    if code == 201 and ("no trading permission" in msg or "kid" in msg or "customer ineligible" in msg):
+        return "no_trading_permission_kid"
+    if code == 201:
+        return "order_rejected_201"
+    return ""
+
+
+def _runtime_dict(runtime_state: dict[str, Any], key: str) -> dict[Any, Any]:
+    value = runtime_state.setdefault(key, {})
+    if not isinstance(value, dict):
+        value = {}
+        runtime_state[key] = value
+    return value
+
+
+def _runtime_order_id(value: Any) -> str:
+    try:
+        if value in (None, ""):
+            return ""
+        return str(int(float(value)))
+    except Exception:
+        return str(value or "").strip()
+
+
+def _runtime_symbol_from_contract(contract: Any) -> str:
+    return str(getattr(contract, "symbol", "") or "").upper().strip()
+
+
+def record_entry_order_rejected(
+    recorder: LiveDataRecorder,
+    managed_positions: dict[str, ManagedPosition],
+    runtime_state: dict[str, Any],
+    *,
+    symbol: str,
+    order_id: Any,
+    quantity: Any = None,
+    price: Any = None,
+    reason: str,
+    ibkr_error_code: Any = None,
+    message: str = "",
+) -> bool:
+    symbol = str(symbol or "").upper().strip()
+    order_key = _runtime_order_id(order_id)
+    if not symbol:
+        return False
+    processed_key = f"{order_key}:{symbol}:{ibkr_error_code}:{reason}"
+    processed = _runtime_set(runtime_state, "entry_rejection_processed")
+    if processed_key in processed:
+        return False
+    processed.add(processed_key)
+
+    order_meta = _runtime_dict(runtime_state, "entry_order_by_order_id").get(order_key, {})
+    qty = quantity if quantity not in (None, "") else order_meta.get("quantity")
+    entry_price = price if price not in (None, "") else order_meta.get("price")
+    pos = managed_positions.get(symbol)
+    if pos is not None:
+        qty = qty if qty not in (None, "") else pos.quantity
+        entry_price = entry_price if entry_price not in (None, "") else pos.entry_price
+        pos.active = False
+        pos.entry_fill_verified = False
+        safe_sqlite_call(
+            getattr(recorder, "sqlite_store", None),
+            "upsert_position",
+            {
+                "strategy_name": STRATEGY_NAME,
+                "session_date": getattr(recorder, "session_date", None),
+                "symbol": symbol,
+                "status": "ENTRY_REJECTED",
+                "quantity": pos.quantity,
+                "avg_price": pos.entry_price,
+                "source": pos.source,
+                "active": 0,
+                "exit_sent": 0,
+                "updated_at": now_utc(),
+                "raw_json": {
+                    **managed_position_payload(pos),
+                    "entry_fill_verified": False,
+                    "ibkr_entry_confirmed": False,
+                    "reject_reason": reason,
+                    "ibkr_error_code": ibkr_error_code,
+                    "ibkr_error_message": message,
+                    "order_id": order_key,
+                },
+            },
+        )
+        managed_positions.pop(symbol, None)
+        persist_managed_positions(recorder, managed_positions)
+
+    ineligible = _runtime_set(runtime_state, "ineligible_symbols")
+    ineligible.add(symbol)
+    rejected_entries = _runtime_dict(runtime_state, "rejected_entries")
+    rejected_entries[symbol] = {
+        "symbol": symbol,
+        "quantity": qty,
+        "price": entry_price,
+        "order_id": order_key,
+        "reason": reason,
+        "ibkr_error_code": ibkr_error_code,
+        "message": message,
+        "time": now_utc(),
+    }
+    runtime_state["entry_rejected_count"] = int(runtime_state.get("entry_rejected_count") or 0) + 1
+    record_lifecycle_with_formal(
+        recorder,
+        "ENTRY_ORDER_REJECTED",
+        symbol,
+        action="BUY",
+        quantity=qty,
+        price=entry_price,
+        order_id=order_key,
+        reason=reason,
+        entry_fill_verified="false",
+        close_fill_verified="false",
+        raw_json={
+            "status": "ENTRY_REJECTED",
+            "active": False,
+            "entry_fill_verified": False,
+            "ibkr_entry_confirmed": False,
+            "reject_reason": reason,
+            "ibkr_error_code": ibkr_error_code,
+            "ibkr_error_message": message,
+            "order_id": order_key,
+        },
+    )
+    print(
+        f"{now_utc()} ENTRY_ORDER_REJECTED symbol={symbol} order_id={order_key} "
+        f"reason={reason} ibkr_error_code={ibkr_error_code}",
+        flush=True,
+    )
+    return True
+
+
+def handle_ibkr_order_rejection_event(
+    recorder: LiveDataRecorder,
+    managed_positions: dict[str, ManagedPosition],
+    runtime_state: dict[str, Any],
+    *,
+    order_id: Any,
+    error_code: Any,
+    message: Any = "",
+    contract: Any = None,
+    status: str = "",
+) -> bool:
+    reason = ibkr_entry_reject_reason(error_code, message)
+    if not reason:
+        return False
+    order_key = _runtime_order_id(order_id)
+    order_meta = _runtime_dict(runtime_state, "entry_order_by_order_id").get(order_key, {})
+    symbol = str(order_meta.get("symbol") or _runtime_symbol_from_contract(contract)).upper().strip()
+    if not symbol:
+        return False
+    return record_entry_order_rejected(
+        recorder,
+        managed_positions,
+        runtime_state,
+        symbol=symbol,
+        order_id=order_key,
+        quantity=order_meta.get("quantity"),
+        price=order_meta.get("price"),
+        reason=reason,
+        ibkr_error_code=error_code,
+        message=str(message or status or ""),
+    )
+
+
+def install_ibkr_order_rejection_handler(
+    ib: IB,
+    recorder: LiveDataRecorder,
+    managed_positions: dict[str, ManagedPosition],
+    runtime_state: dict[str, Any],
+) -> None:
+    if getattr(ib, "_v67_order_rejection_handler_installed", False):
+        return
+
+    def _on_error(req_id: Any, error_code: Any, error_string: Any, contract: Any = None, *args: Any) -> None:
+        try:
+            handled = handle_ibkr_order_rejection_event(
+                recorder,
+                managed_positions,
+                runtime_state,
+                order_id=req_id,
+                error_code=error_code,
+                message=error_string,
+                contract=contract,
+            )
+            if handled:
+                runtime_state["ibkr_error_201_count"] = int(runtime_state.get("ibkr_error_201_count") or 0) + 1
+        except Exception as exc:
+            print(f"{now_utc()} ENTRY_ORDER_REJECT_HANDLER_FAILED source=errorEvent error={exc!r}", flush=True)
+
+    def _on_order_status(*event_args: Any) -> None:
+        try:
+            trade = event_args[0] if event_args else None
+            status = str(getattr(getattr(trade, "orderStatus", None), "status", "") or "")
+            if status not in {"Cancelled", "Inactive", "ApiCancelled"}:
+                return
+            order = getattr(trade, "order", None)
+            order_id = getattr(order, "orderId", "")
+            log_rows = list(getattr(trade, "log", None) or [])
+            message = " ".join(str(getattr(row, "message", "") or "") for row in log_rows)
+            error_code = ""
+            for row in reversed(log_rows):
+                value = getattr(row, "errorCode", None)
+                if value not in (None, ""):
+                    error_code = value
+                    break
+            if not error_code and "201" in message:
+                error_code = 201
+            handle_ibkr_order_rejection_event(
+                recorder,
+                managed_positions,
+                runtime_state,
+                order_id=order_id,
+                error_code=error_code,
+                message=message,
+                contract=getattr(trade, "contract", None),
+                status=status,
+            )
+        except Exception as exc:
+            print(f"{now_utc()} ENTRY_ORDER_REJECT_HANDLER_FAILED source=orderStatusEvent error={exc!r}", flush=True)
+
+    try:
+        if hasattr(ib, "errorEvent"):
+            ib.errorEvent += _on_error
+        if hasattr(ib, "orderStatusEvent"):
+            ib.orderStatusEvent += _on_order_status
+        setattr(ib, "_v67_order_rejection_handler_installed", True)
+    except Exception as exc:
+        print(f"{now_utc()} ENTRY_ORDER_REJECT_HANDLER_INSTALL_FAILED error={exc!r}", flush=True)
+
+
 def record_unverified_reconciliation_close(
     recorder: LiveDataRecorder,
     symbol: str,
@@ -4392,6 +4635,11 @@ def main() -> int:
         "last_restart_unblock_timestamp": 0.0,
         "last_restart_unblock_utc": "",
         "entry_submit_timestamps": [],
+        "entry_order_by_order_id": {},
+        "entry_rejection_processed": set(),
+        "rejected_entries": {},
+        "ineligible_symbols": set(),
+        "entry_rejected_count": 0,
         "ready_candidates": 0,
         "live_ready_candidates": 0,
         "backfill_context_candidates": 0,
@@ -4520,6 +4768,7 @@ def main() -> int:
             host="127.0.0.1",
             port=8767,
         )
+        install_ibkr_order_rejection_handler(ib, recorder, managed_positions, runtime_state)
 
         startup_reconciliation = startup_reconcile_runtime_state(
             ib,
@@ -4740,6 +4989,21 @@ def main() -> int:
 
                 has_active_position = symbol in managed_positions and managed_positions[symbol].active and not managed_positions[symbol].exit_sent
                 entry_symbol_allowed = symbol in _runtime_set(runtime_state, "entry_symbols")
+                symbol_ineligible = symbol in _runtime_set(runtime_state, "ineligible_symbols")
+                if symbol_ineligible and features["ready"]:
+                    rejection_counter["ineligible_no_trading_permission_kid"] += 1
+                    if not state.stale_ready_logged:
+                        record_lifecycle_with_formal(
+                            recorder,
+                            "BUY_BLOCKED",
+                            symbol,
+                            action="BUY",
+                            price=features.get("entry_price"),
+                            reason="ineligible_no_trading_permission_kid",
+                            raw_json={**features, "blocked_by": "ibkr_error_201_cache"},
+                        )
+                        state.stale_ready_logged = True
+                    continue
                 if features["ready"] and not state.signal_sent and not has_active_position and entry_symbol_allowed:
                     if state.ready_since_ts is None:
                         state.ready_since_ts = loop_now
@@ -4931,6 +5195,15 @@ def main() -> int:
                     order.tif = "DAY"
                     order.outsideRth = False
                     trade = ib.placeOrder(q, order)
+                    order_id_for_entry = getattr(getattr(trade, "order", None), "orderId", "")
+                    _runtime_dict(runtime_state, "entry_order_by_order_id")[_runtime_order_id(order_id_for_entry)] = {
+                        "symbol": symbol,
+                        "quantity": qty,
+                        "price": price,
+                        "submitted_at": now_utc(),
+                        "ranking_position": ranking_position,
+                        "score": features.get("score"),
+                    }
                     submission_count = record_entry_submission(runtime_state, loop_now)
                     entries_submitted_this_cycle += 1
                     backlog_window = float(args.entry_backlog_window_seconds or 60.0)
@@ -5008,7 +5281,7 @@ def main() -> int:
                         f"candidate_age_seconds={diagnostics.get('candidate_age_seconds')} "
                         f"last_restart_unblock_time={diagnostics.get('last_restart_unblock_time') or ''} "
                         f"entry_decision_time={diagnostics.get('entry_decision_time')} "
-                        f"orderId={trade.order.orderId} tif={order.tif} outsideRth={order.outsideRth}",
+                        f"orderId={order_id_for_entry} tif={order.tif} outsideRth={order.outsideRth}",
                         flush=True,
                     )
                     state.signal_sent = True
@@ -5180,6 +5453,8 @@ def main() -> int:
                 f"risk_guard_block={int(risk_guard_block)} risk_guard_reason={risk_guard_reason} "
                 f"open_price_ok={open_price_ok} open_price_missing={open_price_missing} "
                 f"subscriptions_active={len(tickers)} subscriptions_cap={subscriptions_cap} subscription_cap_block={int(subscription_cap_block)} "
+                f"ineligible_symbols={len(_runtime_set(runtime_state, 'ineligible_symbols'))} "
+                f"entry_rejected_count={int(runtime_state.get('entry_rejected_count') or 0)} "
                 f"process_uptime_seconds={process_uptime_seconds:.1f} "
                 f"best={best_symbol}:{best_score:.2f} top5=[{top5_str}] rejects=[{rejection_summary}]"
                 f"{portfolio_part}"
