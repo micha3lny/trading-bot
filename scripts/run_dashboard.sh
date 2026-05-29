@@ -2,6 +2,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+export PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}"
 
 if [[ -d venv ]]; then
   # shellcheck disable=SC1091

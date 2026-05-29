@@ -4,9 +4,14 @@ import argparse
 import csv
 import json
 import sqlite3
+import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 MARKET_OPEN_UTC = "13:30"
 STRICT_SETUP_NAME = "v67_original_600usd_setup"
