@@ -72,13 +72,13 @@ def is_current_window(window: DateWindow) -> bool:
 
 
 @st.cache_data(ttl=5)
-def load_live_snapshot(sqlite_path: str, start_date: str, end_date: str, strategy: str) -> dict:
-    return load_dashboard_snapshot(sqlite_path, DateWindow(start_date, end_date), strategy)
+def load_live_snapshot(sqlite_path: str, start_date: str, end_date: str, strategy: str, include_reconstructed: bool) -> dict:
+    return load_dashboard_snapshot(sqlite_path, DateWindow(start_date, end_date), strategy, include_reconstructed=include_reconstructed)
 
 
 @st.cache_data(ttl=3600)
-def load_historical_snapshot(sqlite_path: str, start_date: str, end_date: str, strategy: str) -> dict:
-    return load_dashboard_snapshot(sqlite_path, DateWindow(start_date, end_date), strategy)
+def load_historical_snapshot(sqlite_path: str, start_date: str, end_date: str, strategy: str, include_reconstructed: bool) -> dict:
+    return load_dashboard_snapshot(sqlite_path, DateWindow(start_date, end_date), strategy, include_reconstructed=include_reconstructed)
 
 
 @st.cache_data(ttl=15)
@@ -236,7 +236,7 @@ def render_open_positions(df: pd.DataFrame) -> None:
 def render_closed_positions(df: pd.DataFrame) -> None:
     st.subheader("Closed Positions")
     if df.empty:
-        st.info("No closed positions in the selected window.")
+        st.info("No confirmed closed trades in trades table.")
         return
     cols = [
         "symbol", "entry_date", "exit_date", "qty", "ibkr_commission", "commission_status", "buy", "sell", "gross", "net_actual", "net_pct", "peak_pct",
@@ -363,6 +363,14 @@ def render_diagnostics(diag: dict) -> None:
     ]
     for col, (label, key) in zip(pos_cols, position_labels):
         col.metric(label, int(diag.get(key, 0)))
+    closed_cols = st.columns(3)
+    closed_labels = [
+        ("Persisted Closed", "persisted_closed_trades_count"),
+        ("Reconstructed Pairs", "reconstructed_execution_pairs_count"),
+        ("Displayed Closed", "displayed_closed_trades_count"),
+    ]
+    for col, (label, key) in zip(closed_cols, closed_labels):
+        col.metric(label, int(diag.get(key, 0)))
 
 
 def main() -> None:
@@ -388,14 +396,15 @@ def main() -> None:
             start_date, end_date = start.isoformat(), end.isoformat()
         strategies = ["All", *cached_strategies(sqlite_path, start_date, end_date)]
         strategy = st.selectbox("Strategy", strategies, index=0)
+        include_reconstructed = st.toggle("Show execution-reconstructed trades", value=False)
         auto_refresh = st.toggle("Auto refresh current session", value=True)
 
     window = DateWindow(start_date, end_date)
     current = is_current_window(window)
     if current:
-        snapshot = load_live_snapshot(sqlite_path, start_date, end_date, strategy)
+        snapshot = load_live_snapshot(sqlite_path, start_date, end_date, strategy, include_reconstructed)
     else:
-        snapshot = load_historical_snapshot(sqlite_path, start_date, end_date, strategy)
+        snapshot = load_historical_snapshot(sqlite_path, start_date, end_date, strategy, include_reconstructed)
 
     loaded_at = snapshot.get("loaded_at", "")
     st.caption(f"SQLite: `{snapshot.get('source')}` | window: {start_date} to {end_date} | strategy: {strategy} | loaded_at: {loaded_at}")
@@ -403,6 +412,8 @@ def main() -> None:
     render_summary(snapshot["summary"])
     st.divider()
     render_data_quality_summary(snapshot.get("data_quality_summary", {}))
+    if int(snapshot.get("diagnostics", {}).get("execution_reconstruction_disabled", 0) or 0):
+        st.warning("EXECUTION_RECONSTRUCTION_DISABLED_IN_DASHBOARD: executions exist, but no persisted closed trades exist for this window.")
     st.divider()
     render_open_positions(snapshot["open_positions"])
     st.divider()

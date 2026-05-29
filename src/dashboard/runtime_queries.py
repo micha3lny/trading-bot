@@ -985,7 +985,14 @@ def apply_symbol_session_peak_fallbacks(
     return out
 
 
-def load_closed_positions(conn: sqlite3.Connection, window: DateWindow, strategy: str | None, executions: pd.DataFrame) -> pd.DataFrame:
+def load_closed_positions(
+    conn: sqlite3.Connection,
+    window: DateWindow,
+    strategy: str | None,
+    executions: pd.DataFrame,
+    *,
+    include_reconstructed: bool = False,
+) -> tuple[pd.DataFrame, dict[str, int]]:
     lookup_window = expanded_lookup_window(window)
     runtime_peak_map = load_runtime_peak_map(conn, window, strategy)
     runtime_symbol_peak_map = load_runtime_symbol_peak_map(conn, window, strategy)
@@ -1000,6 +1007,7 @@ def load_closed_positions(conn: sqlite3.Connection, window: DateWindow, strategy
         position_entry_times=position_entry_map(conn, lookup_window, strategy),
         runtime_entry_times=runtime_entry_event_map(conn, lookup_window, strategy),
     )
+    reconstructed_count = int(len(reconstructed))
     if not trades.empty and not reconstructed.empty:
         trade_keys = {
             (str(row.get("exit_date") or date_part(row.get("exit_time")) or row.get("session_date") or ""), str(row.get("symbol") or "").upper())
@@ -1011,12 +1019,24 @@ def load_closed_positions(conn: sqlite3.Connection, window: DateWindow, strategy
                 axis=1,
             )
         ]
-    frames = [df for df in (trades, reconstructed) if not df.empty]
+    persisted_count = int(len(trades))
+    displayed_frames = [trades]
+    if include_reconstructed:
+        displayed_frames.append(reconstructed)
+    frames = [df for df in displayed_frames if not df.empty]
+    diag = {
+        "persisted_closed_trades_count": persisted_count,
+        "reconstructed_execution_pairs_count": reconstructed_count,
+        "displayed_closed_trades_count": 0,
+        "execution_reconstruction_disabled": int(not include_reconstructed and persisted_count == 0 and reconstructed_count > 0),
+    }
     if not frames:
-        return pd.DataFrame()
+        return pd.DataFrame(), diag
     closed = pd.concat(frames, ignore_index=True, sort=False)
     closed = apply_symbol_session_peak_fallbacks(closed, runtime_symbol_peak_map, lifecycle_symbol_peak_map)
-    return closed.sort_values(["net_actual", "symbol"], na_position="last").reset_index(drop=True)
+    closed = closed.sort_values(["net_actual", "symbol"], na_position="last").reset_index(drop=True)
+    diag["displayed_closed_trades_count"] = int(len(closed))
+    return closed, diag
 
 
 def execution_net_positions(executions: pd.DataFrame | None) -> dict[tuple[str, str, str], float]:
@@ -1570,7 +1590,13 @@ def exit_simulation(closed_positions: pd.DataFrame) -> pd.DataFrame:
     ])
 
 
-def load_dashboard_snapshot(sqlite_path: str | Path | None, window: DateWindow, strategy: str | None = "All") -> dict[str, Any]:
+def load_dashboard_snapshot(
+    sqlite_path: str | Path | None,
+    window: DateWindow,
+    strategy: str | None = "All",
+    *,
+    include_reconstructed: bool = False,
+) -> dict[str, Any]:
     path = Path(resolve_sqlite_path(sqlite_path))
     if not path.exists():
         empty = pd.DataFrame()
@@ -1589,9 +1615,16 @@ def load_dashboard_snapshot(sqlite_path: str | Path | None, window: DateWindow, 
     try:
         executions = load_executions(conn, window, strategy)
         execution_lookup = load_executions(conn, expanded_lookup_window(window), strategy)
-        closed = load_closed_positions(conn, window, strategy, execution_lookup)
+        closed, closed_diag = load_closed_positions(
+            conn,
+            window,
+            strategy,
+            execution_lookup,
+            include_reconstructed=include_reconstructed,
+        )
         open_positions = load_open_positions(conn, window, strategy, executions, execution_lookup)
         diagnostics = load_diagnostics(conn, window, strategy)
+        diagnostics.update(closed_diag)
         diagnostics.update(load_position_row_diagnostics(conn, window, strategy, len(open_positions)))
         return {
             "summary": build_summary(open_positions, closed),

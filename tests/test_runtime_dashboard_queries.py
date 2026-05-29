@@ -67,7 +67,16 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             )
             store.close()
 
-            snapshot = load_dashboard_snapshot(db, DateWindow(session_date, session_date), "v67")
+            default_snapshot = load_dashboard_snapshot(db, DateWindow(session_date, session_date), "v67")
+
+            self.assertEqual(default_snapshot["summary"]["closed_trades"], 0)
+            self.assertTrue(default_snapshot["closed_positions"].empty)
+            self.assertEqual(default_snapshot["diagnostics"]["persisted_closed_trades_count"], 0)
+            self.assertEqual(default_snapshot["diagnostics"]["reconstructed_execution_pairs_count"], 1)
+            self.assertEqual(default_snapshot["diagnostics"]["displayed_closed_trades_count"], 0)
+            self.assertEqual(default_snapshot["diagnostics"]["execution_reconstruction_disabled"], 1)
+
+            snapshot = load_dashboard_snapshot(db, DateWindow(session_date, session_date), "v67", include_reconstructed=True)
 
             self.assertEqual(snapshot["summary"]["closed_trades"], 1)
             self.assertEqual(snapshot["summary"]["open_trades"], 1)
@@ -111,7 +120,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             })
             store.close()
 
-            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "All")
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "All", include_reconstructed=True)
             closed = snapshot["closed_positions"].iloc[0]
 
             self.assertEqual(closed["symbol"], "MRAM")
@@ -145,7 +154,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             })
             store.close()
 
-            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "All")
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "All", include_reconstructed=True)
             closed = snapshot["closed_positions"].iloc[0]
 
             self.assertEqual(closed["symbol"], "GRRR")
@@ -968,7 +977,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             })
             store.close()
 
-            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-26", "2026-05-26"), "v67")
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-26", "2026-05-26"), "v67", include_reconstructed=True)
 
             self.assertEqual(snapshot["summary"]["closed_trades"], 1)
             self.assertEqual(snapshot["summary"]["open_trades"], 0)
@@ -1134,7 +1143,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             })
             store.close()
 
-            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-28", "2026-05-28"), "v67")
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-28", "2026-05-28"), "v67", include_reconstructed=True)
             closed = snapshot["closed_positions"]
 
             self.assertEqual(len(closed), 1)
