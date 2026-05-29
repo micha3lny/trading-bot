@@ -1,0 +1,157 @@
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.backfill_closed_trades_from_executions import reconstruct_closed_trades_from_executions
+from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
+
+
+def execution_row(
+    execution_id: str,
+    *,
+    symbol: str,
+    side: str,
+    quantity: float,
+    price: float,
+    executed_at: str,
+    commission: float | None = None,
+    strategy_name: str = "v67",
+) -> dict:
+    return {
+        "execution_id": execution_id,
+        "strategy_name": strategy_name,
+        "session_date": executed_at[:10],
+        "symbol": symbol,
+        "side": side,
+        "quantity": quantity,
+        "price": price,
+        "executed_at": executed_at,
+        "recorded_at": executed_at,
+        "commission": commission,
+        "commission_currency": "USD" if commission is not None else None,
+        "commission_source": "ibkr" if commission is not None else "missing",
+        "raw_json": {
+            "execution": {
+                "execId": execution_id,
+                "side": side,
+                "shares": quantity,
+                "price": price,
+                "time": executed_at,
+            }
+        },
+    }
+
+
+class ClosedTradeExecutionBackfillTests(unittest.TestCase):
+    def make_store(self, tmp: str) -> SQLiteRuntimeStore:
+        return SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+
+    def test_same_day_buy_sell_creates_one_closed_trade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_store(tmp)
+            try:
+                store.upsert_execution(
+                    execution_row("B1", symbol="AKTX", side="BOT", quantity=5, price=17.0, executed_at="2026-05-28T13:35:00+00:00", commission=0.86)
+                )
+                store.upsert_execution(
+                    execution_row("S1", symbol="AKTX", side="SLD", quantity=5, price=17.5, executed_at="2026-05-28T14:05:00+00:00", commission=0.88)
+                )
+
+                dry_run = reconstruct_closed_trades_from_executions(store, "2026-05-28", apply=False)
+                self.assertEqual(dry_run["planned"], 1)
+                self.assertEqual(store.query("SELECT COUNT(*) AS n FROM trades")[0]["n"], 0)
+
+                result = reconstruct_closed_trades_from_executions(store, "2026-05-28", apply=True)
+                rows = store.query("SELECT * FROM trades")
+
+                self.assertEqual(result["created"], 1)
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                self.assertEqual(row["trade_id"], "reconstructed:2026-05-28:2026-05-28:AKTX:B1:S1")
+                self.assertEqual(row["session_date"], "2026-05-28")
+                self.assertEqual(row["status"], "CLOSED")
+                self.assertEqual(row["entry_fill_time"], "2026-05-28T13:35:00+00:00")
+                self.assertEqual(row["exit_fill_time"], "2026-05-28T14:05:00+00:00")
+                self.assertAlmostEqual(row["gross_pnl"], 2.5)
+                self.assertAlmostEqual(row["commission"], 1.74)
+                self.assertAlmostEqual(row["net_pnl"], 0.76)
+                self.assertEqual(row["ibkr_entry_confirmed"], 1)
+                self.assertEqual(row["ibkr_exit_confirmed"], 1)
+                self.assertEqual(row["ibkr_position_flat_confirmed"], 1)
+            finally:
+                store.close()
+
+    def test_previous_day_buy_selected_day_sell_creates_carried_closed_trade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_store(tmp)
+            try:
+                store.upsert_execution(
+                    execution_row("B_DUOT", symbol="DUOT", side="BOT", quantity=2, price=6.0, executed_at="2026-05-27T18:00:00+00:00", commission=0.42)
+                )
+                store.upsert_execution(
+                    execution_row("S_DUOT", symbol="DUOT", side="SLD", quantity=2, price=7.0, executed_at="2026-05-28T13:40:00+00:00", commission=0.44)
+                )
+
+                result = reconstruct_closed_trades_from_executions(store, "2026-05-28", apply=True)
+                rows = store.query("SELECT * FROM trades")
+
+                self.assertEqual(result["created"], 1)
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                self.assertEqual(row["trade_id"], "reconstructed:2026-05-27:2026-05-28:DUOT:B_DUOT:S_DUOT")
+                self.assertEqual(row["session_date"], "2026-05-27")
+                self.assertEqual(row["entry_fill_time"], "2026-05-27T18:00:00+00:00")
+                self.assertEqual(row["exit_fill_time"], "2026-05-28T13:40:00+00:00")
+                self.assertAlmostEqual(row["gross_pnl"], 2.0)
+                self.assertAlmostEqual(row["commission"], 0.86)
+            finally:
+                store.close()
+
+    def test_sell_only_without_recoverable_buy_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_store(tmp)
+            try:
+                store.upsert_execution(
+                    execution_row("S_ONLY", symbol="EOSE", side="SLD", quantity=4, price=3.2, executed_at="2026-05-28T13:45:00+00:00", commission=0.5)
+                )
+
+                result = reconstruct_closed_trades_from_executions(store, "2026-05-28", apply=True)
+
+                self.assertEqual(result["created"], 0)
+                self.assertEqual(result["planned"], 0)
+                self.assertEqual(result["skipped_sell_only"], 1)
+                self.assertEqual(store.query("SELECT COUNT(*) AS n FROM trades")[0]["n"], 0)
+            finally:
+                store.close()
+
+    def test_rerun_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_store(tmp)
+            try:
+                store.upsert_execution(
+                    execution_row("B1", symbol="MRAM", side="BOT", quantity=3, price=31.65, executed_at="2026-05-28T13:35:00+00:00", commission=0.91)
+                )
+                store.upsert_execution(
+                    execution_row("S1", symbol="MRAM", side="SLD", quantity=3, price=28.99, executed_at="2026-05-28T20:22:02+00:00", commission=0.92)
+                )
+
+                first = reconstruct_closed_trades_from_executions(store, "2026-05-28", apply=True)
+                second = reconstruct_closed_trades_from_executions(store, "2026-05-28", apply=True)
+
+                self.assertEqual(first["created"], 1)
+                self.assertEqual(second["created"], 0)
+                self.assertEqual(second["skipped_existing"], 1)
+                self.assertEqual(store.query("SELECT COUNT(*) AS n FROM trades")[0]["n"], 1)
+            finally:
+                store.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
