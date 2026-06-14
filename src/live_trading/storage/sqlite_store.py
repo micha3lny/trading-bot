@@ -13,6 +13,17 @@ from src.live_trading.unified_logger import append_unified_log, unified_logger_i
 
 
 DEFAULT_SQLITE_PATH = "data/runtime/trading_runtime.sqlite"
+HIGH_FREQUENCY_RUNTIME_EVENT_THROTTLE_SECONDS = {
+    "BUY_BLOCKED": 300,
+    "RISK_GUARD_BLOCK_ENTRY": 300,
+    "PEAK_UPDATED": 300,
+    "SIGNAL_READY": 300,
+    "POSITION_MISSING_IN_IBKR": 300,
+    "POSITION_DRIFT_DETECTED": 300,
+}
+SUMMARY_RUNTIME_EVENT_TYPES = {
+    "BUY_BLOCKED": "BUY_BLOCKED_SUMMARY",
+}
 
 
 def utc_now_iso() -> str:
@@ -223,6 +234,20 @@ class SQLiteRuntimeStore:
             CREATE INDEX IF NOT EXISTS idx_runtime_events_symbol ON runtime_events(symbol);
             CREATE INDEX IF NOT EXISTS idx_runtime_events_session_date ON runtime_events(session_date);
             CREATE INDEX IF NOT EXISTS idx_runtime_events_resolved ON runtime_events(resolved);
+
+            CREATE TABLE IF NOT EXISTS runtime_event_counters (
+                date TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                symbol TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                count INTEGER DEFAULT 0,
+                first_seen_at TEXT,
+                last_seen_at TEXT,
+                PRIMARY KEY (date, event_type, symbol, reason)
+            );
+            CREATE INDEX IF NOT EXISTS idx_runtime_event_counters_date ON runtime_event_counters(date);
+            CREATE INDEX IF NOT EXISTS idx_runtime_event_counters_event_type ON runtime_event_counters(event_type);
+            CREATE INDEX IF NOT EXISTS idx_runtime_event_counters_symbol ON runtime_event_counters(symbol);
 
             CREATE TABLE IF NOT EXISTS trades (
                 trade_id TEXT PRIMARY KEY,
@@ -487,26 +512,57 @@ class SQLiteRuntimeStore:
 
     def record_runtime_event(self, **kwargs: Any) -> int:
         now = kwargs.get("event_time") or utc_now_iso()
+        event_type = str(kwargs.get("event_type") or kwargs.get("event") or "UNKNOWN")
+        event_type_upper = event_type.upper()
+        session_date = kwargs.get("session_date") or session_date_utc()
+        symbol = str(kwargs.get("symbol") or "").upper()
+        reason = str(kwargs.get("reason") or "")
+        repeat_count = safe_int(kwargs.get("repeat_count")) or 1
+        counter_count = self._increment_runtime_event_counter(
+            date=str(session_date or iso_date_part(now) or session_date_utc()),
+            event_type=event_type_upper,
+            symbol=symbol,
+            reason=reason,
+            count=repeat_count,
+            event_time=str(now),
+        )
+        should_persist, persisted_event_type = self._should_persist_runtime_event(
+            event_type=event_type_upper,
+            persisted_event_type=SUMMARY_RUNTIME_EVENT_TYPES.get(event_type_upper, event_type_upper),
+            session_date=str(session_date or ""),
+            symbol=symbol,
+            reason=reason,
+            event_time=str(now),
+        )
+        if not should_persist:
+            return 0
+        raw_json = kwargs.get("raw_json")
+        if persisted_event_type != event_type_upper:
+            raw_json = {
+                "aggregated_event_type": event_type_upper,
+                "count": counter_count,
+                "sqlite_throttle_seconds": HIGH_FREQUENCY_RUNTIME_EVENT_THROTTLE_SECONDS.get(event_type_upper),
+            }
         row = {
             "event_time": now,
             "severity": kwargs.get("severity") or "INFO",
-            "event_type": kwargs.get("event_type") or kwargs.get("event") or "UNKNOWN",
+            "event_type": persisted_event_type,
             "strategy_name": kwargs.get("strategy_name"),
             "strategy_version": kwargs.get("strategy_version"),
-            "session_date": kwargs.get("session_date") or session_date_utc(),
-            "symbol": kwargs.get("symbol"),
+            "session_date": session_date,
+            "symbol": symbol,
             "trade_id": kwargs.get("trade_id"),
             "order_id": kwargs.get("order_id"),
             "execution_id": kwargs.get("execution_id"),
             "source": kwargs.get("source"),
-            "reason": kwargs.get("reason"),
+            "reason": reason,
             "action_required": bool_int(kwargs.get("action_required")),
             "acknowledged": bool_int(kwargs.get("acknowledged")),
             "resolved": bool_int(kwargs.get("resolved")),
             "first_seen_at": kwargs.get("first_seen_at") or now,
             "last_seen_at": kwargs.get("last_seen_at") or now,
-            "repeat_count": safe_int(kwargs.get("repeat_count")) or 1,
-            "raw_json": kwargs.get("raw_json"),
+            "repeat_count": repeat_count,
+            "raw_json": raw_json,
         }
         cur = self.execute(
             """
@@ -523,6 +579,62 @@ class SQLiteRuntimeStore:
             clean_row(row, row.keys()),
         )
         return int(cur.lastrowid)
+
+    def _increment_runtime_event_counter(self, *, date: str, event_type: str, symbol: str, reason: str, count: int, event_time: str) -> int:
+        self.execute(
+            """
+            INSERT INTO runtime_event_counters (date, event_type, symbol, reason, count, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(date, event_type, symbol, reason) DO UPDATE SET
+                count=runtime_event_counters.count + excluded.count,
+                last_seen_at=excluded.last_seen_at
+            """,
+            [date, event_type, symbol or "", reason or "", count, event_time, event_time],
+        )
+        row = self.query(
+            """
+            SELECT count
+            FROM runtime_event_counters
+            WHERE date = ? AND event_type = ? AND symbol = ? AND reason = ?
+            """,
+            [date, event_type, symbol or "", reason or ""],
+        )
+        return safe_int(row[0].get("count")) if row else count
+
+    def _should_persist_runtime_event(
+        self,
+        *,
+        event_type: str,
+        persisted_event_type: str,
+        session_date: str,
+        symbol: str,
+        reason: str,
+        event_time: str,
+    ) -> tuple[bool, str]:
+        throttle_seconds = HIGH_FREQUENCY_RUNTIME_EVENT_THROTTLE_SECONDS.get(event_type)
+        if not throttle_seconds:
+            return True, persisted_event_type
+        rows = self.query(
+            """
+            SELECT last_seen_at
+            FROM runtime_events
+            WHERE event_type = ?
+              AND COALESCE(session_date, '') = ?
+              AND COALESCE(symbol, '') = ?
+              AND COALESCE(reason, '') = ?
+            ORDER BY last_seen_at DESC, event_time DESC
+            LIMIT 1
+            """,
+            [persisted_event_type, session_date or "", symbol or "", reason or ""],
+        )
+        if not rows:
+            return True, persisted_event_type
+        try:
+            previous = datetime.fromisoformat(str(rows[0].get("last_seen_at") or "").replace("Z", "+00:00"))
+            current = datetime.fromisoformat(str(event_time).replace("Z", "+00:00"))
+        except Exception:
+            return True, persisted_event_type
+        return (current - previous).total_seconds() >= throttle_seconds, persisted_event_type
 
     def record_risk_event(self, **kwargs: Any) -> str:
         now = kwargs.get("event_time") or utc_now_iso()

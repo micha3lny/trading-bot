@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from scripts.cleanup_runtime_events import cleanup_runtime_events
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.v66_ibkr_account_recorder import record_recent_fills
@@ -348,6 +349,58 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 store.record_runtime_event(event_type="TEST_EVENT", symbol="RKLB")
                 store.record_runtime_event(event_type="TEST_EVENT", symbol="RKLB")
                 self.assertEqual(store.query("SELECT COUNT(*) AS n FROM runtime_events")[0]["n"], 2)
+            finally:
+                store.close()
+
+    def test_repeated_buy_blocked_is_throttled_but_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                for _ in range(1000):
+                    store.record_runtime_event(
+                        event_time="2026-06-14T13:30:00+00:00",
+                        event_type="BUY_BLOCKED",
+                        session_date="2026-06-14",
+                        symbol="AKTX",
+                        reason="entries_blocked",
+                        raw_json={"large_payload": "x" * 1000},
+                    )
+
+                runtime_events = store.query("SELECT event_type, raw_json FROM runtime_events")
+                counters = store.query(
+                    """
+                    SELECT count
+                    FROM runtime_event_counters
+                    WHERE date = '2026-06-14'
+                      AND event_type = 'BUY_BLOCKED'
+                      AND symbol = 'AKTX'
+                      AND reason = 'entries_blocked'
+                    """
+                )
+
+                self.assertLessEqual(len(runtime_events), 2)
+                self.assertEqual(counters[0]["count"], 1000)
+                self.assertEqual(runtime_events[0]["event_type"], "BUY_BLOCKED_SUMMARY")
+                self.assertLess(len(runtime_events[0]["raw_json"] or ""), 300)
+            finally:
+                store.close()
+
+    def test_runtime_event_cleanup_preserves_ledger_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.record_runtime_event(event_time="2026-05-01T13:30:00+00:00", event_type="OLD_EVENT", session_date="2026-05-01")
+                store.upsert_execution({"execution_id": "E_KEEP", "symbol": "KEEP", "side": "BOT", "quantity": 1, "price": 10, "executed_at": "2026-05-01T13:31:00+00:00"})
+                store.upsert_order({"order_key": "O_KEEP", "symbol": "KEEP", "side": "BUY", "quantity": 1})
+                store.upsert_trade({"trade_id": "T_KEEP", "symbol": "KEEP", "status": "CLOSED", "quantity": 1})
+
+                result = cleanup_runtime_events(store, older_than_days=1, apply=True)
+
+                self.assertGreaterEqual(result["runtime_events_matching_before"], 1)
+                self.assertEqual(store.query("SELECT COUNT(*) AS n FROM runtime_events")[0]["n"], 0)
+                self.assertEqual(store.query("SELECT COUNT(*) AS n FROM executions")[0]["n"], 1)
+                self.assertEqual(store.query("SELECT COUNT(*) AS n FROM orders")[0]["n"], 1)
+                self.assertEqual(store.query("SELECT COUNT(*) AS n FROM trades")[0]["n"], 1)
             finally:
                 store.close()
 
