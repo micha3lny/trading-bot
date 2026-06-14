@@ -394,9 +394,10 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 store.upsert_order({"order_key": "O_KEEP", "symbol": "KEEP", "side": "BUY", "quantity": 1})
                 store.upsert_trade({"trade_id": "T_KEEP", "symbol": "KEEP", "status": "CLOSED", "quantity": 1})
 
-                result = cleanup_runtime_events(store, older_than_days=1, apply=True)
+                result = cleanup_runtime_events(store, older_than_days=1, apply=True, batch_size=1)
 
                 self.assertGreaterEqual(result["runtime_events_matching_before"], 1)
+                self.assertGreaterEqual(result["runtime_events_deleted"], 1)
                 self.assertEqual(store.query("SELECT COUNT(*) AS n FROM runtime_events")[0]["n"], 0)
                 self.assertEqual(store.query("SELECT COUNT(*) AS n FROM executions")[0]["n"], 1)
                 self.assertEqual(store.query("SELECT COUNT(*) AS n FROM orders")[0]["n"], 1)
