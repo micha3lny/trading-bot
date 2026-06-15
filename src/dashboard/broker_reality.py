@@ -65,6 +65,14 @@ class ReconciliationResult:
     pnl_comparison: pd.DataFrame
 
 
+@dataclass(frozen=True)
+class BrokerExecutionsFetchResult:
+    raw_executions: pd.DataFrame
+    filtered_executions: pd.DataFrame
+    status: str
+    diagnostics: dict[str, Any]
+
+
 def parse_dt(value: Any) -> datetime | None:
     if value in (None, ""):
         return None
@@ -342,53 +350,111 @@ def fetch_ibkr_live_portfolio(host: str, port: int, client_id: int, timeout: flo
             pass
 
 
-def fetch_ibkr_executions_for_date(host: str, port: int, client_id: int, selected_date: str, timeout: float = 4.0) -> tuple[pd.DataFrame, str]:
+def fetch_ibkr_executions_diagnostic(host: str, port: int, client_id: int, selected_date: str, timeout: float = 4.0) -> BrokerExecutionsFetchResult:
     loop_info = ensure_asyncio_event_loop()
+    diagnostics: dict[str, Any] = {
+        "selected_date": selected_date,
+        "timezone_used": "UTC",
+        "api_methods_used": [],
+        "raw_execution_count_before_filtering": 0,
+        "execution_count_after_date_filtering": 0,
+        "raw_commission_report_count": 0,
+        "ibkr_messages": [],
+        "event_loop_info": loop_info,
+        "session_only_warning": "IBKR_API_EXECUTIONS_SESSION_ONLY",
+    }
     try:
         from ib_insync import ExecutionFilter, IB  # type: ignore
     except Exception as exc:
-        return empty_broker_executions(), f"ib_insync_unavailable: {exc}; {loop_info}"
+        diagnostics["ibkr_messages"].append(f"ib_insync_unavailable: {exc}")
+        return BrokerExecutionsFetchResult(empty_broker_executions(), empty_broker_executions(), f"ib_insync_unavailable: {exc}; {loop_info}", diagnostics)
     ib = IB()
     try:
+        def on_error(req_id: int, error_code: int, error_string: str, contract: Any = None) -> None:
+            diagnostics["ibkr_messages"].append(f"error reqId={req_id} code={error_code} message={error_string}")
+
+        try:
+            ib.errorEvent += on_error
+        except Exception as exc:
+            diagnostics["ibkr_messages"].append(f"error_event_attach_failed: {exc}")
         ib.connect(host, int(port), clientId=int(client_id), timeout=timeout)
-        execution_filter = ExecutionFilter()
-        execution_filter.time = f"{selected_date.replace('-', '')} 00:00:00"
-        fills = ib.reqExecutions(execution_filter)
+        fills_by_method: list[tuple[str, Any]] = []
+        try:
+            execution_filter = ExecutionFilter()
+            execution_filter.time = f"{selected_date.replace('-', '')} 00:00:00"
+            fills_by_method.append(("ib.reqExecutions(filter_time)", ib.reqExecutions(execution_filter)))
+        except Exception as exc:
+            diagnostics["ibkr_messages"].append(f"reqExecutions_filter_failed: {exc}")
+        try:
+            fills_by_method.append(("ib.reqExecutions()", ib.reqExecutions()))
+        except Exception as exc:
+            diagnostics["ibkr_messages"].append(f"reqExecutions_unfiltered_failed: {exc}")
+        try:
+            fills_attr = ib.fills()
+            fills_by_method.append(("ib.fills()", fills_attr))
+        except Exception as exc:
+            diagnostics["ibkr_messages"].append(f"fills_failed: {exc}")
+        try:
+            executions_attr = getattr(ib, "executions", None)
+            if callable(executions_attr):
+                fills_by_method.append(("ib.executions()", executions_attr()))
+        except Exception as exc:
+            diagnostics["ibkr_messages"].append(f"executions_failed: {exc}")
+
+        seen_exec_ids: set[str] = set()
         rows: list[dict[str, Any]] = []
-        for fill in fills:
-            contract = getattr(fill, "contract", None)
-            execution = getattr(fill, "execution", None)
-            commission_report = getattr(fill, "commissionReport", None)
-            rows.append(
-                normalize_execution_record(
-                    {
-                        "execution_time": getattr(execution, "time", None),
-                        "symbol": getattr(contract, "symbol", None),
-                        "side": getattr(execution, "side", None),
-                        "quantity": getattr(execution, "shares", None),
-                        "price": getattr(execution, "price", None),
-                        "commission": getattr(commission_report, "commission", None),
-                        "execution_id": getattr(execution, "execId", None),
-                        "order_id": getattr(execution, "orderId", None),
-                        "perm_id": getattr(execution, "permId", None),
-                        "account": getattr(execution, "acctNumber", None),
-                        "exchange": getattr(execution, "exchange", None),
-                        "currency": getattr(commission_report, "currency", None),
-                    },
-                    source="ibkr_api",
+        for method, fills in fills_by_method:
+            diagnostics["api_methods_used"].append(method)
+            for fill in fills or []:
+                contract = getattr(fill, "contract", None)
+                execution = getattr(fill, "execution", fill)
+                commission_report = getattr(fill, "commissionReport", None)
+                exec_id = str(getattr(execution, "execId", "") or "")
+                dedupe_key = exec_id or f"{method}:{len(rows)}"
+                if dedupe_key in seen_exec_ids:
+                    continue
+                seen_exec_ids.add(dedupe_key)
+                if commission_report is not None:
+                    diagnostics["raw_commission_report_count"] += 1
+                rows.append(
+                    normalize_execution_record(
+                        {
+                            "execution_time": getattr(execution, "time", None),
+                            "symbol": getattr(contract, "symbol", None),
+                            "side": getattr(execution, "side", None),
+                            "quantity": getattr(execution, "shares", None),
+                            "price": getattr(execution, "price", None),
+                            "commission": getattr(commission_report, "commission", None),
+                            "execution_id": exec_id,
+                            "order_id": getattr(execution, "orderId", None),
+                            "perm_id": getattr(execution, "permId", None),
+                            "account": getattr(execution, "acctNumber", None),
+                            "exchange": getattr(execution, "exchange", None),
+                            "currency": getattr(commission_report, "currency", None),
+                        },
+                        source=method,
+                    )
                 )
-            )
-        df = pd.DataFrame(rows, columns=BROKER_EXECUTION_COLUMNS)
-        if not df.empty:
-            df = df[df["execution_time"].map(date_part) == selected_date].reset_index(drop=True)
-        return df, f"OK; {loop_info}"
+        raw_df = pd.DataFrame(rows, columns=BROKER_EXECUTION_COLUMNS)
+        diagnostics["raw_execution_count_before_filtering"] = int(len(raw_df))
+        filtered_df = raw_df
+        if not raw_df.empty:
+            filtered_df = raw_df[raw_df["execution_time"].map(date_part) == selected_date].reset_index(drop=True)
+        diagnostics["execution_count_after_date_filtering"] = int(len(filtered_df))
+        return BrokerExecutionsFetchResult(raw_df, filtered_df, f"OK; {loop_info}", diagnostics)
     except Exception as exc:
-        return empty_broker_executions(), f"ibkr_executions_error: {exc}; {loop_info}"
+        diagnostics["ibkr_messages"].append(f"ibkr_executions_error: {exc}")
+        return BrokerExecutionsFetchResult(empty_broker_executions(), empty_broker_executions(), f"ibkr_executions_error: {exc}; {loop_info}", diagnostics)
     finally:
         try:
             ib.disconnect()
         except Exception:
             pass
+
+
+def fetch_ibkr_executions_for_date(host: str, port: int, client_id: int, selected_date: str, timeout: float = 4.0) -> tuple[pd.DataFrame, str]:
+    result = fetch_ibkr_executions_diagnostic(host, port, client_id, selected_date, timeout)
+    return result.filtered_executions, result.status
 
 
 def execution_signature(row: dict[str, Any]) -> tuple[str, str, float, float]:

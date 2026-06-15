@@ -24,7 +24,7 @@ from src.dashboard.broker_reality import (  # noqa: E402
     describe_asyncio_event_loop,
     empty_broker_executions,
     empty_closed_trades,
-    fetch_ibkr_executions_for_date,
+    fetch_ibkr_executions_diagnostic,
     fetch_ibkr_live_portfolio,
     load_sqlite_active_positions,
     load_sqlite_closed_trades,
@@ -566,8 +566,19 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
     portfolio = pd.DataFrame()
     portfolio_status = "NOT_LOADED"
     broker_executions = empty_broker_executions()
+    raw_broker_executions = empty_broker_executions()
     broker_closed_trades = empty_closed_trades()
     broker_status = "CSV_REQUIRED_FOR_HISTORICAL_DATE"
+    broker_execution_diagnostics = {
+        "selected_date": selected_date,
+        "timezone_used": "UTC",
+        "api_methods_used": [],
+        "raw_execution_count_before_filtering": 0,
+        "execution_count_after_date_filtering": 0,
+        "raw_commission_report_count": 0,
+        "ibkr_messages": [],
+        "session_only_warning": "IBKR_API_EXECUTIONS_SESSION_ONLY",
+    }
     sqlite_executions = empty_broker_executions()
     sqlite_closed_trades = empty_closed_trades()
     sqlite_positions = pd.DataFrame()
@@ -586,39 +597,56 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
 
     if use_api_executions:
         try:
-            broker_executions, broker_status = fetch_ibkr_executions_for_date(host, int(port), int(client_id), selected_date, float(timeout))
+            execution_fetch = fetch_ibkr_executions_diagnostic(host, int(port), int(client_id), selected_date, float(timeout))
+            raw_broker_executions = execution_fetch.raw_executions
+            broker_executions = execution_fetch.filtered_executions
+            broker_status = execution_fetch.status
+            broker_execution_diagnostics = execution_fetch.diagnostics
             api_executions_count = len(broker_executions)
         except Exception as exc:
+            raw_broker_executions = empty_broker_executions()
             broker_executions = empty_broker_executions()
             broker_status = f"ibkr_executions_exception: {exc}"
+            broker_execution_diagnostics["ibkr_messages"].append(str(exc))
             st.error("IBKR execution request failed")
             st.exception(exc)
     if uploaded_csv is not None:
         try:
-            broker_executions = parse_ibkr_activity_csv(uploaded_csv)
-            broker_executions = broker_executions[broker_executions["execution_time"].map(lambda x: str(x)[:10]) == selected_date].reset_index(drop=True)
+            raw_broker_executions = parse_ibkr_activity_csv(uploaded_csv)
+            broker_executions = raw_broker_executions[raw_broker_executions["execution_time"].map(lambda x: str(x)[:10]) == selected_date].reset_index(drop=True)
             broker_status = "OK"
             csv_loaded = True
+            broker_execution_diagnostics["raw_execution_count_before_filtering"] = int(len(raw_broker_executions))
+            broker_execution_diagnostics["execution_count_after_date_filtering"] = int(len(broker_executions))
+            broker_execution_diagnostics["api_methods_used"] = ["IBKR Activity CSV upload"]
         except Exception as exc:
+            raw_broker_executions = empty_broker_executions()
             broker_executions = empty_broker_executions()
             broker_status = f"csv_upload_parse_error: {exc}"
+            broker_execution_diagnostics["ibkr_messages"].append(str(exc))
             st.error("IBKR Activity CSV parse failed")
             st.exception(exc)
     elif csv_path.strip():
         path = Path(csv_path.strip()).expanduser()
         if path.exists():
             try:
-                broker_executions = parse_ibkr_activity_csv(path.read_text())
-                broker_executions = broker_executions[broker_executions["execution_time"].map(lambda x: str(x)[:10]) == selected_date].reset_index(drop=True)
+                raw_broker_executions = parse_ibkr_activity_csv(path.read_text())
+                broker_executions = raw_broker_executions[raw_broker_executions["execution_time"].map(lambda x: str(x)[:10]) == selected_date].reset_index(drop=True)
                 broker_status = "OK"
                 csv_loaded = True
+                broker_execution_diagnostics["raw_execution_count_before_filtering"] = int(len(raw_broker_executions))
+                broker_execution_diagnostics["execution_count_after_date_filtering"] = int(len(broker_executions))
+                broker_execution_diagnostics["api_methods_used"] = [f"IBKR Activity CSV path {path}"]
             except Exception as exc:
+                raw_broker_executions = empty_broker_executions()
                 broker_executions = empty_broker_executions()
                 broker_status = f"csv_path_parse_error: {exc}"
+                broker_execution_diagnostics["ibkr_messages"].append(str(exc))
                 st.error("IBKR Activity CSV path parse failed")
                 st.exception(exc)
         else:
             broker_status = f"csv_path_not_found: {path}"
+            broker_execution_diagnostics["ibkr_messages"].append(broker_status)
 
     try:
         sqlite_executions = load_sqlite_executions(sqlite_path, selected_date)
@@ -679,12 +707,22 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
 
     st.divider()
     st.subheader("Broker Executions")
+    exec_diag_cols = st.columns(4)
+    exec_diag_cols[0].metric("Raw API/CSV executions", int(broker_execution_diagnostics.get("raw_execution_count_before_filtering", len(raw_broker_executions)) or 0))
+    exec_diag_cols[1].metric("After date filter", int(broker_execution_diagnostics.get("execution_count_after_date_filtering", len(broker_executions)) or 0))
+    exec_diag_cols[2].metric("Commission reports", int(broker_execution_diagnostics.get("raw_commission_report_count", 0) or 0))
+    exec_diag_cols[3].metric("Timezone", str(broker_execution_diagnostics.get("timezone_used", "UTC")))
     if broker_executions.empty:
         st.info("No executions for selected date")
+        st.warning("Broker Closed Trades require Broker Executions. If API executions are empty, upload Activity Statement / Trades CSV.")
+        if use_api_executions and raw_broker_executions.empty and not csv_loaded:
+            st.warning("IBKR_API_EXECUTIONS_SESSION_ONLY: IBKR API may return only executions from the current API session, not full historical selected-date activity.")
         if not csv_loaded and not use_api_executions:
             st.warning("CSV_REQUIRED_FOR_HISTORICAL_DATE")
     else:
         st.dataframe(broker_executions, width="stretch", hide_index=True)
+    with st.expander("Raw Broker Executions Preview", expanded=False):
+        dataframe_or_info(raw_broker_executions.head(50), "No raw broker executions returned before date filtering.", key="raw_broker_executions_preview")
 
     st.divider()
     st.subheader("Broker Closed Trades / Realized Trades")
@@ -707,7 +745,7 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
         st.warning(status)
     else:
         st.error(status)
-    cols = st.columns(6)
+    cols = st.columns(8)
     for col, (label, key) in zip(
         cols,
         [
@@ -772,6 +810,8 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
         st.write("portfolio_rows", len(portfolio))
         st.write("broker_executions_type", type(broker_executions))
         st.write("broker_executions_rows", len(broker_executions))
+        st.write("raw_broker_executions_rows", len(raw_broker_executions))
+        st.write("broker_execution_diagnostics", broker_execution_diagnostics)
         st.write("broker_closed_trades_rows", len(broker_closed_trades))
         st.write("sqlite_closed_trades_rows", len(sqlite_closed_trades))
         st.write("sqlite_executions_type", type(sqlite_executions))
