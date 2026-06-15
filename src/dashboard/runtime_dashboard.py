@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -443,6 +442,16 @@ def render_diagnostics(diag: dict) -> None:
     ]
     for col, (label, key) in zip(closed_cols, closed_labels):
         col.metric(label, int(diag.get(key, 0)))
+    reducer_cols = st.columns(4)
+    reducer_cols[0].metric("SQLite Closed Trades", int(diag.get("closed_trades_count", 0) or 0))
+    reducer_cols[1].metric("Broker Closed Trades", str(diag.get("broker_closed_trades_count", "N/A")))
+    reducer_cols[2].metric("Reducer Updated <60s", int(diag.get("trades_updated_last_60s", 0) or 0))
+    reducer_cols[3].metric("Reducer Running", int(diag.get("reducer_running", 0) or 0))
+    st.caption(
+        "runtime_trust_status="
+        f"{diag.get('runtime_trust_status', 'UNKNOWN')} "
+        f"last_reducer_run_at={diag.get('last_reducer_run_at', '')}"
+    )
 
 
 def dataframe_or_info(df: pd.DataFrame, message: str, *, key: str | None = None) -> None:
@@ -521,7 +530,19 @@ def render_runtime_tab(sqlite_path: str, start_date: str, end_date: str, strateg
         snapshot = load_historical_snapshot(sqlite_path, start_date, end_date, strategy, include_reconstructed)
 
     loaded_at = snapshot.get("loaded_at", "")
-    st.caption(f"SQLite: `{snapshot.get('source')}` | window: {start_date} to {end_date} | strategy: {strategy} | loaded_at: {loaded_at}")
+    snapshot_version = snapshot.get("snapshot_version", "")
+    trust_status = snapshot.get("trust_status", "")
+    st.caption(
+        f"SQLite: `{snapshot.get('source')}` | window: {start_date} to {end_date} | "
+        f"strategy: {strategy} | loaded_at: {loaded_at} | snapshot_version: {snapshot_version}"
+    )
+    if trust_status == "SQLITE_UNTRUSTED_REDUCER_ACTIVE":
+        st.warning(
+            "Runtime Dashboard is SQLite-only and reducer rows changed in the last 60 seconds. "
+            "Treat Runtime PnL as UNTRUSTED until Broker Reality reconciliation is stable."
+        )
+    elif trust_status:
+        st.info(f"Runtime source: {trust_status}. Broker Reality remains the broker-truth reconciliation view.")
 
     render_summary(snapshot["summary"])
     st.divider()
@@ -542,7 +563,7 @@ def render_runtime_tab(sqlite_path: str, start_date: str, end_date: str, strateg
     render_diagnostics(snapshot["diagnostics"])
 
     if current and auto_refresh:
-        st.markdown('<p class="small-note">Auto refresh active: rerendering every 5 seconds for current session.</p>', unsafe_allow_html=True)
+        st.markdown('<p class="small-note">Auto refresh disabled for Runtime stability. Refresh the browser manually after reducer/backfill settles.</p>', unsafe_allow_html=True)
 
 
 def render_broker_reality_tab(sqlite_path: str) -> None:
@@ -868,8 +889,8 @@ def main() -> None:
             start_date, end_date = start.isoformat(), end.isoformat()
         strategies = ["All", *cached_strategies(sqlite_path, start_date, end_date)]
         strategy = st.selectbox("Strategy", strategies, index=0)
-        include_reconstructed = st.toggle("Show execution-reconstructed trades", value=False)
-        auto_refresh = st.toggle("Auto refresh current session", value=True)
+        include_reconstructed = st.toggle("Show execution-reconstructed trades", value=False, disabled=True)
+        auto_refresh = st.toggle("Auto refresh current session", value=False)
 
     runtime_tab, broker_tab = st.tabs(["Runtime Dashboard", "Broker Reality / IBKR Reconciliation"])
     with runtime_tab:
@@ -878,8 +899,7 @@ def main() -> None:
         render_broker_reality_tab(sqlite_path)
 
     if auto_refresh and start_date == end_date == utc_today():
-        time.sleep(5)
-        st.rerun()
+        st.caption("Auto refresh is intentionally disabled on Runtime Dashboard to avoid reading partial reducer state.")
 
 
 if __name__ == "__main__":

@@ -121,6 +121,8 @@ def to_float(value: Any, default: float | None = 0.0) -> float | None:
     try:
         if value in (None, ""):
             return default
+        if pd.isna(value):
+            return default
         return float(value)
     except Exception:
         return default
@@ -760,9 +762,13 @@ def closed_from_trades(
             exit_price AS sell,
             quantity AS qty,
             gross_pnl AS gross,
+            commission AS persisted_commission,
+            net_pnl AS persisted_net_pnl,
             mfe_pct AS peak_pct,
             exit_reason,
-            raw_json
+            raw_json,
+            updated_at,
+            trade_reduction_version
         FROM trades t
         WHERE (
             substr(t.exit_fill_time, 1, 10) BETWEEN ? AND ?
@@ -795,12 +801,28 @@ def closed_from_trades(
     expected_commission_counts: list[int] = []
     commission_source_details: list[str] = []
     for row in out.to_dict("records"):
-        buy_rows, sell_rows, matched_by = execution_matches_for_trade(row, executions)
-        entry_time, exit_time, flags = infer_entry_exit_times(row, buy_rows, sell_rows)
+        buy_rows: list[dict[str, Any]] = []
+        sell_rows: list[dict[str, Any]] = []
+        matched_by = "trades_table"
+        flags: set[str] = set()
+        entry_time = row.get("entry_time")
+        exit_time = row.get("exit_time") or row.get("closed_at")
+        if not entry_time:
+            flags.add("MISSING_ENTRY")
+        if not exit_time:
+            flags.add("MISSING_EXIT")
         enriched_row = {**row, "entry_time": entry_time, "exit_time": exit_time}
-        commission, commission_status = confirmed_commission_for_execution_rows(buy_rows, sell_rows)
-        peak_pct, peak_source = peak_from_sources(enriched_row, runtime_peak_map, lifecycle_peak_map, candle_rows)
         raw = parse_raw_json(row.get("raw_json"))
+        persisted_commission = to_float(row.get("persisted_commission"), None)
+        commission = abs(float(persisted_commission)) if persisted_commission is not None else 0.0
+        raw_commission_status = str(raw.get("commission_status") or raw.get("commission_source") or "").upper()
+        if raw_commission_status in {"OK", "PARTIAL", "MISSING"}:
+            commission_status = raw_commission_status
+        elif commission > 0:
+            commission_status = "OK"
+        else:
+            commission_status = "MISSING"
+        peak_pct, peak_source = peak_from_sources(enriched_row, runtime_peak_map, lifecycle_peak_map, candle_rows)
         drop_from_peak = to_float(raw.get("drop_from_peak_pct"), None)
         if drop_from_peak is None:
             drop_from_peak = to_float(raw.get("giveback_pct"), None)
@@ -813,13 +835,13 @@ def closed_from_trades(
         peak_sources.append(peak_source)
         peak_match_qualities.append("exact_trade_id" if peak_source != "missing" else "missing")
         drop_values.append(drop_from_peak)
-        entry_execution_counts.append(len(buy_rows))
-        exit_execution_counts.append(len(sell_rows))
-        confirmed_count = confirmed_commission_execution_count(buy_rows, sell_rows)
+        entry_execution_counts.append(int(raw.get("entry_execution_count") or raw.get("buy_execution_count") or 0))
+        exit_execution_counts.append(int(raw.get("exit_execution_count") or raw.get("sell_execution_count") or 0))
+        confirmed_count = int(raw.get("confirmed_commission_execution_count") or (2 if commission_status == "OK" else (1 if commission_status == "PARTIAL" else 0)))
         confirmed_commission_counts.append(confirmed_count)
-        expected_count = len(buy_rows) + len(sell_rows)
+        expected_count = int(raw.get("expected_commission_execution_count") or raw.get("execution_count") or 0)
         expected_commission_counts.append(expected_count)
-        commission_source_details.append(f"matched_by={matched_by} matched={len(buy_rows) + len(sell_rows)} ibkr={confirmed_count}")
+        commission_source_details.append(f"matched_by={matched_by} persisted_commission={commission} ibkr={confirmed_count}")
     out["ibkr_commission"] = commissions
     out["commission_status"] = commission_statuses
     out["data_quality"] = data_quality
@@ -850,13 +872,25 @@ def closed_from_trades(
     out["sell"] = pd.to_numeric(out["sell"], errors="coerce").fillna(0.0)
     out["qty"] = pd.to_numeric(out["qty"], errors="coerce").fillna(0.0)
     out["peak_pct"] = pd.to_numeric(out["peak_pct"], errors="coerce")
-    out["net_actual"] = out["gross"] - out["ibkr_commission"]
+    persisted_net = pd.to_numeric(out.get("persisted_net_pnl"), errors="coerce")
+    out["net_actual"] = persisted_net.fillna(out["gross"] - out["ibkr_commission"])
     denominator = (out["buy"] * out["qty"].abs()).replace(0, pd.NA)
     out["net_pct"] = ((out["net_actual"] / denominator) * 100.0).fillna(0.0)
     out["pnl_pct"] = out["net_pct"]
     fallback_drop = out["net_pct"].fillna(0.0) - out["peak_pct"]
     out["drop_from_peak_pct"] = pd.to_numeric(out["drop_from_peak_pct"], errors="coerce").fillna(fallback_drop)
     out["hold_minutes"] = [hold_minutes(a, b or c) for a, b, c in zip(out["entry_time"], out["exit_time"], out["closed_at"])]
+    reconstructed_mask = (
+        out["trade_id"].fillna("").astype(str).str.startswith("reconstructed:")
+        | out["raw_json"].fillna("").astype(str).str.contains("sqlite_execution_reducer|executions_pair", regex=True)
+    )
+    out["_is_reconstructed_trade"] = reconstructed_mask.astype(int)
+    dedupe_cols = ["exit_date", "symbol", "qty", "buy", "sell"]
+    out = (
+        out.sort_values(["_is_reconstructed_trade", "updated_at"], na_position="last")
+        .drop_duplicates(subset=dedupe_cols, keep="first")
+        .drop(columns=["_is_reconstructed_trade"])
+    )
     return out[
         [
             "trade_id", "symbol", "qty", "ibkr_commission", "buy", "sell", "gross", "net_actual", "net_pct", "pnl_pct", "peak_pct",
@@ -865,7 +899,7 @@ def closed_from_trades(
             "entry_date", "exit_date", "carried_closed_today",
             "entry_execution_count", "exit_execution_count", "confirmed_commission_execution_count",
             "expected_commission_execution_count", "peak_source", "peak_match_quality", "commission_source_detail",
-            "closed_source",
+            "closed_source", "updated_at", "trade_reduction_version",
         ]
     ]
 
@@ -1037,15 +1071,18 @@ def load_closed_positions(
     lifecycle_symbol_peak_map = load_lifecycle_symbol_peak_map(window)
     candle_rows: dict[tuple[str, str], pd.DataFrame] = {}
     trades = closed_from_trades(conn, window, strategy, executions, runtime_peak_map, lifecycle_peak_map, candle_rows)
-    reconstructed = closed_from_executions(
-        executions,
-        window,
-        trade_entry_times=trade_entry_map(conn, lookup_window, strategy),
-        position_entry_times=position_entry_map(conn, lookup_window, strategy),
-        runtime_entry_times=runtime_entry_event_map(conn, lookup_window, strategy),
-    )
-    reconstructed_count = int(len(reconstructed))
-    if not trades.empty and not reconstructed.empty:
+    reconstructed = pd.DataFrame()
+    reconstructed_count = 0
+    if include_reconstructed:
+        reconstructed = closed_from_executions(
+            executions,
+            window,
+            trade_entry_times=trade_entry_map(conn, lookup_window, strategy),
+            position_entry_times=position_entry_map(conn, lookup_window, strategy),
+            runtime_entry_times=runtime_entry_event_map(conn, lookup_window, strategy),
+        )
+        reconstructed_count = int(len(reconstructed))
+    if include_reconstructed and not trades.empty and not reconstructed.empty:
         trade_keys = {
             (str(row.get("exit_date") or date_part(row.get("exit_time")) or row.get("session_date") or ""), str(row.get("symbol") or "").upper())
             for row in trades.to_dict("records")
@@ -1065,7 +1102,8 @@ def load_closed_positions(
         "persisted_closed_trades_count": persisted_count,
         "reconstructed_execution_pairs_count": reconstructed_count,
         "displayed_closed_trades_count": 0,
-        "execution_reconstruction_disabled": int(not include_reconstructed and persisted_count == 0 and reconstructed_count > 0),
+        "execution_reconstruction_disabled": int(not include_reconstructed and persisted_count == 0 and not executions.empty),
+        "runtime_closed_source": "persisted_trades",
     }
     if not frames:
         return pd.DataFrame(), diag
@@ -1863,6 +1901,15 @@ def load_dashboard_snapshot(
             diagnostics["carried_closed_today_count"] = int(pd.Series(closed["carried_closed_today"]).fillna(False).astype(bool).sum())
         else:
             diagnostics["carried_closed_today_count"] = 0
+        trades_updated_last_60s = int(diagnostics.get("trades_updated_last_60s", 0) or 0)
+        diagnostics["runtime_trust_status"] = "SQLITE_UNTRUSTED_REDUCER_ACTIVE" if trades_updated_last_60s > 0 else "SQLITE_PERSISTED_TRADES"
+        diagnostics["broker_closed_trades_count"] = "N/A"
+        snapshot_version = (
+            f"closed={len(closed)};"
+            f"trades={diagnostics.get('trades_count', 0)};"
+            f"reconstructed={diagnostics.get('reconstructed_trades_count', 0)};"
+            f"last_reducer={diagnostics.get('last_reducer_run_at', '')}"
+        )
         snapshot = {
             "summary": build_summary(open_positions, closed),
             "data_quality_summary": build_data_quality_summary(closed),
@@ -1873,6 +1920,8 @@ def load_dashboard_snapshot(
             "diagnostics": diagnostics,
             "executions": executions,
             "loaded_at": datetime.now(timezone.utc).isoformat(),
+            "snapshot_version": snapshot_version,
+            "trust_status": diagnostics["runtime_trust_status"],
             "source": str(path),
         }
         conn.commit()
