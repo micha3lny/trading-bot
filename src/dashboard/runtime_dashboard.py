@@ -23,12 +23,15 @@ from src.dashboard.broker_reality import (  # noqa: E402
     ReconciliationResult,
     describe_asyncio_event_loop,
     empty_broker_executions,
+    empty_closed_trades,
     fetch_ibkr_executions_for_date,
     fetch_ibkr_live_portfolio,
     load_sqlite_active_positions,
+    load_sqlite_closed_trades,
     load_sqlite_executions,
     load_sqlite_trade_pnl,
     parse_ibkr_activity_csv,
+    reconstruct_closed_trades_fifo,
     reconcile_broker_vs_sqlite,
     reconciliation_export_frames,
 )
@@ -197,7 +200,7 @@ def render_summary(summary: dict) -> None:
 
 def render_data_quality_summary(summary: dict) -> None:
     st.subheader("Closed Trade Data Quality")
-    cols = st.columns(6)
+    cols = st.columns(8)
     cols[0].metric("Closed", int(summary.get("closed_trades_count", 0)))
     cols[1].metric("Comm OK", int(summary.get("commission_ok", 0)))
     cols[2].metric("Comm Partial", int(summary.get("commission_partial", 0)))
@@ -472,6 +475,10 @@ def empty_reconciliation_result(selected_date: str, broker_status: str = "NOT_LO
         "extra_in_sqlite": 0,
         "execution_mismatches": 0,
         "position_mismatches": 0,
+        "matched_trades": 0,
+        "missing_trades": 0,
+        "extra_trades": 0,
+        "trade_mismatches": 0,
     }
     return ReconciliationResult(
         summary=summary,
@@ -480,16 +487,24 @@ def empty_reconciliation_result(selected_date: str, broker_status: str = "NOT_LO
         extra_in_sqlite=pd.DataFrame(),
         execution_mismatches=pd.DataFrame(),
         position_mismatches=pd.DataFrame(),
+        broker_closed_trades=empty_closed_trades(),
+        sqlite_closed_trades=empty_closed_trades(),
+        matched_trades=pd.DataFrame(),
+        missing_trades=pd.DataFrame(),
+        extra_trades=pd.DataFrame(),
+        trade_mismatches=pd.DataFrame(),
         pnl_comparison=pd.DataFrame(
             [
                 {
                     "selected_date": selected_date,
-                    "broker_realized_pnl": 0.0,
+                    "broker_gross_pnl": 0.0,
                     "broker_commission": 0.0,
+                    "broker_net_pnl": 0.0,
                     "sqlite_gross": 0.0,
                     "sqlite_commission": 0.0,
                     "sqlite_net": 0.0,
                     "sqlite_closed_trades": 0,
+                    "net_delta": 0.0,
                     "commission_delta": 0.0,
                 }
             ]
@@ -551,8 +566,10 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
     portfolio = pd.DataFrame()
     portfolio_status = "NOT_LOADED"
     broker_executions = empty_broker_executions()
+    broker_closed_trades = empty_closed_trades()
     broker_status = "CSV_REQUIRED_FOR_HISTORICAL_DATE"
     sqlite_executions = empty_broker_executions()
+    sqlite_closed_trades = empty_closed_trades()
     sqlite_positions = pd.DataFrame()
     sqlite_trade_pnl = pd.DataFrame()
     result = empty_reconciliation_result(selected_date, broker_status)
@@ -605,10 +622,18 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
 
     try:
         sqlite_executions = load_sqlite_executions(sqlite_path, selected_date)
+        sqlite_closed_trades = load_sqlite_closed_trades(sqlite_path, selected_date)
         sqlite_positions = load_sqlite_active_positions(sqlite_path, selected_date)
         sqlite_trade_pnl = load_sqlite_trade_pnl(sqlite_path, selected_date)
     except Exception as exc:
         st.error("SQLite reconciliation data load failed")
+        st.exception(exc)
+
+    try:
+        broker_closed_trades = reconstruct_closed_trades_fifo(broker_executions, selected_date)
+    except Exception as exc:
+        broker_closed_trades = empty_closed_trades()
+        st.error("Broker closed trade FIFO reconstruction failed")
         st.exception(exc)
 
     try:
@@ -617,6 +642,8 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
             sqlite_executions,
             portfolio,
             sqlite_positions,
+            broker_closed_trades,
+            sqlite_closed_trades,
             sqlite_trade_pnl,
             selected_date=selected_date,
             broker_status=broker_status,
@@ -660,6 +687,16 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
         st.dataframe(broker_executions, width="stretch", hide_index=True)
 
     st.divider()
+    st.subheader("Broker Closed Trades / Realized Trades")
+    if broker_closed_trades.empty:
+        st.info("No broker closed trades reconstructed for selected date.")
+        if not broker_executions.empty:
+            st.caption("FIFO reconstruction needs matching BUY and SELL executions in the loaded broker execution set.")
+    else:
+        st.caption("source=BROKER_FIFO_RECONSTRUCTED")
+        st.dataframe(broker_closed_trades, width="stretch", hide_index=True)
+
+    st.divider()
     st.subheader("Reconciliation Summary")
     status = result.summary.get("status")
     if status == "IBKR_RECONCILED":
@@ -670,9 +707,7 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
         st.warning(status)
     else:
         st.error(status)
-    pnl_row = result.pnl_comparison.iloc[0].to_dict() if not result.pnl_comparison.empty else {}
-    pnl_diff = float(pnl_row.get("broker_realized_pnl", 0.0) or 0.0) - float(pnl_row.get("sqlite_net", 0.0) or 0.0)
-    cols = st.columns(5)
+    cols = st.columns(6)
     for col, (label, key) in zip(
         cols,
         [
@@ -680,22 +715,42 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
             ("Missing SQLite", "missing_in_sqlite"),
             ("Extra SQLite", "extra_in_sqlite"),
             ("Position Mismatches", "position_mismatches"),
-            ("PnL Difference", None),
+            ("Matched Trades", "matched_trades"),
+            ("Missing Trades", "missing_trades"),
+            ("Extra Trades", "extra_trades"),
+            ("Trade Mismatches", "trade_mismatches"),
         ],
     ):
-        if key is None:
-            col.metric(label, money(pnl_diff))
-        else:
-            col.metric(label, int(result.summary.get(key, 0) or 0))
+        col.metric(label, int(result.summary.get(key, 0) or 0))
+    pnl_cols = st.columns(7)
+    pnl_metrics = [
+        ("Broker Gross", "broker_gross_pnl"),
+        ("Broker Comms", "broker_commission"),
+        ("Broker Net", "broker_net_pnl"),
+        ("SQLite Gross", "sqlite_gross_pnl"),
+        ("SQLite Comms", "sqlite_commission"),
+        ("SQLite Net", "sqlite_net_pnl"),
+        ("Difference", "net_pnl_difference"),
+    ]
+    for col, (label, key) in zip(pnl_cols, pnl_metrics):
+        col.metric(label, money(float(result.summary.get(key, 0.0) or 0.0)))
     st.caption(
         f"broker_executions={len(broker_executions)} sqlite_executions={len(sqlite_executions)} "
+        f"broker_closed_trades={len(broker_closed_trades)} sqlite_closed_trades={len(sqlite_closed_trades)} "
         f"portfolio_rows={len(portfolio)}"
     )
     if status == "CSV_REQUIRED_FOR_HISTORICAL_DATE":
         st.warning("CSV_REQUIRED_FOR_HISTORICAL_DATE")
 
     st.subheader("Mismatches")
-    mismatch_tabs = st.tabs(["Missing in SQLite", "Extra in SQLite", "Execution Mismatches", "Position Mismatches", "Trades / PnL"])
+    mismatch_tabs = st.tabs([
+        "Missing Executions",
+        "Extra Executions",
+        "Execution Mismatches",
+        "Position Mismatches",
+        "Closed Trade Mismatches",
+        "Trades / PnL",
+    ])
     with mismatch_tabs[0]:
         dataframe_or_info(result.missing_in_sqlite, "No broker executions missing in SQLite.")
     with mismatch_tabs[1]:
@@ -705,6 +760,10 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
     with mismatch_tabs[3]:
         dataframe_or_info(result.position_mismatches, "No position mismatches.")
     with mismatch_tabs[4]:
+        dataframe_or_info(result.trade_mismatches, "No closed trade quantity/pnl/commission mismatches.")
+        dataframe_or_info(result.missing_trades, "No broker closed trades missing in SQLite.")
+        dataframe_or_info(result.extra_trades, "No extra SQLite closed trades.")
+    with mismatch_tabs[5]:
         dataframe_or_info(result.pnl_comparison, "No PnL comparison available.")
 
     with st.expander("Diagnostics", expanded=False):
@@ -713,6 +772,8 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
         st.write("portfolio_rows", len(portfolio))
         st.write("broker_executions_type", type(broker_executions))
         st.write("broker_executions_rows", len(broker_executions))
+        st.write("broker_closed_trades_rows", len(broker_closed_trades))
+        st.write("sqlite_closed_trades_rows", len(sqlite_closed_trades))
         st.write("sqlite_executions_type", type(sqlite_executions))
         st.write("sqlite_executions_rows", len(sqlite_executions))
         st.write("sqlite_positions_rows", len(sqlite_positions))

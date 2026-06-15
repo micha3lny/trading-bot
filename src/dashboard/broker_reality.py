@@ -32,6 +32,21 @@ BROKER_EXECUTION_COLUMNS = [
     "source",
 ]
 
+BROKER_CLOSED_TRADE_COLUMNS = [
+    "symbol",
+    "entry_time",
+    "exit_time",
+    "quantity",
+    "entry_price",
+    "exit_price",
+    "realized_pnl",
+    "commission",
+    "net_pnl",
+    "source",
+    "entry_execution_id",
+    "exit_execution_id",
+]
+
 
 @dataclass(frozen=True)
 class ReconciliationResult:
@@ -41,6 +56,12 @@ class ReconciliationResult:
     extra_in_sqlite: pd.DataFrame
     execution_mismatches: pd.DataFrame
     position_mismatches: pd.DataFrame
+    broker_closed_trades: pd.DataFrame
+    sqlite_closed_trades: pd.DataFrame
+    matched_trades: pd.DataFrame
+    missing_trades: pd.DataFrame
+    extra_trades: pd.DataFrame
+    trade_mismatches: pd.DataFrame
     pnl_comparison: pd.DataFrame
 
 
@@ -102,6 +123,10 @@ def pick(row: dict[str, Any], *names: str) -> Any:
 
 def empty_broker_executions() -> pd.DataFrame:
     return pd.DataFrame(columns=BROKER_EXECUTION_COLUMNS)
+
+
+def empty_closed_trades() -> pd.DataFrame:
+    return pd.DataFrame(columns=BROKER_CLOSED_TRADE_COLUMNS)
 
 
 def ensure_asyncio_event_loop() -> str:
@@ -237,6 +262,48 @@ def load_sqlite_executions(sqlite_path: str | Path, selected_date: str) -> pd.Da
             }
         )
     return pd.DataFrame(out, columns=BROKER_EXECUTION_COLUMNS)
+
+
+def load_sqlite_closed_trades(sqlite_path: str | Path, selected_date: str) -> pd.DataFrame:
+    path = Path(resolve_sqlite_path(sqlite_path))
+    if not path.exists():
+        return empty_closed_trades()
+    conn = sqlite3.connect(str(path))
+    try:
+        rows = pd.read_sql_query(
+            """
+            SELECT trade_id, symbol, entry_fill_time, exit_fill_time, closed_at,
+                   quantity, entry_price, exit_price, gross_pnl, commission, net_pnl,
+                   raw_json
+            FROM trades
+            WHERE UPPER(COALESCE(status, '')) = 'CLOSED'
+              AND COALESCE(substr(exit_fill_time, 1, 10), substr(closed_at, 1, 10), session_date) = ?
+            ORDER BY COALESCE(exit_fill_time, closed_at), symbol, trade_id
+            """,
+            conn,
+            params=[selected_date],
+        )
+    finally:
+        conn.close()
+    out: list[dict[str, Any]] = []
+    for row in rows.to_dict("records"):
+        out.append(
+            {
+                "symbol": str(row.get("symbol") or "").upper(),
+                "entry_time": iso_time(row.get("entry_fill_time")),
+                "exit_time": iso_time(row.get("exit_fill_time") or row.get("closed_at")),
+                "quantity": abs(to_float(row.get("quantity"), 0.0) or 0.0),
+                "entry_price": to_float(row.get("entry_price"), None),
+                "exit_price": to_float(row.get("exit_price"), None),
+                "realized_pnl": to_float(row.get("gross_pnl"), 0.0) or 0.0,
+                "commission": abs(to_float(row.get("commission"), 0.0) or 0.0),
+                "net_pnl": to_float(row.get("net_pnl"), 0.0) or 0.0,
+                "source": "sqlite_trades",
+                "entry_execution_id": "",
+                "exit_execution_id": str(row.get("trade_id") or ""),
+            }
+        )
+    return pd.DataFrame(out, columns=BROKER_CLOSED_TRADE_COLUMNS)
 
 
 def fetch_ibkr_live_portfolio(host: str, port: int, client_id: int, timeout: float = 4.0) -> tuple[pd.DataFrame, str]:
@@ -423,6 +490,141 @@ def match_executions(
     return pd.DataFrame(matched), pd.DataFrame(missing), pd.DataFrame(extra), pd.DataFrame(mismatches)
 
 
+def reconstruct_closed_trades_fifo(executions: pd.DataFrame, selected_date: str) -> pd.DataFrame:
+    if executions.empty:
+        return empty_closed_trades()
+    rows = executions.copy()
+    rows["_dt"] = pd.to_datetime(rows["execution_time"], errors="coerce", utc=True)
+    rows = rows.sort_values(["symbol", "_dt", "execution_id"], na_position="last")
+    lots_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    closed: list[dict[str, Any]] = []
+
+    for row in rows.to_dict("records"):
+        symbol = str(row.get("symbol") or "").upper()
+        side = normalize_side(row.get("side"))
+        qty = abs(to_float(row.get("quantity"), 0.0) or 0.0)
+        price = to_float(row.get("price"), None)
+        if not symbol or qty <= 0 or price is None:
+            continue
+        commission = abs(to_float(row.get("commission"), 0.0) or 0.0)
+        if side == "BUY":
+            lots_by_symbol.setdefault(symbol, []).append(
+                {
+                    "remaining_qty": qty,
+                    "original_qty": qty,
+                    "price": float(price),
+                    "commission": commission,
+                    "execution_time": row.get("execution_time"),
+                    "execution_id": row.get("execution_id"),
+                }
+            )
+            continue
+        if side != "SELL":
+            continue
+        remaining_sell = qty
+        sell_original_qty = qty
+        lots = lots_by_symbol.setdefault(symbol, [])
+        while remaining_sell > 1e-9 and lots:
+            lot = lots[0]
+            match_qty = min(float(lot["remaining_qty"]), remaining_sell)
+            buy_comm = (float(lot.get("commission") or 0.0) * match_qty / float(lot.get("original_qty") or match_qty)) if lot.get("original_qty") else 0.0
+            sell_comm = (commission * match_qty / sell_original_qty) if sell_original_qty else 0.0
+            gross = (float(price) - float(lot["price"])) * match_qty
+            total_comm = buy_comm + sell_comm
+            exit_date = date_part(row.get("execution_time"))
+            if exit_date == selected_date:
+                closed.append(
+                    {
+                        "symbol": symbol,
+                        "entry_time": iso_time(lot.get("execution_time")),
+                        "exit_time": iso_time(row.get("execution_time")),
+                        "quantity": match_qty,
+                        "entry_price": float(lot["price"]),
+                        "exit_price": float(price),
+                        "realized_pnl": gross,
+                        "commission": total_comm,
+                        "net_pnl": gross - total_comm,
+                        "source": "BROKER_FIFO_RECONSTRUCTED",
+                        "entry_execution_id": str(lot.get("execution_id") or ""),
+                        "exit_execution_id": str(row.get("execution_id") or ""),
+                    }
+                )
+            lot["remaining_qty"] = float(lot["remaining_qty"]) - match_qty
+            remaining_sell -= match_qty
+            if float(lot["remaining_qty"]) <= 1e-9:
+                lots.pop(0)
+    return pd.DataFrame(closed, columns=BROKER_CLOSED_TRADE_COLUMNS)
+
+
+def trade_signature(row: dict[str, Any]) -> tuple[str, float, float, float]:
+    return (
+        str(row.get("symbol") or "").upper(),
+        round(float(to_float(row.get("quantity"), 0.0) or 0.0), 6),
+        round(float(to_float(row.get("entry_price"), 0.0) or 0.0), 4),
+        round(float(to_float(row.get("exit_price"), 0.0) or 0.0), 4),
+    )
+
+
+def compare_closed_trades(
+    broker_trades: pd.DataFrame,
+    sqlite_trades: pd.DataFrame,
+    *,
+    pnl_tolerance: float = 0.02,
+    commission_tolerance: float = 0.02,
+    quantity_tolerance: float = 1e-6,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    broker_rows = broker_trades.to_dict("records") if not broker_trades.empty else []
+    sqlite_rows = sqlite_trades.to_dict("records") if not sqlite_trades.empty else []
+    used_sqlite: set[int] = set()
+    matched: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    mismatches: list[dict[str, Any]] = []
+    for broker_row in broker_rows:
+        match_idx: int | None = None
+        broker_sig = trade_signature(broker_row)
+        for idx, sqlite_row in enumerate(sqlite_rows):
+            if idx in used_sqlite:
+                continue
+            if trade_signature(sqlite_row) == broker_sig:
+                match_idx = idx
+                break
+        if match_idx is None:
+            missing.append({**broker_row, "mismatch_type": "MISSING_TRADE_IN_SQLITE"})
+            continue
+        used_sqlite.add(match_idx)
+        sqlite_row = sqlite_rows[match_idx]
+        qty_delta = (to_float(broker_row.get("quantity"), 0.0) or 0.0) - (to_float(sqlite_row.get("quantity"), 0.0) or 0.0)
+        pnl_delta = (to_float(broker_row.get("realized_pnl"), 0.0) or 0.0) - (to_float(sqlite_row.get("realized_pnl"), 0.0) or 0.0)
+        commission_delta = (to_float(broker_row.get("commission"), 0.0) or 0.0) - (to_float(sqlite_row.get("commission"), 0.0) or 0.0)
+        flags: list[str] = []
+        if abs(qty_delta) > quantity_tolerance:
+            flags.append("QUANTITY_MISMATCH")
+        if abs(pnl_delta) > pnl_tolerance:
+            flags.append("PNL_MISMATCH")
+        if abs(commission_delta) > commission_tolerance:
+            flags.append("COMMISSION_MISMATCH")
+        row = {
+            "symbol": broker_row.get("symbol"),
+            "broker_quantity": broker_row.get("quantity"),
+            "sqlite_quantity": sqlite_row.get("quantity"),
+            "broker_realized_pnl": broker_row.get("realized_pnl"),
+            "sqlite_realized_pnl": sqlite_row.get("realized_pnl"),
+            "broker_commission": broker_row.get("commission"),
+            "sqlite_commission": sqlite_row.get("commission"),
+            "broker_net_pnl": broker_row.get("net_pnl"),
+            "sqlite_net_pnl": sqlite_row.get("net_pnl"),
+            "quantity_delta": qty_delta,
+            "pnl_delta": pnl_delta,
+            "commission_delta": commission_delta,
+            "status": "MATCHED" if not flags else ";".join(flags),
+        }
+        matched.append(row)
+        if flags:
+            mismatches.append(row)
+    extra = [{**row, "mismatch_type": "EXTRA_TRADE_IN_SQLITE"} for idx, row in enumerate(sqlite_rows) if idx not in used_sqlite]
+    return pd.DataFrame(matched), pd.DataFrame(missing), pd.DataFrame(extra), pd.DataFrame(mismatches)
+
+
 def load_sqlite_active_positions(sqlite_path: str | Path, selected_date: str) -> pd.DataFrame:
     path = Path(resolve_sqlite_path(sqlite_path))
     if not path.exists():
@@ -525,6 +727,8 @@ def reconcile_broker_vs_sqlite(
     sqlite_executions: pd.DataFrame,
     ibkr_portfolio: pd.DataFrame,
     sqlite_positions: pd.DataFrame,
+    broker_closed_trades: pd.DataFrame,
+    sqlite_closed_trades: pd.DataFrame,
     sqlite_trade_pnl: pd.DataFrame,
     *,
     selected_date: str,
@@ -534,19 +738,24 @@ def reconcile_broker_vs_sqlite(
     position_mismatches = compare_positions(ibkr_portfolio, sqlite_positions)
     if not position_mismatches.empty:
         position_mismatches = position_mismatches[position_mismatches["status"] != "MATCHED"].reset_index(drop=True)
-    broker_commission = float(pd.to_numeric(broker_executions.get("commission", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not broker_executions.empty else 0.0
-    broker_realized = 0.0
+    matched_trades, missing_trades, extra_trades, trade_mismatches = compare_closed_trades(broker_closed_trades, sqlite_closed_trades)
+    broker_gross = float(pd.to_numeric(broker_closed_trades.get("realized_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not broker_closed_trades.empty else 0.0
+    broker_commission = float(pd.to_numeric(broker_closed_trades.get("commission", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not broker_closed_trades.empty else 0.0
+    broker_net = float(pd.to_numeric(broker_closed_trades.get("net_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not broker_closed_trades.empty else 0.0
     sqlite_pnl_row = sqlite_trade_pnl.iloc[0].to_dict() if not sqlite_trade_pnl.empty else {}
+    sqlite_net = float(sqlite_pnl_row.get("sqlite_net", 0.0) or 0.0)
     pnl_comparison = pd.DataFrame(
         [
             {
                 "selected_date": selected_date,
-                "broker_realized_pnl": broker_realized,
+                "broker_gross_pnl": broker_gross,
                 "broker_commission": broker_commission,
+                "broker_net_pnl": broker_net,
                 "sqlite_gross": sqlite_pnl_row.get("sqlite_gross", 0.0),
                 "sqlite_commission": sqlite_pnl_row.get("sqlite_commission", 0.0),
-                "sqlite_net": sqlite_pnl_row.get("sqlite_net", 0.0),
+                "sqlite_net": sqlite_net,
                 "sqlite_closed_trades": sqlite_pnl_row.get("trades", 0),
+                "net_delta": broker_net - sqlite_net,
                 "commission_delta": broker_commission - float(sqlite_pnl_row.get("sqlite_commission", 0.0) or 0.0),
             }
         ]
@@ -555,7 +764,15 @@ def reconcile_broker_vs_sqlite(
         status = "CSV_REQUIRED_FOR_HISTORICAL_DATE"
     elif broker_executions.empty and not sqlite_executions.empty:
         status = "NOT_RECONCILED"
-    elif missing.empty and extra.empty and execution_mismatches.empty and position_mismatches.empty:
+    elif (
+        missing.empty
+        and extra.empty
+        and execution_mismatches.empty
+        and position_mismatches.empty
+        and missing_trades.empty
+        and extra_trades.empty
+        and trade_mismatches.empty
+    ):
         status = "IBKR_RECONCILED"
     else:
         status = "IBKR_MISMATCH"
@@ -569,8 +786,35 @@ def reconcile_broker_vs_sqlite(
         "extra_in_sqlite": int(len(extra)),
         "execution_mismatches": int(len(execution_mismatches)),
         "position_mismatches": int(len(position_mismatches)),
+        "broker_closed_trades": int(len(broker_closed_trades)),
+        "sqlite_closed_trades": int(len(sqlite_closed_trades)),
+        "matched_trades": int(len(matched_trades)),
+        "missing_trades": int(len(missing_trades)),
+        "extra_trades": int(len(extra_trades)),
+        "trade_mismatches": int(len(trade_mismatches)),
+        "broker_gross_pnl": broker_gross,
+        "broker_commission": broker_commission,
+        "broker_net_pnl": broker_net,
+        "sqlite_gross_pnl": float(sqlite_pnl_row.get("sqlite_gross", 0.0) or 0.0),
+        "sqlite_commission": float(sqlite_pnl_row.get("sqlite_commission", 0.0) or 0.0),
+        "sqlite_net_pnl": sqlite_net,
+        "net_pnl_difference": broker_net - sqlite_net,
     }
-    return ReconciliationResult(summary, matched, missing, extra, execution_mismatches, position_mismatches, pnl_comparison)
+    return ReconciliationResult(
+        summary,
+        matched,
+        missing,
+        extra,
+        execution_mismatches,
+        position_mismatches,
+        broker_closed_trades,
+        sqlite_closed_trades,
+        matched_trades,
+        missing_trades,
+        extra_trades,
+        trade_mismatches,
+        pnl_comparison,
+    )
 
 
 def reconciliation_export_frames(result: ReconciliationResult) -> dict[str, pd.DataFrame]:
@@ -581,5 +825,11 @@ def reconciliation_export_frames(result: ReconciliationResult) -> dict[str, pd.D
         "extra_in_sqlite": result.extra_in_sqlite,
         "execution_mismatches": result.execution_mismatches,
         "position_mismatches": result.position_mismatches,
+        "broker_closed_trades": result.broker_closed_trades,
+        "sqlite_closed_trades": result.sqlite_closed_trades,
+        "matched_trades": result.matched_trades,
+        "missing_trades": result.missing_trades,
+        "extra_trades": result.extra_trades,
+        "trade_mismatches": result.trade_mismatches,
         "pnl_comparison": result.pnl_comparison,
     }
