@@ -342,6 +342,34 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_reducer_does_not_resurrect_historical_open_lot_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.conn.execute(
+                    """
+                    INSERT INTO executions (
+                        execution_id, strategy_name, session_date, symbol, side,
+                        quantity, price, executed_at, recorded_at, commission_source, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "B_OLD_OPEN", "v67", "2026-05-13", "OLDOPEN", "BOT",
+                        5, 10, "2026-05-13T13:30:00+00:00", "2026-05-13T13:30:00+00:00", "missing", "{}",
+                    ),
+                )
+                store.conn.commit()
+                store.rebuild_symbol_trade_state("OLDOPEN")
+
+                active = store.query("SELECT * FROM positions WHERE symbol = 'OLDOPEN' AND COALESCE(active, 0) = 1")
+                stale = store.query("SELECT * FROM positions WHERE symbol = 'OLDOPEN' AND status = 'STALE_CARRY_OPEN'")
+
+                self.assertEqual(active, [])
+                self.assertEqual(len(stale), 1)
+                self.assertEqual(stale[0]["active"], 0)
+            finally:
+                store.close()
+
     def test_runtime_event_append_works(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")

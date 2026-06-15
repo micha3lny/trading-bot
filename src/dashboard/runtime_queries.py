@@ -18,7 +18,8 @@ from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, migrate_r
 
 
 CLOSED_STATUSES = {"CLOSED", "DONE", "EXIT_FILLED", "FLAT"}
-OPEN_POSITION_STATUSES = {"OPEN", "EXIT_ORDER", "EXIT_PENDING", "EXIT_SENT", "RECONCILING"}
+TERMINAL_POSITION_STATUSES = {"CLOSED", "FLAT", "FLAT_CONFIRMED", "ENTRY_REJECTED", "ENTRY_NOT_FILLED", "STALE_DUPLICATE_SUPPRESSED"}
+OPEN_POSITION_STATUSES = {"OPEN", "EXIT_ORDER"}
 DEFAULT_RECORDER_ROOT = Path("data/live/recorder")
 
 
@@ -60,6 +61,26 @@ def parse_raw_json(value: Any) -> dict[str, Any]:
         return json.loads(value)
     except Exception:
         return {}
+
+
+def raw_bool(raw: dict[str, Any], *keys: str) -> bool:
+    for key in keys:
+        value = raw.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str) and value.strip().lower() in {"1", "true", "yes", "y", "on"}:
+            return True
+    return False
+
+
+def append_quality(existing: Any, *flags: str) -> str:
+    parts = [x.strip() for x in str(existing or "OK").split(";") if x.strip() and x.strip() != "OK"]
+    for flag in flags:
+        if flag and flag not in parts:
+            parts.append(flag)
+    return ";".join(parts) if parts else "OK"
 
 
 def raw_json_peak_value(raw: dict[str, Any]) -> float | None:
@@ -806,6 +827,14 @@ def closed_from_trades(
     out["exit_time"] = exit_times
     out["entry_date"] = [date_part(value) or str(session_date or "") for value, session_date in zip(out["entry_time"], out["session_date"])]
     out["exit_date"] = [date_part(exit_time) or date_part(closed_at) or str(session_date or "") for exit_time, closed_at, session_date in zip(out["exit_time"], out["closed_at"], out["session_date"])]
+    carried_flags: list[bool] = []
+    enriched_quality: list[str] = []
+    for quality, entry_date, exit_date in zip(out["data_quality"], out["entry_date"], out["exit_date"]):
+        carried = bool(entry_date and exit_date and entry_date < exit_date and window.start_date <= exit_date <= window.end_date)
+        carried_flags.append(carried)
+        enriched_quality.append(append_quality(quality, "CARRIED_POSITION_CLOSED_TODAY") if carried else str(quality or "OK"))
+    out["data_quality"] = enriched_quality
+    out["carried_closed_today"] = carried_flags
     out["peak_pct"] = peak_values
     out["peak_source"] = peak_sources
     out["peak_match_quality"] = peak_match_qualities
@@ -833,7 +862,7 @@ def closed_from_trades(
             "trade_id", "symbol", "qty", "ibkr_commission", "buy", "sell", "gross", "net_actual", "net_pct", "pnl_pct", "peak_pct",
             "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
             "entry_time", "exit_time", "commission_status", "data_quality", "session_date",
-            "entry_date", "exit_date",
+            "entry_date", "exit_date", "carried_closed_today",
             "entry_execution_count", "exit_execution_count", "confirmed_commission_execution_count",
             "expected_commission_execution_count", "peak_source", "peak_match_quality", "commission_source_detail",
             "closed_source",
@@ -1266,22 +1295,49 @@ def load_open_positions(
     execution_lookup: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     clause, params = strategy_clause("p", strategy)
+    open_sql = ",".join("?" for _ in OPEN_POSITION_STATUSES)
+    terminal_sql = ",".join("?" for _ in TERMINAL_POSITION_STATUSES)
     rows = read_sql(
         conn,
         f"""
-        WITH latest_positions AS (
+        WITH active_candidates AS (
             SELECT
                 p.*,
+                p.rowid AS position_rowid,
+                CASE
+                    WHEN LOWER(COALESCE(p.source, '')) = 'sqlite_execution_reducer' THEN 40
+                    WHEN COALESCE(p.ibkr_quantity, 0) != 0 THEN 30
+                    WHEN COALESCE(p.raw_json, '') LIKE '%"ibkr_entry_confirmed": true%' THEN 25
+                    WHEN COALESCE(p.raw_json, '') LIKE '%"entry_fill_verified": true%' THEN 20
+                    WHEN LOWER(COALESCE(p.source, '')) = 'live_buy' THEN 10
+                    ELSE 0
+                END AS source_priority,
                 ROW_NUMBER() OVER (
-                    PARTITION BY COALESCE(p.strategy_name, 'unknown'), UPPER(p.symbol)
-                    ORDER BY COALESCE(p.updated_at, '') DESC, COALESCE(p.session_date, '') DESC, p.position_key DESC
+                    PARTITION BY UPPER(p.symbol)
+                    ORDER BY
+                        CASE
+                            WHEN LOWER(COALESCE(p.source, '')) = 'sqlite_execution_reducer' THEN 40
+                            WHEN COALESCE(p.ibkr_quantity, 0) != 0 THEN 30
+                            WHEN COALESCE(p.raw_json, '') LIKE '%"ibkr_entry_confirmed": true%' THEN 25
+                            WHEN COALESCE(p.raw_json, '') LIKE '%"entry_fill_verified": true%' THEN 20
+                            WHEN LOWER(COALESCE(p.source, '')) = 'live_buy' THEN 10
+                            ELSE 0
+                        END DESC,
+                        COALESCE(p.updated_at, '') DESC,
+                        COALESCE(p.session_date, '') DESC,
+                        p.rowid DESC
                 ) AS rn
             FROM positions p
-            WHERE p.session_date BETWEEN ? AND ? {clause}
+            WHERE COALESCE(p.session_date, '') <= ? {clause}
+              AND COALESCE(p.active, 0) = 1
+              AND UPPER(COALESCE(p.status, '')) IN ({open_sql})
+              AND COALESCE(p.raw_json, '') NOT LIKE '%"active": false%'
+              AND COALESCE(p.raw_json, '') NOT LIKE '%"ibkr_position_flat_confirmed": true%'
         )
         SELECT
             COALESCE(strategy_name, 'unknown') AS strategy,
             session_date,
+            position_key,
             symbol,
             status,
             quantity,
@@ -1291,13 +1347,25 @@ def load_open_positions(
             active,
             exit_sent,
             updated_at,
+            source,
+            source_priority,
             raw_json
-        FROM latest_positions p
+        FROM active_candidates p
         WHERE p.rn = 1
-          AND COALESCE(p.active, 0) = 1
+          AND NOT EXISTS (
+              SELECT 1
+              FROM positions newer
+              WHERE UPPER(newer.symbol) = UPPER(p.symbol)
+                AND COALESCE(newer.session_date, '') <= ?
+                AND COALESCE(newer.updated_at, '') > COALESCE(p.updated_at, '')
+                AND (
+                    UPPER(COALESCE(newer.status, '')) IN ({terminal_sql})
+                    OR COALESCE(newer.raw_json, '') LIKE '%"ibkr_position_flat_confirmed": true%'
+                )
+          )
         ORDER BY p.symbol
         """,
-        [window.start_date, window.end_date, *params],
+        [window.end_date, *params, *sorted(OPEN_POSITION_STATUSES), window.end_date, *sorted(TERMINAL_POSITION_STATUSES)],
     )
     if rows.empty:
         return rows
@@ -1306,7 +1374,6 @@ def load_open_positions(
     entry_by_execution = entry_execution_map(execution_lookup if execution_lookup is not None else executions)
     entry_by_trade = trade_entry_map(conn, lookup_window, strategy)
     entry_by_event = runtime_entry_event_map(conn, lookup_window, strategy)
-    historical_window = window.end_date < utc_today()
     out: list[dict[str, Any]] = []
     for row in rows.to_dict("records"):
         row_strategy = str(row.get("strategy") or "unknown")
@@ -1314,8 +1381,6 @@ def load_open_positions(
         session_date = str(row.get("session_date") or "")
         net_key = (session_date, row_strategy, symbol)
         execution_net = net_by_execution.get(net_key)
-        if historical_window and (execution_net is None or execution_net <= 1e-9):
-            continue
         if execution_net is not None and abs(execution_net) < 1e-9:
             continue
         raw = parse_raw_json(row.get("raw_json"))
@@ -1360,6 +1425,21 @@ def load_open_positions(
             or entry_lookup.get("entry_time")
             or row.get("updated_at")
         )
+        entry_date = date_part(entry_time) or str(session_date or "")
+        stale_carry = bool(entry_date and entry_date < window.end_date)
+        ibkr_confirmed = bool(
+            (ibkr_qty is not None and abs(ibkr_qty) > 1e-9)
+            or raw_bool(raw, "ibkr_confirmed", "ibkr_entry_confirmed", "entry_fill_verified", "ibkr_position_confirmed")
+        )
+        data_quality = "OK"
+        position_bucket = "today"
+        display_status = row.get("status") or ("EXIT_ORDER" if row.get("exit_sent") else "OPEN")
+        if stale_carry:
+            position_bucket = "carry_stale"
+            data_quality = append_quality(data_quality, "STALE_CARRY_OPEN")
+            display_status = f"{display_status}|STALE_CARRY_OPEN"
+            if not ibkr_confirmed:
+                data_quality = append_quality(data_quality, "IBKR_UNCONFIRMED")
         entry_source = (
             "trade"
             if trade_entry_time
@@ -1385,11 +1465,17 @@ def load_open_positions(
             "giveback_pct": (now_pct - peak_pct) if now_pct is not None and peak_pct is not None else None,
             "hold_minutes": hold_minutes(hold_base),
             "ibkr_commission": entry_commission or 0.0,
-            "status": row.get("status") or ("EXIT_SENT" if row.get("exit_sent") else "OPEN"),
+            "status": display_status,
             "strategy": row_strategy,
             "entry_time": entry_time,
+            "entry_date": entry_date,
             "entry_source": entry_source,
             "session_date": session_date,
+            "position_key": row.get("position_key"),
+            "source": row.get("source"),
+            "ibkr_confirmed": ibkr_confirmed,
+            "data_quality": data_quality,
+            "position_bucket": position_bucket,
             "price_status": price_status,
             "now_price_source": now_price_source,
             "market_price_at": price_time,
@@ -1566,10 +1652,10 @@ def load_position_row_diagnostics(
         f"""
         SELECT COUNT(*) AS count
         FROM positions p
-        WHERE p.session_date BETWEEN ? AND ? {clause}
+        WHERE COALESCE(p.session_date, '') <= ? {clause}
           AND COALESCE(p.active, 0) = 1
         """,
-        [window.start_date, window.end_date, *params],
+        [window.end_date, *params],
     )
     latest_candidate_rows = read_sql(
         conn,
@@ -1582,16 +1668,16 @@ def load_position_row_diagnostics(
                     ORDER BY COALESCE(p.updated_at, '') DESC, COALESCE(p.session_date, '') DESC, p.position_key DESC
                 ) AS rn
             FROM positions p
-            WHERE p.session_date BETWEEN ? AND ? {clause}
+            WHERE COALESCE(p.session_date, '') <= ? {clause}
         )
         SELECT COUNT(*) AS count
         FROM latest_positions p
         WHERE p.rn = 1
           AND COALESCE(p.active, 0) = 1
-          AND UPPER(COALESCE(p.status, 'OPEN')) IN ('OPEN', 'EXIT_ORDER', 'EXIT_PENDING', 'EXIT_SENT', 'RECONCILING')
+          AND UPPER(COALESCE(p.status, 'OPEN')) IN ('OPEN', 'EXIT_ORDER')
           AND COALESCE(p.ibkr_quantity, p.quantity, 0) != 0
         """,
-        [window.start_date, window.end_date, *params],
+        [window.end_date, *params],
     )
     exit_order_stale_rows = read_sql(
         conn,
@@ -1604,16 +1690,32 @@ def load_position_row_diagnostics(
                     ORDER BY COALESCE(p.updated_at, '') DESC, COALESCE(p.session_date, '') DESC, p.position_key DESC
                 ) AS rn
             FROM positions p
-            WHERE p.session_date BETWEEN ? AND ? {clause}
+            WHERE COALESCE(p.session_date, '') <= ? {clause}
         )
         SELECT COUNT(*) AS count
         FROM latest_positions p
         WHERE p.rn = 1
           AND COALESCE(p.active, 0) = 1
-          AND UPPER(COALESCE(p.status, '')) IN ('EXIT_ORDER', 'EXIT_PENDING', 'EXIT_SENT')
+          AND UPPER(COALESCE(p.status, '')) IN ('EXIT_ORDER')
           AND COALESCE(p.ibkr_quantity, 0) = 0
         """,
-        [window.start_date, window.end_date, *params],
+        [window.end_date, *params],
+    )
+    duplicate_rows = read_sql(
+        conn,
+        f"""
+        SELECT COUNT(*) AS count
+        FROM (
+            SELECT UPPER(symbol) AS symbol, COUNT(*) AS active_rows
+            FROM positions p
+            WHERE COALESCE(p.session_date, '') <= ? {clause}
+              AND COALESCE(p.active, 0) = 1
+              AND UPPER(COALESCE(p.status, '')) IN ('OPEN', 'EXIT_ORDER')
+            GROUP BY UPPER(symbol)
+            HAVING COUNT(*) > 1
+        )
+        """,
+        [window.end_date, *params],
     )
     ibkr_rows = read_sql(
         conn,
@@ -1634,8 +1736,10 @@ def load_position_row_diagnostics(
         "sqlite_active_positions_count": sqlite_active,
         "latest_active_positions_count": int(latest_open_count),
         "latest_active_position_candidates_count": latest_candidates,
+        "open_positions_count": int(latest_open_count),
         "ibkr_positions_count": ibkr_positions,
         "stale_active_positions_count": stale,
+        "duplicate_active_symbol_count": int(duplicate_rows.iloc[0]["count"] or 0) if not duplicate_rows.empty else 0,
         "exit_order_stale_count": int(exit_order_stale_rows.iloc[0]["count"] or 0) if not exit_order_stale_rows.empty else 0,
     }
 
@@ -1748,6 +1852,17 @@ def load_dashboard_snapshot(
         diagnostics = load_diagnostics(conn, window, strategy)
         diagnostics.update(closed_diag)
         diagnostics.update(load_position_row_diagnostics(conn, window, strategy, len(open_positions)))
+        if not open_positions.empty and "position_bucket" in open_positions.columns:
+            diagnostics["today_open_positions_count"] = int((open_positions["position_bucket"].fillna("") == "today").sum())
+            diagnostics["stale_carry_open_count"] = int((open_positions["position_bucket"].fillna("") == "carry_stale").sum())
+        else:
+            diagnostics["today_open_positions_count"] = 0
+            diagnostics["stale_carry_open_count"] = 0
+        diagnostics["closed_trades_count"] = int(len(closed))
+        if not closed.empty and "carried_closed_today" in closed.columns:
+            diagnostics["carried_closed_today_count"] = int(pd.Series(closed["carried_closed_today"]).fillna(False).astype(bool).sum())
+        else:
+            diagnostics["carried_closed_today_count"] = 0
         snapshot = {
             "summary": build_summary(open_positions, closed),
             "data_quality_summary": build_data_quality_summary(closed),

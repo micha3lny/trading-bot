@@ -1012,7 +1012,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["summary"]["open_trades"], 0)
             self.assertTrue(snapshot["open_positions"].empty)
 
-    def test_historical_active_position_without_execution_net_is_hidden(self) -> None:
+    def test_historical_active_position_without_execution_net_is_flagged_as_carry_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
             store = SQLiteRuntimeStore(db)
@@ -1030,8 +1030,9 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
 
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-26", "2026-05-26"), "v67")
 
-            self.assertEqual(snapshot["summary"]["open_trades"], 0)
-            self.assertTrue(snapshot["open_positions"].empty)
+            self.assertEqual(snapshot["summary"]["open_trades"], 1)
+            self.assertFalse(snapshot["open_positions"].empty)
+            self.assertEqual(snapshot["open_positions"].iloc[0]["position_bucket"], "today")
 
     def test_dashboard_uses_latest_position_row_and_ignores_stale_active_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1590,6 +1591,141 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 conn.close()
             self.assertIn("updated_at", after)
             self.assertIn("trade_reduction_version", after)
+
+    def test_duplicate_active_symbol_prefers_execution_reducer_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_position({
+                    "position_key": "v67:2026-06-15:ELMT:live",
+                    "session_date": "2026-06-15",
+                    "strategy_name": "v67",
+                    "symbol": "ELMT",
+                    "quantity": 2,
+                    "avg_price": 10,
+                    "active": 1,
+                    "status": "OPEN",
+                    "source": "live_buy",
+                    "updated_at": "2026-06-15T13:30:00+00:00",
+                    "raw_json": {"entry_price": 10, "market_price": 10.4, "entry_time": "2026-06-15T13:30:00+00:00"},
+                })
+                store.upsert_position({
+                    "position_key": "v67:2026-06-15:ELMT:reducer",
+                    "session_date": "2026-06-15",
+                    "strategy_name": "v67",
+                    "symbol": "ELMT",
+                    "quantity": 2,
+                    "avg_price": 10,
+                    "ibkr_quantity": 2,
+                    "active": 1,
+                    "status": "OPEN",
+                    "source": "sqlite_execution_reducer",
+                    "updated_at": "2026-06-15T13:29:00+00:00",
+                    "raw_json": {"entry_fill_verified": True, "entry_price": 10, "market_price": 10.5, "entry_time": "2026-06-15T13:29:00+00:00"},
+                })
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-15", "2026-06-15"), "v67")
+            open_positions = snapshot["open_positions"]
+            self.assertEqual(len(open_positions), 1)
+            self.assertEqual(open_positions.iloc[0]["symbol"], "ELMT")
+            self.assertEqual(open_positions.iloc[0]["source"], "sqlite_execution_reducer")
+
+    def test_latest_closed_row_suppresses_older_active_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_position({
+                    "position_key": "v67:2026-06-15:BRCB:open",
+                    "session_date": "2026-06-15",
+                    "strategy_name": "v67",
+                    "symbol": "BRCB",
+                    "quantity": 1,
+                    "avg_price": 20,
+                    "active": 1,
+                    "status": "OPEN",
+                    "updated_at": "2026-06-15T13:30:00+00:00",
+                    "raw_json": {"entry_price": 20, "market_price": 21, "entry_time": "2026-06-15T13:30:00+00:00"},
+                })
+                store.upsert_position({
+                    "position_key": "v67:2026-06-15:BRCB:closed",
+                    "session_date": "2026-06-15",
+                    "strategy_name": "v67",
+                    "symbol": "BRCB",
+                    "quantity": 0,
+                    "avg_price": 21,
+                    "ibkr_quantity": 0,
+                    "active": 0,
+                    "status": "CLOSED",
+                    "updated_at": "2026-06-15T13:40:00+00:00",
+                    "raw_json": {"active": False, "ibkr_position_flat_confirmed": True},
+                })
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-15", "2026-06-15"), "v67")
+            self.assertTrue(snapshot["open_positions"].empty)
+
+    def test_stale_active_open_is_flagged_as_carry_not_today(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_position({
+                    "position_key": "v67:2026-06-03:ACMR",
+                    "session_date": "2026-06-03",
+                    "strategy_name": "v67",
+                    "symbol": "ACMR",
+                    "quantity": 1,
+                    "avg_price": 30,
+                    "active": 1,
+                    "status": "OPEN",
+                    "updated_at": "2026-06-03T13:30:00+00:00",
+                    "raw_json": {"entry_price": 30, "market_price": 31, "entry_time": "2026-06-03T13:30:00+00:00"},
+                })
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-15", "2026-06-15"), "v67")
+            row = snapshot["open_positions"].iloc[0]
+            self.assertEqual(row["position_bucket"], "carry_stale")
+            self.assertIn("STALE_CARRY_OPEN", row["data_quality"])
+            self.assertEqual(snapshot["diagnostics"]["today_open_positions_count"], 0)
+            self.assertEqual(snapshot["diagnostics"]["stale_carry_open_count"], 1)
+
+    def test_carried_closed_trade_is_flagged_on_exit_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_trade({
+                    "trade_id": "T_CARRY_CLOSE",
+                    "strategy_name": "v67",
+                    "session_date": "2026-05-13",
+                    "symbol": "OUST",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-05-13T13:30:00+00:00",
+                    "exit_fill_time": "2026-06-15T13:45:00+00:00",
+                    "closed_at": "2026-06-15T13:45:00+00:00",
+                    "entry_price": 10,
+                    "exit_price": 11,
+                    "quantity": 1,
+                    "gross_pnl": 1,
+                    "commission": 0,
+                    "net_pnl": 1,
+                    "raw_json": {},
+                })
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-15", "2026-06-15"), "v67")
+            row = snapshot["closed_positions"].iloc[0]
+            self.assertTrue(bool(row["carried_closed_today"]))
+            self.assertIn("CARRIED_POSITION_CLOSED_TODAY", row["data_quality"])
+            self.assertEqual(snapshot["diagnostics"]["carried_closed_today_count"], 1)
 
 
 if __name__ == "__main__":

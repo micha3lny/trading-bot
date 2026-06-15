@@ -122,6 +122,23 @@ def normalized_execution_side(value: Any) -> str:
     return text
 
 
+def position_source_priority(source: Any, raw_json: Any = None, ibkr_quantity: Any = None) -> int:
+    source_text = str(source or "").strip().lower()
+    raw = parse_jsonish(raw_json)
+    if source_text == "sqlite_execution_reducer":
+        return 40
+    qty = safe_float(ibkr_quantity)
+    if qty is not None and abs(qty) > 1e-9:
+        return 30
+    if bool_int(raw.get("ibkr_entry_confirmed")) or bool_int(raw.get("ibkr_confirmed")):
+        return 25
+    if bool_int(raw.get("entry_fill_verified")):
+        return 20
+    if source_text == "live_buy":
+        return 10
+    return 0
+
+
 def iso_date_part(value: Any) -> str:
     if not value:
         return ""
@@ -722,7 +739,7 @@ class SQLiteRuntimeStore:
             symbol = str(execution.get("symbol") or "").upper().strip()
             if not symbol:
                 return
-            self.rebuild_symbol_trade_state(symbol)
+            self.rebuild_symbol_trade_state(symbol, allow_historical_open_lots=True)
         except Exception as exc:
             line = f"{utc_now_iso()} SQLITE_WRITE_FAILED method=rebuild_symbol_trade_state error={exc!r}"
             print(line, flush=True)
@@ -801,10 +818,16 @@ class SQLiteRuntimeStore:
         self.execute(f"DELETE FROM trades WHERE trade_id IN ({placeholders})", duplicate_ids)
         return len(duplicate_ids)
 
-    def rebuild_symbol_trade_state(self, symbol: str, strategy_name: str | None = None) -> dict[str, Any]:
+    def rebuild_symbol_trade_state(
+        self,
+        symbol: str,
+        strategy_name: str | None = None,
+        *,
+        allow_historical_open_lots: bool = False,
+    ) -> dict[str, Any]:
         if self._transaction_depth == 0:
             with self.transaction():
-                return self.rebuild_symbol_trade_state(symbol, strategy_name)
+                return self.rebuild_symbol_trade_state(symbol, strategy_name, allow_historical_open_lots=allow_historical_open_lots)
         symbol = str(symbol or "").upper().strip()
         if not symbol:
             return {"symbol": symbol, "closed_trades": 0, "open_quantity": 0.0}
@@ -948,6 +971,35 @@ class SQLiteRuntimeStore:
             entry_date = str(first_lot.get("session_date") or "") or iso_date_part(entry_time) or latest_session
             strategy = str(first_lot.get("strategy_name") or latest_strategy or "unknown")
             self.mark_position_flat(symbol=symbol, strategy_name=strategy, reason="sqlite_execution_reducer_superseded_open_lot", status="CLOSED")
+            today = session_date_utc()
+            is_historical_open = bool(entry_date and entry_date < today)
+            if is_historical_open and not allow_historical_open_lots:
+                self.upsert_position(
+                    {
+                        "position_key": f"{strategy}:{entry_date}:{symbol}:stale_open_lot",
+                        "strategy_name": strategy,
+                        "session_date": entry_date,
+                        "symbol": symbol,
+                        "status": "STALE_CARRY_OPEN",
+                        "quantity": open_qty,
+                        "avg_price": avg_price,
+                        "source": "sqlite_execution_reducer",
+                        "ibkr_quantity": None,
+                        "active": 0,
+                        "exit_sent": 0,
+                        "updated_at": last_event_time,
+                        "raw_json": {
+                            "active": False,
+                            "entry_fill_verified": True,
+                            "entry_time": entry_time,
+                            "entry_price": avg_price,
+                            "stale_open_lot_suppressed": True,
+                            "requires_ibkr_confirmation": True,
+                            "open_lot_execution_ids": [lot.get("execution_id") for lot in open_lots],
+                        },
+                    }
+                )
+                return {"symbol": symbol, "closed_trades": closed_count, "open_quantity": open_qty, "open_lot_suppressed": True}
             self.upsert_position(
                 {
                     "position_key": f"{strategy}:{entry_date}:{symbol}",
@@ -1132,6 +1184,59 @@ class SQLiteRuntimeStore:
             "updated_at": row.get("updated_at") or utc_now_iso(),
             "raw_json": row.get("raw_json") or row,
         }
+        active_statuses = {"OPEN", "EXIT_ORDER"}
+        if data["active"] and str(data.get("status") or "").upper() in active_statuses and symbol:
+            incoming_priority = position_source_priority(data.get("source"), data.get("raw_json"), data.get("ibkr_quantity"))
+            existing_rows = self.query(
+                """
+                SELECT position_key, source, ibkr_quantity, updated_at, raw_json
+                FROM positions
+                WHERE UPPER(symbol) = ?
+                  AND position_key != ?
+                  AND COALESCE(active, 0) = 1
+                  AND UPPER(COALESCE(status, '')) IN ('OPEN', 'EXIT_ORDER')
+                """,
+                [symbol, position_key],
+            )
+            stronger_existing = False
+            for existing in existing_rows:
+                existing_priority = position_source_priority(existing.get("source"), existing.get("raw_json"), existing.get("ibkr_quantity"))
+                if existing_priority > incoming_priority:
+                    stronger_existing = True
+                    break
+            if stronger_existing:
+                raw = parse_jsonish(data.get("raw_json"))
+                raw.update({
+                    "active": False,
+                    "stale_duplicate_suppressed": True,
+                    "duplicate_suppressed_reason": "stronger_active_position_exists",
+                    "duplicate_suppressed_at": data["updated_at"],
+                })
+                data["active"] = 0
+                data["status"] = "STALE_DUPLICATE_SUPPRESSED"
+                data["raw_json"] = raw
+            else:
+                for existing in existing_rows:
+                    raw = parse_jsonish(existing.get("raw_json"))
+                    raw.update({
+                        "active": False,
+                        "stale_duplicate_suppressed": True,
+                        "duplicate_suppressed_reason": "canonical_position_replaced",
+                        "duplicate_suppressed_by": position_key,
+                        "duplicate_suppressed_at": data["updated_at"],
+                    })
+                    self.execute(
+                        """
+                        UPDATE positions
+                        SET active = 0,
+                            status = 'STALE_DUPLICATE_SUPPRESSED',
+                            exit_sent = 0,
+                            updated_at = ?,
+                            raw_json = ?
+                        WHERE position_key = ?
+                        """,
+                        (data["updated_at"], safe_json(raw), existing["position_key"]),
+                    )
         self._upsert("positions", data, ["position_key"], list(data.keys()))
         return position_key
 

@@ -193,16 +193,18 @@ def render_data_quality_summary(summary: dict) -> None:
     cols[5].metric("Warnings", int(summary.get("data_quality_warning_count", 0)))
 
 
-def render_open_positions(df: pd.DataFrame) -> None:
-    st.subheader("Open Positions")
+def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", prefix: str = "open") -> None:
+    if title:
+        st.subheader(title)
     if df.empty:
         st.info("No open positions in the selected window.")
         return
     cols = [
         "symbol", "qty", "buy", "now", "upnl", "now_pct", "peak_pct", "giveback_pct",
-        "hold_minutes", "entry_time", "entry_source", "status", "strategy",
+        "hold_minutes", "entry_time", "entry_source", "status", "strategy", "data_quality", "ibkr_confirmed",
     ]
-    out = filter_table(df[cols].copy(), "open").sort_values(["upnl", "symbol"], na_position="last")
+    available = [col for col in cols if col in df.columns]
+    out = filter_table(df[available].copy(), prefix).sort_values(["upnl", "symbol"], na_position="last")
     out["entry_time"] = out.apply(
         lambda row: f"ADOPTED {display_time(row['entry_time'])}" if str(row.get("entry_source") or "").upper() == "ADOPTED" else display_time(row["entry_time"]),
         axis=1,
@@ -223,14 +225,39 @@ def render_open_positions(df: pd.DataFrame) -> None:
             "entry_time": "Entry Time",
             "status": "Status",
             "strategy": "Strategy",
+            "data_quality": "Data Quality",
+            "ibkr_confirmed": "IBKR Confirmed",
         }
     )
-    out = out[["Symbol", "Qty", "Buy", "Now", "UPNL", "Now %", "Peak %", "Drop from Peak %", "Min", "Entry Time", "Status", "Strategy"]]
+    display_cols = ["Symbol", "Qty", "Buy", "Now", "UPNL", "Now %", "Peak %", "Drop from Peak %", "Min", "Entry Time", "Status", "Strategy"]
+    if "Data Quality" in out.columns:
+        display_cols.append("Data Quality")
+    if "IBKR Confirmed" in out.columns:
+        display_cols.append("IBKR Confirmed")
+    out = out[display_cols]
     st.dataframe(
         style_pnl(out, ["UPNL", "Now %"]),
         width="stretch",
         hide_index=True,
     )
+
+
+def render_open_position_sections(df: pd.DataFrame) -> None:
+    if df.empty or "position_bucket" not in df.columns:
+        render_open_positions(df)
+        return
+    today = df[df["position_bucket"].fillna("") == "today"].copy()
+    carry = df[df["position_bucket"].fillna("") == "carry_stale"].copy()
+    if today.empty:
+        st.subheader("Today Open Positions")
+        st.info("No today open positions in the selected window.")
+    else:
+        render_open_positions(today, title="Today Open Positions", prefix="today_open")
+    if carry.empty:
+        st.subheader("Carry / Stale Open Positions")
+        st.info("No carry/stale open positions requiring verification.")
+    else:
+        render_open_positions(carry, title="Carry / Stale Open Positions", prefix="carry_open")
 
 
 def render_rejected_entries(df: pd.DataFrame) -> None:
@@ -380,20 +407,23 @@ def render_diagnostics(diag: dict) -> None:
     ]
     for col, (label, key) in zip(cols, labels):
         col.metric(label, int(diag.get(key, 0)))
-    pos_cols = st.columns(4)
+    pos_cols = st.columns(6)
     position_labels = [
         ("SQLite Active Rows", "sqlite_active_positions_count"),
         ("Latest Active", "latest_active_positions_count"),
+        ("Today Open", "today_open_positions_count"),
+        ("Carry/Stale Open", "stale_carry_open_count"),
+        ("Duplicate Symbols", "duplicate_active_symbol_count"),
         ("IBKR Positions", "ibkr_positions_count"),
-        ("Stale Active Rows", "stale_active_positions_count"),
     ]
     for col, (label, key) in zip(pos_cols, position_labels):
         col.metric(label, int(diag.get(key, 0)))
-    closed_cols = st.columns(3)
+    closed_cols = st.columns(4)
     closed_labels = [
         ("Persisted Closed", "persisted_closed_trades_count"),
         ("Reconstructed Pairs", "reconstructed_execution_pairs_count"),
         ("Displayed Closed", "displayed_closed_trades_count"),
+        ("Carried Closed Today", "carried_closed_today_count"),
     ]
     for col, (label, key) in zip(closed_cols, closed_labels):
         col.metric(label, int(diag.get(key, 0)))
@@ -441,7 +471,7 @@ def main() -> None:
     if int(snapshot.get("diagnostics", {}).get("execution_reconstruction_disabled", 0) or 0):
         st.warning("EXECUTION_RECONSTRUCTION_DISABLED_IN_DASHBOARD: executions exist, but no persisted closed trades exist for this window.")
     st.divider()
-    render_open_positions(snapshot["open_positions"])
+    render_open_position_sections(snapshot["open_positions"])
     st.divider()
     render_rejected_entries(snapshot.get("rejected_entries", pd.DataFrame()))
     st.divider()
