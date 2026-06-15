@@ -556,10 +556,10 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
     with settings:
         col1, col2, col3, col4 = st.columns(4)
         host = col1.text_input("IBKR host", value="127.0.0.1", key="broker_host")
-        port = col2.number_input("IBKR port", value=7497, step=1, key="broker_port")
+        port = col2.number_input("IBKR port", value=4002, step=1, key="broker_port")
         client_id = col3.number_input("Client ID", value=177, step=1, key="broker_client_id")
         timeout = col4.number_input("Timeout seconds", value=4.0, step=0.5, key="broker_timeout")
-        use_api_executions = st.toggle("Try IBKR API executions for selected date", value=False)
+        use_api_executions = st.toggle("Try IBKR API executions for selected date", value=True)
         uploaded_csv = st.file_uploader("IBKR Activity Statement / Trades CSV fallback", type=["csv", "txt"], key="broker_activity_csv")
         csv_path = st.text_input("Or Activity CSV file path on server", value="", key="broker_activity_csv_path")
 
@@ -576,6 +576,12 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
         "raw_execution_count_before_filtering": 0,
         "execution_count_after_date_filtering": 0,
         "raw_commission_report_count": 0,
+        "fills_count": 0,
+        "req_executions_count": 0,
+        "req_executions_filter_count": 0,
+        "executions_attr_count": 0,
+        "unique_execution_client_ids": [],
+        "first_5_raw_executions": [],
         "ibkr_messages": [],
         "session_only_warning": "IBKR_API_EXECUTIONS_SESSION_ONLY",
     }
@@ -707,11 +713,16 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
 
     st.divider()
     st.subheader("Broker Executions")
-    exec_diag_cols = st.columns(4)
+    exec_diag_cols = st.columns(6)
     exec_diag_cols[0].metric("Raw API/CSV executions", int(broker_execution_diagnostics.get("raw_execution_count_before_filtering", len(raw_broker_executions)) or 0))
     exec_diag_cols[1].metric("After date filter", int(broker_execution_diagnostics.get("execution_count_after_date_filtering", len(broker_executions)) or 0))
-    exec_diag_cols[2].metric("Commission reports", int(broker_execution_diagnostics.get("raw_commission_report_count", 0) or 0))
-    exec_diag_cols[3].metric("Timezone", str(broker_execution_diagnostics.get("timezone_used", "UTC")))
+    exec_diag_cols[2].metric("ib.fills()", int(broker_execution_diagnostics.get("fills_count", 0) or 0))
+    exec_diag_cols[3].metric("reqExecutions", int(broker_execution_diagnostics.get("req_executions_count", 0) or 0))
+    exec_diag_cols[4].metric("Commission reports", int(broker_execution_diagnostics.get("raw_commission_report_count", 0) or 0))
+    exec_diag_cols[5].metric("Timezone", str(broker_execution_diagnostics.get("timezone_used", "UTC")))
+    client_ids = broker_execution_diagnostics.get("unique_execution_client_ids") or []
+    if client_ids:
+        st.caption(f"Execution clientIds: {', '.join(str(x) for x in client_ids)}")
     if broker_executions.empty:
         st.info("No executions for selected date")
         st.warning("Broker Closed Trades require Broker Executions. If API executions are empty, upload Activity Statement / Trades CSV.")

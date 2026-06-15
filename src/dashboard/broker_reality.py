@@ -29,6 +29,7 @@ BROKER_EXECUTION_COLUMNS = [
     "account",
     "exchange",
     "currency",
+    "execution_client_id",
     "source",
 ]
 
@@ -183,6 +184,7 @@ def normalize_execution_record(row: dict[str, Any], *, source: str = "csv") -> d
         "account": str(pick(row, "account", "accountid", "acctid") or "").strip(),
         "exchange": str(pick(row, "exchange", "listingexchange") or "").strip(),
         "currency": str(pick(row, "currency", "currencyprimary", "fxcurrency") or "").strip(),
+        "execution_client_id": str(pick(row, "clientid", "client id", "executionclientid") or "").strip(),
         "source": source,
     }
 
@@ -266,6 +268,7 @@ def load_sqlite_executions(sqlite_path: str | Path, selected_date: str) -> pd.Da
                 "account": str(raw.get("account") or raw.get("acctNumber") or ""),
                 "exchange": str(row.get("exchange") or ""),
                 "currency": str(row.get("commission_currency") or raw.get("currency") or ""),
+                "execution_client_id": str(raw.get("clientId") or raw.get("client_id") or ""),
                 "source": "sqlite",
             }
         )
@@ -359,6 +362,12 @@ def fetch_ibkr_executions_diagnostic(host: str, port: int, client_id: int, selec
         "raw_execution_count_before_filtering": 0,
         "execution_count_after_date_filtering": 0,
         "raw_commission_report_count": 0,
+        "fills_count": 0,
+        "req_executions_count": 0,
+        "req_executions_filter_count": 0,
+        "executions_attr_count": 0,
+        "unique_execution_client_ids": [],
+        "first_5_raw_executions": [],
         "ibkr_messages": [],
         "event_loop_info": loop_info,
         "session_only_warning": "IBKR_API_EXECUTIONS_SESSION_ONLY",
@@ -380,24 +389,31 @@ def fetch_ibkr_executions_diagnostic(host: str, port: int, client_id: int, selec
         ib.connect(host, int(port), clientId=int(client_id), timeout=timeout)
         fills_by_method: list[tuple[str, Any]] = []
         try:
-            execution_filter = ExecutionFilter()
-            execution_filter.time = f"{selected_date.replace('-', '')} 00:00:00"
-            fills_by_method.append(("ib.reqExecutions(filter_time)", ib.reqExecutions(execution_filter)))
-        except Exception as exc:
-            diagnostics["ibkr_messages"].append(f"reqExecutions_filter_failed: {exc}")
-        try:
-            fills_by_method.append(("ib.reqExecutions()", ib.reqExecutions()))
-        except Exception as exc:
-            diagnostics["ibkr_messages"].append(f"reqExecutions_unfiltered_failed: {exc}")
-        try:
             fills_attr = ib.fills()
+            diagnostics["fills_count"] = int(len(fills_attr or []))
             fills_by_method.append(("ib.fills()", fills_attr))
         except Exception as exc:
             diagnostics["ibkr_messages"].append(f"fills_failed: {exc}")
         try:
+            req_executions = ib.reqExecutions()
+            diagnostics["req_executions_count"] = int(len(req_executions or []))
+            fills_by_method.append(("ib.reqExecutions()", req_executions))
+        except Exception as exc:
+            diagnostics["ibkr_messages"].append(f"reqExecutions_unfiltered_failed: {exc}")
+        try:
+            execution_filter = ExecutionFilter()
+            execution_filter.time = f"{selected_date.replace('-', '')} 00:00:00"
+            filtered_executions = ib.reqExecutions(execution_filter)
+            diagnostics["req_executions_filter_count"] = int(len(filtered_executions or []))
+            fills_by_method.append(("ib.reqExecutions(filter_time)", filtered_executions))
+        except Exception as exc:
+            diagnostics["ibkr_messages"].append(f"reqExecutions_filter_failed: {exc}")
+        try:
             executions_attr = getattr(ib, "executions", None)
             if callable(executions_attr):
-                fills_by_method.append(("ib.executions()", executions_attr()))
+                executions_rows = executions_attr()
+                diagnostics["executions_attr_count"] = int(len(executions_rows or []))
+                fills_by_method.append(("ib.executions()", executions_rows))
         except Exception as exc:
             diagnostics["ibkr_messages"].append(f"executions_failed: {exc}")
 
@@ -431,12 +447,17 @@ def fetch_ibkr_executions_diagnostic(host: str, port: int, client_id: int, selec
                             "account": getattr(execution, "acctNumber", None),
                             "exchange": getattr(execution, "exchange", None),
                             "currency": getattr(commission_report, "currency", None),
+                            "clientId": getattr(execution, "clientId", None),
                         },
                         source=method,
                     )
                 )
         raw_df = pd.DataFrame(rows, columns=BROKER_EXECUTION_COLUMNS)
         diagnostics["raw_execution_count_before_filtering"] = int(len(raw_df))
+        if not raw_df.empty:
+            client_ids = [str(x) for x in raw_df["execution_client_id"].dropna().unique() if str(x)]
+            diagnostics["unique_execution_client_ids"] = sorted(client_ids)
+            diagnostics["first_5_raw_executions"] = raw_df.head(5).to_dict("records")
         filtered_df = raw_df
         if not raw_df.empty:
             filtered_df = raw_df[raw_df["execution_time"].map(date_part) == selected_date].reset_index(drop=True)

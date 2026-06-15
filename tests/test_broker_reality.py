@@ -14,6 +14,7 @@ from src.dashboard.broker_reality import (
     ensure_asyncio_event_loop,
     load_sqlite_executions,
     match_executions,
+    normalize_execution_record,
     parse_ibkr_activity_csv,
     reconstruct_closed_trades_fifo,
 )
@@ -48,6 +49,24 @@ E1,AKTX,BUY,5,17.01,0.86,2026-06-15 13:35:39,101,501,U123,SMART,USD
         self.assertEqual(rows.iloc[0]["symbol"], "AKTX")
         self.assertEqual(rows.iloc[0]["side"], "BUY")
         self.assertAlmostEqual(rows.iloc[0]["commission"], 0.86)
+
+    def test_normalize_execution_keeps_execution_client_id(self) -> None:
+        row = normalize_execution_record(
+            {
+                "execution_id": "E1",
+                "symbol": "AKTX",
+                "side": "BUY",
+                "quantity": 5,
+                "price": 17.01,
+                "commission": 0.86,
+                "execution_time": "2026-06-15 13:35:39",
+                "clientId": 67,
+            },
+            source="ib.fills()",
+        )
+
+        self.assertEqual(row["execution_client_id"], "67")
+        self.assertEqual(row["source"], "ib.fills()")
 
     def test_ibkr_activity_csv_parser_flex_trades_section(self) -> None:
         csv = """Trades,Header,Asset Category,Currency,Symbol,Date/Time,Quantity,T. Price,Comm/Fee,Buy/Sell,Exec ID
