@@ -19,6 +19,17 @@ from src.dashboard.runtime_queries import (  # noqa: E402
     load_dashboard_snapshot,
     utc_today,
 )
+from src.dashboard.broker_reality import (  # noqa: E402
+    empty_broker_executions,
+    fetch_ibkr_executions_for_date,
+    fetch_ibkr_live_portfolio,
+    load_sqlite_active_positions,
+    load_sqlite_executions,
+    load_sqlite_trade_pnl,
+    parse_ibkr_activity_csv,
+    reconcile_broker_vs_sqlite,
+    reconciliation_export_frames,
+)
 from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, resolve_sqlite_path  # noqa: E402
 
 
@@ -429,32 +440,26 @@ def render_diagnostics(diag: dict) -> None:
         col.metric(label, int(diag.get(key, 0)))
 
 
-def main() -> None:
-    st.markdown(CSS, unsafe_allow_html=True)
-    st.title("Runtime Trading Dashboard")
+def dataframe_or_info(df: pd.DataFrame, message: str, *, key: str | None = None) -> None:
+    if df.empty:
+        st.info(message)
+    else:
+        st.dataframe(df, width="stretch", hide_index=True, key=key)
 
-    with st.sidebar:
-        st.header("Data")
-        sqlite_path = st.text_input("SQLite DB", value=resolve_sqlite_path(DEFAULT_SQLITE_PATH))
-        sessions = cached_sessions(sqlite_path)
-        today = utc_today()
-        mode = st.radio("Session selector", ["Today", "Specific date", "Date range"], index=0)
-        if mode == "Today":
-            start_date = end_date = today
-        elif mode == "Specific date":
-            default = pd.to_datetime(sessions[0]).date() if sessions else date.today()
-            selected = st.date_input("Date", value=default)
-            start_date = end_date = selected.isoformat()
+
+def export_reconciliation_csv(frames: dict[str, pd.DataFrame]) -> str:
+    chunks = []
+    for name, frame in frames.items():
+        chunks.append(f"# {name}\n")
+        if frame.empty:
+            chunks.append("\n")
         else:
-            default_end = pd.to_datetime(sessions[0]).date() if sessions else date.today()
-            default_start = default_end - timedelta(days=7)
-            start, end = st.date_input("Date range", value=(default_start, default_end))
-            start_date, end_date = start.isoformat(), end.isoformat()
-        strategies = ["All", *cached_strategies(sqlite_path, start_date, end_date)]
-        strategy = st.selectbox("Strategy", strategies, index=0)
-        include_reconstructed = st.toggle("Show execution-reconstructed trades", value=False)
-        auto_refresh = st.toggle("Auto refresh current session", value=True)
+            chunks.append(frame.to_csv(index=False))
+            chunks.append("\n")
+    return "".join(chunks)
 
+
+def render_runtime_tab(sqlite_path: str, start_date: str, end_date: str, strategy: str, include_reconstructed: bool, auto_refresh: bool) -> None:
     window = DateWindow(start_date, end_date)
     current = is_current_window(window)
     if current:
@@ -487,6 +492,143 @@ def main() -> None:
         st.markdown('<p class="small-note">Auto refresh active: rerendering every 5 seconds for current session.</p>', unsafe_allow_html=True)
         time.sleep(5)
         st.rerun()
+
+
+def render_broker_reality_tab(sqlite_path: str) -> None:
+    st.header("Broker Reality / IBKR Reconciliation")
+    selected = st.date_input("Broker execution date", value=pd.to_datetime(utc_today()).date(), key="broker_reality_date")
+    selected_date = selected.isoformat()
+
+    settings = st.expander("IBKR connection / Activity CSV fallback", expanded=False)
+    with settings:
+        col1, col2, col3, col4 = st.columns(4)
+        host = col1.text_input("IBKR host", value="127.0.0.1", key="broker_host")
+        port = col2.number_input("IBKR port", value=7497, step=1, key="broker_port")
+        client_id = col3.number_input("Client ID", value=177, step=1, key="broker_client_id")
+        timeout = col4.number_input("Timeout seconds", value=4.0, step=0.5, key="broker_timeout")
+        use_api_executions = st.toggle("Try IBKR API executions for selected date", value=False)
+        uploaded_csv = st.file_uploader("IBKR Activity Statement / Trades CSV fallback", type=["csv", "txt"], key="broker_activity_csv")
+        csv_path = st.text_input("Or Activity CSV file path on server", value="", key="broker_activity_csv_path")
+
+    portfolio, portfolio_status = fetch_ibkr_live_portfolio(host, int(port), int(client_id), float(timeout))
+    st.subheader("Broker Portfolio Now")
+    st.caption(f"portfolio_status={portfolio_status}")
+    dataframe_or_info(portfolio, "No live IBKR portfolio rows returned.")
+
+    broker_executions = empty_broker_executions()
+    broker_status = "CSV_REQUIRED_FOR_HISTORICAL_DATE"
+    if use_api_executions:
+        broker_executions, broker_status = fetch_ibkr_executions_for_date(host, int(port), int(client_id), selected_date, float(timeout))
+    if uploaded_csv is not None:
+        broker_executions = parse_ibkr_activity_csv(uploaded_csv)
+        broker_executions = broker_executions[broker_executions["execution_time"].map(lambda x: str(x)[:10]) == selected_date].reset_index(drop=True)
+        broker_status = "OK"
+    elif csv_path.strip():
+        path = Path(csv_path.strip()).expanduser()
+        if path.exists():
+            broker_executions = parse_ibkr_activity_csv(path.read_text())
+            broker_executions = broker_executions[broker_executions["execution_time"].map(lambda x: str(x)[:10]) == selected_date].reset_index(drop=True)
+            broker_status = "OK"
+        else:
+            broker_status = f"csv_path_not_found: {path}"
+
+    sqlite_executions = load_sqlite_executions(sqlite_path, selected_date)
+    sqlite_positions = load_sqlite_active_positions(sqlite_path, selected_date)
+    sqlite_trade_pnl = load_sqlite_trade_pnl(sqlite_path, selected_date)
+    result = reconcile_broker_vs_sqlite(
+        broker_executions,
+        sqlite_executions,
+        portfolio,
+        sqlite_positions,
+        sqlite_trade_pnl,
+        selected_date=selected_date,
+        broker_status=broker_status,
+    )
+
+    st.subheader("Reconciliation Summary")
+    status = result.summary.get("status")
+    if status == "IBKR_RECONCILED":
+        st.success(status)
+    elif status == "CSV_REQUIRED_FOR_HISTORICAL_DATE":
+        st.warning(status)
+    elif status == "NOT_RECONCILED":
+        st.warning(status)
+    else:
+        st.error(status)
+    cols = st.columns(6)
+    for col, (label, key) in zip(
+        cols,
+        [
+            ("Broker Execs", "broker_execution_count"),
+            ("SQLite Execs", "sqlite_execution_count"),
+            ("Matched", "matched_executions"),
+            ("Missing SQLite", "missing_in_sqlite"),
+            ("Extra SQLite", "extra_in_sqlite"),
+            ("Position Mismatches", "position_mismatches"),
+        ],
+    ):
+        col.metric(label, int(result.summary.get(key, 0) or 0))
+    st.caption(f"broker_status={broker_status}")
+
+    st.subheader("Broker Executions for Selected Date")
+    dataframe_or_info(broker_executions, "No broker executions loaded. Use IBKR API or Activity CSV fallback.")
+
+    st.subheader("SQLite Executions for Selected Date")
+    dataframe_or_info(sqlite_executions, "No SQLite executions for selected date.")
+
+    st.subheader("Mismatches")
+    mismatch_tabs = st.tabs(["Missing in SQLite", "Extra in SQLite", "Execution Mismatches", "Position Mismatches", "Trades / PnL"])
+    with mismatch_tabs[0]:
+        dataframe_or_info(result.missing_in_sqlite, "No broker executions missing in SQLite.")
+    with mismatch_tabs[1]:
+        dataframe_or_info(result.extra_in_sqlite, "No extra SQLite executions.")
+    with mismatch_tabs[2]:
+        dataframe_or_info(result.execution_mismatches, "No quantity/price/commission mismatches.")
+    with mismatch_tabs[3]:
+        dataframe_or_info(result.position_mismatches, "No position mismatches.")
+    with mismatch_tabs[4]:
+        dataframe_or_info(result.pnl_comparison, "No PnL comparison available.")
+
+    export_csv = export_reconciliation_csv(reconciliation_export_frames(result))
+    st.download_button(
+        "Export reconciliation report CSV",
+        data=export_csv,
+        file_name=f"ibkr_reconciliation_{selected_date}.csv",
+        mime="text/csv",
+    )
+
+
+def main() -> None:
+    st.markdown(CSS, unsafe_allow_html=True)
+    st.title("Runtime Trading Dashboard")
+
+    with st.sidebar:
+        st.header("Data")
+        sqlite_path = st.text_input("SQLite DB", value=resolve_sqlite_path(DEFAULT_SQLITE_PATH))
+        sessions = cached_sessions(sqlite_path)
+        today = utc_today()
+        mode = st.radio("Session selector", ["Today", "Specific date", "Date range"], index=0)
+        if mode == "Today":
+            start_date = end_date = today
+        elif mode == "Specific date":
+            default = pd.to_datetime(sessions[0]).date() if sessions else date.today()
+            selected = st.date_input("Date", value=default)
+            start_date = end_date = selected.isoformat()
+        else:
+            default_end = pd.to_datetime(sessions[0]).date() if sessions else date.today()
+            default_start = default_end - timedelta(days=7)
+            start, end = st.date_input("Date range", value=(default_start, default_end))
+            start_date, end_date = start.isoformat(), end.isoformat()
+        strategies = ["All", *cached_strategies(sqlite_path, start_date, end_date)]
+        strategy = st.selectbox("Strategy", strategies, index=0)
+        include_reconstructed = st.toggle("Show execution-reconstructed trades", value=False)
+        auto_refresh = st.toggle("Auto refresh current session", value=True)
+
+    runtime_tab, broker_tab = st.tabs(["Runtime Dashboard", "Broker Reality / IBKR Reconciliation"])
+    with runtime_tab:
+        render_runtime_tab(sqlite_path, start_date, end_date, strategy, include_reconstructed, auto_refresh)
+    with broker_tab:
+        render_broker_reality_tab(sqlite_path)
 
 
 if __name__ == "__main__":
