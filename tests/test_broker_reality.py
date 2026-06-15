@@ -161,6 +161,57 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
         self.assertIn("net_difference", mismatches.columns)
         self.assertAlmostEqual(mismatches.iloc[0]["net_difference"], 0.5)
 
+    def test_carry_lot_grouping_matches_split_sqlite_trades(self) -> None:
+        broker = pd.DataFrame([
+            {
+                "symbol": "VECO",
+                "trade_id": "broker:VECO",
+                "entry_time": "2026-06-05T13:30:00+00:00",
+                "exit_time": "2026-06-15T19:55:00+00:00",
+                "quantity": 3,
+                "entry_price": 10.0,
+                "exit_price": 12.0,
+                "realized_pnl": 6.0,
+                "commission": 1.2,
+                "net_pnl": 4.8,
+            }
+        ])
+        sqlite = pd.DataFrame([
+            {
+                "symbol": "VECO",
+                "trade_id": "reconstructed:VECO:1",
+                "entry_time": "2026-06-05T13:30:00+00:00",
+                "exit_time": "2026-06-15T19:55:00+00:00",
+                "quantity": 1,
+                "entry_price": 10.0,
+                "exit_price": 12.0,
+                "realized_pnl": 2.0,
+                "commission": 0.4,
+                "net_pnl": 1.6,
+            },
+            {
+                "symbol": "VECO",
+                "trade_id": "reconstructed:VECO:2",
+                "entry_time": "2026-06-05T13:31:00+00:00",
+                "exit_time": "2026-06-15T19:55:00+00:00",
+                "quantity": 2,
+                "entry_price": 10.0,
+                "exit_price": 12.0,
+                "realized_pnl": 4.0,
+                "commission": 0.8,
+                "net_pnl": 3.2,
+            },
+        ])
+
+        matched, missing, extra, mismatches = compare_closed_trades(broker, sqlite)
+
+        self.assertEqual(len(matched), 1)
+        self.assertTrue(missing.empty)
+        self.assertTrue(extra.empty)
+        self.assertTrue(mismatches.empty)
+        self.assertAlmostEqual(matched.iloc[0]["sqlite_qty"], 3)
+        self.assertAlmostEqual(matched.iloc[0]["sqlite_net"], 4.8)
+
     def test_local_stale_open_and_ibkr_orphan_detection(self) -> None:
         ibkr = pd.DataFrame([
             {"symbol": "ORPH", "quantity": 4, "average_cost": 10.0, "market_price": 10.5, "unrealized_pnl": 2.0}

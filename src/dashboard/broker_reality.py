@@ -655,6 +655,65 @@ def trade_signature(row: dict[str, Any]) -> tuple[str, float, float, float]:
     )
 
 
+def aggregate_logical_carry_trades(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse split carry lots into one logical symbol/exit-date trade for reconciliation."""
+    if not rows:
+        return []
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        symbol = str(row.get("symbol") or "").upper()
+        exit_date = date_part(row.get("exit_time")) or date_part(row.get("closed_at")) or date_part(row.get("entry_time"))
+        grouped.setdefault((symbol, exit_date), []).append(row)
+
+    out: list[dict[str, Any]] = []
+    for (symbol, exit_date), group in grouped.items():
+        carried = any(
+            date_part(row.get("entry_time"))
+            and exit_date
+            and date_part(row.get("entry_time")) < exit_date
+            for row in group
+        )
+        if len(group) == 1 and not carried:
+            out.append(group[0])
+            continue
+        total_qty = sum(abs(to_float(row.get("quantity"), 0.0) or 0.0) for row in group)
+        gross = sum(to_float(row.get("realized_pnl"), 0.0) or 0.0 for row in group)
+        commission = sum(abs(to_float(row.get("commission"), 0.0) or 0.0) for row in group)
+        net = sum(to_float(row.get("net_pnl"), 0.0) or 0.0 for row in group)
+        weighted_entry = 0.0
+        weighted_exit = 0.0
+        for row in group:
+            qty = abs(to_float(row.get("quantity"), 0.0) or 0.0)
+            weighted_entry += (to_float(row.get("entry_price"), 0.0) or 0.0) * qty
+            weighted_exit += (to_float(row.get("exit_price"), 0.0) or 0.0) * qty
+        entry_times = sorted([str(row.get("entry_time")) for row in group if row.get("entry_time")])
+        exit_times = sorted([str(row.get("exit_time")) for row in group if row.get("exit_time")])
+        trade_ids = [str(row.get("trade_id") or row.get("entry_execution_id") or row.get("exit_execution_id") or "") for row in group]
+        entry_exec_ids = [str(row.get("entry_execution_id") or "") for row in group if row.get("entry_execution_id")]
+        exit_exec_ids = [str(row.get("exit_execution_id") or "") for row in group if row.get("exit_execution_id")]
+        first = dict(group[0])
+        first.update(
+            {
+                "symbol": symbol,
+                "trade_id": "logical:" + "|".join([x for x in trade_ids if x]),
+                "entry_time": entry_times[0] if entry_times else None,
+                "exit_time": exit_times[-1] if exit_times else None,
+                "quantity": total_qty,
+                "entry_price": (weighted_entry / total_qty) if total_qty else None,
+                "exit_price": (weighted_exit / total_qty) if total_qty else None,
+                "realized_pnl": gross,
+                "commission": commission,
+                "net_pnl": net,
+                "source": "LOGICAL_CARRY_GROUP",
+                "entry_execution_id": "|".join(entry_exec_ids),
+                "exit_execution_id": "|".join(exit_exec_ids),
+                "grouped_lot_count": len(group),
+            }
+        )
+        out.append(first)
+    return out
+
+
 def compare_closed_trades(
     broker_trades: pd.DataFrame,
     sqlite_trades: pd.DataFrame,
@@ -663,8 +722,8 @@ def compare_closed_trades(
     commission_tolerance: float = 0.02,
     quantity_tolerance: float = 1e-6,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    broker_rows = broker_trades.to_dict("records") if not broker_trades.empty else []
-    sqlite_rows = sqlite_trades.to_dict("records") if not sqlite_trades.empty else []
+    broker_rows = aggregate_logical_carry_trades(broker_trades.to_dict("records") if not broker_trades.empty else [])
+    sqlite_rows = aggregate_logical_carry_trades(sqlite_trades.to_dict("records") if not sqlite_trades.empty else [])
     used_sqlite: set[int] = set()
     matched: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
