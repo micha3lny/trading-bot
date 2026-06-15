@@ -473,6 +473,57 @@ def export_reconciliation_csv(frames: dict[str, pd.DataFrame]) -> str:
     return "".join(chunks)
 
 
+def select_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    out = df.copy()
+    for column in columns:
+        if column not in out.columns:
+            out[column] = None
+    return out[columns]
+
+
+def trade_difference_contributors(result: ReconciliationResult) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    if not result.trade_mismatches.empty:
+        for row in result.trade_mismatches.to_dict("records"):
+            rows.append(
+                {
+                    "symbol": row.get("symbol"),
+                    "net_difference": float(row.get("net_difference") or 0.0),
+                    "source": "trade_mismatch",
+                }
+            )
+    if not result.missing_trades.empty:
+        for row in result.missing_trades.to_dict("records"):
+            rows.append(
+                {
+                    "symbol": row.get("symbol"),
+                    "net_difference": float(row.get("net") or 0.0),
+                    "source": "missing_sqlite",
+                }
+            )
+    if not result.extra_trades.empty:
+        for row in result.extra_trades.to_dict("records"):
+            rows.append(
+                {
+                    "symbol": row.get("symbol"),
+                    "net_difference": -float(row.get("net") or 0.0),
+                    "source": "missing_broker",
+                }
+            )
+    if not rows:
+        return pd.DataFrame(columns=["symbol", "net_difference", "abs_net_difference", "rows"])
+    df = pd.DataFrame(rows)
+    grouped = (
+        df.groupby("symbol", dropna=False)
+        .agg(net_difference=("net_difference", "sum"), rows=("symbol", "size"))
+        .reset_index()
+    )
+    grouped["abs_net_difference"] = pd.to_numeric(grouped["net_difference"], errors="coerce").abs()
+    return grouped.sort_values("abs_net_difference", ascending=False, na_position="last").head(10)
+
+
 def empty_reconciliation_result(selected_date: str, broker_status: str = "NOT_LOADED") -> ReconciliationResult:
     summary = {
         "status": "CSV_REQUIRED_FOR_HISTORICAL_DATE" if not str(broker_status).startswith("OK") else "NOT_RECONCILED",
@@ -813,12 +864,18 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
         st.warning("CSV_REQUIRED_FOR_HISTORICAL_DATE")
 
     st.subheader("Mismatches")
+    contributors = trade_difference_contributors(result)
+    if not contributors.empty:
+        st.caption("Top 10 symbols contributing most to reconciliation net difference")
+        st.dataframe(contributors, width="stretch", hide_index=True)
     mismatch_tabs = st.tabs([
         "Missing Executions",
         "Extra Executions",
         "Execution Mismatches",
         "Position Mismatches",
-        "Closed Trade Mismatches",
+        "Trade Mismatches",
+        "Missing SQLite Trades",
+        "Missing Broker Trades",
         "Trades / PnL",
     ])
     with mismatch_tabs[0]:
@@ -828,12 +885,47 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
     with mismatch_tabs[2]:
         dataframe_or_info(result.execution_mismatches, "No quantity/price/commission mismatches.")
     with mismatch_tabs[3]:
-        dataframe_or_info(result.position_mismatches, "No position mismatches.")
+        position_columns = [
+            "symbol",
+            "broker_qty",
+            "sqlite_qty",
+            "broker_avg_cost",
+            "sqlite_avg_cost",
+            "broker_market_value",
+            "sqlite_market_value",
+            "qty_difference",
+            "cost_difference",
+            "status",
+        ]
+        dataframe_or_info(select_columns(result.position_mismatches, position_columns), "No position mismatches.")
     with mismatch_tabs[4]:
-        dataframe_or_info(result.trade_mismatches, "No closed trade quantity/pnl/commission mismatches.")
-        dataframe_or_info(result.missing_trades, "No broker closed trades missing in SQLite.")
-        dataframe_or_info(result.extra_trades, "No extra SQLite closed trades.")
+        trade_mismatch_columns = [
+            "symbol",
+            "broker_trade_id",
+            "sqlite_trade_id",
+            "broker_qty",
+            "sqlite_qty",
+            "broker_entry_time",
+            "sqlite_entry_time",
+            "broker_exit_time",
+            "sqlite_exit_time",
+            "broker_gross",
+            "sqlite_gross",
+            "broker_commission",
+            "sqlite_commission",
+            "broker_net",
+            "sqlite_net",
+            "net_difference",
+            "status",
+        ]
+        dataframe_or_info(select_columns(result.trade_mismatches, trade_mismatch_columns), "No closed trade quantity/pnl/commission mismatches.")
     with mismatch_tabs[5]:
+        missing_columns = ["symbol", "qty", "entry_time", "exit_time", "gross", "commission", "net", "trade_id", "mismatch_type"]
+        dataframe_or_info(select_columns(result.missing_trades, missing_columns), "No broker closed trades missing in SQLite.")
+    with mismatch_tabs[6]:
+        missing_columns = ["symbol", "qty", "entry_time", "exit_time", "gross", "commission", "net", "trade_id", "mismatch_type"]
+        dataframe_or_info(select_columns(result.extra_trades, missing_columns), "No SQLite closed trades missing in broker.")
+    with mismatch_tabs[7]:
         dataframe_or_info(result.pnl_comparison, "No PnL comparison available.")
 
     with st.expander("Diagnostics", expanded=False):
@@ -862,6 +954,27 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
         "Export reconciliation report CSV",
         data=export_csv,
         file_name=f"ibkr_reconciliation_{selected_date}.csv",
+        mime="text/csv",
+    )
+    export_cols = st.columns(2)
+    export_cols[0].download_button(
+        "Export trade_mismatches.csv",
+        data=select_columns(result.trade_mismatches, [
+            "symbol", "broker_trade_id", "sqlite_trade_id", "broker_qty", "sqlite_qty",
+            "broker_entry_time", "sqlite_entry_time", "broker_exit_time", "sqlite_exit_time",
+            "broker_gross", "sqlite_gross", "broker_commission", "sqlite_commission",
+            "broker_net", "sqlite_net", "net_difference", "status",
+        ]).to_csv(index=False),
+        file_name=f"trade_mismatches_{selected_date}.csv",
+        mime="text/csv",
+    )
+    export_cols[1].download_button(
+        "Export position_mismatches.csv",
+        data=select_columns(result.position_mismatches, [
+            "symbol", "broker_qty", "sqlite_qty", "broker_avg_cost", "sqlite_avg_cost",
+            "broker_market_value", "sqlite_market_value", "qty_difference", "cost_difference", "status",
+        ]).to_csv(index=False),
+        file_name=f"position_mismatches_{selected_date}.csv",
         mime="text/csv",
     )
 

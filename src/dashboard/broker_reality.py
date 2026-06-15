@@ -35,6 +35,7 @@ BROKER_EXECUTION_COLUMNS = [
 
 BROKER_CLOSED_TRADE_COLUMNS = [
     "symbol",
+    "trade_id",
     "entry_time",
     "exit_time",
     "quantity",
@@ -301,6 +302,7 @@ def load_sqlite_closed_trades(sqlite_path: str | Path, selected_date: str) -> pd
         out.append(
             {
                 "symbol": str(row.get("symbol") or "").upper(),
+                "trade_id": str(row.get("trade_id") or ""),
                 "entry_time": iso_time(row.get("entry_fill_time")),
                 "exit_time": iso_time(row.get("exit_fill_time") or row.get("closed_at")),
                 "quantity": abs(to_float(row.get("quantity"), 0.0) or 0.0),
@@ -623,6 +625,7 @@ def reconstruct_closed_trades_fifo(executions: pd.DataFrame, selected_date: str)
                 closed.append(
                     {
                         "symbol": symbol,
+                        "trade_id": f"{lot.get('execution_id') or ''}:{row.get('execution_id') or ''}",
                         "entry_time": iso_time(lot.get("execution_time")),
                         "exit_time": iso_time(row.get("execution_time")),
                         "quantity": match_qty,
@@ -666,6 +669,30 @@ def compare_closed_trades(
     matched: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
     mismatches: list[dict[str, Any]] = []
+
+    def row_trade_id(row: dict[str, Any], prefix: str) -> str:
+        explicit = str(row.get("trade_id") or "").strip()
+        if explicit:
+            return explicit
+        entry_exec = str(row.get("entry_execution_id") or "").strip()
+        exit_exec = str(row.get("exit_execution_id") or "").strip()
+        if entry_exec or exit_exec:
+            return f"{entry_exec}:{exit_exec}".strip(":")
+        return f"{prefix}:{str(row.get('symbol') or '').upper()}:{row.get('entry_time') or ''}:{row.get('exit_time') or ''}"
+
+    def public_missing_row(row: dict[str, Any], prefix: str, mismatch_type: str) -> dict[str, Any]:
+        return {
+            "symbol": str(row.get("symbol") or "").upper(),
+            "qty": row.get("quantity"),
+            "entry_time": row.get("entry_time"),
+            "exit_time": row.get("exit_time"),
+            "gross": row.get("realized_pnl"),
+            "commission": row.get("commission"),
+            "net": row.get("net_pnl"),
+            "trade_id": row_trade_id(row, prefix),
+            "mismatch_type": mismatch_type,
+        }
+
     for broker_row in broker_rows:
         match_idx: int | None = None
         broker_sig = trade_signature(broker_row)
@@ -676,7 +703,7 @@ def compare_closed_trades(
                 match_idx = idx
                 break
         if match_idx is None:
-            missing.append({**broker_row, "mismatch_type": "MISSING_TRADE_IN_SQLITE"})
+            missing.append(public_missing_row(broker_row, "broker", "MISSING_TRADE_IN_SQLITE"))
             continue
         used_sqlite.add(match_idx)
         sqlite_row = sqlite_rows[match_idx]
@@ -691,15 +718,22 @@ def compare_closed_trades(
         if abs(commission_delta) > commission_tolerance:
             flags.append("COMMISSION_MISMATCH")
         row = {
-            "symbol": broker_row.get("symbol"),
-            "broker_quantity": broker_row.get("quantity"),
-            "sqlite_quantity": sqlite_row.get("quantity"),
-            "broker_realized_pnl": broker_row.get("realized_pnl"),
-            "sqlite_realized_pnl": sqlite_row.get("realized_pnl"),
+            "symbol": str(broker_row.get("symbol") or "").upper(),
+            "broker_trade_id": row_trade_id(broker_row, "broker"),
+            "sqlite_trade_id": row_trade_id(sqlite_row, "sqlite"),
+            "broker_qty": broker_row.get("quantity"),
+            "sqlite_qty": sqlite_row.get("quantity"),
+            "broker_entry_time": broker_row.get("entry_time"),
+            "sqlite_entry_time": sqlite_row.get("entry_time"),
+            "broker_exit_time": broker_row.get("exit_time"),
+            "sqlite_exit_time": sqlite_row.get("exit_time"),
+            "broker_gross": broker_row.get("realized_pnl"),
+            "sqlite_gross": sqlite_row.get("realized_pnl"),
             "broker_commission": broker_row.get("commission"),
             "sqlite_commission": sqlite_row.get("commission"),
-            "broker_net_pnl": broker_row.get("net_pnl"),
-            "sqlite_net_pnl": sqlite_row.get("net_pnl"),
+            "broker_net": broker_row.get("net_pnl"),
+            "sqlite_net": sqlite_row.get("net_pnl"),
+            "net_difference": (to_float(broker_row.get("net_pnl"), 0.0) or 0.0) - (to_float(sqlite_row.get("net_pnl"), 0.0) or 0.0),
             "quantity_delta": qty_delta,
             "pnl_delta": pnl_delta,
             "commission_delta": commission_delta,
@@ -708,8 +742,15 @@ def compare_closed_trades(
         matched.append(row)
         if flags:
             mismatches.append(row)
-    extra = [{**row, "mismatch_type": "EXTRA_TRADE_IN_SQLITE"} for idx, row in enumerate(sqlite_rows) if idx not in used_sqlite]
-    return pd.DataFrame(matched), pd.DataFrame(missing), pd.DataFrame(extra), pd.DataFrame(mismatches)
+    extra = [public_missing_row(row, "sqlite", "EXTRA_TRADE_IN_SQLITE") for idx, row in enumerate(sqlite_rows) if idx not in used_sqlite]
+    mismatch_df = pd.DataFrame(mismatches)
+    if not mismatch_df.empty and "net_difference" in mismatch_df.columns:
+        mismatch_df = (
+            mismatch_df.assign(_abs_net_difference=pd.to_numeric(mismatch_df["net_difference"], errors="coerce").abs())
+            .sort_values("_abs_net_difference", ascending=False, na_position="last")
+            .drop(columns=["_abs_net_difference"])
+        )
+    return pd.DataFrame(matched), pd.DataFrame(missing), pd.DataFrame(extra), mismatch_df
 
 
 def load_sqlite_active_positions(sqlite_path: str | Path, selected_date: str) -> pd.DataFrame:
@@ -768,14 +809,28 @@ def compare_positions(ibkr_portfolio: pd.DataFrame, sqlite_positions: pd.DataFra
             if ibkr_avg is not None and sqlite_avg is not None and abs(ibkr_avg - sqlite_avg) > 0.01:
                 statuses.append("AVG_PRICE_MISMATCH")
         status = ";".join(statuses) if statuses else "MATCHED"
+        broker_avg_cost = broker_row.get("average_cost") if broker_row else None
+        sqlite_avg_cost = sqlite_row.get("avg_price") if sqlite_row else None
+        broker_market_value = broker_row.get("market_value") if broker_row else None
+        sqlite_market_value = None
+        if sqlite_row:
+            sqlite_market_value = (to_float(sqlite_qty, 0.0) or 0.0) * (to_float(sqlite_avg_cost, 0.0) or 0.0)
         rows.append(
             {
                 "symbol": symbol,
                 "status": status,
+                "broker_qty": ibkr_qty if broker_row else None,
+                "sqlite_qty": sqlite_qty if sqlite_row else None,
+                "broker_avg_cost": broker_avg_cost,
+                "sqlite_avg_cost": sqlite_avg_cost,
+                "broker_market_value": broker_market_value,
+                "sqlite_market_value": sqlite_market_value,
+                "qty_difference": (ibkr_qty if broker_row else 0.0) - (sqlite_qty if sqlite_row else 0.0),
+                "cost_difference": (to_float(broker_avg_cost, 0.0) or 0.0) - (to_float(sqlite_avg_cost, 0.0) or 0.0),
                 "ibkr_quantity": ibkr_qty if broker_row else None,
                 "sqlite_quantity": sqlite_qty if sqlite_row else None,
-                "ibkr_avg_cost": broker_row.get("average_cost") if broker_row else None,
-                "sqlite_avg_price": sqlite_row.get("avg_price") if sqlite_row else None,
+                "ibkr_avg_cost": broker_avg_cost,
+                "sqlite_avg_price": sqlite_avg_cost,
                 "ibkr_market_price": broker_row.get("market_price") if broker_row else None,
                 "ibkr_unrealized_pnl": broker_row.get("unrealized_pnl") if broker_row else None,
                 "sqlite_status": sqlite_row.get("status") if sqlite_row else None,

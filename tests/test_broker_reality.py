@@ -156,6 +156,10 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
         self.assertTrue(missing.empty)
         self.assertTrue(extra.empty)
         self.assertEqual(mismatches.iloc[0]["status"], "PNL_MISMATCH")
+        self.assertIn("broker_trade_id", mismatches.columns)
+        self.assertIn("sqlite_trade_id", mismatches.columns)
+        self.assertIn("net_difference", mismatches.columns)
+        self.assertAlmostEqual(mismatches.iloc[0]["net_difference"], 0.5)
 
     def test_local_stale_open_and_ibkr_orphan_detection(self) -> None:
         ibkr = pd.DataFrame([
@@ -170,6 +174,10 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
         statuses = {row["symbol"]: row["status"] for row in mismatches.to_dict("records")}
         self.assertEqual(statuses["STALE"], "LOCAL_STALE_OPEN")
         self.assertEqual(statuses["ORPH"], "IBKR_ORPHAN_POSITION")
+        self.assertIn("broker_qty", mismatches.columns)
+        self.assertIn("sqlite_qty", mismatches.columns)
+        self.assertIn("qty_difference", mismatches.columns)
+        self.assertIn("cost_difference", mismatches.columns)
 
     def test_sqlite_execution_selected_date_filtering(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
