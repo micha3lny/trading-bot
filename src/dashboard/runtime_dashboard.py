@@ -21,6 +21,7 @@ from src.dashboard.runtime_queries import (  # noqa: E402
 )
 from src.dashboard.broker_reality import (  # noqa: E402
     ReconciliationResult,
+    describe_asyncio_event_loop,
     empty_broker_executions,
     fetch_ibkr_executions_for_date,
     fetch_ibkr_live_portfolio,
@@ -462,7 +463,7 @@ def export_reconciliation_csv(frames: dict[str, pd.DataFrame]) -> str:
 
 def empty_reconciliation_result(selected_date: str, broker_status: str = "NOT_LOADED") -> ReconciliationResult:
     summary = {
-        "status": "CSV_REQUIRED_FOR_HISTORICAL_DATE" if broker_status != "OK" else "NOT_RECONCILED",
+        "status": "CSV_REQUIRED_FOR_HISTORICAL_DATE" if not str(broker_status).startswith("OK") else "NOT_RECONCILED",
         "broker_status": broker_status,
         "broker_execution_count": 0,
         "sqlite_execution_count": 0,
@@ -625,42 +626,40 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
         st.error("Broker vs SQLite reconciliation failed")
         st.exception(exc)
 
-    ibkr_connected = portfolio_status == "OK"
+    ibkr_connected = str(portfolio_status).startswith("OK")
     account = ""
     if not portfolio.empty and "account" in portfolio.columns:
         account = ", ".join(sorted(str(x) for x in portfolio["account"].dropna().unique() if str(x)))
+    last_refresh = pd.Timestamp.utcnow().strftime("%d-%m-%Y %H:%M:%S UTC")
 
-    st.subheader("Broker Debug")
-    dbg = st.columns(7)
-    dbg[0].metric("IBKR connected", "true" if ibkr_connected else "false")
-    dbg[1].metric("Account", account or "N/A")
-    dbg[2].metric("Client ID", int(client_id))
-    dbg[3].metric("Selected date", selected_date)
-    dbg[4].metric("API executions", api_executions_count)
-    dbg[5].metric("SQLite executions", len(sqlite_executions))
-    dbg[6].metric("CSV loaded", "true" if csv_loaded else "false")
-
-    if debug_broker:
-        with st.expander("Raw broker tab diagnostics", expanded=True):
-            st.write("portfolio_type", type(portfolio))
-            st.write("portfolio_rows", len(portfolio))
-            st.write("broker_executions_type", type(broker_executions))
-            st.write("broker_executions_rows", len(broker_executions))
-            st.write("sqlite_executions_type", type(sqlite_executions))
-            st.write("sqlite_executions_rows", len(sqlite_executions))
-            st.write("sqlite_positions_rows", len(sqlite_positions))
-            st.write("portfolio_status", portfolio_status)
-            st.write("broker_status", broker_status)
-
-    st.subheader("Broker Portfolio")
-    st.caption(f"portfolio_status={portfolio_status}")
-    if portfolio_status != "OK":
+    st.subheader("Broker Status")
+    status_cols = st.columns(4)
+    status_cols[0].metric("Connection", "Connected" if ibkr_connected else "Disconnected")
+    status_cols[1].metric("Account", account or "N/A")
+    status_cols[2].metric("Selected Date", selected_date)
+    status_cols[3].metric("Last Refresh", last_refresh)
+    if not ibkr_connected:
         st.warning(f"IBKR connection unavailable: {portfolio_status}")
+    if broker_status and not str(broker_status).startswith("OK"):
+        st.warning(str(broker_status))
+
+    st.divider()
+    st.subheader("Broker Portfolio")
     if portfolio.empty:
         st.info("No portfolio positions")
     else:
         st.dataframe(portfolio, width="stretch", hide_index=True)
 
+    st.divider()
+    st.subheader("Broker Executions")
+    if broker_executions.empty:
+        st.info("No executions for selected date")
+        if not csv_loaded and not use_api_executions:
+            st.warning("CSV_REQUIRED_FOR_HISTORICAL_DATE")
+    else:
+        st.dataframe(broker_executions, width="stretch", hide_index=True)
+
+    st.divider()
     st.subheader("Reconciliation Summary")
     status = result.summary.get("status")
     if status == "IBKR_RECONCILED":
@@ -671,30 +670,29 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
         st.warning(status)
     else:
         st.error(status)
-    cols = st.columns(6)
+    pnl_row = result.pnl_comparison.iloc[0].to_dict() if not result.pnl_comparison.empty else {}
+    pnl_diff = float(pnl_row.get("broker_realized_pnl", 0.0) or 0.0) - float(pnl_row.get("sqlite_net", 0.0) or 0.0)
+    cols = st.columns(5)
     for col, (label, key) in zip(
         cols,
         [
-            ("Broker Execs", "broker_execution_count"),
-            ("SQLite Execs", "sqlite_execution_count"),
             ("Matched", "matched_executions"),
             ("Missing SQLite", "missing_in_sqlite"),
             ("Extra SQLite", "extra_in_sqlite"),
             ("Position Mismatches", "position_mismatches"),
+            ("PnL Difference", None),
         ],
     ):
-        col.metric(label, int(result.summary.get(key, 0) or 0))
-    st.caption(f"broker_status={broker_status}")
+        if key is None:
+            col.metric(label, money(pnl_diff))
+        else:
+            col.metric(label, int(result.summary.get(key, 0) or 0))
+    st.caption(
+        f"broker_executions={len(broker_executions)} sqlite_executions={len(sqlite_executions)} "
+        f"portfolio_rows={len(portfolio)}"
+    )
     if status == "CSV_REQUIRED_FOR_HISTORICAL_DATE":
         st.warning("CSV_REQUIRED_FOR_HISTORICAL_DATE")
-    if broker_executions.empty:
-        st.info("No executions for selected date")
-
-    st.subheader("Broker Executions")
-    dataframe_or_info(broker_executions, "No broker executions loaded. Use IBKR API or Activity CSV fallback.")
-
-    st.subheader("SQLite Executions")
-    dataframe_or_info(sqlite_executions, "No SQLite executions for selected date.")
 
     st.subheader("Mismatches")
     mismatch_tabs = st.tabs(["Missing in SQLite", "Extra in SQLite", "Execution Mismatches", "Position Mismatches", "Trades / PnL"])
@@ -708,6 +706,23 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
         dataframe_or_info(result.position_mismatches, "No position mismatches.")
     with mismatch_tabs[4]:
         dataframe_or_info(result.pnl_comparison, "No PnL comparison available.")
+
+    with st.expander("Diagnostics", expanded=False):
+        st.write("event_loop_info", describe_asyncio_event_loop())
+        st.write("portfolio_type", type(portfolio))
+        st.write("portfolio_rows", len(portfolio))
+        st.write("broker_executions_type", type(broker_executions))
+        st.write("broker_executions_rows", len(broker_executions))
+        st.write("sqlite_executions_type", type(sqlite_executions))
+        st.write("sqlite_executions_rows", len(sqlite_executions))
+        st.write("sqlite_positions_rows", len(sqlite_positions))
+        st.write("api_executions_count", api_executions_count)
+        st.write("csv_loaded", csv_loaded)
+        st.write("portfolio_status", portfolio_status)
+        st.write("broker_status", broker_status)
+        if debug_broker:
+            st.subheader("SQLite Executions")
+            dataframe_or_info(sqlite_executions, "No SQLite executions for selected date.", key="broker_diag_sqlite_execs")
 
     export_csv = export_reconciliation_csv(reconciliation_export_frames(result))
     st.download_button(

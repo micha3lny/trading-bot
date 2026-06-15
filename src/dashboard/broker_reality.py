@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -100,6 +102,30 @@ def pick(row: dict[str, Any], *names: str) -> Any:
 
 def empty_broker_executions() -> pd.DataFrame:
     return pd.DataFrame(columns=BROKER_EXECUTION_COLUMNS)
+
+
+def ensure_asyncio_event_loop() -> str:
+    thread_name = threading.current_thread().name
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return f"created_replacement_loop thread={thread_name}"
+        return f"existing_loop thread={thread_name} running={loop.is_running()}"
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return f"created_loop thread={thread_name}"
+
+
+def describe_asyncio_event_loop() -> str:
+    thread_name = threading.current_thread().name
+    try:
+        loop = asyncio.get_event_loop()
+        return f"thread={thread_name} loop_present=true running={loop.is_running()} closed={loop.is_closed()}"
+    except RuntimeError as exc:
+        return f"thread={thread_name} loop_present=false error={exc}"
 
 
 def normalize_execution_record(row: dict[str, Any], *, source: str = "csv") -> dict[str, Any]:
@@ -214,10 +240,11 @@ def load_sqlite_executions(sqlite_path: str | Path, selected_date: str) -> pd.Da
 
 
 def fetch_ibkr_live_portfolio(host: str, port: int, client_id: int, timeout: float = 4.0) -> tuple[pd.DataFrame, str]:
+    loop_info = ensure_asyncio_event_loop()
     try:
         from ib_insync import IB  # type: ignore
     except Exception as exc:
-        return pd.DataFrame(), f"ib_insync_unavailable: {exc}"
+        return pd.DataFrame(), f"ib_insync_unavailable: {exc}; {loop_info}"
     ib = IB()
     try:
         ib.connect(host, int(port), clientId=int(client_id), timeout=timeout)
@@ -238,9 +265,9 @@ def fetch_ibkr_live_portfolio(host: str, port: int, client_id: int, timeout: flo
                     "last_refresh_time": refreshed_at,
                 }
             )
-        return pd.DataFrame(rows), "OK"
+        return pd.DataFrame(rows), f"OK; {loop_info}"
     except Exception as exc:
-        return pd.DataFrame(), f"ibkr_portfolio_error: {exc}"
+        return pd.DataFrame(), f"ibkr_portfolio_error: {exc}; {loop_info}"
     finally:
         try:
             ib.disconnect()
@@ -249,10 +276,11 @@ def fetch_ibkr_live_portfolio(host: str, port: int, client_id: int, timeout: flo
 
 
 def fetch_ibkr_executions_for_date(host: str, port: int, client_id: int, selected_date: str, timeout: float = 4.0) -> tuple[pd.DataFrame, str]:
+    loop_info = ensure_asyncio_event_loop()
     try:
         from ib_insync import ExecutionFilter, IB  # type: ignore
     except Exception as exc:
-        return empty_broker_executions(), f"ib_insync_unavailable: {exc}"
+        return empty_broker_executions(), f"ib_insync_unavailable: {exc}; {loop_info}"
     ib = IB()
     try:
         ib.connect(host, int(port), clientId=int(client_id), timeout=timeout)
@@ -286,9 +314,9 @@ def fetch_ibkr_executions_for_date(host: str, port: int, client_id: int, selecte
         df = pd.DataFrame(rows, columns=BROKER_EXECUTION_COLUMNS)
         if not df.empty:
             df = df[df["execution_time"].map(date_part) == selected_date].reset_index(drop=True)
-        return df, "OK"
+        return df, f"OK; {loop_info}"
     except Exception as exc:
-        return empty_broker_executions(), f"ibkr_executions_error: {exc}"
+        return empty_broker_executions(), f"ibkr_executions_error: {exc}; {loop_info}"
     finally:
         try:
             ib.disconnect()
@@ -523,7 +551,7 @@ def reconcile_broker_vs_sqlite(
             }
         ]
     )
-    if broker_status and broker_status != "OK" and broker_executions.empty:
+    if broker_status and not str(broker_status).startswith("OK") and broker_executions.empty:
         status = "CSV_REQUIRED_FOR_HISTORICAL_DATE"
     elif broker_executions.empty and not sqlite_executions.empty:
         status = "NOT_RECONCILED"

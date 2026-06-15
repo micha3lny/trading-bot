@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -8,6 +10,7 @@ import pandas as pd
 
 from src.dashboard.broker_reality import (
     compare_positions,
+    ensure_asyncio_event_loop,
     load_sqlite_executions,
     match_executions,
     parse_ibkr_activity_csv,
@@ -16,6 +19,22 @@ from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
 
 class BrokerRealityTests(unittest.TestCase):
+    def test_ensure_asyncio_event_loop_in_worker_thread(self) -> None:
+        result: dict[str, str] = {}
+
+        def worker() -> None:
+            result["info"] = ensure_asyncio_event_loop()
+            loop = asyncio.get_event_loop()
+            result["closed"] = str(loop.is_closed())
+            loop.close()
+
+        thread = threading.Thread(target=worker, name="ScriptRunner.scriptThread")
+        thread.start()
+        thread.join()
+
+        self.assertIn("loop", result["info"])
+        self.assertEqual(result["closed"], "False")
+
     def test_ibkr_activity_csv_parser_simple_header(self) -> None:
         csv = """Execution ID,Symbol,Side,Quantity,Price,Commission,Time,Order ID,Perm ID,Account,Exchange,Currency
 E1,AKTX,BUY,5,17.01,0.86,2026-06-15 13:35:39,101,501,U123,SMART,USD
