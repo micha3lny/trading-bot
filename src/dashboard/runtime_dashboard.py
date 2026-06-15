@@ -527,8 +527,6 @@ def render_runtime_tab(sqlite_path: str, start_date: str, end_date: str, strateg
 
     if current and auto_refresh:
         st.markdown('<p class="small-note">Auto refresh active: rerendering every 5 seconds for current session.</p>', unsafe_allow_html=True)
-        time.sleep(5)
-        st.rerun()
 
 
 def render_broker_reality_tab(sqlite_path: str) -> None:
@@ -751,6 +749,10 @@ def main() -> None:
         render_runtime_tab(sqlite_path, start_date, end_date, strategy, include_reconstructed, auto_refresh)
     with broker_tab:
         render_broker_reality_tab(sqlite_path)
+
+    if auto_refresh and start_date == end_date == utc_today():
+        time.sleep(5)
+        st.rerun()
 
 
 if __name__ == "__main__":
