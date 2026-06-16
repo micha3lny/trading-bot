@@ -11,6 +11,7 @@ from src.live_trading.order_lifecycle.store import JsonlLifecycleStore
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.v67_live_top100_expansion_paper_trader import (
     ManagedPosition,
+    restore_managed_positions,
     send_exit_order,
     startup_reconcile_runtime_state,
 )
@@ -85,6 +86,69 @@ def recorder_in_tmp(tmp: str) -> LiveDataRecorder:
 
 
 class StartupReconciliationTests(unittest.TestCase):
+    def test_restore_managed_positions_rejects_candidates_when_broker_flat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            recorder.path("managed_positions.json").write_text(
+                """
+                {
+                  "positions": {
+                    "RKLB": {
+                      "quantity": 10,
+                      "entry_price": 12.0,
+                      "peak_price": 12.5,
+                      "active": true,
+                      "entry_fill_verified": true
+                    }
+                  }
+                }
+                """,
+                encoding="utf-8",
+            )
+            runtime_state = {}
+
+            restored = restore_managed_positions(
+                recorder,
+                {"RKLB": FakeContract("RKLB")},
+                broker_qty_by_symbol={},
+                runtime_state=runtime_state,
+            )
+
+            self.assertEqual(restored, {})
+            self.assertEqual(runtime_state["startup_restore_broker_snapshot_count"], 0)
+            self.assertEqual(runtime_state["startup_restore_candidate_count"], 1)
+            self.assertEqual(runtime_state["startup_restore_open_count"], 0)
+            self.assertEqual(runtime_state["startup_restore_rejected_count"], 1)
+
+    def test_restore_managed_positions_uses_broker_quantity_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            recorder.path("managed_positions.json").write_text(
+                """
+                {
+                  "positions": {
+                    "RKLB": {
+                      "quantity": 10,
+                      "entry_price": 12.0,
+                      "peak_price": 12.5,
+                      "active": true,
+                      "entry_fill_verified": true
+                    }
+                  }
+                }
+                """,
+                encoding="utf-8",
+            )
+
+            restored = restore_managed_positions(
+                recorder,
+                {"RKLB": FakeContract("RKLB")},
+                broker_qty_by_symbol={"RKLB": 7},
+                runtime_state={},
+            )
+
+            self.assertEqual(restored["RKLB"].quantity, 7)
+
     def test_local_open_but_ibkr_flat_marks_inactive_and_unblocks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             recorder = recorder_in_tmp(tmp)

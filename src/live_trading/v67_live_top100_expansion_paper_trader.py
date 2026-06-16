@@ -1083,11 +1083,18 @@ def persist_managed_positions(
         )
 
 
-def restore_managed_positions(recorder: LiveDataRecorder, contract_by_symbol: dict[str, Any]) -> dict[str, ManagedPosition]:
+def restore_managed_positions(
+    recorder: LiveDataRecorder,
+    contract_by_symbol: dict[str, Any],
+    broker_qty_by_symbol: dict[str, float] | None = None,
+    runtime_state: dict[str, Any] | None = None,
+) -> dict[str, ManagedPosition]:
     path = recorder.path("managed_positions.json")
     restored: dict[str, ManagedPosition] = {}
     if not path.exists():
         return restored
+    candidate_count = 0
+    rejected_count = 0
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         for symbol, row in payload.get("positions", {}).items():
@@ -1103,6 +1110,14 @@ def restore_managed_positions(recorder: LiveDataRecorder, contract_by_symbol: di
             entry_verified = safe_bool(row.get("entry_fill_verified"), False)
             if "entry_fill_verified" not in row and exit_sent:
                 entry_verified = True
+            candidate_count += 1
+            if broker_qty_by_symbol is not None:
+                broker_qty = float(broker_qty_by_symbol.get(symbol, 0.0) or 0.0)
+                if abs(broker_qty) <= 1e-9:
+                    rejected_count += 1
+                    continue
+                if same_position_direction(float(qty), broker_qty) and whole_share_quantity(broker_qty):
+                    qty = int(abs(round(broker_qty)))
             restored[symbol] = ManagedPosition(
                 symbol=symbol,
                 contract=contract_by_symbol[symbol],
@@ -1120,6 +1135,19 @@ def restore_managed_positions(recorder: LiveDataRecorder, contract_by_symbol: di
             )
     except Exception as exc:
         print(f"{now_utc()} managed_positions_restore_error={exc!r}", flush=True)
+    if runtime_state is not None:
+        runtime_state["startup_restore_broker_snapshot_count"] = len(broker_qty_by_symbol or {})
+        runtime_state["startup_restore_candidate_count"] = candidate_count
+        runtime_state["startup_restore_open_count"] = len(restored)
+        runtime_state["startup_restore_rejected_count"] = rejected_count
+    print(
+        f"{now_utc()} STARTUP_RESTORE_DIAGNOSTICS "
+        f"broker_snapshot_count={len(broker_qty_by_symbol or {})} "
+        f"restored_candidate_count={candidate_count} "
+        f"restored_open_count={len(restored)} "
+        f"restored_rejected_count={rejected_count}",
+        flush=True,
+    )
     return restored
 
 
@@ -4918,7 +4946,14 @@ def main() -> int:
             tickers[symbol] = ib.reqMktData(q, "", False, False)
             print(f"Subscribed {symbol} conId={q.conId}", flush=True)
 
-        restored = restore_managed_positions(recorder, contract_by_symbol)
+        startup_broker_rows = ibkr_portfolio_position_rows(ib)
+        startup_broker_qty_by_symbol = {row["symbol"]: float(row["quantity"]) for row in startup_broker_rows}
+        restored = restore_managed_positions(
+            recorder,
+            contract_by_symbol,
+            broker_qty_by_symbol=startup_broker_qty_by_symbol,
+            runtime_state=runtime_state,
+        )
         if restored:
             managed_positions.update(restored)
             for symbol, pos in restored.items():
@@ -4966,6 +5001,19 @@ def main() -> int:
             managed_positions,
             contract_by_symbol,
             runtime_state,
+        )
+        post_startup_broker_rows = ibkr_portfolio_position_rows(ib)
+        post_startup_broker_qty_by_symbol = {row["symbol"]: float(row["quantity"]) for row in post_startup_broker_rows}
+        sqlite_rebuild_result = safe_sqlite_call(
+            getattr(recorder, "sqlite_store", None),
+            "rebuild_positions_from_executions",
+            broker_net_positions=post_startup_broker_qty_by_symbol,
+        )
+        print(
+            f"{now_utc()} STARTUP_SQLITE_POSITION_REBUILD "
+            f"broker_snapshot_count={len(post_startup_broker_qty_by_symbol)} "
+            f"result={json.dumps(sqlite_rebuild_result or {}, sort_keys=True, default=str)}",
+            flush=True,
         )
         if runtime_state.get("pending_eod_flatten"):
             process_pending_eod_flatten_retry(
