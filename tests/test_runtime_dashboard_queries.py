@@ -1742,6 +1742,45 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["diagnostics"]["today_open_positions_count"], 0)
             self.assertEqual(snapshot["diagnostics"]["stale_carry_open_count"], 0)
 
+    def test_today_active_position_with_zero_ibkr_quantity_is_still_displayed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_position({
+                    "position_key": "v67:2026-06-16:ARTV",
+                    "session_date": "2026-06-16",
+                    "strategy_name": "v67",
+                    "symbol": "ARTV",
+                    "quantity": 8,
+                    "avg_price": 4.20,
+                    "ibkr_quantity": 0,
+                    "active": 1,
+                    "status": "OPEN",
+                    "updated_at": "2026-06-16T14:09:04+00:00",
+                    "raw_json": {
+                        "entry_price": 4.20,
+                        "market_price": 4.35,
+                        "market_price_at": "2026-06-16T14:09:05+00:00",
+                        "entry_time": "2026-06-16T14:09:04+00:00",
+                    },
+                })
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-16", "2026-06-16"), "v67")
+
+            self.assertEqual(len(snapshot["open_positions"]), 1)
+            row = snapshot["open_positions"].iloc[0]
+            self.assertEqual(row["symbol"], "ARTV")
+            self.assertEqual(row["position_bucket"], "today")
+            self.assertEqual(snapshot["summary"]["open_trades"], 1)
+            self.assertEqual(snapshot["diagnostics"]["active_positions_raw_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["active_positions_today_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["displayed_open_positions_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["orphan_stale_position_count"], 0)
+            self.assertTrue(snapshot["excluded_open_positions"].empty)
+
     def test_confirmed_stale_active_open_is_still_flagged_as_carry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"

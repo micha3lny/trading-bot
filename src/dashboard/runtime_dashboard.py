@@ -533,6 +533,31 @@ def render_orphan_stale_positions(df: pd.DataFrame) -> None:
     st.dataframe(out, width="stretch", hide_index=True)
 
 
+def render_excluded_open_positions(df: pd.DataFrame) -> None:
+    if df is None or df.empty:
+        return
+    with st.expander("Excluded Open Positions", expanded=False):
+        out = df.copy().rename(
+            columns={
+                "symbol": "Symbol",
+                "position_key": "Position Key",
+                "session_date": "Session Date",
+                "status": "Status",
+                "quantity": "Qty",
+                "ibkr_quantity": "IBKR Qty",
+                "updated_at": "Updated At",
+                "source": "Source",
+                "exclusion_reason": "Exclusion Reason",
+            }
+        )
+        cols = [
+            "Symbol", "Qty", "IBKR Qty", "Status", "Session Date", "Updated At",
+            "Source", "Exclusion Reason", "Position Key",
+        ]
+        out = out[[col for col in cols if col in out.columns]]
+        st.dataframe(out, width="stretch", hide_index=True)
+
+
 def render_rejected_entries(df: pd.DataFrame) -> None:
     st.subheader("Rejected Entries")
     if df.empty:
@@ -684,14 +709,16 @@ def render_diagnostics(diag: dict) -> None:
     ]
     for col, (label, key) in zip(cols, labels):
         col.metric(label, int(diag.get(key, 0)))
-    pos_cols = st.columns(7)
+    pos_cols = st.columns(8)
     position_labels = [
+        ("Active Raw", "active_positions_raw_count"),
+        ("Active Today", "active_positions_today_count"),
         ("SQLite Active Rows", "sqlite_active_positions_count"),
-        ("Latest Active", "latest_active_positions_count"),
+        ("Displayed Open", "displayed_open_positions_count"),
         ("Today Open", "today_open_positions_count"),
-        ("Carry/Stale Open", "stale_carry_open_count"),
+        ("Carry/Stale", "stale_carry_count"),
         ("Orphan Stale", "orphan_stale_position_count"),
-        ("Duplicate Symbols", "duplicate_active_symbol_count"),
+        ("Excluded Open", "excluded_open_positions_count"),
         ("IBKR Positions", "ibkr_positions_count"),
     ]
     for col, (label, key) in zip(pos_cols, position_labels):
@@ -867,6 +894,7 @@ def render_runtime_tab(sqlite_path: str, start_date: str, end_date: str, strateg
     render_open_position_sections(snapshot["open_positions"])
     st.divider()
     render_orphan_stale_positions(snapshot.get("orphan_stale_positions", pd.DataFrame()))
+    render_excluded_open_positions(snapshot.get("excluded_open_positions", pd.DataFrame()))
     st.divider()
     render_rejected_entries(snapshot.get("rejected_entries", pd.DataFrame()))
     st.divider()

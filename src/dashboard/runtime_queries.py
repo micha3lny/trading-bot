@@ -1480,8 +1480,6 @@ def load_open_positions(
         if bool(raw.get("ibkr_position_flat_confirmed")):
             continue
         ibkr_qty = to_float(row.get("ibkr_quantity"), None)
-        if ibkr_qty is not None and abs(ibkr_qty) <= 1e-9:
-            continue
         qty = to_float(row.get("quantity"), None)
         if qty is None:
             qty = to_float(row.get("ibkr_quantity"), 0.0)
@@ -1578,6 +1576,101 @@ def load_open_positions(
             "now_price_source": now_price_source,
             "market_price_at": price_time,
         })
+    return pd.DataFrame(out)
+
+
+def load_excluded_open_positions(
+    conn: sqlite3.Connection,
+    window: DateWindow,
+    strategy: str | None,
+    displayed_open_positions: pd.DataFrame,
+    orphan_stale_positions: pd.DataFrame,
+) -> pd.DataFrame:
+    clause, params = strategy_clause("p", strategy)
+    open_sql = ",".join("?" for _ in OPEN_POSITION_STATUSES)
+    rows = read_sql(
+        conn,
+        f"""
+        WITH active_candidates AS (
+            SELECT
+                p.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY UPPER(p.symbol)
+                    ORDER BY
+                        CASE
+                            WHEN LOWER(COALESCE(p.source, '')) = 'sqlite_execution_reducer' THEN 40
+                            WHEN COALESCE(p.ibkr_quantity, 0) != 0 THEN 30
+                            WHEN COALESCE(p.raw_json, '') LIKE '%"ibkr_entry_confirmed": true%' THEN 25
+                            WHEN COALESCE(p.raw_json, '') LIKE '%"entry_fill_verified": true%' THEN 20
+                            WHEN LOWER(COALESCE(p.source, '')) = 'live_buy' THEN 10
+                            ELSE 0
+                        END DESC,
+                        COALESCE(p.updated_at, '') DESC,
+                        COALESCE(p.session_date, '') DESC,
+                        p.rowid DESC
+                ) AS rn
+            FROM positions p
+            WHERE COALESCE(p.session_date, '') <= ? {clause}
+              AND COALESCE(p.active, 0) = 1
+              AND UPPER(COALESCE(p.status, '')) IN ({open_sql})
+              AND COALESCE(p.raw_json, '') NOT LIKE '%"active": false%'
+              AND COALESCE(p.raw_json, '') NOT LIKE '%"ibkr_position_flat_confirmed": true%'
+        )
+        SELECT
+            COALESCE(strategy_name, 'unknown') AS strategy,
+            session_date,
+            position_key,
+            symbol,
+            status,
+            quantity,
+            avg_price,
+            ibkr_quantity,
+            updated_at,
+            source,
+            raw_json
+        FROM active_candidates p
+        WHERE p.rn = 1
+        ORDER BY p.symbol
+        """,
+        [window.end_date, *params, *sorted(OPEN_POSITION_STATUSES)],
+    )
+    if rows.empty:
+        return pd.DataFrame(columns=[
+            "symbol", "position_key", "session_date", "status", "quantity", "ibkr_quantity",
+            "updated_at", "source", "exclusion_reason",
+        ])
+    displayed_keys = set()
+    if not displayed_open_positions.empty and "position_key" in displayed_open_positions.columns:
+        displayed_keys = {str(x) for x in displayed_open_positions["position_key"].dropna().tolist()}
+    orphan_keys = set()
+    if not orphan_stale_positions.empty and "position_key" in orphan_stale_positions.columns:
+        orphan_keys = {str(x) for x in orphan_stale_positions["position_key"].dropna().tolist()}
+    out: list[dict[str, Any]] = []
+    for row in rows.to_dict("records"):
+        key = str(row.get("position_key") or "")
+        if key and key in displayed_keys:
+            continue
+        raw = parse_raw_json(row.get("raw_json"))
+        reason = "FILTERED_BY_OPEN_POSITION_RULES"
+        if key and key in orphan_keys:
+            reason = "ORPHAN_STALE_POSITION"
+        elif bool(raw.get("ibkr_position_flat_confirmed")):
+            reason = "IBKR_FLAT_CONFIRMED"
+        elif str(row.get("status") or "").upper() not in OPEN_POSITION_STATUSES:
+            reason = "STATUS_NOT_OPEN"
+        out.append(
+            {
+                "symbol": str(row.get("symbol") or "").upper(),
+                "position_key": row.get("position_key"),
+                "session_date": row.get("session_date"),
+                "status": row.get("status"),
+                "quantity": row.get("quantity"),
+                "ibkr_quantity": row.get("ibkr_quantity"),
+                "updated_at": row.get("updated_at"),
+                "source": row.get("source"),
+                "exclusion_reason": reason,
+            }
+        )
     return pd.DataFrame(out)
 
 
@@ -1843,6 +1936,17 @@ def load_position_row_diagnostics(
         """,
         [window.end_date, *params],
     )
+    today_active_rows = read_sql(
+        conn,
+        f"""
+        SELECT COUNT(*) AS count
+        FROM positions p
+        WHERE COALESCE(p.session_date, '') = ? {clause}
+          AND COALESCE(p.active, 0) = 1
+          AND UPPER(COALESCE(p.status, '')) IN ('OPEN', 'EXIT_ORDER')
+        """,
+        [window.end_date, *params],
+    )
     latest_candidate_rows = read_sql(
         conn,
         f"""
@@ -1919,6 +2023,9 @@ def load_position_row_diagnostics(
     ibkr_positions = int(ibkr_rows.iloc[0]["ibkr_positions_count"] or 0) if not ibkr_rows.empty else 0
     stale = max(0, sqlite_active - int(latest_open_count))
     return {
+        "active_positions_raw_count": sqlite_active,
+        "active_positions_today_count": int(today_active_rows.iloc[0]["count"] or 0) if not today_active_rows.empty else 0,
+        "displayed_open_positions_count": int(latest_open_count),
         "sqlite_active_positions_count": sqlite_active,
         "latest_active_positions_count": int(latest_open_count),
         "latest_active_position_candidates_count": latest_candidates,
@@ -2036,6 +2143,7 @@ def load_dashboard_snapshot(
         )
         open_positions = load_open_positions(conn, window, strategy, executions, execution_lookup)
         orphan_stale_positions = load_orphan_stale_positions(conn, window, strategy)
+        excluded_open_positions = load_excluded_open_positions(conn, window, strategy, open_positions, orphan_stale_positions)
         rejected_entries = load_rejected_entries(conn, window, strategy)
         diagnostics = load_diagnostics(conn, window, strategy)
         diagnostics.update(closed_diag)
@@ -2047,6 +2155,9 @@ def load_dashboard_snapshot(
             diagnostics["today_open_positions_count"] = 0
             diagnostics["stale_carry_open_count"] = 0
         diagnostics["orphan_stale_position_count"] = int(len(orphan_stale_positions))
+        diagnostics["stale_carry_count"] = int(diagnostics.get("stale_carry_open_count", 0) or 0)
+        diagnostics["orphan_stale_count"] = int(diagnostics.get("orphan_stale_position_count", 0) or 0)
+        diagnostics["excluded_open_positions_count"] = int(len(excluded_open_positions))
         if not orphan_stale_positions.empty:
             oldest = orphan_stale_positions.sort_values(["age_days", "symbol"], ascending=[False, True]).iloc[0].to_dict()
             diagnostics["oldest_orphan_stale_position"] = str(oldest.get("symbol") or "")
@@ -2075,6 +2186,7 @@ def load_dashboard_snapshot(
             "data_quality_summary": build_data_quality_summary(closed),
             "open_positions": open_positions,
             "orphan_stale_positions": orphan_stale_positions,
+            "excluded_open_positions": excluded_open_positions,
             "rejected_entries": rejected_entries,
             "closed_positions": closed,
             "exit_simulation": exit_simulation(closed),
