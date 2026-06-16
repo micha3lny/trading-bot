@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
+import sqlite3
+import subprocess
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 import pandas as pd
 import streamlit as st
@@ -35,6 +40,7 @@ from src.dashboard.broker_reality import (  # noqa: E402
     reconciliation_export_frames,
 )
 from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, resolve_sqlite_path  # noqa: E402
+from src.live_trading.market_calendar import previous_us_equity_trading_day  # noqa: E402
 
 
 st.set_page_config(
@@ -143,6 +149,206 @@ def display_number_or_missing(value, *, decimals: int = 6) -> str:
         return f"{float(value):.{decimals}f}"
     except Exception:
         return str(value)
+
+
+def status_badge(label: str) -> None:
+    normalized = str(label or "UNKNOWN").upper()
+    if normalized == "OK":
+        st.success(normalized)
+    elif normalized in {"UNKNOWN", "PARTIAL", "STALE"}:
+        st.warning(normalized)
+    else:
+        st.error(normalized)
+
+
+def sqlite_connect_readonly(sqlite_path: str) -> sqlite3.Connection:
+    path = Path(sqlite_path)
+    uri = f"file:{path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=5)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def sqlite_scalar(sqlite_path: str, sql: str, params: list[object] | None = None, default: object = 0) -> object:
+    try:
+        with sqlite_connect_readonly(sqlite_path) as conn:
+            row = conn.execute(sql, params or []).fetchone()
+            if row is None:
+                return default
+            return row[0]
+    except Exception:
+        return default
+
+
+def sqlite_row(sqlite_path: str, sql: str, params: list[object] | None = None) -> dict[str, object]:
+    try:
+        with sqlite_connect_readonly(sqlite_path) as conn:
+            row = conn.execute(sql, params or []).fetchone()
+            return dict(row) if row is not None else {}
+    except Exception:
+        return {}
+
+
+def parse_raw_json(value: object) -> dict[str, object]:
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(str(value))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def parquet_files_for_session(history_dir: str | Path, session_date: str, session_type: str = "RTH") -> list[Path]:
+    dt = pd.to_datetime(session_date).date()
+    root = Path(history_dir) / f"session_type={session_type.upper()}"
+    return sorted(root.glob(f"symbol=*/year={dt.year:04d}/month={dt.month:02d}/day={dt.day:02d}.parquet"))
+
+
+def infer_top100_source_date(latest_path: str | Path) -> str:
+    latest = Path(latest_path)
+    if not latest.exists():
+        return "MISSING"
+    candidates: list[tuple[float, str]] = []
+    for path in latest.parent.glob("daily_top100_*.csv"):
+        if path.name == latest.name or path.name.endswith("_diagnostics.csv"):
+            continue
+        stem = path.stem.replace("daily_top100_", "")
+        if len(stem) == 10:
+            try:
+                pd.to_datetime(stem)
+            except Exception:
+                continue
+            delta = abs(path.stat().st_mtime - latest.stat().st_mtime)
+            candidates.append((delta, stem))
+    if not candidates:
+        return "UNKNOWN"
+    return sorted(candidates, key=lambda item: item[0])[0][1]
+
+
+def load_top100_readiness(latest_path: str | Path, expected_symbols: int = 100) -> dict[str, object]:
+    path = Path(latest_path)
+    if not path.exists():
+        return {
+            "path": str(path),
+            "generated_at": "MISSING",
+            "modified_at": "MISSING",
+            "source_date": "MISSING",
+            "symbols": 0,
+            "status": "MISSING",
+        }
+    modified = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    try:
+        df = pd.read_csv(path)
+        symbols = int(df["symbol"].dropna().astype(str).str.strip().ne("").sum()) if "symbol" in df.columns else int(len(df))
+    except Exception:
+        symbols = 0
+    source_date = infer_top100_source_date(path)
+    age_hours = (datetime.now(timezone.utc) - modified).total_seconds() / 3600.0
+    status = "OK" if symbols >= expected_symbols and age_hours <= 36 else ("STALE" if symbols >= expected_symbols else "PARTIAL")
+    return {
+        "path": str(path),
+        "generated_at": modified.isoformat(),
+        "modified_at": modified.strftime("%d-%m-%Y %H:%M:%S UTC"),
+        "source_date": source_date,
+        "symbols": symbols,
+        "status": status,
+    }
+
+
+def load_eod_readiness(sqlite_path: str, session_date: str) -> dict[str, object]:
+    final = sqlite_row(
+        sqlite_path,
+        """
+        SELECT event_time, event_type, reason, raw_json
+        FROM runtime_events
+        WHERE event_type = 'EOD_FINAL_STATUS'
+          AND substr(event_time, 1, 10) <= ?
+        ORDER BY event_time DESC
+        LIMIT 1
+        """,
+        [session_date],
+    )
+    flatten = sqlite_row(
+        sqlite_path,
+        """
+        SELECT event_time, event_type, reason, raw_json
+        FROM runtime_events
+        WHERE event_type LIKE 'EOD_FLATTEN%'
+          AND substr(event_time, 1, 10) <= ?
+        ORDER BY event_time DESC
+        LIMIT 1
+        """,
+        [session_date],
+    )
+    verified = sqlite_scalar(
+        sqlite_path,
+        """
+        SELECT COUNT(*)
+        FROM runtime_events
+        WHERE event_type IN ('POSITION_VERIFIED_CLOSED', 'EOD_FLATTEN_SUCCESS')
+          AND substr(event_time, 1, 10) = ?
+        """,
+        [session_date],
+        0,
+    )
+    final_raw = parse_raw_json(final.get("raw_json"))
+    clean = final_raw.get("clean")
+    if clean is None:
+        clean = 1 if str(final.get("reason") or "").lower() in {"clean", "eod_success"} else None
+    status = "OK" if clean in {1, True, "1", "true", "True"} else ("FAILED" if final else "UNKNOWN")
+    return {
+        "last_flatten_event": flatten.get("event_type") or "UNKNOWN",
+        "last_flatten_at": flatten.get("event_time") or "UNKNOWN",
+        "last_final_status": final.get("event_type") or "UNKNOWN",
+        "last_final_at": final.get("event_time") or "UNKNOWN",
+        "positions_verified_closed": int(verified or 0),
+        "status": status,
+        "raw": final_raw,
+    }
+
+
+def post_json(url: str, payload: dict[str, object], timeout: float = 8.0) -> tuple[int, str]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urlrequest.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as response:
+            return int(response.status), response.read().decode("utf-8", errors="replace")
+    except urlerror.HTTPError as exc:
+        return int(exc.code), exc.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        return 0, repr(exc)
+
+
+def get_json(url: str, timeout: float = 5.0) -> tuple[int, str]:
+    try:
+        with urlrequest.urlopen(url, timeout=timeout) as response:
+            return int(response.status), response.read().decode("utf-8", errors="replace")
+    except urlerror.HTTPError as exc:
+        return int(exc.code), exc.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        return 0, repr(exc)
+
+
+def run_dashboard_command(command: list[str], timeout: int = 900) -> tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+        output = (proc.stdout or "") + (("\nSTDERR:\n" + proc.stderr) if proc.stderr else "")
+        return int(proc.returncode), output.strip()
+    except subprocess.TimeoutExpired as exc:
+        output = (exc.stdout or "") + (("\nSTDERR:\n" + exc.stderr) if exc.stderr else "")
+        return 124, f"COMMAND_TIMEOUT timeout_seconds={timeout}\n{output}".strip()
+    except Exception as exc:
+        return 1, repr(exc)
 
 
 def style_pnl(df: pd.DataFrame, pnl_columns: list[str]):
@@ -979,6 +1185,199 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
     )
 
 
+def render_readiness_card(title: str, value: object, status: str, details: list[str]) -> None:
+    st.markdown(f"### {title}")
+    cols = st.columns([1, 1])
+    cols[0].metric("Value", value)
+    with cols[1]:
+        status_badge(status)
+    for detail in details:
+        st.caption(detail)
+
+
+def render_operational_readiness_tab(sqlite_path: str, selected_session_date: str) -> None:
+    st.header("Operational Readiness")
+    st.caption("Pre-session/post-session operational flags. Broker portfolio is read live from IBKR; SQLite/file checks are local snapshots.")
+
+    controls = st.expander("Readiness settings", expanded=False)
+    with controls:
+        readiness_date = st.date_input(
+            "Selected/current trading date",
+            value=pd.to_datetime(selected_session_date).date(),
+            key="ops_readiness_date",
+        ).isoformat()
+        previous_session = previous_us_equity_trading_day(pd.to_datetime(readiness_date).date()).isoformat()
+        history_dir = st.text_input("Universe 1m parquet dir", value="data/history/universe_1m", key="ops_history_dir")
+        top100_latest = st.text_input("Top100 latest CSV", value="data/universe/daily_top100_latest.csv", key="ops_top100_latest")
+        expected_parquet_min = int(st.number_input("Universe parquet expected minimum", value=2000, min_value=1, step=100, key="ops_expected_parquet"))
+        expected_top100 = int(st.number_input("Top100 expected symbols", value=100, min_value=1, step=1, key="ops_expected_top100"))
+        control_api_url = st.text_input("Control API base URL", value="http://127.0.0.1:8767", key="ops_control_api_url").rstrip("/")
+        col1, col2, col3, col4 = st.columns(4)
+        host = col1.text_input("IBKR host", value="127.0.0.1", key="ops_ibkr_host")
+        port = int(col2.number_input("IBKR port", value=4002, step=1, key="ops_ibkr_port"))
+        client_id = int(col3.number_input("Client ID", value=178, step=1, key="ops_ibkr_client_id"))
+        timeout = float(col4.number_input("Timeout seconds", value=4.0, step=0.5, key="ops_ibkr_timeout"))
+
+    refresh_clicked = st.button("Refresh broker status", key="ops_refresh_broker")
+    if refresh_clicked:
+        st.cache_data.clear()
+
+    broker_portfolio = pd.DataFrame()
+    broker_status_message = "NOT_LOADED"
+    try:
+        broker_portfolio, broker_status_message = fetch_ibkr_live_portfolio(host, port, client_id, timeout)
+    except Exception as exc:
+        broker_status_message = f"ERROR {exc!r}"
+        st.error("Broker status refresh failed")
+        st.exception(exc)
+    broker_open_count = int(len(broker_portfolio)) if not broker_portfolio.empty else 0
+    broker_status = "OK" if broker_open_count == 0 and str(broker_status_message).startswith("OK") else ("UNKNOWN" if not str(broker_status_message).startswith("OK") else "FAILED")
+
+    sqlite_active = int(sqlite_scalar(sqlite_path, "SELECT COUNT(*) FROM positions WHERE active=1", default=0) or 0)
+    sqlite_status = "OK" if sqlite_active == 0 else "FAILED"
+
+    parquet_files = parquet_files_for_session(history_dir, previous_session)
+    parquet_count = len(parquet_files)
+    universe_status = "OK" if parquet_count >= expected_parquet_min else ("PARTIAL" if parquet_count > 0 else "MISSING")
+
+    top100 = load_top100_readiness(top100_latest, expected_symbols=expected_top100)
+    eod = load_eod_readiness(sqlite_path, readiness_date)
+
+    row1 = st.columns(2)
+    with row1[0]:
+        render_readiness_card(
+            "Broker open positions",
+            broker_open_count,
+            broker_status,
+            [
+                f"source=IBKR API host={host} port={port} client_id={client_id}",
+                f"message={broker_status_message}",
+                "OK means broker has zero open positions before/after session.",
+            ],
+        )
+    with row1[1]:
+        render_readiness_card(
+            "SQLite active positions",
+            sqlite_active,
+            sqlite_status,
+            [
+                "query=positions where active=1",
+                "OK means SQLite has zero active positions before next session.",
+            ],
+        )
+
+    row2 = st.columns(2)
+    with row2[0]:
+        render_readiness_card(
+            "Universe data readiness",
+            f"{parquet_count}/{expected_parquet_min}",
+            universe_status,
+            [
+                f"selected_date={readiness_date}",
+                f"previous_completed_session={previous_session}",
+                f"history_dir={history_dir}",
+            ],
+        )
+    with row2[1]:
+        render_readiness_card(
+            "Top100 readiness",
+            int(top100.get("symbols", 0) or 0),
+            str(top100.get("status") or "UNKNOWN"),
+            [
+                f"path={top100.get('path')}",
+                f"modified_at={top100.get('modified_at')}",
+                f"source_date={top100.get('source_date')}",
+            ],
+        )
+
+    row3 = st.columns(2)
+    with row3[0]:
+        render_readiness_card(
+            "EOD status",
+            eod.get("last_final_status", "UNKNOWN"),
+            str(eod.get("status") or "UNKNOWN"),
+            [
+                f"last_flatten_event={eod.get('last_flatten_event')} at={eod.get('last_flatten_at')}",
+                f"last_final_at={eod.get('last_final_at')}",
+                f"positions_verified_closed={eod.get('positions_verified_closed')}",
+            ],
+        )
+    with row3[1]:
+        health_code, health_body = get_json(f"{control_api_url}/health", timeout=3.0)
+        health_status = "OK" if health_code == 200 else "UNKNOWN"
+        render_readiness_card(
+            "Control API",
+            health_code,
+            health_status,
+            [
+                f"url={control_api_url}/health",
+                f"response={health_body[:240]}",
+            ],
+        )
+
+    with st.expander("Broker Portfolio Now", expanded=False):
+        dataframe_or_info(broker_portfolio, "No broker portfolio positions.")
+    with st.expander("Readiness raw diagnostics", expanded=False):
+        st.json(
+            {
+                "readiness_date": readiness_date,
+                "previous_completed_session": previous_session,
+                "broker_open_positions": broker_open_count,
+                "broker_status_message": broker_status_message,
+                "sqlite_active_positions": sqlite_active,
+                "parquet_count": parquet_count,
+                "top100": top100,
+                "eod": eod,
+                "health_code": health_code,
+                "health_body": health_body,
+                "sample_parquet_files": [str(p) for p in parquet_files[:10]],
+            }
+        )
+
+    st.divider()
+    st.subheader("Manual Actions")
+    st.warning("Manual actions can start long-running jobs. Use confirmation checkboxes intentionally.")
+    action_cols = st.columns(3)
+
+    with action_cols[0]:
+        confirm_collector = st.checkbox("Confirm collector re-run", key="ops_confirm_collector")
+        if st.button("Re-run universe collector for selected date", disabled=not confirm_collector, key="ops_run_collector"):
+            payload = {
+                "start_date": previous_session,
+                "end_date": previous_session,
+                "session_type": "RTH",
+                "max_tasks": 3000,
+                "max_attempts": 5,
+                "force": True,
+                "allow_live_session": False,
+            }
+            code, body = post_json(f"{control_api_url}/run_history_collector", payload, timeout=10.0)
+            st.code(f"HTTP {code}\n{body}", language="json")
+
+    with action_cols[1]:
+        confirm_top100 = st.checkbox("Confirm Top100 rebuild", key="ops_confirm_top100")
+        if st.button("Re-run Top100 build", disabled=not confirm_top100, key="ops_run_top100"):
+            command = ["bash", str(REPO_ROOT / "scripts" / "build_daily_top100_premarket.sh"), previous_session]
+            rc, output = run_dashboard_command(command, timeout=1200)
+            st.code("$ " + " ".join(command) + f"\nreturncode={rc}\n{output}", language="bash")
+
+    with action_cols[2]:
+        confirm_reconciliation = st.checkbox("Confirm reconciliation refresh", key="ops_confirm_reconciliation")
+        if st.button("Re-run reconciliation", disabled=not confirm_reconciliation, key="ops_run_reconciliation"):
+            command = [
+                sys.executable,
+                "-m",
+                "src.live_trading.order_lifecycle.reconciliation",
+                "--json",
+            ]
+            rc, output = run_dashboard_command(command, timeout=120)
+            code, body = get_json(f"{control_api_url}/health", timeout=5.0)
+            st.code(
+                "$ " + " ".join(command) + f"\nreturncode={rc}\n{output}\n\nCONTROL_API_HEALTH HTTP {code}\n{body}",
+                language="json",
+            )
+
+
 def main() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
     st.title("Runtime Trading Dashboard")
@@ -1005,11 +1404,17 @@ def main() -> None:
         include_reconstructed = st.toggle("Show execution-reconstructed trades", value=False, disabled=True)
         auto_refresh = st.toggle("Auto refresh current session", value=False)
 
-    runtime_tab, broker_tab = st.tabs(["Runtime Dashboard", "Broker Reality / IBKR Reconciliation"])
+    runtime_tab, broker_tab, readiness_tab = st.tabs([
+        "Runtime Dashboard",
+        "Broker Reality / IBKR Reconciliation",
+        "Operational Readiness",
+    ])
     with runtime_tab:
         render_runtime_tab(sqlite_path, start_date, end_date, strategy, include_reconstructed, auto_refresh)
     with broker_tab:
         render_broker_reality_tab(sqlite_path)
+    with readiness_tab:
+        render_operational_readiness_tab(sqlite_path, end_date)
 
     if auto_refresh and start_date == end_date == utc_today():
         st.caption("Auto refresh is intentionally disabled on Runtime Dashboard to avoid reading partial reducer state.")
