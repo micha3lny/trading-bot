@@ -228,14 +228,20 @@ def infer_top100_source_date(latest_path: str | Path) -> str:
     return sorted(candidates, key=lambda item: item[0])[0][1]
 
 
-def load_top100_readiness(latest_path: str | Path, expected_symbols: int = 100) -> dict[str, object]:
+def load_top100_readiness(
+    latest_path: str | Path,
+    *,
+    expected_symbols: int = 100,
+    expected_source_session_date: str | None = None,
+) -> dict[str, object]:
     path = Path(latest_path)
     if not path.exists():
         return {
             "path": str(path),
             "generated_at": "MISSING",
             "modified_at": "MISSING",
-            "source_date": "MISSING",
+            "top100_source_session_date": "MISSING",
+            "expected_source_session_date": expected_source_session_date or "UNKNOWN",
             "symbols": 0,
             "status": "MISSING",
         }
@@ -247,14 +253,28 @@ def load_top100_readiness(latest_path: str | Path, expected_symbols: int = 100) 
         symbols = 0
     source_date = infer_top100_source_date(path)
     age_hours = (datetime.now(timezone.utc) - modified).total_seconds() / 3600.0
-    status = "OK" if symbols >= expected_symbols and age_hours <= 36 else ("STALE" if symbols >= expected_symbols else "PARTIAL")
+    has_enough_symbols = symbols >= expected_symbols
+    source_matches_expected = (
+        not expected_source_session_date
+        or source_date == expected_source_session_date
+    )
+    if not has_enough_symbols:
+        status = "PARTIAL"
+    elif not source_matches_expected:
+        status = "STALE"
+    elif age_hours > 36:
+        status = "STALE"
+    else:
+        status = "OK"
     return {
         "path": str(path),
         "generated_at": modified.isoformat(),
         "modified_at": modified.strftime("%d-%m-%Y %H:%M:%S UTC"),
-        "source_date": source_date,
+        "top100_source_session_date": source_date,
+        "expected_source_session_date": expected_source_session_date or "UNKNOWN",
         "symbols": symbols,
         "status": status,
+        "source_matches_expected": source_matches_expected,
     }
 
 
@@ -1240,8 +1260,31 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
     parquet_count = len(parquet_files)
     universe_status = "OK" if parquet_count >= expected_parquet_min else ("PARTIAL" if parquet_count > 0 else "MISSING")
 
-    top100 = load_top100_readiness(top100_latest, expected_symbols=expected_top100)
+    top100 = load_top100_readiness(
+        top100_latest,
+        expected_symbols=expected_top100,
+        expected_source_session_date=previous_session,
+    )
     eod = load_eod_readiness(sqlite_path, readiness_date)
+    ready_for_next_session = all(
+        status == "OK"
+        for status in [
+            broker_status,
+            sqlite_status,
+            universe_status,
+            str(top100.get("status") or "UNKNOWN"),
+            str(eod.get("status") or "UNKNOWN"),
+        ]
+    )
+
+    st.subheader("Ready for Next Session")
+    ready_cols = st.columns([1, 3])
+    with ready_cols[0]:
+        status_badge("OK" if ready_for_next_session else "FAILED")
+    ready_cols[1].caption(
+        "Requires broker open positions=0, SQLite active positions=0, universe parquet OK, "
+        "Top100 source session matching previous completed session, and EOD OK."
+    )
 
     row1 = st.columns(2)
     with row1[0]:
@@ -1286,7 +1329,8 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
             [
                 f"path={top100.get('path')}",
                 f"modified_at={top100.get('modified_at')}",
-                f"source_date={top100.get('source_date')}",
+                f"top100_source_session_date={top100.get('top100_source_session_date')}",
+                f"expected_source_session_date={top100.get('expected_source_session_date')}",
             ],
         )
 
