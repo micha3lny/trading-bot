@@ -183,6 +183,7 @@ class SQLiteRuntimeStore:
         self.conn = sqlite3.connect(str(self.path))
         self.conn.row_factory = sqlite3.Row
         self._transaction_depth = 0
+        self._broker_net_positions: dict[str, float] | None = None
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
@@ -191,6 +192,16 @@ class SQLiteRuntimeStore:
 
     def close(self) -> None:
         self.conn.close()
+
+    def set_broker_net_positions(self, positions: dict[str, float] | None) -> None:
+        if positions is None:
+            self._broker_net_positions = None
+            return
+        self._broker_net_positions = {
+            str(symbol or "").upper().strip(): float(quantity or 0.0)
+            for symbol, quantity in positions.items()
+            if str(symbol or "").strip()
+        }
 
     @contextmanager
     def transaction(self):
@@ -739,7 +750,11 @@ class SQLiteRuntimeStore:
             symbol = str(execution.get("symbol") or "").upper().strip()
             if not symbol:
                 return
-            self.rebuild_symbol_trade_state(symbol, allow_historical_open_lots=False)
+            self.rebuild_symbol_trade_state(
+                symbol,
+                allow_historical_open_lots=False,
+                broker_net_positions=self._broker_net_positions,
+            )
         except Exception as exc:
             line = f"{utc_now_iso()} SQLITE_WRITE_FAILED method=rebuild_symbol_trade_state error={exc!r}"
             print(line, flush=True)

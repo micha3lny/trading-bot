@@ -4948,6 +4948,11 @@ def main() -> int:
 
         startup_broker_rows = ibkr_portfolio_position_rows(ib)
         startup_broker_qty_by_symbol = {row["symbol"]: float(row["quantity"]) for row in startup_broker_rows}
+        safe_sqlite_call(
+            getattr(recorder, "sqlite_store", None),
+            "set_broker_net_positions",
+            startup_broker_qty_by_symbol,
+        )
         restored = restore_managed_positions(
             recorder,
             contract_by_symbol,
@@ -5004,6 +5009,11 @@ def main() -> int:
         )
         post_startup_broker_rows = ibkr_portfolio_position_rows(ib)
         post_startup_broker_qty_by_symbol = {row["symbol"]: float(row["quantity"]) for row in post_startup_broker_rows}
+        safe_sqlite_call(
+            getattr(recorder, "sqlite_store", None),
+            "set_broker_net_positions",
+            post_startup_broker_qty_by_symbol,
+        )
         sqlite_rebuild_result = safe_sqlite_call(
             getattr(recorder, "sqlite_store", None),
             "rebuild_positions_from_executions",
@@ -5551,6 +5561,11 @@ def main() -> int:
             if loop_now - last_portfolio_record >= args.portfolio_interval_seconds:
                 try:
                     latest_portfolio_rows = ibkr_portfolio_position_rows(ib)
+                    safe_sqlite_call(
+                        getattr(recorder, "sqlite_store", None),
+                        "set_broker_net_positions",
+                        {row["symbol"]: float(row["quantity"]) for row in latest_portfolio_rows},
+                    )
                     record_account_snapshot(ib, recorder)
                     new_fills = record_recent_fills(ib, recorder, seen_fills)
                     lifecycle_fills_updated = enrich_lifecycle_with_fills(recorder)

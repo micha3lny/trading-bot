@@ -471,6 +471,24 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_upsert_execution_respects_store_broker_flat_target(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.set_broker_net_positions({})
+                store.upsert_execution({"execution_id": "B_FLAT_TARGET", "strategy_name": "v67", "session_date": today, "symbol": "FLATX", "side": "BOT", "quantity": 4, "price": 10, "executed_at": f"{today}T13:30:00+00:00"})
+
+                active = store.query("SELECT * FROM positions WHERE symbol = 'FLATX' AND COALESCE(active, 0) = 1")
+                suppressed = store.query("SELECT * FROM positions WHERE symbol = 'FLATX' AND status = 'BROKER_UNCONFIRMED_OPEN_LOT'")
+
+                self.assertEqual(active, [])
+                self.assertEqual(len(suppressed), 1)
+                self.assertEqual(suppressed[0]["active"], 0)
+                self.assertAlmostEqual(suppressed[0]["quantity"], 4)
+            finally:
+                store.close()
+
     def test_repair_rebuild_clears_active_position_without_execution_net(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
