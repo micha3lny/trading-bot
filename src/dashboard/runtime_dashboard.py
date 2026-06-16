@@ -610,7 +610,8 @@ def render_closed_positions(df: pd.DataFrame) -> None:
         hide_index=True,
     )
     debug_cols = [
-        "trade_id", "symbol", "entry_execution_count", "exit_execution_count",
+        "trade_id", "symbol", "entry_execution_id", "exit_execution_id", "source",
+        "entry_execution_count", "exit_execution_count",
         "confirmed_commission_execution_count", "expected_commission_execution_count",
         "peak_source", "peak_match_quality", "commission_source_detail", "closed_source", "data_quality",
     ]
@@ -621,6 +622,9 @@ def render_closed_positions(df: pd.DataFrame) -> None:
                 columns={
                     "trade_id": "Trade ID",
                     "symbol": "Symbol",
+                    "entry_execution_id": "Entry Execution ID",
+                    "exit_execution_id": "Exit Execution ID",
+                    "source": "Source",
                     "entry_execution_count": "Entry Execs",
                     "exit_execution_count": "Exit Execs",
                     "confirmed_commission_execution_count": "Confirmed Comm Execs",

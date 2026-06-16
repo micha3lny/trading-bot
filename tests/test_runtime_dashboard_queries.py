@@ -467,6 +467,47 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(closed["confirmed_commission_execution_count"], 0)
             self.assertIn("matched_by=trades_table", closed["commission_source_detail"])
 
+    def test_fifo_lots_with_same_prices_are_not_deduped_by_dashboard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            for trade_id, qty, buy_exec, sell_exec in [
+                ("reconstructed:2026-06-16:2026-06-16:RXT:B_RXT_1:S_RXT_1", 58, "B_RXT_1", "S_RXT_1"),
+                ("reconstructed:2026-06-16:2026-06-16:RXT:B_RXT_2:S_RXT_1", 42, "B_RXT_2", "S_RXT_1"),
+                ("reconstructed:2026-06-16:2026-06-16:RXT:B_RXT_3:S_RXT_2", 58, "B_RXT_3", "S_RXT_2"),
+            ]:
+                store.upsert_trade({
+                    "trade_id": trade_id,
+                    "session_date": "2026-06-16",
+                    "strategy_name": "unknown",
+                    "symbol": "RXT",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-06-16T13:35:00+00:00",
+                    "exit_fill_time": "2026-06-16T14:10:00+00:00",
+                    "entry_price": 1.25,
+                    "exit_price": 1.30,
+                    "quantity": qty,
+                    "gross_pnl": round((1.30 - 1.25) * qty, 6),
+                    "commission": 0.0,
+                    "net_pnl": round((1.30 - 1.25) * qty, 6),
+                    "raw_json": {
+                        "reconstruction_source": "sqlite_execution_reducer",
+                        "buy_execution_id": buy_exec,
+                        "sell_execution_id": sell_exec,
+                    },
+                })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-16", "2026-06-16"), "All")
+            closed = snapshot["closed_positions"]
+
+            self.assertEqual(len(closed), 3)
+            self.assertEqual(closed["symbol"].tolist(), ["RXT", "RXT", "RXT"])
+            self.assertAlmostEqual(closed["qty"].sum(), 158.0)
+            self.assertEqual(set(closed["entry_execution_id"]), {"B_RXT_1", "B_RXT_2", "B_RXT_3"})
+            self.assertEqual(set(closed["exit_execution_id"]), {"S_RXT_1", "S_RXT_2"})
+            self.assertEqual(snapshot["summary"]["closed_trades"], 3)
+
     def test_closed_trade_times_fall_back_to_execution_recorded_at(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"

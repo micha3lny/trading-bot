@@ -64,6 +64,18 @@ def parse_raw_json(value: Any) -> dict[str, Any]:
         return {}
 
 
+def raw_trade_execution_id(raw: dict[str, Any], side: str) -> str:
+    if side == "entry":
+        keys = ("buy_execution_id", "entry_execution_id", "bot_execution_id")
+    else:
+        keys = ("sell_execution_id", "exit_execution_id", "sld_execution_id")
+    for key in keys:
+        value = raw.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
 def raw_bool(raw: dict[str, Any], *keys: str) -> bool:
     for key in keys:
         value = raw.get(key)
@@ -809,6 +821,9 @@ def closed_from_trades(
     confirmed_commission_counts: list[int] = []
     expected_commission_counts: list[int] = []
     commission_source_details: list[str] = []
+    entry_execution_ids: list[str] = []
+    exit_execution_ids: list[str] = []
+    trade_sources: list[str] = []
     for row in out.to_dict("records"):
         buy_rows: list[dict[str, Any]] = []
         sell_rows: list[dict[str, Any]] = []
@@ -822,6 +837,9 @@ def closed_from_trades(
             flags.add("MISSING_EXIT")
         enriched_row = {**row, "entry_time": entry_time, "exit_time": exit_time}
         raw = parse_raw_json(row.get("raw_json"))
+        entry_execution_id = raw_trade_execution_id(raw, "entry")
+        exit_execution_id = raw_trade_execution_id(raw, "exit")
+        trade_source = str(raw.get("reconstruction_source") or raw.get("source") or "trades_table")
         persisted_commission = to_float(row.get("persisted_commission"), None)
         commission = abs(float(persisted_commission)) if persisted_commission is not None else 0.0
         raw_commission_status = str(raw.get("commission_status") or raw.get("commission_source") or "").upper()
@@ -851,6 +869,9 @@ def closed_from_trades(
         expected_count = int(raw.get("expected_commission_execution_count") or raw.get("execution_count") or 0)
         expected_commission_counts.append(expected_count)
         commission_source_details.append(f"matched_by={matched_by} persisted_commission={commission} ibkr={confirmed_count}")
+        entry_execution_ids.append(entry_execution_id)
+        exit_execution_ids.append(exit_execution_id)
+        trade_sources.append(trade_source)
     out["ibkr_commission"] = commissions
     out["commission_status"] = commission_statuses
     out["data_quality"] = data_quality
@@ -875,6 +896,9 @@ def closed_from_trades(
     out["confirmed_commission_execution_count"] = confirmed_commission_counts
     out["expected_commission_execution_count"] = expected_commission_counts
     out["commission_source_detail"] = commission_source_details
+    out["entry_execution_id"] = entry_execution_ids
+    out["exit_execution_id"] = exit_execution_ids
+    out["source"] = trade_sources
     out["closed_source"] = "trades"
     out["gross"] = pd.to_numeric(out["gross"], errors="coerce").fillna(0.0)
     out["buy"] = pd.to_numeric(out["buy"], errors="coerce").fillna(0.0)
@@ -894,11 +918,30 @@ def closed_from_trades(
         | out["raw_json"].fillna("").astype(str).str.contains("sqlite_execution_reducer|executions_pair", regex=True)
     )
     out["_is_reconstructed_trade"] = reconstructed_mask.astype(int)
-    dedupe_cols = ["exit_date", "symbol", "qty", "buy", "sell"]
+    exec_pair_key = out["entry_execution_id"].fillna("").astype(str) + "|" + out["exit_execution_id"].fillna("").astype(str)
+    out["_closed_identity"] = out["trade_id"].fillna("").astype(str)
+    out.loc[exec_pair_key.str.strip("|") != "", "_closed_identity"] = "execpair:" + exec_pair_key
+    fallback_identity = (
+        "fallback:"
+        + out["exit_date"].fillna("").astype(str)
+        + "|"
+        + out["symbol"].fillna("").astype(str)
+        + "|"
+        + out["qty"].fillna(0).astype(str)
+        + "|"
+        + out["buy"].fillna(0).astype(str)
+        + "|"
+        + out["sell"].fillna(0).astype(str)
+        + "|"
+        + out["entry_time"].fillna("").astype(str)
+        + "|"
+        + out["exit_time"].fillna("").astype(str)
+    )
+    out.loc[out["_closed_identity"].str.strip() == "", "_closed_identity"] = fallback_identity
     out = (
         out.sort_values(["_is_reconstructed_trade", "updated_at"], na_position="last")
-        .drop_duplicates(subset=dedupe_cols, keep="first")
-        .drop(columns=["_is_reconstructed_trade"])
+        .drop_duplicates(subset=["_closed_identity"], keep="first")
+        .drop(columns=["_is_reconstructed_trade", "_closed_identity"])
     )
     return out[
         [
@@ -908,7 +951,7 @@ def closed_from_trades(
             "entry_date", "exit_date", "carried_closed_today",
             "entry_execution_count", "exit_execution_count", "confirmed_commission_execution_count",
             "expected_commission_execution_count", "peak_source", "peak_match_quality", "commission_source_detail",
-            "closed_source", "updated_at", "trade_reduction_version",
+            "entry_execution_id", "exit_execution_id", "source", "closed_source", "updated_at", "trade_reduction_version",
         ]
     ]
 

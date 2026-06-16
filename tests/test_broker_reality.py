@@ -13,6 +13,7 @@ from src.dashboard.broker_reality import (
     compare_closed_trades,
     ensure_asyncio_event_loop,
     load_sqlite_executions,
+    load_sqlite_closed_trades,
     match_executions,
     normalize_execution_record,
     parse_ibkr_activity_csv,
@@ -259,6 +260,41 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
             rows = load_sqlite_executions(db, "2026-06-15")
 
         self.assertEqual(rows["execution_id"].tolist(), ["TODAY"])
+
+    def test_sqlite_closed_trades_exposes_execution_pair_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_trade({
+                    "trade_id": "reconstructed:2026-06-16:2026-06-16:RXT:B1:S1",
+                    "session_date": "2026-06-16",
+                    "strategy_name": "unknown",
+                    "symbol": "RXT",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-06-16T13:35:00+00:00",
+                    "exit_fill_time": "2026-06-16T14:10:00+00:00",
+                    "entry_price": 1.25,
+                    "exit_price": 1.30,
+                    "quantity": 58,
+                    "gross_pnl": 2.9,
+                    "commission": 0.7,
+                    "net_pnl": 2.2,
+                    "raw_json": {
+                        "reconstruction_source": "sqlite_execution_reducer",
+                        "buy_execution_id": "B1",
+                        "sell_execution_id": "S1",
+                    },
+                })
+            finally:
+                store.close()
+
+            rows = load_sqlite_closed_trades(db, "2026-06-16")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows.iloc[0]["entry_execution_id"], "B1")
+        self.assertEqual(rows.iloc[0]["exit_execution_id"], "S1")
+        self.assertEqual(rows.iloc[0]["source"], "sqlite_execution_reducer")
 
 
 if __name__ == "__main__":

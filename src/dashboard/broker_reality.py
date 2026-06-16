@@ -299,6 +299,20 @@ def load_sqlite_closed_trades(sqlite_path: str | Path, selected_date: str) -> pd
         conn.close()
     out: list[dict[str, Any]] = []
     for row in rows.to_dict("records"):
+        raw = parse_raw_json(row.get("raw_json"))
+        entry_execution_id = str(
+            raw.get("buy_execution_id")
+            or raw.get("entry_execution_id")
+            or raw.get("bot_execution_id")
+            or ""
+        )
+        exit_execution_id = str(
+            raw.get("sell_execution_id")
+            or raw.get("exit_execution_id")
+            or raw.get("sld_execution_id")
+            or ""
+        )
+        source = str(raw.get("reconstruction_source") or raw.get("source") or "sqlite_trades")
         out.append(
             {
                 "symbol": str(row.get("symbol") or "").upper(),
@@ -311,9 +325,9 @@ def load_sqlite_closed_trades(sqlite_path: str | Path, selected_date: str) -> pd
                 "realized_pnl": to_float(row.get("gross_pnl"), 0.0) or 0.0,
                 "commission": abs(to_float(row.get("commission"), 0.0) or 0.0),
                 "net_pnl": to_float(row.get("net_pnl"), 0.0) or 0.0,
-                "source": "sqlite_trades",
-                "entry_execution_id": "",
-                "exit_execution_id": str(row.get("trade_id") or ""),
+                "source": source,
+                "entry_execution_id": entry_execution_id,
+                "exit_execution_id": exit_execution_id,
             }
         )
     return pd.DataFrame(out, columns=BROKER_CLOSED_TRADE_COLUMNS)

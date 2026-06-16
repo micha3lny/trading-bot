@@ -1152,11 +1152,24 @@ class SQLiteRuntimeStore:
                     data.get("exit_price") or 0.0,
                 ],
             )
+            current_raw = parse_jsonish(data.get("raw_json"))
+            current_buy_exec = str(current_raw.get("buy_execution_id") or "")
+            current_sell_exec = str(current_raw.get("sell_execution_id") or "")
             for duplicate in duplicates:
                 duplicate_id = str(duplicate.get("trade_id") or "")
                 duplicate_raw = parse_jsonish(duplicate.get("raw_json"))
                 source = str(duplicate_raw.get("reconstruction_source") or "").lower()
                 if not duplicate_id.startswith("reconstructed:") and "execution" not in source:
+                    continue
+                duplicate_buy_exec = str(duplicate_raw.get("buy_execution_id") or "")
+                duplicate_sell_exec = str(duplicate_raw.get("sell_execution_id") or "")
+                if (
+                    current_buy_exec
+                    and current_sell_exec
+                    and duplicate_buy_exec
+                    and duplicate_sell_exec
+                    and (duplicate_buy_exec, duplicate_sell_exec) != (current_buy_exec, current_sell_exec)
+                ):
                     continue
                 self.execute("UPDATE executions SET trade_id = ? WHERE trade_id = ?", (trade_id, duplicate_id))
                 self.execute("DELETE FROM trades WHERE trade_id = ?", (duplicate_id,))
