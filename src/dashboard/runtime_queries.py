@@ -889,12 +889,30 @@ def closed_from_trades(
     out["exit_date"] = [date_part(exit_time) or date_part(closed_at) or str(session_date or "") for exit_time, closed_at, session_date in zip(out["exit_time"], out["closed_at"], out["session_date"])]
     carried_flags: list[bool] = []
     enriched_quality: list[str] = []
-    for quality, entry_date, exit_date in zip(out["data_quality"], out["entry_date"], out["exit_date"]):
+    runtime_pnl_trusted: list[bool] = []
+    untrusted_reasons: list[str] = []
+    for quality, entry_date, exit_date, source in zip(out["data_quality"], out["entry_date"], out["exit_date"], trade_sources):
         carried = bool(entry_date and exit_date and entry_date < exit_date and window.start_date <= exit_date <= window.end_date)
+        reconstructed_source = str(source or "").lower() in {
+            "sqlite_execution_reducer",
+            "executions_pair_repair",
+            "executions_pair",
+            "reconstructed_executions",
+            "carried_recovered",
+        }
+        untrusted_carry_basis = carried and reconstructed_source
         carried_flags.append(carried)
-        enriched_quality.append(append_quality(quality, "CARRIED_POSITION_CLOSED_TODAY") if carried else str(quality or "OK"))
+        if carried:
+            quality = append_quality(quality, "CARRIED_POSITION_CLOSED_TODAY")
+        if untrusted_carry_basis:
+            quality = append_quality(quality, "CARRY_BASIS_UNVERIFIED")
+        enriched_quality.append(str(quality or "OK"))
+        runtime_pnl_trusted.append(not untrusted_carry_basis)
+        untrusted_reasons.append("carry_basis_unverified" if untrusted_carry_basis else "")
     out["data_quality"] = enriched_quality
     out["carried_closed_today"] = carried_flags
+    out["runtime_pnl_trusted"] = runtime_pnl_trusted
+    out["runtime_pnl_untrusted_reason"] = untrusted_reasons
     out["peak_pct"] = peak_values
     out["peak_source"] = peak_sources
     out["peak_match_quality"] = peak_match_qualities
@@ -915,6 +933,12 @@ def closed_from_trades(
     out["peak_pct"] = pd.to_numeric(out["peak_pct"], errors="coerce")
     persisted_net = pd.to_numeric(out.get("persisted_net_pnl"), errors="coerce")
     out["net_actual"] = persisted_net.fillna(out["gross"] - out["ibkr_commission"])
+    untrusted_mask = ~pd.Series(out["runtime_pnl_trusted"]).fillna(True).astype(bool)
+    if untrusted_mask.any():
+        out.loc[untrusted_mask, "raw_sqlite_gross"] = out.loc[untrusted_mask, "gross"]
+        out.loc[untrusted_mask, "raw_sqlite_net_actual"] = out.loc[untrusted_mask, "net_actual"]
+        out.loc[untrusted_mask, "gross"] = pd.NA
+        out.loc[untrusted_mask, "net_actual"] = pd.NA
     denominator = (out["buy"] * out["qty"].abs()).replace(0, pd.NA)
     out["net_pct"] = ((out["net_actual"] / denominator) * 100.0).fillna(0.0)
     out["pnl_pct"] = out["net_pct"]
@@ -957,6 +981,7 @@ def closed_from_trades(
             "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
             "entry_time", "exit_time", "commission_status", "data_quality", "session_date",
             "entry_date", "exit_date", "carried_closed_today",
+            "runtime_pnl_trusted", "runtime_pnl_untrusted_reason",
             "entry_execution_count", "exit_execution_count", "confirmed_commission_execution_count",
             "expected_commission_execution_count", "peak_source", "peak_match_quality", "commission_source_detail",
             "entry_execution_id", "exit_execution_id", "source", "closed_source", "updated_at", "trade_reduction_version",
@@ -2012,24 +2037,27 @@ def load_position_row_diagnostics(
 
 
 def build_summary(open_positions: pd.DataFrame, closed_positions: pd.DataFrame) -> dict[str, float]:
-    gross = float(closed_positions["gross"].fillna(0).sum()) if not closed_positions.empty else 0.0
-    commissions = float(closed_positions["ibkr_commission"].fillna(0).sum()) if not closed_positions.empty else 0.0
-    net = float(closed_positions["net_actual"].fillna(0).sum()) if not closed_positions.empty else 0.0
+    trusted_closed = closed_positions
+    if not closed_positions.empty and "runtime_pnl_trusted" in closed_positions.columns:
+        trusted_closed = closed_positions[closed_positions["runtime_pnl_trusted"].fillna(True).astype(bool)]
+    gross = float(trusted_closed["gross"].fillna(0).sum()) if not trusted_closed.empty else 0.0
+    commissions = float(trusted_closed["ibkr_commission"].fillna(0).sum()) if not trusted_closed.empty else 0.0
+    net = float(trusted_closed["net_actual"].fillna(0).sum()) if not trusted_closed.empty else 0.0
     open_upnl = float(pd.to_numeric(open_positions["upnl"], errors="coerce").fillna(0).sum()) if not open_positions.empty else 0.0
-    wins = closed_positions[closed_positions["gross"].fillna(0) > 0] if not closed_positions.empty else closed_positions
-    win_rate = (len(wins) / len(closed_positions) * 100.0) if len(closed_positions) else 0.0
-    peak_values = pd.to_numeric(closed_positions["peak_pct"], errors="coerce") if not closed_positions.empty else pd.Series(dtype=float)
-    giveback_values = pd.to_numeric(closed_positions["drop_from_peak_pct"], errors="coerce") if not closed_positions.empty else pd.Series(dtype=float)
+    wins = trusted_closed[trusted_closed["gross"].fillna(0) > 0] if not trusted_closed.empty else trusted_closed
+    win_rate = (len(wins) / len(trusted_closed) * 100.0) if len(trusted_closed) else 0.0
+    peak_values = pd.to_numeric(trusted_closed["peak_pct"], errors="coerce") if not trusted_closed.empty else pd.Series(dtype=float)
+    giveback_values = pd.to_numeric(trusted_closed["drop_from_peak_pct"], errors="coerce") if not trusted_closed.empty else pd.Series(dtype=float)
     return {
         "gross_pnl": gross,
         "net_actual_pnl": net,
         "open_upnl": open_upnl,
         "total_pnl": net + open_upnl,
         "win_rate": win_rate,
-        "avg_peak": float(peak_values.fillna(0).mean()) if not closed_positions.empty else 0.0,
-        "avg_giveback": float(giveback_values.fillna(0).mean()) if not closed_positions.empty else 0.0,
+        "avg_peak": float(peak_values.fillna(0).mean()) if not trusted_closed.empty else 0.0,
+        "avg_giveback": float(giveback_values.fillna(0).mean()) if not trusted_closed.empty else 0.0,
         "commissions": commissions,
-        "expectancy": gross / len(closed_positions) if len(closed_positions) else 0.0,
+        "expectancy": gross / len(trusted_closed) if len(trusted_closed) else 0.0,
         "closed_trades": float(len(closed_positions)),
         "open_trades": float(len(open_positions)),
     }
@@ -2164,6 +2192,13 @@ def load_dashboard_snapshot(
             diagnostics["oldest_orphan_stale_position_age_days"] = 0.0
             diagnostics["cleanup_recommendation"] = ""
         diagnostics["closed_trades_count"] = int(len(closed))
+        if not closed.empty and "runtime_pnl_trusted" in closed.columns:
+            untrusted_closed = closed[~closed["runtime_pnl_trusted"].fillna(True).astype(bool)]
+            diagnostics["untrusted_carry_closed_count"] = int(len(untrusted_closed))
+            diagnostics["untrusted_carry_closed_symbols"] = ",".join(sorted({str(x).upper() for x in untrusted_closed["symbol"].dropna().tolist()}))
+        else:
+            diagnostics["untrusted_carry_closed_count"] = 0
+            diagnostics["untrusted_carry_closed_symbols"] = ""
         raw_closed_ids = {
             str(row.get("trade_id") or "")
             for row in raw_closed_rows.to_dict("records")

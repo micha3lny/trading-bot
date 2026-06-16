@@ -736,6 +736,11 @@ def render_diagnostics(diag: dict) -> None:
         st.warning(f"Runtime dropped open symbols: {diag.get('dropped_symbols', '')}")
     if int(diag.get("dropped_closed_trade_count", 0) or 0) > 0:
         st.warning(f"Runtime dropped closed trade IDs: {diag.get('dropped_closed_trade_ids', '')}")
+    if int(diag.get("untrusted_carry_closed_count", 0) or 0) > 0:
+        st.warning(
+            "Runtime excluded unverified carry closed trades from PnL. "
+            f"symbols={diag.get('untrusted_carry_closed_symbols', '')}. Broker Reality is source of truth for these rows."
+        )
     cols = st.columns(8)
     labels = [
         ("Orphans", "orphans"),
@@ -766,13 +771,14 @@ def render_diagnostics(diag: dict) -> None:
     ]
     for col, (label, key) in zip(pos_cols, position_labels):
         col.metric(label, int(diag.get(key, 0)))
-    closed_cols = st.columns(7)
+    closed_cols = st.columns(8)
     closed_labels = [
         ("Raw Closed", "raw_closed_trade_count"),
         ("Persisted Closed", "persisted_closed_trades_count"),
         ("Reconstructed Pairs", "reconstructed_execution_pairs_count"),
         ("Displayed Closed", "displayed_closed_trades_count"),
         ("Dropped Closed", "dropped_closed_trade_count"),
+        ("Untrusted Carry", "untrusted_carry_closed_count"),
         ("Carried Closed Today", "carried_closed_today_count"),
     ]
     for col, (label, key) in zip(closed_cols, closed_labels):

@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pandas as pd
+
 from src.dashboard.runtime_queries import DateWindow, list_sessions, list_strategies, load_dashboard_snapshot, load_diagnostics, utc_today
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
@@ -2007,6 +2009,48 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["diagnostics"]["displayed_closed_trade_count"], 1)
             self.assertEqual(snapshot["diagnostics"]["dropped_closed_trade_count"], 0)
             self.assertEqual(snapshot["diagnostics"]["dropped_closed_trade_ids"], "")
+
+    def test_reconstructed_carry_closed_trade_does_not_inflate_runtime_pnl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_trade({
+                    "trade_id": "reconstructed:2026-05-13:2026-06-16:OUST:B_OLD:S_TODAY",
+                    "strategy_name": "v67",
+                    "session_date": "2026-05-13",
+                    "symbol": "OUST",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-05-13T13:30:00+00:00",
+                    "exit_fill_time": "2026-06-16T14:45:00+00:00",
+                    "closed_at": "2026-06-16T14:45:00+00:00",
+                    "entry_price": 1.00,
+                    "exit_price": 12.487727,
+                    "quantity": 22,
+                    "gross_pnl": 252.73,
+                    "commission": 1.025094,
+                    "net_pnl": 251.704906,
+                    "raw_json": {
+                        "reconstruction_source": "sqlite_execution_reducer",
+                        "buy_execution_id": "B_OLD",
+                        "sell_execution_id": "S_TODAY",
+                    },
+                })
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-16", "2026-06-16"), "v67")
+
+            self.assertEqual(snapshot["summary"]["closed_trades"], 1)
+            self.assertAlmostEqual(snapshot["summary"]["gross_pnl"], 0.0)
+            self.assertAlmostEqual(snapshot["summary"]["net_actual_pnl"], 0.0)
+            row = snapshot["closed_positions"].iloc[0]
+            self.assertFalse(bool(row["runtime_pnl_trusted"]))
+            self.assertIn("CARRY_BASIS_UNVERIFIED", row["data_quality"])
+            self.assertTrue(pd.isna(row["gross"]))
+            self.assertTrue(pd.isna(row["net_actual"]))
+            self.assertEqual(snapshot["diagnostics"]["untrusted_carry_closed_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["untrusted_carry_closed_symbols"], "OUST")
 
 
 if __name__ == "__main__":
