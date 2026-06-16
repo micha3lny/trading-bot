@@ -5,6 +5,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -76,19 +77,20 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 store.close()
 
     def test_bot_fill_creates_open_position(self) -> None:
+        today = date.today().isoformat()
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
             try:
                 store.upsert_execution({
                     "execution_id": "B_OPEN",
                     "strategy_name": "v67",
-                    "session_date": "2026-05-29",
+                    "session_date": today,
                     "symbol": "AKTX",
                     "side": "BOT",
                     "quantity": 5,
                     "price": 10.0,
-                    "executed_at": "2026-05-29T13:35:00+00:00",
-                    "recorded_at": "2026-05-29T13:35:00+00:00",
+                    "executed_at": f"{today}T13:35:00+00:00",
+                    "recorded_at": f"{today}T13:35:00+00:00",
                     "commission": 0.35,
                     "commission_source": "ibkr",
                 })
@@ -367,6 +369,90 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 self.assertEqual(active, [])
                 self.assertEqual(len(stale), 1)
                 self.assertEqual(stale[0]["active"], 0)
+            finally:
+                store.close()
+
+    def test_full_close_sets_position_inactive(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B_FULL", "strategy_name": "v67", "session_date": today, "symbol": "FULL", "side": "BOT", "quantity": 10, "price": 5, "executed_at": f"{today}T13:30:00+00:00"})
+                store.upsert_execution({"execution_id": "S_FULL", "strategy_name": "v67", "session_date": today, "symbol": "FULL", "side": "SLD", "quantity": 10, "price": 6, "executed_at": f"{today}T13:45:00+00:00"})
+
+                active = store.query("SELECT * FROM positions WHERE symbol = 'FULL' AND COALESCE(active, 0) = 1")
+                closed = store.query("SELECT * FROM trades WHERE symbol = 'FULL' AND status = 'CLOSED'")
+
+                self.assertEqual(active, [])
+                self.assertEqual(len(closed), 1)
+                self.assertAlmostEqual(closed[0]["quantity"], 10)
+            finally:
+                store.close()
+
+    def test_partial_close_reduces_active_quantity(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B_PART", "strategy_name": "v67", "session_date": today, "symbol": "PART", "side": "BOT", "quantity": 100, "price": 10, "executed_at": f"{today}T13:30:00+00:00"})
+                store.upsert_execution({"execution_id": "S_PART", "strategy_name": "v67", "session_date": today, "symbol": "PART", "side": "SLD", "quantity": 40, "price": 11, "executed_at": f"{today}T13:45:00+00:00"})
+
+                active = store.query("SELECT * FROM positions WHERE symbol = 'PART' AND COALESCE(active, 0) = 1")
+                closed = store.query("SELECT * FROM trades WHERE symbol = 'PART' AND status = 'CLOSED'")
+
+                self.assertEqual(len(active), 1)
+                self.assertAlmostEqual(active[0]["quantity"], 60)
+                self.assertAlmostEqual(active[0]["ibkr_quantity"], 60)
+                self.assertEqual(len(closed), 1)
+                self.assertAlmostEqual(closed[0]["quantity"], 40)
+            finally:
+                store.close()
+
+    def test_reducer_keeps_current_lot_and_suppresses_old_unmatched_lot(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B_OLD_MIX", "strategy_name": "v67", "session_date": "2026-05-13", "symbol": "MIXED", "side": "BOT", "quantity": 5, "price": 10, "executed_at": "2026-05-13T13:30:00+00:00"})
+                store.upsert_execution({"execution_id": "B_NEW_MIX", "strategy_name": "v67", "session_date": today, "symbol": "MIXED", "side": "BOT", "quantity": 2, "price": 20, "executed_at": f"{today}T13:31:00+00:00"})
+                result = store.rebuild_symbol_trade_state("MIXED")
+
+                active = store.query("SELECT * FROM positions WHERE symbol = 'MIXED' AND COALESCE(active, 0) = 1")
+                stale = store.query("SELECT * FROM positions WHERE symbol = 'MIXED' AND status = 'STALE_CARRY_OPEN'")
+
+                self.assertAlmostEqual(result["open_quantity"], 2)
+                self.assertAlmostEqual(result["suppressed_historical_open_quantity"], 5)
+                self.assertEqual(len(active), 1)
+                self.assertAlmostEqual(active[0]["quantity"], 2)
+                self.assertEqual(len(stale), 1)
+                self.assertEqual(stale[0]["active"], 0)
+            finally:
+                store.close()
+
+    def test_repair_rebuild_clears_active_position_without_execution_net(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_position({
+                    "position_key": "v67:2026-05-13:STALE",
+                    "strategy_name": "v67",
+                    "session_date": "2026-05-13",
+                    "symbol": "STALE",
+                    "status": "OPEN",
+                    "quantity": 8,
+                    "avg_price": 12,
+                    "source": "live_buy",
+                    "ibkr_quantity": 8,
+                    "active": 1,
+                    "raw_json": {"active": True},
+                })
+                result = store.rebuild_positions_from_executions(["STALE"])
+
+                active = store.query("SELECT * FROM positions WHERE symbol = 'STALE' AND COALESCE(active, 0) = 1")
+
+                self.assertEqual(active, [])
+                self.assertEqual(result["symbols_processed"], 1)
+                self.assertEqual(result["open_symbols_count"], 0)
             finally:
                 store.close()
 

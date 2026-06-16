@@ -739,7 +739,7 @@ class SQLiteRuntimeStore:
             symbol = str(execution.get("symbol") or "").upper().strip()
             if not symbol:
                 return
-            self.rebuild_symbol_trade_state(symbol, allow_historical_open_lots=True)
+            self.rebuild_symbol_trade_state(symbol, allow_historical_open_lots=False)
         except Exception as exc:
             line = f"{utc_now_iso()} SQLITE_WRITE_FAILED method=rebuild_symbol_trade_state error={exc!r}"
             print(line, flush=True)
@@ -962,7 +962,53 @@ class SQLiteRuntimeStore:
                 if (safe_float(lot.get("remaining_qty")) or 0.0) <= 1e-9:
                     open_lots.pop(0)
 
+        today = session_date_utc()
+        suppressed_historical_lots: list[dict[str, Any]] = []
+        if not allow_historical_open_lots:
+            current_open_lots: list[dict[str, Any]] = []
+            for lot in open_lots:
+                entry_time = execution_sort_time(lot)
+                entry_date = str(lot.get("session_date") or "") or iso_date_part(entry_time) or latest_session
+                if entry_date and entry_date < today:
+                    suppressed_historical_lots.append(lot)
+                else:
+                    current_open_lots.append(lot)
+            open_lots = current_open_lots
+
         open_qty = sum(safe_float(lot.get("remaining_qty")) or 0.0 for lot in open_lots)
+        suppressed_qty = sum(safe_float(lot.get("remaining_qty")) or 0.0 for lot in suppressed_historical_lots)
+        if suppressed_qty > 1e-9:
+            stale_cost = sum((safe_float(lot.get("remaining_qty")) or 0.0) * (safe_float(lot.get("price")) or 0.0) for lot in suppressed_historical_lots)
+            stale_avg_price = stale_cost / suppressed_qty if suppressed_qty else None
+            stale_first = suppressed_historical_lots[0]
+            stale_entry_time = execution_sort_time(stale_first)
+            stale_entry_date = str(stale_first.get("session_date") or "") or iso_date_part(stale_entry_time) or latest_session
+            stale_strategy = str(stale_first.get("strategy_name") or latest_strategy or "unknown")
+            self.upsert_position(
+                {
+                    "position_key": f"{stale_strategy}:{stale_entry_date}:{symbol}:stale_open_lot",
+                    "strategy_name": stale_strategy,
+                    "session_date": stale_entry_date,
+                    "symbol": symbol,
+                    "status": "STALE_CARRY_OPEN",
+                    "quantity": suppressed_qty,
+                    "avg_price": stale_avg_price,
+                    "source": "sqlite_execution_reducer",
+                    "ibkr_quantity": None,
+                    "active": 0,
+                    "exit_sent": 0,
+                    "updated_at": last_event_time,
+                    "raw_json": {
+                        "active": False,
+                        "entry_fill_verified": True,
+                        "entry_time": stale_entry_time,
+                        "entry_price": stale_avg_price,
+                        "stale_open_lot_suppressed": True,
+                        "requires_ibkr_confirmation": True,
+                        "open_lot_execution_ids": [lot.get("execution_id") for lot in suppressed_historical_lots],
+                    },
+                }
+            )
         if open_qty > 1e-9:
             weighted_cost = sum((safe_float(lot.get("remaining_qty")) or 0.0) * (safe_float(lot.get("price")) or 0.0) for lot in open_lots)
             avg_price = weighted_cost / open_qty if open_qty else None
@@ -970,36 +1016,7 @@ class SQLiteRuntimeStore:
             entry_time = execution_sort_time(first_lot)
             entry_date = str(first_lot.get("session_date") or "") or iso_date_part(entry_time) or latest_session
             strategy = str(first_lot.get("strategy_name") or latest_strategy or "unknown")
-            self.mark_position_flat(symbol=symbol, strategy_name=strategy, reason="sqlite_execution_reducer_superseded_open_lot", status="CLOSED")
-            today = session_date_utc()
-            is_historical_open = bool(entry_date and entry_date < today)
-            if is_historical_open and not allow_historical_open_lots:
-                self.upsert_position(
-                    {
-                        "position_key": f"{strategy}:{entry_date}:{symbol}:stale_open_lot",
-                        "strategy_name": strategy,
-                        "session_date": entry_date,
-                        "symbol": symbol,
-                        "status": "STALE_CARRY_OPEN",
-                        "quantity": open_qty,
-                        "avg_price": avg_price,
-                        "source": "sqlite_execution_reducer",
-                        "ibkr_quantity": None,
-                        "active": 0,
-                        "exit_sent": 0,
-                        "updated_at": last_event_time,
-                        "raw_json": {
-                            "active": False,
-                            "entry_fill_verified": True,
-                            "entry_time": entry_time,
-                            "entry_price": avg_price,
-                            "stale_open_lot_suppressed": True,
-                            "requires_ibkr_confirmation": True,
-                            "open_lot_execution_ids": [lot.get("execution_id") for lot in open_lots],
-                        },
-                    }
-                )
-                return {"symbol": symbol, "closed_trades": closed_count, "open_quantity": open_qty, "open_lot_suppressed": True}
+            self.mark_position_flat(symbol=symbol, reason="sqlite_execution_reducer_superseded_open_lot", status="CLOSED")
             self.upsert_position(
                 {
                     "position_key": f"{strategy}:{entry_date}:{symbol}",
@@ -1054,7 +1071,53 @@ class SQLiteRuntimeStore:
                         },
                     }
                 )
-        return {"symbol": symbol, "closed_trades": closed_count, "open_quantity": open_qty}
+        return {
+            "symbol": symbol,
+            "closed_trades": closed_count,
+            "open_quantity": open_qty,
+            "suppressed_historical_open_quantity": suppressed_qty,
+            "open_lot_suppressed": suppressed_qty > 1e-9,
+        }
+
+    def rebuild_positions_from_executions(
+        self,
+        symbols: list[str] | tuple[str, ...] | None = None,
+        *,
+        allow_historical_open_lots: bool = False,
+    ) -> dict[str, Any]:
+        if self._transaction_depth == 0:
+            with self.transaction():
+                return self.rebuild_positions_from_executions(
+                    symbols,
+                    allow_historical_open_lots=allow_historical_open_lots,
+                )
+        if symbols is None:
+            rows = self.query(
+                """
+                SELECT symbol FROM executions WHERE COALESCE(symbol, '') != ''
+                UNION
+                SELECT symbol FROM positions WHERE COALESCE(active, 0) = 1 AND COALESCE(symbol, '') != ''
+                ORDER BY symbol
+                """
+            )
+            symbols_to_rebuild = [str(row.get("symbol") or "").upper() for row in rows]
+        else:
+            symbols_to_rebuild = sorted({str(symbol or "").upper().strip() for symbol in symbols if str(symbol or "").strip()})
+
+        results = [
+            self.rebuild_symbol_trade_state(symbol, allow_historical_open_lots=allow_historical_open_lots)
+            for symbol in symbols_to_rebuild
+        ]
+        open_symbols = [row["symbol"] for row in results if (safe_float(row.get("open_quantity")) or 0.0) > 1e-9]
+        suppressed_symbols = [row["symbol"] for row in results if row.get("open_lot_suppressed")]
+        return {
+            "symbols_processed": len(symbols_to_rebuild),
+            "open_symbols": open_symbols,
+            "open_symbols_count": len(open_symbols),
+            "suppressed_historical_open_symbols": suppressed_symbols,
+            "suppressed_historical_open_symbols_count": len(suppressed_symbols),
+            "closed_trades_rebuilt": sum(safe_int(row.get("closed_trades")) or 0 for row in results),
+        }
 
     def upsert_order(self, row: dict[str, Any]) -> str:
         order_key = str(
