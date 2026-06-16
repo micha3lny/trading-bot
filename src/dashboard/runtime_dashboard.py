@@ -501,6 +501,38 @@ def render_open_position_sections(df: pd.DataFrame) -> None:
         render_open_positions(carry, title="Carry / Stale Open Positions", prefix="carry_open")
 
 
+def render_orphan_stale_positions(df: pd.DataFrame) -> None:
+    st.subheader("Orphan Stale Positions")
+    if df.empty:
+        st.info("No orphan stale positions.")
+        return
+    cols = [
+        "symbol", "qty", "buy", "entry_time", "entry_date", "age_days", "status",
+        "strategy", "source", "data_quality", "cleanup_recommendation",
+    ]
+    available = [col for col in cols if col in df.columns]
+    out = df[available].copy().sort_values(["age_days", "symbol"], ascending=[False, True], na_position="last")
+    if "entry_time" in out.columns:
+        out["entry_time"] = out["entry_time"].map(display_time)
+    out = out.rename(
+        columns={
+            "symbol": "Symbol",
+            "qty": "Qty",
+            "buy": "Buy",
+            "entry_time": "Entry Time",
+            "entry_date": "Entry Date",
+            "age_days": "Age Days",
+            "status": "Status",
+            "strategy": "Strategy",
+            "source": "Source",
+            "data_quality": "Data Quality",
+            "cleanup_recommendation": "Cleanup Recommendation",
+        }
+    )
+    st.warning("These rows are excluded from Open Trades/Open PnL. Use cleanup only after confirming broker has no position.")
+    st.dataframe(out, width="stretch", hide_index=True)
+
+
 def render_rejected_entries(df: pd.DataFrame) -> None:
     st.subheader("Rejected Entries")
     if df.empty:
@@ -648,12 +680,13 @@ def render_diagnostics(diag: dict) -> None:
     ]
     for col, (label, key) in zip(cols, labels):
         col.metric(label, int(diag.get(key, 0)))
-    pos_cols = st.columns(6)
+    pos_cols = st.columns(7)
     position_labels = [
         ("SQLite Active Rows", "sqlite_active_positions_count"),
         ("Latest Active", "latest_active_positions_count"),
         ("Today Open", "today_open_positions_count"),
         ("Carry/Stale Open", "stale_carry_open_count"),
+        ("Orphan Stale", "orphan_stale_position_count"),
         ("Duplicate Symbols", "duplicate_active_symbol_count"),
         ("IBKR Positions", "ibkr_positions_count"),
     ]
@@ -828,6 +861,8 @@ def render_runtime_tab(sqlite_path: str, start_date: str, end_date: str, strateg
         st.warning("EXECUTION_RECONSTRUCTION_DISABLED_IN_DASHBOARD: executions exist, but no persisted closed trades exist for this window.")
     st.divider()
     render_open_position_sections(snapshot["open_positions"])
+    st.divider()
+    render_orphan_stale_positions(snapshot.get("orphan_stale_positions", pd.DataFrame()))
     st.divider()
     render_rejected_entries(snapshot.get("rejected_entries", pd.DataFrame()))
     st.divider()
@@ -1266,6 +1301,14 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
         expected_source_session_date=previous_session,
     )
     eod = load_eod_readiness(sqlite_path, readiness_date)
+    try:
+        ops_snapshot = load_dashboard_snapshot(sqlite_path, DateWindow(readiness_date, readiness_date), "All")
+    except Exception as exc:
+        ops_snapshot = {"diagnostics": {}, "orphan_stale_positions": pd.DataFrame()}
+        st.error("Operational readiness SQLite snapshot failed")
+        st.exception(exc)
+    orphan_stale_positions = ops_snapshot.get("orphan_stale_positions", pd.DataFrame())
+    orphan_stale_count = int(len(orphan_stale_positions)) if isinstance(orphan_stale_positions, pd.DataFrame) else 0
     ready_for_next_session = all(
         status == "OK"
         for status in [
@@ -1275,7 +1318,7 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
             str(top100.get("status") or "UNKNOWN"),
             str(eod.get("status") or "UNKNOWN"),
         ]
-    )
+    ) and orphan_stale_count == 0
 
     st.subheader("Ready for Next Session")
     ready_cols = st.columns([1, 3])
@@ -1347,6 +1390,19 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
             ],
         )
     with row3[1]:
+        render_readiness_card(
+            "Orphan stale positions",
+            orphan_stale_count,
+            "OK" if orphan_stale_count == 0 else "FAILED",
+            [
+                f"oldest={ops_snapshot.get('diagnostics', {}).get('oldest_orphan_stale_position', '')}",
+                f"age_days={ops_snapshot.get('diagnostics', {}).get('oldest_orphan_stale_position_age_days', 0.0)}",
+                f"recommendation={ops_snapshot.get('diagnostics', {}).get('cleanup_recommendation', '')}",
+            ],
+        )
+
+    row4 = st.columns(2)
+    with row4[0]:
         health_code, health_body = get_json(f"{control_api_url}/health", timeout=3.0)
         health_status = "OK" if health_code == 200 else "UNKNOWN"
         render_readiness_card(
@@ -1358,6 +1414,13 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
                 f"response={health_body[:240]}",
             ],
         )
+    with row4[1]:
+        st.markdown("### Cleanup Recommendation")
+        if orphan_stale_count:
+            st.error("Close stale orphan position")
+            st.caption("Broker does not confirm this as a real open position. Cleanup marks stale SQLite rows inactive.")
+        else:
+            st.success("OK")
 
     with st.expander("Broker Portfolio Now", expanded=False):
         dataframe_or_info(broker_portfolio, "No broker portfolio positions.")
@@ -1372,6 +1435,8 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
                 "parquet_count": parquet_count,
                 "top100": top100,
                 "eod": eod,
+                "orphan_stale_position_count": orphan_stale_count,
+                "orphan_stale_positions": orphan_stale_positions.to_dict("records") if isinstance(orphan_stale_positions, pd.DataFrame) else [],
                 "health_code": health_code,
                 "health_body": health_body,
                 "sample_parquet_files": [str(p) for p in parquet_files[:10]],
@@ -1381,7 +1446,7 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
     st.divider()
     st.subheader("Manual Actions")
     st.warning("Manual actions can start long-running jobs. Use confirmation checkboxes intentionally.")
-    action_cols = st.columns(3)
+    action_cols = st.columns(4)
 
     with action_cols[0]:
         confirm_collector = st.checkbox("Confirm collector re-run", key="ops_confirm_collector")
@@ -1420,6 +1485,19 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
                 "$ " + " ".join(command) + f"\nreturncode={rc}\n{output}\n\nCONTROL_API_HEALTH HTTP {code}\n{body}",
                 language="json",
             )
+
+    with action_cols[3]:
+        confirm_cleanup = st.checkbox("Confirm stale orphan cleanup", key="ops_confirm_stale_orphan_cleanup")
+        if st.button("Close stale orphan position", disabled=not confirm_cleanup or orphan_stale_count == 0, key="ops_cleanup_stale_orphan"):
+            command = [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "cleanup_duplicate_stale_open_positions.py"),
+                "--date",
+                readiness_date,
+                "--apply",
+            ]
+            rc, output = run_dashboard_command(command, timeout=120)
+            st.code("$ " + " ".join(command) + f"\nreturncode={rc}\n{output}", language="bash")
 
 
 def main() -> None:

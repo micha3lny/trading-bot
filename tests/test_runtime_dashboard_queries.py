@@ -1669,7 +1669,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-15", "2026-06-15"), "v67")
             self.assertTrue(snapshot["open_positions"].empty)
 
-    def test_stale_active_open_is_flagged_as_carry_not_today(self) -> None:
+    def test_stale_unconfirmed_carry_open_is_excluded_as_orphan_stale_position(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
             store = SQLiteRuntimeStore(db)
@@ -1690,10 +1690,47 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 store.close()
 
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-15", "2026-06-15"), "v67")
+            self.assertTrue(snapshot["open_positions"].empty)
+            self.assertEqual(snapshot["summary"]["open_trades"], 0)
+            self.assertFalse(snapshot["orphan_stale_positions"].empty)
+            row = snapshot["orphan_stale_positions"].iloc[0]
+            self.assertEqual(row["symbol"], "ACMR")
+            self.assertIn("ORPHAN_STALE_POSITION", row["data_quality"])
+            self.assertEqual(snapshot["diagnostics"]["orphan_stale_position_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["oldest_orphan_stale_position"], "ACMR")
+            self.assertEqual(snapshot["diagnostics"]["today_open_positions_count"], 0)
+            self.assertEqual(snapshot["diagnostics"]["stale_carry_open_count"], 0)
+
+    def test_confirmed_stale_active_open_is_still_flagged_as_carry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_position({
+                    "position_key": "v67:2026-06-03:ACMR",
+                    "session_date": "2026-06-03",
+                    "strategy_name": "v67",
+                    "symbol": "ACMR",
+                    "quantity": 1,
+                    "avg_price": 30,
+                    "active": 1,
+                    "status": "OPEN",
+                    "updated_at": "2026-06-03T13:30:00+00:00",
+                    "raw_json": {
+                        "entry_price": 30,
+                        "market_price": 31,
+                        "entry_time": "2026-06-03T13:30:00+00:00",
+                        "entry_fill_verified": True,
+                    },
+                })
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-15", "2026-06-15"), "v67")
             row = snapshot["open_positions"].iloc[0]
             self.assertEqual(row["position_bucket"], "carry_stale")
             self.assertIn("STALE_CARRY_OPEN", row["data_quality"])
-            self.assertEqual(snapshot["diagnostics"]["today_open_positions_count"], 0)
+            self.assertTrue(snapshot["orphan_stale_positions"].empty)
             self.assertEqual(snapshot["diagnostics"]["stale_carry_open_count"], 1)
 
     def test_carried_closed_trade_is_flagged_on_exit_date(self) -> None:

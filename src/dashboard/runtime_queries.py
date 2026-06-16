@@ -18,9 +18,10 @@ from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, migrate_r
 
 
 CLOSED_STATUSES = {"CLOSED", "DONE", "EXIT_FILLED", "FLAT"}
-TERMINAL_POSITION_STATUSES = {"CLOSED", "FLAT", "FLAT_CONFIRMED", "ENTRY_REJECTED", "ENTRY_NOT_FILLED", "STALE_DUPLICATE_SUPPRESSED"}
+TERMINAL_POSITION_STATUSES = {"CLOSED", "FLAT", "FLAT_CONFIRMED", "ENTRY_REJECTED", "ENTRY_NOT_FILLED", "STALE_DUPLICATE_SUPPRESSED", "ORPHAN_STALE_POSITION"}
 OPEN_POSITION_STATUSES = {"OPEN", "EXIT_ORDER"}
 DEFAULT_RECORDER_ROOT = Path("data/live/recorder")
+DEFAULT_ORPHAN_STALE_DAYS = 7
 
 
 @dataclass(frozen=True)
@@ -170,6 +171,14 @@ def hold_minutes(start: Any, end: Any = None) -> float:
     if start_dt is None:
         return 0.0
     return max(0.0, (end_dt - start_dt).total_seconds() / 60.0)
+
+
+def age_days(start: Any, end: Any = None) -> float | None:
+    start_dt = parse_dt(start)
+    end_dt = parse_dt(end) or datetime.now(timezone.utc)
+    if start_dt is None:
+        return None
+    return max(0.0, (end_dt - start_dt).total_seconds() / 86400.0)
 
 
 def adopted_timestamp_value(value: Any) -> str | None:
@@ -1478,6 +1487,14 @@ def load_open_positions(
             display_status = f"{display_status}|STALE_CARRY_OPEN"
             if not ibkr_confirmed:
                 data_quality = append_quality(data_quality, "IBKR_UNCONFIRMED")
+        stale_age_days = age_days(entry_time, f"{window.end_date}T23:59:59+00:00")
+        if (
+            stale_carry
+            and not ibkr_confirmed
+            and stale_age_days is not None
+            and stale_age_days > DEFAULT_ORPHAN_STALE_DAYS
+        ):
+            continue
         entry_source = (
             "trade"
             if trade_entry_time
@@ -1518,6 +1535,94 @@ def load_open_positions(
             "now_price_source": now_price_source,
             "market_price_at": price_time,
         })
+    return pd.DataFrame(out)
+
+
+def load_orphan_stale_positions(
+    conn: sqlite3.Connection,
+    window: DateWindow,
+    strategy: str | None,
+    *,
+    stale_days: int = DEFAULT_ORPHAN_STALE_DAYS,
+) -> pd.DataFrame:
+    clause, params = strategy_clause("p", strategy)
+    open_sql = ",".join("?" for _ in OPEN_POSITION_STATUSES)
+    rows = read_sql(
+        conn,
+        f"""
+        WITH active_candidates AS (
+            SELECT
+                p.*,
+                p.rowid AS position_rowid,
+                ROW_NUMBER() OVER (
+                    PARTITION BY UPPER(p.symbol)
+                    ORDER BY COALESCE(p.updated_at, '') DESC, COALESCE(p.session_date, '') DESC, p.rowid DESC
+                ) AS rn
+            FROM positions p
+            WHERE COALESCE(p.session_date, '') <= ? {clause}
+              AND COALESCE(p.active, 0) = 1
+              AND UPPER(COALESCE(p.status, '')) IN ({open_sql})
+              AND COALESCE(p.raw_json, '') NOT LIKE '%"active": false%'
+              AND COALESCE(p.raw_json, '') NOT LIKE '%"ibkr_position_flat_confirmed": true%'
+        )
+        SELECT
+            COALESCE(strategy_name, 'unknown') AS strategy,
+            session_date,
+            position_key,
+            symbol,
+            status,
+            quantity,
+            avg_price,
+            ibkr_quantity,
+            updated_at,
+            source,
+            raw_json
+        FROM active_candidates p
+        WHERE p.rn = 1
+        ORDER BY p.symbol
+        """,
+        [window.end_date, *params, *sorted(OPEN_POSITION_STATUSES)],
+    )
+    if rows.empty:
+        return pd.DataFrame(columns=[
+            "symbol", "qty", "buy", "entry_time", "entry_date", "age_days", "status",
+            "strategy", "position_key", "source", "data_quality", "cleanup_recommendation",
+        ])
+    out: list[dict[str, Any]] = []
+    for row in rows.to_dict("records"):
+        raw = parse_raw_json(row.get("raw_json"))
+        symbol = str(row.get("symbol") or "").upper()
+        row_strategy = str(row.get("strategy") or "unknown")
+        raw_entry_time = raw.get("entry_time") or raw.get("buy_time")
+        entry_time = displayable_entry_time(raw_entry_time) or str(row.get("session_date") or "")
+        entry_date = date_part(entry_time) or str(row.get("session_date") or "")
+        if not entry_date or entry_date >= window.end_date:
+            continue
+        ibkr_qty = to_float(row.get("ibkr_quantity"), None)
+        ibkr_confirmed = bool(
+            (ibkr_qty is not None and abs(ibkr_qty) > 1e-9)
+            or raw_bool(raw, "ibkr_confirmed", "ibkr_entry_confirmed", "entry_fill_verified", "ibkr_position_confirmed")
+        )
+        days = age_days(entry_time, f"{window.end_date}T23:59:59+00:00")
+        if ibkr_confirmed or days is None or days <= stale_days:
+            continue
+        qty = to_float(row.get("quantity"), None)
+        out.append(
+            {
+                "symbol": symbol,
+                "qty": qty if qty is not None else to_float(row.get("ibkr_quantity"), 0.0),
+                "buy": to_float(row.get("avg_price") or raw.get("entry_price"), None),
+                "entry_time": entry_time,
+                "entry_date": entry_date,
+                "age_days": days,
+                "status": f"{row.get('status') or 'OPEN'}|ORPHAN_STALE_POSITION",
+                "strategy": row_strategy,
+                "position_key": row.get("position_key"),
+                "source": row.get("source"),
+                "data_quality": "STALE_CARRY_OPEN;IBKR_UNCONFIRMED;ORPHAN_STALE_POSITION",
+                "cleanup_recommendation": "Close stale orphan position",
+            }
+        )
     return pd.DataFrame(out)
 
 
@@ -1865,6 +1970,7 @@ def load_dashboard_snapshot(
             "summary": build_summary(empty, empty),
             "data_quality_summary": build_data_quality_summary(empty),
             "open_positions": empty,
+            "orphan_stale_positions": empty,
             "rejected_entries": empty,
             "closed_positions": empty,
             "exit_simulation": empty,
@@ -1886,6 +1992,7 @@ def load_dashboard_snapshot(
             include_reconstructed=include_reconstructed,
         )
         open_positions = load_open_positions(conn, window, strategy, executions, execution_lookup)
+        orphan_stale_positions = load_orphan_stale_positions(conn, window, strategy)
         rejected_entries = load_rejected_entries(conn, window, strategy)
         diagnostics = load_diagnostics(conn, window, strategy)
         diagnostics.update(closed_diag)
@@ -1896,6 +2003,16 @@ def load_dashboard_snapshot(
         else:
             diagnostics["today_open_positions_count"] = 0
             diagnostics["stale_carry_open_count"] = 0
+        diagnostics["orphan_stale_position_count"] = int(len(orphan_stale_positions))
+        if not orphan_stale_positions.empty:
+            oldest = orphan_stale_positions.sort_values(["age_days", "symbol"], ascending=[False, True]).iloc[0].to_dict()
+            diagnostics["oldest_orphan_stale_position"] = str(oldest.get("symbol") or "")
+            diagnostics["oldest_orphan_stale_position_age_days"] = float(oldest.get("age_days") or 0.0)
+            diagnostics["cleanup_recommendation"] = "Close stale orphan position"
+        else:
+            diagnostics["oldest_orphan_stale_position"] = ""
+            diagnostics["oldest_orphan_stale_position_age_days"] = 0.0
+            diagnostics["cleanup_recommendation"] = ""
         diagnostics["closed_trades_count"] = int(len(closed))
         if not closed.empty and "carried_closed_today" in closed.columns:
             diagnostics["carried_closed_today_count"] = int(pd.Series(closed["carried_closed_today"]).fillna(False).astype(bool).sum())
@@ -1914,6 +2031,7 @@ def load_dashboard_snapshot(
             "summary": build_summary(open_positions, closed),
             "data_quality_summary": build_data_quality_summary(closed),
             "open_positions": open_positions,
+            "orphan_stale_positions": orphan_stale_positions,
             "rejected_entries": rejected_entries,
             "closed_positions": closed,
             "exit_simulation": exit_simulation(closed),
