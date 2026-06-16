@@ -696,6 +696,8 @@ def render_diagnostics(diag: dict) -> None:
     stale_count = int(diag.get("stale_active_positions_count", 0) or 0)
     if stale_count > 0:
         st.warning(f"STALE_POSITION_ROWS_PRESENT stale_active_positions_count={stale_count}")
+    if int(diag.get("ibkr_positions_count", 0) or 0) > 0 and int(diag.get("displayed_open_positions_count", 0) or 0) == 0:
+        st.error("BROKER_RUNTIME_OPEN_POSITION_MISMATCH: broker/reconciliation has open positions but Runtime displayed open positions is 0.")
     cols = st.columns(8)
     labels = [
         ("Orphans", "orphans"),
@@ -709,15 +711,15 @@ def render_diagnostics(diag: dict) -> None:
     ]
     for col, (label, key) in zip(cols, labels):
         col.metric(label, int(diag.get(key, 0)))
-    pos_cols = st.columns(8)
+    pos_cols = st.columns(9)
     position_labels = [
         ("Active Raw", "active_positions_raw_count"),
         ("Active Today", "active_positions_today_count"),
-        ("SQLite Active Rows", "sqlite_active_positions_count"),
+        ("After Orphan Filter", "active_positions_after_orphan_filter_count"),
         ("Displayed Open", "displayed_open_positions_count"),
-        ("Today Open", "today_open_positions_count"),
-        ("Carry/Stale", "stale_carry_count"),
-        ("Orphan Stale", "orphan_stale_position_count"),
+        ("Displayed Today", "displayed_today_open_count"),
+        ("Displayed Carry", "displayed_carry_open_count"),
+        ("Orphan Stale", "orphan_stale_count"),
         ("Excluded Open", "excluded_open_positions_count"),
         ("IBKR Positions", "ibkr_positions_count"),
     ]
