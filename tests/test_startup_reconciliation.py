@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import contextlib
 import tempfile
 import unittest
 import csv
+import io
 from pathlib import Path
 from types import SimpleNamespace
 
-from src.live_trading.order_lifecycle.models import LifecycleEventType
+from src.live_trading.order_lifecycle.models import LifecycleEvent, LifecycleEventType, OrderSide, PositionState
 from src.live_trading.order_lifecycle.store import JsonlLifecycleStore
+from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.v67_live_top100_expansion_paper_trader import (
     ManagedPosition,
@@ -207,6 +210,37 @@ class StartupReconciliationTests(unittest.TestCase):
             self.assertIn("ENTRY_NOT_FILLED", lifecycle_text)
             self.assertIn("entry_fill_verified", lifecycle_text)
             self.assertIn("false", lifecycle_text)
+
+    def test_broker_sqlite_flat_ignores_stale_lifecycle_open_positions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            recorder.sqlite_store = store
+            try:
+                JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl")).append_event(
+                    LifecycleEvent(
+                        event_type=LifecycleEventType.ENTRY_ORDER_FILLED,
+                        symbol="AVLN",
+                        strategy="v67",
+                        state_after=PositionState.OPEN,
+                        execution_id="OLD_BUY",
+                        quantity=3,
+                        price=10.0,
+                        raw_json={"side": OrderSide.BUY.value},
+                    )
+                )
+                runtime_state = {}
+                out = io.StringIO()
+
+                with contextlib.redirect_stdout(out):
+                    result = startup_reconcile_runtime_state(FakeIB(), recorder, {}, {"AVLN": FakeContract("AVLN")}, runtime_state)
+
+                self.assertEqual(result["closed_local"], [])
+                self.assertIn("STARTUP_RECONCILIATION_STALE_LOCAL_STATE_IGNORED", out.getvalue())
+                self.assertEqual(runtime_state["startup_reconciliation_broker_open_count"], 0)
+                self.assertEqual(runtime_state["startup_reconciliation_sqlite_active_count"], 0)
+            finally:
+                store.close()
 
     def test_ibkr_flat_after_verified_entry_without_sell_fill_is_unverified_close(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

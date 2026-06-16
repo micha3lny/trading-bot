@@ -190,6 +190,38 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
             self.assertIn("EOD_FLATTEN_RETRY", events)
             self.assertIn("EOD_FLATTEN_SUCCESS", events)
 
+    def test_pending_eod_flatten_ignored_when_broker_and_sqlite_flat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            runtime_state = {}
+            recorder.path("eod_pending.json").write_text(
+                json.dumps(
+                    {
+                        "recorded_at": "2026-05-22T20:00:00+00:00",
+                        "pending_eod_flatten": True,
+                        "reason": "main_loop_eod_active_failsafe",
+                        "symbols": ["AVLN", "AVNW", "BETR"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            out = io.StringIO()
+
+            with contextlib.redirect_stdout(out):
+                restored = load_pending_eod_flatten(
+                    recorder,
+                    runtime_state,
+                    broker_open_count=0,
+                    sqlite_active_count=0,
+                )
+
+            self.assertFalse(restored)
+            self.assertFalse(runtime_state["pending_eod_flatten"])
+            self.assertEqual(runtime_state["eod_pending_symbols_count"], 3)
+            self.assertEqual(runtime_state["eod_pending_ignored_count"], 3)
+            self.assertFalse(json.loads(recorder.path("eod_pending.json").read_text())["pending_eod_flatten"])
+            self.assertIn("EOD_FLATTEN_PENDING_IGNORED_BROKER_FLAT", out.getvalue())
+
     def test_pending_eod_flatten_blocks_new_entries(self) -> None:
         runtime_state = {"pending_eod_flatten": True, "entries_blocked_reason": ""}
 
