@@ -1393,76 +1393,31 @@ def load_open_positions(
     execution_lookup: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     clause, params = strategy_clause("p", strategy)
-    terminal_sql = ",".join("?" for _ in TERMINAL_POSITION_STATUSES)
     rows = read_sql(
         conn,
         f"""
-        WITH active_candidates AS (
-            SELECT
-                p.*,
-                p.rowid AS position_rowid,
-                CASE
-                    WHEN LOWER(COALESCE(p.source, '')) = 'sqlite_execution_reducer' THEN 40
-                    WHEN COALESCE(p.ibkr_quantity, 0) != 0 THEN 30
-                    WHEN COALESCE(p.raw_json, '') LIKE '%"ibkr_entry_confirmed": true%' THEN 25
-                    WHEN COALESCE(p.raw_json, '') LIKE '%"entry_fill_verified": true%' THEN 20
-                    WHEN LOWER(COALESCE(p.source, '')) = 'live_buy' THEN 10
-                    ELSE 0
-                END AS source_priority,
-                ROW_NUMBER() OVER (
-                    PARTITION BY UPPER(p.symbol)
-                    ORDER BY
-                        CASE
-                            WHEN LOWER(COALESCE(p.source, '')) = 'sqlite_execution_reducer' THEN 40
-                            WHEN COALESCE(p.ibkr_quantity, 0) != 0 THEN 30
-                            WHEN COALESCE(p.raw_json, '') LIKE '%"ibkr_entry_confirmed": true%' THEN 25
-                            WHEN COALESCE(p.raw_json, '') LIKE '%"entry_fill_verified": true%' THEN 20
-                            WHEN LOWER(COALESCE(p.source, '')) = 'live_buy' THEN 10
-                            ELSE 0
-                        END DESC,
-                        COALESCE(p.updated_at, '') DESC,
-                        COALESCE(p.session_date, '') DESC,
-                        p.rowid DESC
-                ) AS rn
-            FROM positions p
-            WHERE COALESCE(p.session_date, '') <= ? {clause}
-              AND COALESCE(p.active, 0) = 1
-              AND {OPEN_POSITION_STATUS_SQL}
-              AND COALESCE(p.raw_json, '') NOT LIKE '%"active": false%'
-              AND COALESCE(p.raw_json, '') NOT LIKE '%"ibkr_position_flat_confirmed": true%'
-        )
         SELECT
-            COALESCE(strategy_name, 'unknown') AS strategy,
-            session_date,
-            position_key,
-            symbol,
-            status,
-            quantity,
-            avg_price,
-            ibkr_quantity,
-            ibkr_avg_cost,
-            active,
-            exit_sent,
-            updated_at,
-            source,
-            source_priority,
-            raw_json
-        FROM active_candidates p
-        WHERE p.rn = 1
-          AND NOT EXISTS (
-              SELECT 1
-              FROM positions newer
-              WHERE UPPER(newer.symbol) = UPPER(p.symbol)
-                AND COALESCE(newer.session_date, '') <= ?
-                AND COALESCE(newer.updated_at, '') > COALESCE(p.updated_at, '')
-                AND (
-                    UPPER(COALESCE(newer.status, '')) IN ({terminal_sql})
-                    OR COALESCE(newer.raw_json, '') LIKE '%"ibkr_position_flat_confirmed": true%'
-                )
-          )
-        ORDER BY p.symbol
+            COALESCE(p.strategy_name, 'unknown') AS strategy,
+            p.session_date,
+            p.position_key,
+            p.symbol,
+            p.status,
+            p.quantity,
+            p.avg_price,
+            p.ibkr_quantity,
+            p.ibkr_avg_cost,
+            p.active,
+            p.exit_sent,
+            p.updated_at,
+            p.source,
+            p.raw_json
+        FROM positions p
+        WHERE COALESCE(p.active, 0) = 1 {clause}
+          AND UPPER(COALESCE(p.status, '')) != 'ORPHAN_STALE_POSITION'
+          AND UPPER(COALESCE(p.status, '')) NOT LIKE '%ORPHAN_STALE_POSITION%'
+        ORDER BY COALESCE(p.updated_at, '') DESC, UPPER(p.symbol), p.rowid DESC
         """,
-        [window.end_date, *params, window.end_date, *sorted(TERMINAL_POSITION_STATUSES)],
+        params,
     )
     if rows.empty:
         return rows
@@ -1477,16 +1432,14 @@ def load_open_positions(
         session_date = str(row.get("session_date") or "")
         raw = parse_raw_json(row.get("raw_json"))
         status = str(row.get("status") or "").upper()
-        if status.split("|", 1)[0] not in OPEN_POSITION_STATUSES or "ORPHAN_STALE_POSITION" in status:
-            continue
-        if bool(raw.get("ibkr_position_flat_confirmed")):
+        if "ORPHAN_STALE_POSITION" in status:
             continue
         ibkr_qty = to_float(row.get("ibkr_quantity"), None)
         qty = to_float(row.get("quantity"), None)
         if qty is None:
             qty = to_float(row.get("ibkr_quantity"), 0.0)
-        if qty is None or abs(qty) <= 1e-9:
-            continue
+        if qty is None:
+            qty = 0.0
         buy = to_float(row.get("avg_price") or raw.get("entry_price"), 0.0) or 0.0
         now, now_price_source, price_time = raw_now_price(raw)
         price_status = price_status_for(now, price_time, window)
@@ -1673,6 +1626,49 @@ def load_excluded_open_positions(
             }
         )
     return pd.DataFrame(out)
+
+
+def load_raw_active_positions(conn: sqlite3.Connection, strategy: str | None) -> pd.DataFrame:
+    clause, params = strategy_clause("p", strategy)
+    rows = read_sql(
+        conn,
+        f"""
+        SELECT
+            COALESCE(p.strategy_name, 'unknown') AS strategy,
+            p.session_date,
+            p.position_key,
+            p.symbol,
+            p.status,
+            p.quantity,
+            p.avg_price,
+            p.ibkr_quantity,
+            p.active,
+            p.updated_at,
+            p.source,
+            p.raw_json
+        FROM positions p
+        WHERE COALESCE(p.active, 0) = 1 {clause}
+        ORDER BY COALESCE(p.updated_at, '') DESC, UPPER(p.symbol), p.rowid DESC
+        """,
+        params,
+    )
+    if rows.empty:
+        return pd.DataFrame(columns=[
+            "symbol", "quantity", "avg_price", "status", "active", "updated_at",
+            "entry_time", "session_date", "strategy", "source", "position_key",
+        ])
+    out = rows.copy()
+    entry_times: list[Any] = []
+    for row in out.to_dict("records"):
+        raw = parse_raw_json(row.get("raw_json"))
+        entry_times.append(displayable_entry_time(raw.get("entry_time") or raw.get("buy_time")) or row.get("updated_at") or row.get("session_date"))
+    out["entry_time"] = entry_times
+    return out[
+        [
+            "symbol", "quantity", "avg_price", "status", "active", "updated_at",
+            "entry_time", "session_date", "strategy", "source", "position_key",
+        ]
+    ]
 
 
 def load_orphan_stale_positions(
@@ -2144,12 +2140,14 @@ def load_dashboard_snapshot(
             include_reconstructed=include_reconstructed,
         )
         open_positions = load_open_positions(conn, window, strategy, executions, execution_lookup)
+        raw_active_positions = load_raw_active_positions(conn, strategy)
         orphan_stale_positions = load_orphan_stale_positions(conn, window, strategy)
         excluded_open_positions = load_excluded_open_positions(conn, window, strategy, open_positions, orphan_stale_positions)
         rejected_entries = load_rejected_entries(conn, window, strategy)
         diagnostics = load_diagnostics(conn, window, strategy)
         diagnostics.update(closed_diag)
         diagnostics.update(load_position_row_diagnostics(conn, window, strategy, len(open_positions)))
+        diagnostics["active_positions_raw_count"] = int(len(raw_active_positions))
         if not open_positions.empty and "position_bucket" in open_positions.columns:
             diagnostics["today_open_positions_count"] = int((open_positions["position_bucket"].fillna("") == "today").sum())
             diagnostics["stale_carry_open_count"] = int((open_positions["position_bucket"].fillna("") == "carry_stale").sum())
@@ -2191,6 +2189,7 @@ def load_dashboard_snapshot(
             "summary": build_summary(open_positions, closed),
             "data_quality_summary": build_data_quality_summary(closed),
             "open_positions": open_positions,
+            "raw_active_positions": raw_active_positions,
             "orphan_stale_positions": orphan_stale_positions,
             "excluded_open_positions": excluded_open_positions,
             "rejected_entries": rejected_entries,

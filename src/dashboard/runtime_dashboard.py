@@ -501,6 +501,34 @@ def render_open_position_sections(df: pd.DataFrame) -> None:
         render_open_positions(carry, title="Carry / Stale Open Positions", prefix="carry_open")
 
 
+def render_raw_active_positions(df: pd.DataFrame) -> None:
+    st.subheader("Raw active positions from SQLite")
+    if df is None or df.empty:
+        st.info("No raw active positions in SQLite.")
+        return
+    out = df.copy().rename(
+        columns={
+            "symbol": "Symbol",
+            "quantity": "Quantity",
+            "avg_price": "Avg Price",
+            "status": "Status",
+            "active": "Active",
+            "updated_at": "Updated At",
+            "entry_time": "Entry Time",
+            "session_date": "Session Date",
+            "strategy": "Strategy",
+            "source": "Source",
+            "position_key": "Position Key",
+        }
+    )
+    cols = [
+        "Symbol", "Quantity", "Avg Price", "Status", "Active", "Updated At",
+        "Entry Time", "Session Date", "Strategy", "Source", "Position Key",
+    ]
+    out = out[[col for col in cols if col in out.columns]]
+    st.dataframe(out, width="stretch", hide_index=True)
+
+
 def render_orphan_stale_positions(df: pd.DataFrame) -> None:
     st.subheader("Orphan Stale Positions")
     if df.empty:
@@ -696,6 +724,8 @@ def render_diagnostics(diag: dict) -> None:
     stale_count = int(diag.get("stale_active_positions_count", 0) or 0)
     if stale_count > 0:
         st.warning(f"STALE_POSITION_ROWS_PRESENT stale_active_positions_count={stale_count}")
+    if int(diag.get("active_positions_raw_count", 0) or 0) > 0 and int(diag.get("displayed_open_positions_count", 0) or 0) == 0:
+        st.error("RUNTIME_OPEN_POSITION_FILTER_BUG: raw active positions exist in SQLite but Runtime displayed open positions is 0.")
     if int(diag.get("ibkr_positions_count", 0) or 0) > 0 and int(diag.get("displayed_open_positions_count", 0) or 0) == 0:
         st.error("BROKER_RUNTIME_OPEN_POSITION_MISMATCH: broker/reconciliation has open positions but Runtime displayed open positions is 0.")
     cols = st.columns(8)
@@ -894,6 +924,7 @@ def render_runtime_tab(sqlite_path: str, start_date: str, end_date: str, strateg
         st.warning("EXECUTION_RECONSTRUCTION_DISABLED_IN_DASHBOARD: executions exist, but no persisted closed trades exist for this window.")
     st.divider()
     render_open_position_sections(snapshot["open_positions"])
+    render_raw_active_positions(snapshot.get("raw_active_positions", pd.DataFrame()))
     st.divider()
     render_orphan_stale_positions(snapshot.get("orphan_stale_positions", pd.DataFrame()))
     render_excluded_open_positions(snapshot.get("excluded_open_positions", pd.DataFrame()))
