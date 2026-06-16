@@ -446,6 +446,8 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
     ]
     available = [col for col in cols if col in df.columns]
     out = filter_table(df[available].copy(), prefix).sort_values(["upnl", "symbol"], na_position="last")
+    if len(out) != len(df):
+        st.warning(f"Table filters are hiding {len(df) - len(out)} of {len(df)} open-position rows.")
     out["entry_time"] = out.apply(
         lambda row: f"ADOPTED {display_time(row['entry_time'])}" if str(row.get("entry_source") or "").upper() == "ADOPTED" else display_time(row["entry_time"]),
         axis=1,
@@ -622,6 +624,8 @@ def render_closed_positions(df: pd.DataFrame) -> None:
         "entry_time", "exit_time", "data_quality",
     ]
     out = filter_table(df[cols].copy(), "closed").sort_values(["net_actual", "symbol"], na_position="last")
+    if len(out) != len(df):
+        st.warning(f"Table filters are hiding {len(df) - len(out)} of {len(df)} closed-trade rows.")
     out["entry_time"] = out["entry_time"].map(display_time)
     out["exit_time"] = out["exit_time"].map(display_time)
     out["peak_pct"] = out["peak_pct"].map(display_number_or_missing)
@@ -728,6 +732,10 @@ def render_diagnostics(diag: dict) -> None:
         st.error("RUNTIME_OPEN_POSITION_FILTER_BUG: raw active positions exist in SQLite but Runtime displayed open positions is 0.")
     if int(diag.get("ibkr_positions_count", 0) or 0) > 0 and int(diag.get("displayed_open_positions_count", 0) or 0) == 0:
         st.error("BROKER_RUNTIME_OPEN_POSITION_MISMATCH: broker/reconciliation has open positions but Runtime displayed open positions is 0.")
+    if int(diag.get("dropped_open_count", 0) or 0) > 0:
+        st.warning(f"Runtime dropped open symbols: {diag.get('dropped_symbols', '')}")
+    if int(diag.get("dropped_closed_trade_count", 0) or 0) > 0:
+        st.warning(f"Runtime dropped closed trade IDs: {diag.get('dropped_closed_trade_ids', '')}")
     cols = st.columns(8)
     labels = [
         ("Orphans", "orphans"),
@@ -741,8 +749,11 @@ def render_diagnostics(diag: dict) -> None:
     ]
     for col, (label, key) in zip(cols, labels):
         col.metric(label, int(diag.get(key, 0)))
-    pos_cols = st.columns(9)
+    pos_cols = st.columns(12)
     position_labels = [
+        ("Raw SQLite", "raw_active_sqlite_count"),
+        ("Displayed", "displayed_open_count"),
+        ("Dropped", "dropped_open_count"),
         ("Active Raw", "active_positions_raw_count"),
         ("Active Today", "active_positions_today_count"),
         ("After Orphan Filter", "active_positions_after_orphan_filter_count"),
@@ -755,11 +766,13 @@ def render_diagnostics(diag: dict) -> None:
     ]
     for col, (label, key) in zip(pos_cols, position_labels):
         col.metric(label, int(diag.get(key, 0)))
-    closed_cols = st.columns(4)
+    closed_cols = st.columns(7)
     closed_labels = [
+        ("Raw Closed", "raw_closed_trade_count"),
         ("Persisted Closed", "persisted_closed_trades_count"),
         ("Reconstructed Pairs", "reconstructed_execution_pairs_count"),
         ("Displayed Closed", "displayed_closed_trades_count"),
+        ("Dropped Closed", "dropped_closed_trade_count"),
         ("Carried Closed Today", "carried_closed_today_count"),
     ]
     for col, (label, key) in zip(closed_cols, closed_labels):

@@ -1483,14 +1483,6 @@ def load_open_positions(
             display_status = f"{display_status}|STALE_CARRY_OPEN"
             if not ibkr_confirmed:
                 data_quality = append_quality(data_quality, "IBKR_UNCONFIRMED")
-        stale_age_days = age_days(entry_time, f"{window.end_date}T23:59:59+00:00")
-        if (
-            stale_carry
-            and not ibkr_confirmed
-            and stale_age_days is not None
-            and stale_age_days > DEFAULT_ORPHAN_STALE_DAYS
-        ):
-            continue
         entry_source = (
             "trade"
             if trade_entry_time
@@ -1534,6 +1526,39 @@ def load_open_positions(
     return pd.DataFrame(out)
 
 
+def load_raw_closed_trade_rows(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> pd.DataFrame:
+    clause, params = strategy_clause("t", strategy)
+    return read_sql(
+        conn,
+        f"""
+        SELECT
+            t.trade_id,
+            t.symbol,
+            t.quantity,
+            t.status,
+            t.session_date,
+            t.entry_fill_time,
+            t.exit_fill_time,
+            t.closed_at,
+            COALESCE(t.strategy_name, 'unknown') AS strategy,
+            t.updated_at,
+            t.raw_json
+        FROM trades t
+        WHERE (
+            substr(t.exit_fill_time, 1, 10) BETWEEN ? AND ?
+            OR substr(t.closed_at, 1, 10) BETWEEN ? AND ?
+            OR (
+                COALESCE(t.exit_fill_time, t.closed_at) IS NULL
+                AND t.session_date BETWEEN ? AND ?
+            )
+        ) {clause}
+          AND UPPER(COALESCE(t.status, '')) IN ({",".join("?" for _ in CLOSED_STATUSES)})
+        ORDER BY COALESCE(t.closed_at, t.exit_fill_time), t.symbol, t.trade_id
+        """,
+        [window.start_date, window.end_date, window.start_date, window.end_date, window.start_date, window.end_date, *params, *sorted(CLOSED_STATUSES)],
+    )
+
+
 def load_excluded_open_positions(
     conn: sqlite3.Connection,
     window: DateWindow,
@@ -1541,53 +1566,7 @@ def load_excluded_open_positions(
     displayed_open_positions: pd.DataFrame,
     orphan_stale_positions: pd.DataFrame,
 ) -> pd.DataFrame:
-    clause, params = strategy_clause("p", strategy)
-    rows = read_sql(
-        conn,
-        f"""
-        WITH active_candidates AS (
-            SELECT
-                p.*,
-                ROW_NUMBER() OVER (
-                    PARTITION BY UPPER(p.symbol)
-                    ORDER BY
-                        CASE
-                            WHEN LOWER(COALESCE(p.source, '')) = 'sqlite_execution_reducer' THEN 40
-                            WHEN COALESCE(p.ibkr_quantity, 0) != 0 THEN 30
-                            WHEN COALESCE(p.raw_json, '') LIKE '%"ibkr_entry_confirmed": true%' THEN 25
-                            WHEN COALESCE(p.raw_json, '') LIKE '%"entry_fill_verified": true%' THEN 20
-                            WHEN LOWER(COALESCE(p.source, '')) = 'live_buy' THEN 10
-                            ELSE 0
-                        END DESC,
-                        COALESCE(p.updated_at, '') DESC,
-                        COALESCE(p.session_date, '') DESC,
-                        p.rowid DESC
-                ) AS rn
-            FROM positions p
-            WHERE COALESCE(p.session_date, '') <= ? {clause}
-              AND COALESCE(p.active, 0) = 1
-              AND {OPEN_POSITION_STATUS_SQL}
-              AND COALESCE(p.raw_json, '') NOT LIKE '%"active": false%'
-              AND COALESCE(p.raw_json, '') NOT LIKE '%"ibkr_position_flat_confirmed": true%'
-        )
-        SELECT
-            COALESCE(strategy_name, 'unknown') AS strategy,
-            session_date,
-            position_key,
-            symbol,
-            status,
-            quantity,
-            avg_price,
-            ibkr_quantity,
-            updated_at,
-            source,
-            raw_json
-        FROM active_candidates p
-        WHERE p.rn = 1
-        ORDER BY p.symbol
-        """,
-        [window.end_date, *params],
-    )
+    rows = load_raw_active_positions(conn, strategy)
     if rows.empty:
         return pd.DataFrame(columns=[
             "symbol", "position_key", "session_date", "status", "quantity", "ibkr_quantity",
@@ -1604,14 +1583,11 @@ def load_excluded_open_positions(
         key = str(row.get("position_key") or "")
         if key and key in displayed_keys:
             continue
-        raw = parse_raw_json(row.get("raw_json"))
         reason = "FILTERED_BY_OPEN_POSITION_RULES"
         if key and key in orphan_keys:
             reason = "ORPHAN_STALE_POSITION"
-        elif bool(raw.get("ibkr_position_flat_confirmed")):
-            reason = "IBKR_FLAT_CONFIRMED"
-        elif str(row.get("status") or "").upper().split("|", 1)[0] not in OPEN_POSITION_STATUSES:
-            reason = "STATUS_NOT_OPEN"
+        elif "ORPHAN_STALE_POSITION" in str(row.get("status") or "").upper():
+            reason = "ORPHAN_STALE_POSITION"
         out.append(
             {
                 "symbol": str(row.get("symbol") or "").upper(),
@@ -2132,6 +2108,7 @@ def load_dashboard_snapshot(
         conn.execute("BEGIN")
         executions = load_executions(conn, window, strategy)
         execution_lookup = load_executions(conn, expanded_lookup_window(window), strategy)
+        raw_closed_rows = load_raw_closed_trade_rows(conn, window, strategy)
         closed, closed_diag = load_closed_positions(
             conn,
             window,
@@ -2148,6 +2125,21 @@ def load_dashboard_snapshot(
         diagnostics.update(closed_diag)
         diagnostics.update(load_position_row_diagnostics(conn, window, strategy, len(open_positions)))
         diagnostics["active_positions_raw_count"] = int(len(raw_active_positions))
+        diagnostics["raw_active_sqlite_count"] = int(len(raw_active_positions))
+        raw_open_symbols = {
+            str(row.get("symbol") or "").upper()
+            for row in raw_active_positions.to_dict("records")
+            if str(row.get("symbol") or "")
+        }
+        displayed_open_symbols = {
+            str(row.get("symbol") or "").upper()
+            for row in open_positions.to_dict("records")
+            if str(row.get("symbol") or "")
+        }
+        dropped_symbols = sorted(symbol for symbol in raw_open_symbols - displayed_open_symbols if symbol)
+        diagnostics["displayed_open_count"] = int(len(open_positions))
+        diagnostics["dropped_open_count"] = int(len(dropped_symbols))
+        diagnostics["dropped_symbols"] = ",".join(dropped_symbols)
         if not open_positions.empty and "position_bucket" in open_positions.columns:
             diagnostics["today_open_positions_count"] = int((open_positions["position_bucket"].fillna("") == "today").sum())
             diagnostics["stale_carry_open_count"] = int((open_positions["position_bucket"].fillna("") == "carry_stale").sum())
@@ -2172,6 +2164,21 @@ def load_dashboard_snapshot(
             diagnostics["oldest_orphan_stale_position_age_days"] = 0.0
             diagnostics["cleanup_recommendation"] = ""
         diagnostics["closed_trades_count"] = int(len(closed))
+        raw_closed_ids = {
+            str(row.get("trade_id") or "")
+            for row in raw_closed_rows.to_dict("records")
+            if str(row.get("trade_id") or "")
+        }
+        displayed_closed_ids = {
+            str(row.get("trade_id") or "")
+            for row in closed.to_dict("records")
+            if str(row.get("trade_id") or "")
+        }
+        dropped_closed_ids = sorted(raw_closed_ids - displayed_closed_ids)
+        diagnostics["raw_closed_trade_count"] = int(len(raw_closed_rows))
+        diagnostics["displayed_closed_trade_count"] = int(len(closed))
+        diagnostics["dropped_closed_trade_count"] = int(len(dropped_closed_ids))
+        diagnostics["dropped_closed_trade_ids"] = ",".join(dropped_closed_ids)
         if not closed.empty and "carried_closed_today" in closed.columns:
             diagnostics["carried_closed_today_count"] = int(pd.Series(closed["carried_closed_today"]).fillna(False).astype(bool).sum())
         else:

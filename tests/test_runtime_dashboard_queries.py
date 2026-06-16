@@ -1894,6 +1894,85 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertTrue(snapshot["orphan_stale_positions"].empty)
             self.assertEqual(snapshot["diagnostics"]["stale_carry_open_count"], 1)
 
+    def test_unconfirmed_stale_active_open_is_not_hidden_without_orphan_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_position({
+                    "position_key": "v67:2026-05-11:MRAM",
+                    "session_date": "2026-05-11",
+                    "strategy_name": "v67",
+                    "symbol": "MRAM",
+                    "quantity": 3,
+                    "avg_price": 31.65,
+                    "ibkr_quantity": 0,
+                    "active": 1,
+                    "status": "OPEN",
+                    "updated_at": "2026-06-16T14:09:04+00:00",
+                    "raw_json": {
+                        "entry_price": 31.65,
+                        "market_price": 30.50,
+                        "market_price_at": "2026-06-16T14:09:05+00:00",
+                        "entry_time": "2026-05-11T13:30:00+00:00",
+                    },
+                })
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-16", "2026-06-16"), "v67")
+
+            self.assertEqual(len(snapshot["raw_active_positions"]), 1)
+            self.assertEqual(len(snapshot["open_positions"]), 1)
+            self.assertEqual(snapshot["open_positions"].iloc[0]["symbol"], "MRAM")
+            self.assertEqual(snapshot["open_positions"].iloc[0]["position_bucket"], "carry_stale")
+            self.assertEqual(snapshot["diagnostics"]["raw_active_sqlite_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["displayed_open_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["dropped_open_count"], 0)
+            self.assertEqual(snapshot["diagnostics"]["dropped_symbols"], "")
+
+    def test_dropped_open_diagnostics_report_explicit_orphan_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_position({
+                    "position_key": "v67:2026-06-16:FGMC",
+                    "session_date": "2026-06-16",
+                    "strategy_name": "v67",
+                    "symbol": "FGMC",
+                    "quantity": 104,
+                    "avg_price": 1.50,
+                    "active": 1,
+                    "status": "OPEN",
+                    "updated_at": "2026-06-16T14:49:36+00:00",
+                    "raw_json": {"entry_time": "2026-06-16T14:48:43+00:00", "market_price": 1.55},
+                })
+                store.upsert_position({
+                    "position_key": "v67:2026-05-11:MRAM",
+                    "session_date": "2026-05-11",
+                    "strategy_name": "v67",
+                    "symbol": "MRAM",
+                    "quantity": 3,
+                    "avg_price": 31.65,
+                    "active": 1,
+                    "status": "ORPHAN_STALE_POSITION",
+                    "updated_at": "2026-06-16T14:09:04+00:00",
+                    "raw_json": {"entry_time": "2026-05-11T13:30:00+00:00", "market_price": 30.50},
+                })
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-16", "2026-06-16"), "v67")
+
+            self.assertEqual(len(snapshot["raw_active_positions"]), 2)
+            self.assertEqual(len(snapshot["open_positions"]), 1)
+            self.assertEqual(snapshot["open_positions"].iloc[0]["symbol"], "FGMC")
+            self.assertEqual(snapshot["diagnostics"]["raw_active_sqlite_count"], 2)
+            self.assertEqual(snapshot["diagnostics"]["displayed_open_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["dropped_open_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["dropped_symbols"], "MRAM")
+
     def test_carried_closed_trade_is_flagged_on_exit_date(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
@@ -1924,6 +2003,10 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertTrue(bool(row["carried_closed_today"]))
             self.assertIn("CARRIED_POSITION_CLOSED_TODAY", row["data_quality"])
             self.assertEqual(snapshot["diagnostics"]["carried_closed_today_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["raw_closed_trade_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["displayed_closed_trade_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["dropped_closed_trade_count"], 0)
+            self.assertEqual(snapshot["diagnostics"]["dropped_closed_trade_ids"], "")
 
 
 if __name__ == "__main__":
