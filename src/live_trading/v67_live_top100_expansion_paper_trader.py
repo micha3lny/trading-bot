@@ -1088,6 +1088,8 @@ def restore_managed_positions(
     contract_by_symbol: dict[str, Any],
     broker_qty_by_symbol: dict[str, float] | None = None,
     runtime_state: dict[str, Any] | None = None,
+    restore_enabled: bool = True,
+    disabled_reason: str | None = None,
 ) -> dict[str, ManagedPosition]:
     path = recorder.path("managed_positions.json")
     restored: dict[str, ManagedPosition] = {}
@@ -1111,6 +1113,9 @@ def restore_managed_positions(
             if "entry_fill_verified" not in row and exit_sent:
                 entry_verified = True
             candidate_count += 1
+            if not restore_enabled:
+                rejected_count += 1
+                continue
             if broker_qty_by_symbol is not None:
                 broker_qty = float(broker_qty_by_symbol.get(symbol, 0.0) or 0.0)
                 if abs(broker_qty) <= 1e-9:
@@ -1140,8 +1145,13 @@ def restore_managed_positions(
         runtime_state["startup_restore_candidate_count"] = candidate_count
         runtime_state["startup_restore_open_count"] = len(restored)
         runtime_state["startup_restore_rejected_count"] = rejected_count
+        runtime_state["startup_restore_enabled"] = bool(restore_enabled)
+        if disabled_reason:
+            runtime_state["startup_restore_disabled_reason"] = disabled_reason
     print(
         f"{now_utc()} STARTUP_RESTORE_DIAGNOSTICS "
+        f"restore_enabled={int(bool(restore_enabled))} "
+        f"disabled_reason={disabled_reason or 'none'} "
         f"broker_snapshot_count={len(broker_qty_by_symbol or {})} "
         f"restored_candidate_count={candidate_count} "
         f"restored_open_count={len(restored)} "
@@ -4680,6 +4690,12 @@ def main() -> int:
     parser.add_argument("--recorder-dir", default=DEFAULT_RECORDER_DIR)
     parser.add_argument("--sqlite-path", default=None)
     parser.add_argument("--disable-sqlite", action="store_true")
+    parser.add_argument(
+        "--restore-managed-json",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Legacy fallback: allow managed_positions.json to recreate active in-memory positions on startup.",
+    )
     parser.add_argument("--duration-seconds", type=int, default=28800)
     parser.add_argument("--interval-seconds", type=float, default=5.0)
     parser.add_argument("--portfolio-interval-seconds", type=float, default=10.0)
@@ -4958,6 +4974,8 @@ def main() -> int:
             contract_by_symbol,
             broker_qty_by_symbol=startup_broker_qty_by_symbol,
             runtime_state=runtime_state,
+            restore_enabled=bool(args.restore_managed_json),
+            disabled_reason=None if args.restore_managed_json else "sqlite_broker_source_of_truth",
         )
         if restored:
             managed_positions.update(restored)

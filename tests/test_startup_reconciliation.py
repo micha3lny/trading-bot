@@ -149,6 +149,43 @@ class StartupReconciliationTests(unittest.TestCase):
 
             self.assertEqual(restored["RKLB"].quantity, 7)
 
+    def test_restore_managed_positions_disabled_does_not_create_active_positions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            recorder.path("managed_positions.json").write_text(
+                """
+                {
+                  "positions": {
+                    "RKLB": {
+                      "quantity": 10,
+                      "entry_price": 12.0,
+                      "peak_price": 12.5,
+                      "active": true,
+                      "entry_fill_verified": true
+                    }
+                  }
+                }
+                """,
+                encoding="utf-8",
+            )
+            runtime_state = {}
+
+            restored = restore_managed_positions(
+                recorder,
+                {"RKLB": FakeContract("RKLB")},
+                broker_qty_by_symbol={"RKLB": 7},
+                runtime_state=runtime_state,
+                restore_enabled=False,
+                disabled_reason="sqlite_broker_source_of_truth",
+            )
+
+            self.assertEqual(restored, {})
+            self.assertEqual(runtime_state["startup_restore_candidate_count"], 1)
+            self.assertEqual(runtime_state["startup_restore_open_count"], 0)
+            self.assertEqual(runtime_state["startup_restore_rejected_count"], 1)
+            self.assertFalse(runtime_state["startup_restore_enabled"])
+            self.assertEqual(runtime_state["startup_restore_disabled_reason"], "sqlite_broker_source_of_truth")
+
     def test_local_open_but_ibkr_flat_marks_inactive_and_unblocks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             recorder = recorder_in_tmp(tmp)
