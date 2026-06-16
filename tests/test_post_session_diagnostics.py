@@ -217,10 +217,15 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
 
             self.assertFalse(restored)
             self.assertFalse(runtime_state["pending_eod_flatten"])
+            self.assertEqual(runtime_state["eod_pending_file"], str(recorder.path("eod_pending.json")))
             self.assertEqual(runtime_state["eod_pending_symbols_count"], 3)
             self.assertEqual(runtime_state["eod_pending_ignored_count"], 3)
+            self.assertEqual(runtime_state["eod_pending_pending_restored"], 0)
+            self.assertEqual(runtime_state["eod_pending_ignored_reason"], "broker_sqlite_flat_on_startup")
             self.assertFalse(json.loads(recorder.path("eod_pending.json").read_text())["pending_eod_flatten"])
             self.assertIn("EOD_FLATTEN_PENDING_IGNORED_BROKER_FLAT", out.getvalue())
+            self.assertIn("pending_restored=0", out.getvalue())
+            self.assertIn("ignored_reason=broker_sqlite_flat_on_startup", out.getvalue())
 
     def test_pending_eod_flatten_blocks_new_entries(self) -> None:
         runtime_state = {"pending_eod_flatten": True, "entries_blocked_reason": ""}

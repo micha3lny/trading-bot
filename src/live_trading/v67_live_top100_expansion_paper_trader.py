@@ -2042,7 +2042,12 @@ def load_pending_eod_flatten(
     sqlite_active_count: int | None = None,
 ) -> bool:
     path = recorder.path("eod_pending.json")
+    runtime_state["eod_pending_file"] = str(path)
     if not path.exists():
+        runtime_state["eod_pending_symbols_count"] = 0
+        runtime_state["eod_pending_ignored_count"] = 0
+        runtime_state["eod_pending_pending_restored"] = 0
+        runtime_state["eod_pending_ignored_reason"] = ""
         return False
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -2056,15 +2061,21 @@ def load_pending_eod_flatten(
     runtime_state["eod_pending_symbols_count"] = len(symbols)
     if pending and broker_open_count == 0 and sqlite_active_count == 0:
         runtime_state["eod_pending_ignored_count"] = len(symbols)
+        runtime_state["eod_pending_pending_restored"] = 0
+        runtime_state["eod_pending_ignored_reason"] = "broker_sqlite_flat_on_startup"
         persist_pending_eod_flatten(recorder, runtime_state, pending=False, reason="broker_sqlite_flat_on_startup")
         print(
             f"{now_utc()} EOD_FLATTEN_PENDING_IGNORED_BROKER_FLAT "
+            f"eod_pending_file={path} "
             f"broker_open_count=0 sqlite_active_count=0 "
-            f"eod_pending_symbols_count={len(symbols)} eod_pending_ignored_count={len(symbols)}",
+            f"eod_pending_symbols_count={len(symbols)} eod_pending_ignored_count={len(symbols)} "
+            f"pending_restored=0 ignored_reason=broker_sqlite_flat_on_startup",
             flush=True,
         )
         return False
     runtime_state["eod_pending_ignored_count"] = 0
+    runtime_state["eod_pending_pending_restored"] = int(pending)
+    runtime_state["eod_pending_ignored_reason"] = ""
     runtime_state["pending_eod_flatten"] = pending
     runtime_state["pending_eod_flatten_reason"] = str(payload.get("reason") or "")
     runtime_state["pending_eod_flatten_updated_at"] = str(payload.get("recorded_at") or "")
@@ -2072,9 +2083,10 @@ def load_pending_eod_flatten(
     if pending:
         print(
             f"{now_utc()} EOD_FLATTEN_PENDING_RESTORED reason={runtime_state['pending_eod_flatten_reason']} "
+            f"eod_pending_file={path} "
             f"broker_open_count={broker_open_count if broker_open_count is not None else 'unknown'} "
             f"sqlite_active_count={sqlite_active_count if sqlite_active_count is not None else 'unknown'} "
-            f"eod_pending_symbols_count={len(symbols)} "
+            f"eod_pending_symbols_count={len(symbols)} pending_restored=1 ignored_reason=none "
             f"symbols={','.join(runtime_state['pending_eod_flatten_symbols'])}",
             flush=True,
         )
@@ -2517,11 +2529,16 @@ def enforce_eod_flatten_if_due(
     sqlite_active_count = sqlite_active_position_count(recorder)
     if not active_managed and not ibkr_rows and sqlite_active_count == 0 and runtime_state.get("pending_eod_flatten"):
         ignored_count = len(runtime_state.get("pending_eod_flatten_symbols") or [])
+        runtime_state["eod_pending_ignored_count"] = ignored_count
+        runtime_state["eod_pending_pending_restored"] = 0
+        runtime_state["eod_pending_ignored_reason"] = "broker_sqlite_flat_eod_failsafe"
         persist_pending_eod_flatten(recorder, runtime_state, pending=False, reason="broker_sqlite_flat_eod_failsafe")
         print(
             f"{now_utc()} EOD_FLATTEN_PENDING_IGNORED_BROKER_FLAT reason={reason} "
+            f"eod_pending_file={recorder.path('eod_pending.json')} "
             f"broker_open_count=0 sqlite_active_count=0 "
-            f"eod_pending_symbols_count={ignored_count} eod_pending_ignored_count={ignored_count}",
+            f"eod_pending_symbols_count={ignored_count} eod_pending_ignored_count={ignored_count} "
+            f"pending_restored=0 ignored_reason=broker_sqlite_flat_eod_failsafe",
             flush=True,
         )
         return 0
