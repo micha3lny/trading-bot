@@ -12,7 +12,7 @@ from typing import Any
 
 import pandas as pd
 
-from src.dashboard.runtime_queries import parse_raw_json, to_float
+from src.dashboard.runtime_queries import DateWindow, load_dashboard_snapshot, parse_raw_json, to_float
 from src.live_trading.storage.sqlite_store import resolve_sqlite_path
 
 
@@ -280,23 +280,10 @@ def load_sqlite_closed_trades(sqlite_path: str | Path, selected_date: str) -> pd
     path = Path(resolve_sqlite_path(sqlite_path))
     if not path.exists():
         return empty_closed_trades()
-    conn = sqlite3.connect(str(path))
-    try:
-        rows = pd.read_sql_query(
-            """
-            SELECT trade_id, symbol, entry_fill_time, exit_fill_time, closed_at,
-                   quantity, entry_price, exit_price, gross_pnl, commission, net_pnl,
-                   raw_json
-            FROM trades
-            WHERE UPPER(COALESCE(status, '')) = 'CLOSED'
-              AND COALESCE(substr(exit_fill_time, 1, 10), substr(closed_at, 1, 10), session_date) = ?
-            ORDER BY COALESCE(exit_fill_time, closed_at), symbol, trade_id
-            """,
-            conn,
-            params=[selected_date],
-        )
-    finally:
-        conn.close()
+    snapshot = load_dashboard_snapshot(path, DateWindow(selected_date, selected_date), "All", include_reconstructed=False)
+    rows = snapshot.get("closed_positions", pd.DataFrame())
+    if rows is None or rows.empty:
+        return empty_closed_trades()
     out: list[dict[str, Any]] = []
     for row in rows.to_dict("records"):
         raw = parse_raw_json(row.get("raw_json"))
@@ -312,22 +299,22 @@ def load_sqlite_closed_trades(sqlite_path: str | Path, selected_date: str) -> pd
             or raw.get("sld_execution_id")
             or ""
         )
-        source = str(raw.get("reconstruction_source") or raw.get("source") or "sqlite_trades")
+        source = str(row.get("source") or raw.get("reconstruction_source") or raw.get("source") or "sqlite_trades")
         out.append(
             {
                 "symbol": str(row.get("symbol") or "").upper(),
                 "trade_id": str(row.get("trade_id") or ""),
-                "entry_time": iso_time(row.get("entry_fill_time")),
-                "exit_time": iso_time(row.get("exit_fill_time") or row.get("closed_at")),
-                "quantity": abs(to_float(row.get("quantity"), 0.0) or 0.0),
-                "entry_price": to_float(row.get("entry_price"), None),
-                "exit_price": to_float(row.get("exit_price"), None),
-                "realized_pnl": to_float(row.get("gross_pnl"), 0.0) or 0.0,
-                "commission": abs(to_float(row.get("commission"), 0.0) or 0.0),
-                "net_pnl": to_float(row.get("net_pnl"), 0.0) or 0.0,
+                "entry_time": iso_time(row.get("entry_time")),
+                "exit_time": iso_time(row.get("exit_time")),
+                "quantity": abs(to_float(row.get("qty"), 0.0) or 0.0),
+                "entry_price": to_float(row.get("buy"), None),
+                "exit_price": to_float(row.get("sell"), None),
+                "realized_pnl": to_float(row.get("gross"), 0.0) or 0.0,
+                "commission": abs(to_float(row.get("ibkr_commission"), 0.0) or 0.0),
+                "net_pnl": to_float(row.get("net_actual"), 0.0) or 0.0,
                 "source": source,
-                "entry_execution_id": entry_execution_id,
-                "exit_execution_id": exit_execution_id,
+                "entry_execution_id": str(row.get("entry_execution_id") or entry_execution_id),
+                "exit_execution_id": str(row.get("exit_execution_id") or exit_execution_id),
             }
         )
     return pd.DataFrame(out, columns=BROKER_CLOSED_TRADE_COLUMNS)
@@ -917,24 +904,23 @@ def load_sqlite_trade_pnl(sqlite_path: str | Path, selected_date: str) -> pd.Dat
     path = Path(resolve_sqlite_path(sqlite_path))
     if not path.exists():
         return pd.DataFrame()
-    conn = sqlite3.connect(str(path))
-    try:
-        return pd.read_sql_query(
-            """
-            SELECT
-                COUNT(*) AS trades,
-                COALESCE(SUM(gross_pnl), 0) AS sqlite_gross,
-                COALESCE(SUM(commission), 0) AS sqlite_commission,
-                COALESCE(SUM(net_pnl), 0) AS sqlite_net
-            FROM trades
-            WHERE UPPER(COALESCE(status, '')) = 'CLOSED'
-              AND COALESCE(substr(exit_fill_time, 1, 10), substr(closed_at, 1, 10), session_date) = ?
-            """,
-            conn,
-            params=[selected_date],
-        )
-    finally:
-        conn.close()
+    snapshot = load_dashboard_snapshot(path, DateWindow(selected_date, selected_date), "All", include_reconstructed=False)
+    summary = snapshot.get("summary", {})
+    diagnostics = snapshot.get("diagnostics", {})
+    return pd.DataFrame(
+        [
+            {
+                "trades": int(summary.get("closed_trades") or 0),
+                "sqlite_gross": float(summary.get("gross_pnl") or 0.0),
+                "sqlite_commission": float(summary.get("commissions") or 0.0),
+                "sqlite_net": float(summary.get("net_actual_pnl") or 0.0),
+                "reconciliation_sqlite_trade_source": "runtime_trusted_closed_view",
+                "runtime_trade_source": "load_dashboard_snapshot",
+                "trusted_closed_count": int(summary.get("closed_trades") or 0) - int(diagnostics.get("untrusted_carry_closed_count") or 0),
+                "untrusted_carry_count": int(diagnostics.get("untrusted_carry_closed_count") or 0),
+            }
+        ]
+    )
 
 
 def reconcile_broker_vs_sqlite(
@@ -994,6 +980,10 @@ def reconcile_broker_vs_sqlite(
     summary = {
         "status": status,
         "broker_status": broker_status,
+        "reconciliation_sqlite_trade_source": str(sqlite_pnl_row.get("reconciliation_sqlite_trade_source", "runtime_trusted_closed_view")),
+        "runtime_trade_source": str(sqlite_pnl_row.get("runtime_trade_source", "load_dashboard_snapshot")),
+        "trusted_closed_count": int(sqlite_pnl_row.get("trusted_closed_count", 0) or 0),
+        "untrusted_carry_count": int(sqlite_pnl_row.get("untrusted_carry_count", 0) or 0),
         "broker_execution_count": int(len(broker_executions)),
         "sqlite_execution_count": int(len(sqlite_executions)),
         "matched_executions": int(len(matched)),

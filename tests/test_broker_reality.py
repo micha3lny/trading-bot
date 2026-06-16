@@ -14,6 +14,7 @@ from src.dashboard.broker_reality import (
     ensure_asyncio_event_loop,
     load_sqlite_executions,
     load_sqlite_closed_trades,
+    load_sqlite_trade_pnl,
     match_executions,
     normalize_execution_record,
     parse_ibkr_activity_csv,
@@ -295,6 +296,49 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
         self.assertEqual(rows.iloc[0]["entry_execution_id"], "B1")
         self.assertEqual(rows.iloc[0]["exit_execution_id"], "S1")
         self.assertEqual(rows.iloc[0]["source"], "sqlite_execution_reducer")
+
+    def test_sqlite_trade_pnl_uses_runtime_trusted_closed_view(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_trade({
+                    "trade_id": "reconstructed:2026-05-13:2026-06-16:OUST:B_OLD:S_TODAY",
+                    "session_date": "2026-05-13",
+                    "strategy_name": "v67",
+                    "symbol": "OUST",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-05-13T13:30:00+00:00",
+                    "exit_fill_time": "2026-06-16T14:45:00+00:00",
+                    "closed_at": "2026-06-16T14:45:00+00:00",
+                    "entry_price": 1.00,
+                    "exit_price": 12.487727,
+                    "quantity": 22,
+                    "gross_pnl": 252.73,
+                    "commission": 1.025094,
+                    "net_pnl": 251.704906,
+                    "raw_json": {
+                        "reconstruction_source": "sqlite_execution_reducer",
+                        "buy_execution_id": "B_OLD",
+                        "sell_execution_id": "S_TODAY",
+                    },
+                })
+            finally:
+                store.close()
+
+            pnl = load_sqlite_trade_pnl(db, "2026-06-16")
+            closed = load_sqlite_closed_trades(db, "2026-06-16")
+
+        self.assertEqual(len(closed), 1)
+        self.assertAlmostEqual(closed.iloc[0]["realized_pnl"], 0.0)
+        self.assertAlmostEqual(closed.iloc[0]["net_pnl"], 0.0)
+        row = pnl.iloc[0]
+        self.assertEqual(row["reconciliation_sqlite_trade_source"], "runtime_trusted_closed_view")
+        self.assertEqual(row["runtime_trade_source"], "load_dashboard_snapshot")
+        self.assertEqual(row["trusted_closed_count"], 0)
+        self.assertEqual(row["untrusted_carry_count"], 1)
+        self.assertAlmostEqual(row["sqlite_gross"], 0.0)
+        self.assertAlmostEqual(row["sqlite_net"], 0.0)
 
 
 if __name__ == "__main__":

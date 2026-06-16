@@ -1205,6 +1205,12 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
         f"broker_closed_trades={len(broker_closed_trades)} sqlite_closed_trades={len(sqlite_closed_trades)} "
         f"portfolio_rows={len(portfolio)}"
     )
+    st.caption(
+        f"reconciliation_sqlite_trade_source={result.summary.get('reconciliation_sqlite_trade_source', '')} "
+        f"runtime_trade_source={result.summary.get('runtime_trade_source', '')} "
+        f"trusted_closed_count={result.summary.get('trusted_closed_count', 0)} "
+        f"untrusted_carry_count={result.summary.get('untrusted_carry_count', 0)}"
+    )
     if status == "CSV_REQUIRED_FOR_HISTORICAL_DATE":
         st.warning("CSV_REQUIRED_FOR_HISTORICAL_DATE")
 
