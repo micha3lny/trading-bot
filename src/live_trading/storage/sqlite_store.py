@@ -824,10 +824,16 @@ class SQLiteRuntimeStore:
         strategy_name: str | None = None,
         *,
         allow_historical_open_lots: bool = False,
+        broker_net_positions: dict[str, float] | None = None,
     ) -> dict[str, Any]:
         if self._transaction_depth == 0:
             with self.transaction():
-                return self.rebuild_symbol_trade_state(symbol, strategy_name, allow_historical_open_lots=allow_historical_open_lots)
+                return self.rebuild_symbol_trade_state(
+                    symbol,
+                    strategy_name,
+                    allow_historical_open_lots=allow_historical_open_lots,
+                    broker_net_positions=broker_net_positions,
+                )
         symbol = str(symbol or "").upper().strip()
         if not symbol:
             return {"symbol": symbol, "closed_trades": 0, "open_quantity": 0.0}
@@ -976,6 +982,39 @@ class SQLiteRuntimeStore:
             open_lots = current_open_lots
 
         open_qty = sum(safe_float(lot.get("remaining_qty")) or 0.0 for lot in open_lots)
+        broker_target_qty: float | None = None
+        broker_suppressed_lots: list[dict[str, Any]] = []
+        if broker_net_positions is not None and symbol in broker_net_positions:
+            broker_target_qty = max(safe_float(broker_net_positions.get(symbol)) or 0.0, 0.0)
+            if broker_target_qty <= 1e-9:
+                broker_suppressed_lots = open_lots
+                open_lots = []
+            elif open_qty > broker_target_qty + 1e-9:
+                qty_to_keep = broker_target_qty
+                kept_reversed: list[dict[str, Any]] = []
+                suppressed_reversed: list[dict[str, Any]] = []
+                for lot in reversed(open_lots):
+                    lot_qty = safe_float(lot.get("remaining_qty")) or 0.0
+                    if lot_qty <= 1e-9:
+                        continue
+                    if qty_to_keep <= 1e-9:
+                        suppressed_reversed.append(lot)
+                        continue
+                    take_qty = min(lot_qty, qty_to_keep)
+                    if take_qty < lot_qty - 1e-9:
+                        kept = dict(lot)
+                        kept["remaining_qty"] = take_qty
+                        kept_reversed.append(kept)
+                        suppressed = dict(lot)
+                        suppressed["remaining_qty"] = lot_qty - take_qty
+                        suppressed_reversed.append(suppressed)
+                    else:
+                        kept_reversed.append(lot)
+                    qty_to_keep -= take_qty
+                open_lots = list(reversed(kept_reversed))
+                broker_suppressed_lots = list(reversed(suppressed_reversed))
+                open_qty = sum(safe_float(lot.get("remaining_qty")) or 0.0 for lot in open_lots)
+
         suppressed_qty = sum(safe_float(lot.get("remaining_qty")) or 0.0 for lot in suppressed_historical_lots)
         if suppressed_qty > 1e-9:
             stale_cost = sum((safe_float(lot.get("remaining_qty")) or 0.0) * (safe_float(lot.get("price")) or 0.0) for lot in suppressed_historical_lots)
@@ -1009,6 +1048,40 @@ class SQLiteRuntimeStore:
                     },
                 }
             )
+        broker_suppressed_qty = sum(safe_float(lot.get("remaining_qty")) or 0.0 for lot in broker_suppressed_lots)
+        if broker_suppressed_qty > 1e-9:
+            broker_suppressed_cost = sum((safe_float(lot.get("remaining_qty")) or 0.0) * (safe_float(lot.get("price")) or 0.0) for lot in broker_suppressed_lots)
+            broker_suppressed_avg = broker_suppressed_cost / broker_suppressed_qty if broker_suppressed_qty else None
+            broker_suppressed_first = broker_suppressed_lots[0]
+            broker_suppressed_entry_time = execution_sort_time(broker_suppressed_first)
+            broker_suppressed_entry_date = str(broker_suppressed_first.get("session_date") or "") or iso_date_part(broker_suppressed_entry_time) or latest_session
+            broker_suppressed_strategy = str(broker_suppressed_first.get("strategy_name") or latest_strategy or "unknown")
+            self.upsert_position(
+                {
+                    "position_key": f"{broker_suppressed_strategy}:{broker_suppressed_entry_date}:{symbol}:broker_unconfirmed_open_lot",
+                    "strategy_name": broker_suppressed_strategy,
+                    "session_date": broker_suppressed_entry_date,
+                    "symbol": symbol,
+                    "status": "BROKER_UNCONFIRMED_OPEN_LOT",
+                    "quantity": broker_suppressed_qty,
+                    "avg_price": broker_suppressed_avg,
+                    "source": "sqlite_execution_reducer",
+                    "ibkr_quantity": broker_target_qty,
+                    "active": 0,
+                    "exit_sent": 0,
+                    "updated_at": last_event_time,
+                    "raw_json": {
+                        "active": False,
+                        "entry_fill_verified": True,
+                        "entry_time": broker_suppressed_entry_time,
+                        "entry_price": broker_suppressed_avg,
+                        "broker_position_reducer_suppressed": True,
+                        "broker_target_quantity": broker_target_qty,
+                        "suppressed_quantity": broker_suppressed_qty,
+                        "open_lot_execution_ids": [lot.get("execution_id") for lot in broker_suppressed_lots],
+                    },
+                }
+            )
         if open_qty > 1e-9:
             weighted_cost = sum((safe_float(lot.get("remaining_qty")) or 0.0) * (safe_float(lot.get("price")) or 0.0) for lot in open_lots)
             avg_price = weighted_cost / open_qty if open_qty else None
@@ -1039,6 +1112,7 @@ class SQLiteRuntimeStore:
                         "market_price": latest_price,
                         "market_price_at": last_event_time,
                         "market_price_source": "execution_reducer",
+                        "broker_target_quantity": broker_target_qty,
                         "open_lot_execution_ids": [lot.get("execution_id") for lot in open_lots],
                     },
                 }
@@ -1076,7 +1150,9 @@ class SQLiteRuntimeStore:
             "closed_trades": closed_count,
             "open_quantity": open_qty,
             "suppressed_historical_open_quantity": suppressed_qty,
-            "open_lot_suppressed": suppressed_qty > 1e-9,
+            "broker_target_quantity": broker_target_qty,
+            "broker_suppressed_open_quantity": broker_suppressed_qty,
+            "open_lot_suppressed": suppressed_qty > 1e-9 or broker_suppressed_qty > 1e-9,
         }
 
     def rebuild_positions_from_executions(
@@ -1084,12 +1160,14 @@ class SQLiteRuntimeStore:
         symbols: list[str] | tuple[str, ...] | None = None,
         *,
         allow_historical_open_lots: bool = False,
+        broker_net_positions: dict[str, float] | None = None,
     ) -> dict[str, Any]:
         if self._transaction_depth == 0:
             with self.transaction():
                 return self.rebuild_positions_from_executions(
                     symbols,
                     allow_historical_open_lots=allow_historical_open_lots,
+                    broker_net_positions=broker_net_positions,
                 )
         if symbols is None:
             rows = self.query(
@@ -1105,7 +1183,11 @@ class SQLiteRuntimeStore:
             symbols_to_rebuild = sorted({str(symbol or "").upper().strip() for symbol in symbols if str(symbol or "").strip()})
 
         results = [
-            self.rebuild_symbol_trade_state(symbol, allow_historical_open_lots=allow_historical_open_lots)
+            self.rebuild_symbol_trade_state(
+                symbol,
+                allow_historical_open_lots=allow_historical_open_lots,
+                broker_net_positions=broker_net_positions,
+            )
             for symbol in symbols_to_rebuild
         ]
         open_symbols = [row["symbol"] for row in results if (safe_float(row.get("open_quantity")) or 0.0) > 1e-9]
@@ -1116,6 +1198,7 @@ class SQLiteRuntimeStore:
             "open_symbols_count": len(open_symbols),
             "suppressed_historical_open_symbols": suppressed_symbols,
             "suppressed_historical_open_symbols_count": len(suppressed_symbols),
+            "broker_constrained": broker_net_positions is not None,
             "closed_trades_rebuilt": sum(safe_int(row.get("closed_trades")) or 0 for row in results),
         }
 

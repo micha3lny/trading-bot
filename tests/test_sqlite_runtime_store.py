@@ -429,6 +429,29 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_reducer_constrains_active_quantity_to_broker_position(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B_CAP_1", "strategy_name": "v67", "session_date": today, "symbol": "CAPQ", "side": "BOT", "quantity": 100, "price": 10, "executed_at": f"{today}T13:30:00+00:00"})
+                store.upsert_execution({"execution_id": "B_CAP_2", "strategy_name": "v67", "session_date": today, "symbol": "CAPQ", "side": "BOT", "quantity": 50, "price": 11, "executed_at": f"{today}T13:35:00+00:00"})
+                result = store.rebuild_symbol_trade_state("CAPQ", broker_net_positions={"CAPQ": 120})
+
+                active = store.query("SELECT * FROM positions WHERE symbol = 'CAPQ' AND COALESCE(active, 0) = 1")
+                suppressed = store.query("SELECT * FROM positions WHERE symbol = 'CAPQ' AND status = 'BROKER_UNCONFIRMED_OPEN_LOT'")
+
+                self.assertAlmostEqual(result["open_quantity"], 120)
+                self.assertAlmostEqual(result["broker_suppressed_open_quantity"], 30)
+                self.assertEqual(len(active), 1)
+                self.assertAlmostEqual(active[0]["quantity"], 120)
+                self.assertAlmostEqual(active[0]["ibkr_quantity"], 120)
+                self.assertEqual(len(suppressed), 1)
+                self.assertEqual(suppressed[0]["active"], 0)
+                self.assertAlmostEqual(suppressed[0]["quantity"], 30)
+            finally:
+                store.close()
+
     def test_repair_rebuild_clears_active_position_without_execution_net(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
