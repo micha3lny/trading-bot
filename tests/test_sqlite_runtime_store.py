@@ -452,6 +452,25 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_reducer_deactivates_symbol_missing_from_broker_snapshot(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B_GONE", "strategy_name": "v67", "session_date": today, "symbol": "GONE", "side": "BOT", "quantity": 7, "price": 10, "executed_at": f"{today}T13:30:00+00:00"})
+                result = store.rebuild_symbol_trade_state("GONE", broker_net_positions={})
+
+                active = store.query("SELECT * FROM positions WHERE symbol = 'GONE' AND COALESCE(active, 0) = 1")
+                suppressed = store.query("SELECT * FROM positions WHERE symbol = 'GONE' AND status = 'BROKER_UNCONFIRMED_OPEN_LOT'")
+
+                self.assertAlmostEqual(result["open_quantity"], 0)
+                self.assertAlmostEqual(result["broker_suppressed_open_quantity"], 7)
+                self.assertEqual(active, [])
+                self.assertEqual(len(suppressed), 1)
+                self.assertEqual(suppressed[0]["active"], 0)
+            finally:
+                store.close()
+
     def test_repair_rebuild_clears_active_position_without_execution_net(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")

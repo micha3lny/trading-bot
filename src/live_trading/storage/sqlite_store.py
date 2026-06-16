@@ -984,11 +984,12 @@ class SQLiteRuntimeStore:
         open_qty = sum(safe_float(lot.get("remaining_qty")) or 0.0 for lot in open_lots)
         broker_target_qty: float | None = None
         broker_suppressed_lots: list[dict[str, Any]] = []
-        if broker_net_positions is not None and symbol in broker_net_positions:
-            broker_target_qty = max(safe_float(broker_net_positions.get(symbol)) or 0.0, 0.0)
+        if broker_net_positions is not None:
+            broker_target_qty = max(safe_float(broker_net_positions.get(symbol, 0.0)) or 0.0, 0.0)
             if broker_target_qty <= 1e-9:
                 broker_suppressed_lots = open_lots
                 open_lots = []
+                open_qty = 0.0
             elif open_qty > broker_target_qty + 1e-9:
                 qty_to_keep = broker_target_qty
                 kept_reversed: list[dict[str, Any]] = []

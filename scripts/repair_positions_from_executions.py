@@ -65,6 +65,30 @@ def sqlite_active_positions(store: SQLiteRuntimeStore, symbols: list[str] | None
     return {str(row["symbol"]).upper(): float(row["active_qty"] or 0.0) for row in rows}
 
 
+def sqlite_active_position_rows(store: SQLiteRuntimeStore, symbols: list[str] | None = None) -> list[dict[str, Any]]:
+    params: list[Any] = []
+    symbol_filter = ""
+    if symbols:
+        placeholders = ",".join("?" for _ in symbols)
+        symbol_filter = f"AND UPPER(symbol) IN ({placeholders})"
+        params = [symbol.upper() for symbol in symbols]
+    return store.query(
+        f"""
+        SELECT position_key,
+               UPPER(symbol) AS symbol,
+               status,
+               source,
+               COALESCE(ibkr_quantity, quantity, 0) AS quantity,
+               updated_at
+        FROM positions
+        WHERE COALESCE(active, 0) = 1
+          {symbol_filter}
+        ORDER BY UPPER(symbol), updated_at, position_key
+        """,
+        params,
+    )
+
+
 def diff_positions(target: dict[str, float], active: dict[str, float]) -> list[dict[str, Any]]:
     symbols = sorted(set(target) | set(active))
     diffs: list[dict[str, Any]] = []
@@ -82,6 +106,29 @@ def diff_positions(target: dict[str, float], active: dict[str, float]) -> list[d
             }
         )
     return diffs
+
+
+def repair_plan(target: dict[str, float], active: dict[str, float], active_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    active_symbols_all = sorted({str(row.get("symbol") or "").upper() for row in active_rows if row.get("symbol")})
+    target_symbols = sorted(symbol for symbol, qty in target.items() if abs(qty) > 1e-9)
+    to_deactivate = [symbol for symbol in active_symbols_all if abs(target.get(symbol, 0.0)) <= 1e-9]
+    to_trim: list[dict[str, Any]] = []
+    for symbol in sorted(set(active) | set(target)):
+        old_qty = active.get(symbol, 0.0)
+        new_qty = target.get(symbol, 0.0)
+        if symbol in to_deactivate:
+            continue
+        if abs(old_qty - new_qty) > 1e-6:
+            to_trim.append({"symbol": symbol, "old_qty": old_qty, "new_qty": new_qty, "difference": old_qty - new_qty})
+    return {
+        "broker_snapshot_count": len(target_symbols),
+        "broker_snapshot_qty_sum": sum(target.get(symbol, 0.0) for symbol in target_symbols),
+        "sqlite_active_before_count": len(active_symbols_all),
+        "sqlite_active_before_row_count": len(active_rows),
+        "to_deactivate_symbols": to_deactivate,
+        "to_trim_symbols": to_trim,
+        "sqlite_active_after_expected_count": len(target_symbols),
+    }
 
 
 def load_broker_positions_csv(path: str | Path) -> dict[str, float]:
@@ -175,8 +222,10 @@ def main() -> int:
     try:
         before_ledger = ledger_net_positions(store, symbols)
         before_active = sqlite_active_positions(store, symbols)
+        before_active_rows = sqlite_active_position_rows(store, symbols)
         target_positions = broker_positions if broker_positions is not None else before_ledger
         before_diff = diff_positions(target_positions, before_active)
+        plan = repair_plan(target_positions, before_active, before_active_rows)
         result: dict[str, Any] = {
             "apply": args.apply,
             "sqlite_path": str(args.sqlite_path),
@@ -185,6 +234,7 @@ def main() -> int:
             "broker_source": broker_source,
             "broker_positions_count": len(broker_positions or {}),
             "broker_positions_qty_sum": sum((broker_positions or {}).values()),
+            **plan,
             "mismatches_before": len(before_diff),
             "mismatch_rows_before": before_diff,
         }
@@ -196,13 +246,17 @@ def main() -> int:
             )
             after_ledger = ledger_net_positions(store, symbols)
             after_active = sqlite_active_positions(store, symbols)
+            after_active_rows = sqlite_active_position_rows(store, symbols)
             after_target = broker_positions if broker_positions is not None else after_ledger
             after_diff = diff_positions(after_target, after_active)
+            after_plan = repair_plan(after_target, after_active, after_active_rows)
             result.update(
                 {
                     "repair": repair,
                     "mismatches_after": len(after_diff),
                     "mismatch_rows_after": after_diff,
+                    "sqlite_active_after_count": after_plan["sqlite_active_before_count"],
+                    "sqlite_active_after_row_count": after_plan["sqlite_active_before_row_count"],
                 }
             )
             store.record_runtime_event(
