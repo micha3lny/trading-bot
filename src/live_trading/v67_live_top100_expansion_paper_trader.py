@@ -5688,10 +5688,26 @@ def main() -> int:
                     )
                     record_account_snapshot(ib, recorder)
                     new_fills = record_recent_fills(ib, recorder, seen_fills)
+                    position_reconcile_started_at = now_utc()
+                    safe_sqlite_call(
+                        getattr(recorder, "sqlite_store", None),
+                        "mark_operation_status",
+                        "position_reconcile",
+                        "running",
+                        started_at=position_reconcile_started_at,
+                    )
                     sqlite_position_reconcile = safe_sqlite_call(
                         getattr(recorder, "sqlite_store", None),
                         "reconcile_active_positions_to_broker_snapshot",
                         latest_broker_qty_by_symbol,
+                    )
+                    safe_sqlite_call(
+                        getattr(recorder, "sqlite_store", None),
+                        "mark_operation_status",
+                        "position_reconcile",
+                        "idle",
+                        started_at=position_reconcile_started_at,
+                        result=sqlite_position_reconcile or {},
                     )
                     if sqlite_position_reconcile and sqlite_position_reconcile.get("suppressed_historical_open_symbols_count"):
                         print(

@@ -1941,6 +1941,59 @@ def load_diagnostics(conn: sqlite3.Connection, window: DateWindow, strategy: str
         """,
         [window.start_date, window.end_date, window.start_date, window.end_date, window.start_date, window.end_date, *trade_params],
     )
+    runtime_state = pd.DataFrame()
+    if table_columns(conn, "runtime_state"):
+        runtime_state = read_sql(
+            conn,
+            """
+            SELECT key, value, updated_at, raw_json
+            FROM runtime_state
+            WHERE key IN ('fill_ingest', 'position_reconcile')
+            """,
+        )
+    pending_counts = pd.DataFrame()
+    if table_columns(conn, "executions"):
+        pending_counts = read_sql(
+            conn,
+            """
+            SELECT
+                COUNT(*) AS execution_count,
+                SUM(CASE
+                    WHEN COALESCE(commission_source, '') != 'ibkr'
+                         OR commission IS NULL
+                    THEN 1 ELSE 0 END
+                ) AS pending_commission_count,
+                SUM(CASE
+                    WHEN UPPER(COALESCE(side, '')) IN ('SLD', 'SELL')
+                         AND COALESCE(commission_source, '') IN ('ibkr', 'missing')
+                         AND realized_pnl IS NULL
+                    THEN 1 ELSE 0 END
+                ) AS pending_realized_pnl_count
+            FROM executions
+            WHERE COALESCE(substr(executed_at, 1, 10), substr(recorded_at, 1, 10), session_date) BETWEEN ? AND ?
+            """,
+            [window.start_date, window.end_date],
+        )
+    pending_trades = pd.DataFrame()
+    pending_trade_cols = table_columns(conn, "trades")
+    if "status" in pending_trade_cols:
+        pending_trades = read_sql(
+            conn,
+            """
+            SELECT COUNT(*) AS pending_trade_finalization_count
+            FROM trades
+            WHERE UPPER(COALESCE(status, '')) IN ('COMMISSION_PENDING', 'PNL_PENDING', 'RECONCILE_PENDING')
+              AND (
+                substr(exit_fill_time, 1, 10) BETWEEN ? AND ?
+                OR substr(closed_at, 1, 10) BETWEEN ? AND ?
+                OR (
+                    COALESCE(exit_fill_time, closed_at) IS NULL
+                    AND session_date BETWEEN ? AND ?
+                )
+              )
+            """,
+            [window.start_date, window.end_date, window.start_date, window.end_date, window.start_date, window.end_date],
+        )
     out = {
         "orphans": 0,
         "missing_in_ibkr": 0,
@@ -1955,6 +2008,16 @@ def load_diagnostics(conn: sqlite3.Connection, window: DateWindow, strategy: str
         "trades_updated_last_60s": 0,
         "reducer_running": 0,
         "last_reducer_run_at": "",
+        "last_fill_ingest_started_at": "",
+        "last_fill_ingest_finished_at": "",
+        "last_position_reconcile_started_at": "",
+        "last_position_reconcile_finished_at": "",
+        "fill_ingest_running": 0,
+        "position_reconcile_running": 0,
+        "pending_execution_count": 0,
+        "pending_commission_count": 0,
+        "pending_realized_pnl_count": 0,
+        "pending_trade_finalization_count": 0,
     }
     for row in events.to_dict("records"):
         event_type = str(row.get("event_type") or "")
@@ -1987,6 +2050,25 @@ def load_diagnostics(conn: sqlite3.Connection, window: DateWindow, strategy: str
         out["reconstructed_trades_count"] = int(row.get("reconstructed_trades_count") or 0)
         out["trades_updated_last_60s"] = int(row.get("trades_updated_last_60s") or 0)
         out["last_reducer_run_at"] = str(row.get("last_reducer_run_at") or "")
+    if not runtime_state.empty:
+        for row in runtime_state.to_dict("records"):
+            key = str(row.get("key") or "")
+            raw = parse_raw_json(row.get("raw_json"))
+            if key == "fill_ingest":
+                out["last_fill_ingest_started_at"] = str(raw.get("started_at") or "")
+                out["last_fill_ingest_finished_at"] = str(raw.get("finished_at") or "")
+                out["fill_ingest_running"] = 1 if str(raw.get("status") or "").lower() == "running" else 0
+            elif key == "position_reconcile":
+                out["last_position_reconcile_started_at"] = str(raw.get("started_at") or "")
+                out["last_position_reconcile_finished_at"] = str(raw.get("finished_at") or "")
+                out["position_reconcile_running"] = 1 if str(raw.get("status") or "").lower() == "running" else 0
+    if not pending_counts.empty:
+        row = pending_counts.iloc[0].to_dict()
+        out["pending_execution_count"] = int(row.get("execution_count") or 0)
+        out["pending_commission_count"] = int(row.get("pending_commission_count") or 0)
+        out["pending_realized_pnl_count"] = int(row.get("pending_realized_pnl_count") or 0)
+    if not pending_trades.empty:
+        out["pending_trade_finalization_count"] = int(pending_trades.iloc[0].to_dict().get("pending_trade_finalization_count") or 0)
     return out
 
 

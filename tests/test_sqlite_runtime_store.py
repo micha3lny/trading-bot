@@ -135,6 +135,7 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                     "recorded_at": "2026-05-29T14:05:00+00:00",
                     "commission": 0.36,
                     "commission_source": "ibkr",
+                    "realized_pnl": 5.0,
                 })
 
                 latest = store.get_latest_position("AKTX")
@@ -168,7 +169,7 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 self.assertIn("pending_commission_count", str(pending_trade["raw_json"]))
 
                 store.upsert_execution({"execution_id": "B1", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "RKLB", "side": "BOT", "quantity": 2, "price": 10, "executed_at": "2026-05-29T13:30:00+00:00", "commission": 0.35, "commission_source": "ibkr"})
-                store.upsert_execution({"execution_id": "S1", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "RKLB", "side": "SLD", "quantity": 2, "price": 12, "executed_at": "2026-05-29T13:40:00+00:00", "commission": 0.36, "commission_source": "ibkr"})
+                store.upsert_execution({"execution_id": "S1", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "RKLB", "side": "SLD", "quantity": 2, "price": 12, "executed_at": "2026-05-29T13:40:00+00:00", "commission": 0.36, "commission_source": "ibkr", "realized_pnl": 4.0})
 
                 trade = store.query("SELECT status, gross_pnl, commission, net_pnl, raw_json FROM trades")[0]
                 self.assertEqual(trade["status"], "CLOSED")
@@ -494,6 +495,78 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 self.assertEqual(len(suppressed), 1)
                 self.assertEqual(suppressed[0]["active"], 0)
                 self.assertAlmostEqual(suppressed[0]["quantity"], 7)
+            finally:
+                store.close()
+
+    def test_runtime_state_status_and_pending_counts(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                cols = {row["name"] for row in store.conn.execute("PRAGMA table_info(runtime_state)").fetchall()}
+                self.assertIn("key", cols)
+                self.assertIn("raw_json", cols)
+
+                store.mark_operation_status("fill_ingest", "running", started_at=f"{today}T13:30:00+00:00")
+                state = store.get_runtime_state(["fill_ingest"])["fill_ingest"]["raw_json"]
+                self.assertEqual(state["status"], "running")
+                self.assertEqual(state["started_at"], f"{today}T13:30:00+00:00")
+
+                store.mark_operation_status("fill_ingest", "idle", new_fills=2)
+                state = store.get_runtime_state(["fill_ingest"])["fill_ingest"]["raw_json"]
+                self.assertEqual(state["status"], "idle")
+                self.assertEqual(state["new_fills"], 2)
+                self.assertTrue(state["finished_at"])
+
+                store.upsert_execution({
+                    "execution_id": "B_PENDING",
+                    "strategy_name": "v67",
+                    "session_date": today,
+                    "symbol": "PNDX",
+                    "side": "BOT",
+                    "quantity": 1,
+                    "price": 10,
+                    "commission": 0.5,
+                    "commission_source": "ibkr",
+                    "executed_at": f"{today}T13:30:00+00:00",
+                })
+                store.upsert_execution({
+                    "execution_id": "S_PENDING",
+                    "strategy_name": "v67",
+                    "session_date": today,
+                    "symbol": "PNDX",
+                    "side": "SLD",
+                    "quantity": 1,
+                    "price": 11,
+                    "commission": 0.5,
+                    "commission_source": "ibkr",
+                    "executed_at": f"{today}T13:40:00+00:00",
+                })
+
+                trade = store.query("SELECT status, raw_json FROM trades WHERE symbol = 'PNDX'")[0]
+                self.assertEqual(trade["status"], "PNL_PENDING")
+                self.assertEqual(json.loads(trade["raw_json"])["pending_realized_pnl_count"], 1)
+                pending = store.runtime_pending_counts(today)
+                self.assertEqual(pending["pending_realized_pnl_count"], 1)
+                self.assertEqual(pending["pending_trade_finalization_count"], 1)
+
+                store.upsert_execution({
+                    "execution_id": "S_PENDING",
+                    "strategy_name": "v67",
+                    "session_date": today,
+                    "symbol": "PNDX",
+                    "side": "SLD",
+                    "quantity": 1,
+                    "price": 11,
+                    "commission": 0.5,
+                    "commission_source": "ibkr",
+                    "realized_pnl": 1.0,
+                    "executed_at": f"{today}T13:40:00+00:00",
+                })
+                trade = store.query("SELECT status, raw_json FROM trades WHERE symbol = 'PNDX'")[0]
+                self.assertEqual(trade["status"], "CLOSED")
+                self.assertEqual(json.loads(trade["raw_json"])["pending_realized_pnl_count"], 0)
+                self.assertEqual(store.runtime_pending_counts(today)["pending_trade_finalization_count"], 0)
             finally:
                 store.close()
 

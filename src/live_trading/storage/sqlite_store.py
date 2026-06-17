@@ -307,6 +307,14 @@ class SQLiteRuntimeStore:
             CREATE INDEX IF NOT EXISTS idx_runtime_event_counters_event_type ON runtime_event_counters(event_type);
             CREATE INDEX IF NOT EXISTS idx_runtime_event_counters_symbol ON runtime_event_counters(symbol);
 
+            CREATE TABLE IF NOT EXISTS runtime_state (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT,
+                raw_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_runtime_state_updated_at ON runtime_state(updated_at);
+
             CREATE TABLE IF NOT EXISTS trades (
                 trade_id TEXT PRIMARY KEY,
                 strategy_name TEXT NOT NULL,
@@ -783,6 +791,122 @@ class SQLiteRuntimeStore:
             self._upsert("executions", data, ["execution_id"], columns)
             self._reconcile_trade_state_after_execution(data)
 
+    def set_runtime_state(self, key: str, value: Any = None, raw_json: Any = None, *, updated_at: str | None = None) -> None:
+        key = str(key or "").strip()
+        if not key:
+            raise ValueError("runtime_state key is required")
+        now = updated_at or utc_now_iso()
+        payload = parse_jsonish(raw_json)
+        if not payload and raw_json not in (None, ""):
+            payload = {"value": raw_json}
+        row = {
+            "key": key,
+            "value": "" if value is None else str(value),
+            "updated_at": now,
+            "raw_json": payload,
+        }
+        self._upsert("runtime_state", row, ["key"], list(row.keys()))
+
+    def get_runtime_state(self, keys: Iterable[str] | None = None) -> dict[str, dict[str, Any]]:
+        if keys is None:
+            rows = self.query("SELECT key, value, updated_at, raw_json FROM runtime_state ORDER BY key")
+        else:
+            key_list = [str(key) for key in keys if str(key or "").strip()]
+            if not key_list:
+                return {}
+            placeholders = ",".join("?" for _ in key_list)
+            rows = self.query(
+                f"SELECT key, value, updated_at, raw_json FROM runtime_state WHERE key IN ({placeholders}) ORDER BY key",
+                key_list,
+            )
+        out: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            out[str(row.get("key") or "")] = {
+                "value": row.get("value"),
+                "updated_at": row.get("updated_at"),
+                "raw_json": parse_jsonish(row.get("raw_json")),
+            }
+        return out
+
+    def mark_operation_status(self, name: str, status: str, **details: Any) -> None:
+        name = str(name or "").strip()
+        status = str(status or "").strip() or "unknown"
+        if not name:
+            raise ValueError("operation status name is required")
+        now = utc_now_iso()
+        current = self.get_runtime_state([name]).get(name, {}).get("raw_json", {})
+        payload = dict(current)
+        if status == "running":
+            payload["started_at"] = details.pop("started_at", None) or now
+            payload["finished_at"] = ""
+            payload["error"] = ""
+        else:
+            payload.setdefault("started_at", details.get("started_at") or "")
+            payload["finished_at"] = details.pop("finished_at", None) or now
+        payload["status"] = status
+        payload["updated_at"] = now
+        payload.update(details)
+        self.set_runtime_state(name, status, payload, updated_at=now)
+
+    def runtime_pending_counts(self, session_date: str | None = None) -> dict[str, Any]:
+        where = ""
+        params: list[Any] = []
+        if session_date:
+            where = "WHERE COALESCE(substr(executed_at, 1, 10), substr(recorded_at, 1, 10), session_date) = ?"
+            params.append(session_date)
+        execution_rows = self.query(
+            f"""
+            SELECT
+                COUNT(*) AS execution_count,
+                SUM(CASE
+                    WHEN COALESCE(commission_source, '') != 'ibkr'
+                         OR commission IS NULL
+                    THEN 1 ELSE 0 END
+                ) AS pending_commission_count,
+                SUM(CASE
+                    WHEN UPPER(COALESCE(side, '')) IN ('SLD', 'SELL')
+                         AND COALESCE(commission_source, '') IN ('ibkr', 'missing')
+                         AND realized_pnl IS NULL
+                    THEN 1 ELSE 0 END
+                ) AS pending_realized_pnl_count
+            FROM executions
+            {where}
+            """,
+            params,
+        )
+        trade_where = ""
+        trade_params: list[Any] = []
+        if session_date:
+            trade_where = """
+            WHERE (
+                substr(exit_fill_time, 1, 10) = ?
+                OR substr(closed_at, 1, 10) = ?
+                OR (
+                    COALESCE(exit_fill_time, closed_at) IS NULL
+                    AND session_date = ?
+                )
+            )
+            """
+            trade_params.extend([session_date, session_date, session_date])
+        trade_rows = self.query(
+            f"""
+            SELECT COUNT(*) AS pending_trade_finalization_count
+            FROM trades
+            {trade_where}
+            {"AND" if trade_where else "WHERE"} UPPER(COALESCE(status, '')) IN ('COMMISSION_PENDING', 'PNL_PENDING', 'RECONCILE_PENDING')
+            """,
+            trade_params,
+        )
+        exec_row = execution_rows[0] if execution_rows else {}
+        trade_row = trade_rows[0] if trade_rows else {}
+        return {
+            "session_date": session_date or "",
+            "pending_execution_count": int(exec_row.get("execution_count") or 0),
+            "pending_commission_count": int(exec_row.get("pending_commission_count") or 0),
+            "pending_realized_pnl_count": int(exec_row.get("pending_realized_pnl_count") or 0),
+            "pending_trade_finalization_count": int(trade_row.get("pending_trade_finalization_count") or 0),
+        }
+
     def _reconcile_trade_state_after_execution(self, execution: dict[str, Any]) -> None:
         try:
             symbol = str(execution.get("symbol") or "").upper().strip()
@@ -964,9 +1088,15 @@ class SQLiteRuntimeStore:
                 buy_raw = parse_jsonish(lot.get("raw_json"))
                 sell_raw = parse_jsonish(row.get("raw_json"))
                 pending_commission_count = int(buy_commission_missing) + int(sell_commission_missing)
+                sell_realized_expected = sell_commission_confirmed or sell_commission_missing
                 sell_realized_ready = safe_float(row.get("realized_pnl")) is not None
-                pending_realized_pnl_count = 0 if sell_realized_ready else 1
-                trade_status = "CLOSED" if pending_commission_count == 0 else "COMMISSION_PENDING"
+                pending_realized_pnl_count = 1 if sell_realized_expected and not sell_realized_ready else 0
+                if pending_commission_count:
+                    trade_status = "COMMISSION_PENDING"
+                elif pending_realized_pnl_count:
+                    trade_status = "PNL_PENDING"
+                else:
+                    trade_status = "CLOSED"
                 pnl_status = "REALIZED_PNL_READY" if sell_realized_ready else "PNL_PENDING"
                 if pending_commission_count == 0 and buy_commission_confirmed and sell_commission_confirmed:
                     commission_status = "OK"

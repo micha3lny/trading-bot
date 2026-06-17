@@ -201,6 +201,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 "price": 10.5,
                 "commission": 0.25,
                 "commission_source": "ibkr",
+                "realized_pnl": 5.0,
                 "recorded_at": f"{session_date}T13:45:00+00:00",
             })
             store.upsert_position({
@@ -277,6 +278,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 "price": 11,
                 "commission": 0.2,
                 "commission_source": "ibkr",
+                "realized_pnl": 2.0,
                 "executed_at": "2026-05-27T13:41:00+00:00",
                 "recorded_at": "2026-05-27T13:42:00+00:00",
             })
@@ -533,6 +535,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 "price": 11,
                 "commission": 0.12,
                 "commission_source": "ibkr",
+                "realized_pnl": 1.0,
                 "recorded_at": "2026-05-27T13:39:00+00:00",
             })
             store.close()
@@ -681,12 +684,14 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 "price": 11,
                 "commission": 0.12,
                 "commission_source": "ibkr",
+                "realized_pnl": 1.0,
                 "recorded_at": "2026-05-27T13:39:00+00:00",
             })
             store.close()
 
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
-            closed = snapshot["closed_positions"].iloc[0]
+            rows = snapshot["closed_positions"]
+            closed = rows[rows["entry_time"] == "2026-05-27T13:31:00+00:00"].iloc[0]
 
             self.assertEqual(closed["entry_time"], "2026-05-27T13:31:00+00:00")
             self.assertEqual(closed["exit_time"], "2026-05-27T13:39:00+00:00")
@@ -715,7 +720,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 ("B0", "BOT", 10, "2026-05-27T13:30:00+00:00"),
                 ("S0", "SLD", 9.9, "2026-05-27T13:40:00+00:00"),
             ]:
-                store.upsert_execution({
+                row = {
                     "execution_id": execution_id,
                     "trade_id": "T0",
                     "session_date": "2026-05-27",
@@ -727,7 +732,10 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                     "commission": 0.0,
                     "commission_source": "ibkr",
                     "recorded_at": ts,
-                })
+                }
+                if side == "SLD":
+                    row["realized_pnl"] = -1.0
+                store.upsert_execution(row)
             store.close()
 
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
@@ -1344,6 +1352,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 "price": 11,
                 "commission": 0.6,
                 "commission_source": "ibkr",
+                "realized_pnl": 2.0,
                 "executed_at": "2026-05-28T13:35:00+00:00",
                 "recorded_at": "2026-05-28T13:35:00+00:00",
             })

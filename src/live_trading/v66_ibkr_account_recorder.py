@@ -346,36 +346,61 @@ def install_commission_report_handler(ib: IB, recorder: LiveDataRecorder) -> Non
 
 
 def record_recent_fills(ib: IB, recorder: LiveDataRecorder, seen: set[str]) -> int:
-    try:
-        fills = ib.reqExecutions(ExecutionFilter())
-    except Exception:
-        fills = ib.fills()
+    sqlite_store = getattr(recorder, "sqlite_store", None)
+    started_at = now_utc()
+    safe_sqlite_call(sqlite_store, "mark_operation_status", "fill_ingest", "running", started_at=started_at)
     count = 0
-    for fill in fills:
-        key = fill_key(fill)
-        row = fill_row_from_ibkr_fill(fill)
-        status = upsert_fill_row(recorder, row)
-        safe_sqlite_call(getattr(recorder, "sqlite_store", None), "upsert_execution", row)
-        if status != "duplicate":
-            if row.get("commission_source") != "ibkr":
-                rate_limited_recorder_log(
-                    recorder,
-                    "FILLS_WITHOUT_COMMISSION",
-                    f"{now_utc()} FILLS_WITHOUT_COMMISSION execution_id={row.get('execution_id')} symbol={row.get('symbol')}",
-                    key=str(row.get("execution_id") or ""),
-                )
-            else:
-                rate_limited_recorder_log(
-                    recorder,
-                    "COMMISSION_REPORT_MATCHED",
-                    f"{now_utc()} COMMISSION_REPORT_MATCHED execution_id={row.get('execution_id')}",
-                    key=str(row.get("execution_id") or ""),
-                )
-        if key in seen and status != "inserted":
-            continue
-        seen.add(key)
-        count += 1
-    return count
+    try:
+        try:
+            fills = ib.reqExecutions(ExecutionFilter())
+        except Exception:
+            fills = ib.fills()
+        for fill in fills:
+            key = fill_key(fill)
+            row = fill_row_from_ibkr_fill(fill)
+            status = upsert_fill_row(recorder, row)
+            safe_sqlite_call(sqlite_store, "upsert_execution", row)
+            if status != "duplicate":
+                if row.get("commission_source") != "ibkr":
+                    rate_limited_recorder_log(
+                        recorder,
+                        "FILLS_WITHOUT_COMMISSION",
+                        f"{now_utc()} FILLS_WITHOUT_COMMISSION execution_id={row.get('execution_id')} symbol={row.get('symbol')}",
+                        key=str(row.get("execution_id") or ""),
+                    )
+                else:
+                    rate_limited_recorder_log(
+                        recorder,
+                        "COMMISSION_REPORT_MATCHED",
+                        f"{now_utc()} COMMISSION_REPORT_MATCHED execution_id={row.get('execution_id')}",
+                        key=str(row.get("execution_id") or ""),
+                    )
+            if key in seen and status != "inserted":
+                continue
+            seen.add(key)
+            count += 1
+        pending = safe_sqlite_call(sqlite_store, "runtime_pending_counts")
+        safe_sqlite_call(
+            sqlite_store,
+            "mark_operation_status",
+            "fill_ingest",
+            "idle",
+            started_at=started_at,
+            new_fills=count,
+            pending_counts=pending or {},
+        )
+        return count
+    except Exception as exc:
+        safe_sqlite_call(
+            sqlite_store,
+            "mark_operation_status",
+            "fill_ingest",
+            "failed",
+            started_at=started_at,
+            new_fills=count,
+            error=repr(exc),
+        )
+        raise
 
 
 def main() -> int:
