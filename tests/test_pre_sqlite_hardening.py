@@ -255,7 +255,60 @@ class PreSqliteHardeningTests(unittest.TestCase):
             self.assertEqual(raw["market_price"], 10.5)
             self.assertEqual(raw["market_price_at"], "2026-05-28T13:40:00+00:00")
             self.assertEqual(raw["market_price_source"], "live_ticker")
+            self.assertAlmostEqual(raw["unrealized_pnl"], 1.5)
+            self.assertAlmostEqual(raw["unrealized_pct"], 5.0)
+            self.assertAlmostEqual(raw["peak_pct"], 0.0)
+            self.assertAlmostEqual(raw["peak_unrealized_pct"], 0.0)
             self.assertEqual(file_payload["positions"]["CRBP"]["market_price"], 10.5)
+
+    def test_live_market_metrics_update_canonical_reducer_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(tmp, session_date="2026-05-28")
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            recorder.sqlite_store = store
+            store.upsert_position({
+                "position_key": "v67_top100_live_safe_expansion_v46_wide_trail:2026-05-28:CRBP:reducer",
+                "strategy_name": "v67_top100_live_safe_expansion_v46_wide_trail",
+                "session_date": "2026-05-28",
+                "symbol": "CRBP",
+                "quantity": 3,
+                "avg_price": 10.0,
+                "source": "sqlite_execution_reducer",
+                "ibkr_quantity": 3,
+                "active": 1,
+                "status": "OPEN",
+                "updated_at": "2026-05-28T13:31:00+00:00",
+                "raw_json": {
+                    "entry_time": "2026-05-28T13:31:00+00:00",
+                    "entry_price": 10.0,
+                    "market_price": 10.0,
+                    "market_price_source": "execution_reducer",
+                },
+            })
+            pos = ManagedPosition("CRBP", object(), 3, 10.0, "2026-05-28T13:31:00+00:00", 10.8, active=True)
+
+            persist_managed_positions(
+                recorder,
+                {"CRBP": pos},
+                latest_snapshots={"CRBP": {"price": 10.5, "observed_at": "2026-05-28T13:40:00+00:00"}},
+            )
+
+            active_rows = store.query("SELECT source, updated_at, raw_json FROM positions WHERE symbol = 'CRBP' AND active = 1")
+            suppressed_rows = store.query("SELECT status FROM positions WHERE symbol = 'CRBP' AND active = 0 AND status = 'STALE_DUPLICATE_SUPPRESSED'")
+            store.close()
+
+            self.assertEqual(len(active_rows), 1)
+            self.assertEqual(active_rows[0]["source"], "sqlite_execution_reducer")
+            raw = json.loads(active_rows[0]["raw_json"])
+            self.assertEqual(raw["market_price"], 10.5)
+            self.assertEqual(raw["market_price_at"], "2026-05-28T13:40:00+00:00")
+            self.assertEqual(raw["market_price_source"], "live_ticker")
+            self.assertAlmostEqual(raw["unrealized_pnl"], 1.5)
+            self.assertAlmostEqual(raw["unrealized_pct"], 5.0)
+            self.assertAlmostEqual(raw["peak_pct"], 8.0)
+            self.assertAlmostEqual(raw["drop_from_peak_pct"], 3.0)
+            self.assertEqual(raw["market_metrics_merged_from"], "live_buy")
+            self.assertEqual(len(suppressed_rows), 1)
 
     def test_open_position_price_diagnostics_counts_missing_prices(self) -> None:
         pos = ManagedPosition("CRBP", object(), 3, 10.0, "2026-05-28T13:31:00+00:00", 10.0, active=True)

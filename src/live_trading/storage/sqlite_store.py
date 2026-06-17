@@ -1430,6 +1430,38 @@ class SQLiteRuntimeStore:
                     break
             if stronger_existing:
                 raw = parse_jsonish(data.get("raw_json"))
+                live_metric_keys = {
+                    "market_price",
+                    "market_price_at",
+                    "market_price_source",
+                    "unrealized_pnl",
+                    "unrealized_pct",
+                    "peak_pct",
+                    "peak_unrealized_pct",
+                    "peak_price",
+                    "drop_from_peak_pct",
+                    "last_update",
+                    "data_quality",
+                }
+                metric_update = {key: raw.get(key) for key in live_metric_keys if raw.get(key) is not None}
+                if metric_update:
+                    for existing in existing_rows:
+                        existing_priority = position_source_priority(existing.get("source"), existing.get("raw_json"), existing.get("ibkr_quantity"))
+                        if existing_priority <= incoming_priority:
+                            continue
+                        existing_raw = parse_jsonish(existing.get("raw_json"))
+                        existing_raw.update(metric_update)
+                        existing_raw["market_metrics_merged_from"] = data.get("source") or "lower_priority_position"
+                        existing_raw["market_metrics_merged_at"] = data["updated_at"]
+                        self.execute(
+                            """
+                            UPDATE positions
+                            SET updated_at = ?,
+                                raw_json = ?
+                            WHERE position_key = ?
+                            """,
+                            (data["updated_at"], safe_json(existing_raw), existing["position_key"]),
+                        )
                 raw.update({
                     "active": False,
                     "stale_duplicate_suppressed": True,

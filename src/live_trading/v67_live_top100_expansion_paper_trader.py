@@ -961,12 +961,28 @@ def load_exit_sent_symbols(recorder: LiveDataRecorder) -> set[str]:
 
 
 def managed_position_payload(pos: ManagedPosition, market_price_info: dict[str, Any] | None = None) -> dict[str, Any]:
+    market_price = safe_float((market_price_info or {}).get("market_price"))
+    unrealized_pnl = None
+    unrealized_pct = None
+    peak_pct = None
+    drop_from_peak_pct = None
+    if pos.entry_price:
+        peak_pct = (pos.peak_price / pos.entry_price - 1.0) * 100.0
+        if market_price is not None:
+            unrealized_pnl = (market_price - pos.entry_price) * pos.quantity
+            unrealized_pct = (market_price / pos.entry_price - 1.0) * 100.0
+            drop_from_peak_pct = peak_pct - unrealized_pct
     payload = {
         "symbol": pos.symbol,
         "quantity": pos.quantity,
         "entry_price": pos.entry_price,
         "entry_time": pos.entry_time,
         "peak_price": pos.peak_price,
+        "peak_pct": peak_pct,
+        "peak_unrealized_pct": peak_pct,
+        "unrealized_pnl": unrealized_pnl,
+        "unrealized_pct": unrealized_pct,
+        "drop_from_peak_pct": drop_from_peak_pct,
         "active": pos.active,
         "exit_sent": pos.exit_sent,
         "source": pos.source,
@@ -974,6 +990,7 @@ def managed_position_payload(pos: ManagedPosition, market_price_info: dict[str, 
         "last_exit_order_ts": pos.last_exit_order_ts,
         "eod_retry_count": pos.eod_retry_count,
         "entry_fill_verified": pos.entry_fill_verified,
+        "last_update": (market_price_info or {}).get("market_price_at") or now_utc(),
     }
     if market_price_info:
         payload.update({k: v for k, v in market_price_info.items() if v is not None})
