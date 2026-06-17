@@ -675,24 +675,21 @@ def closed_trades_from_commission_reports(executions: pd.DataFrame, selected_dat
     rows["price_num"] = pd.to_numeric(rows["price"], errors="coerce")
     rows["side_norm"] = rows["side"].map(normalize_side)
 
-    closed_symbols = set(
-        rows[
-            (rows["side_norm"] == "SELL")
-            & rows["realized_pnl_num"].notna()
-        ]["symbol"].astype(str).str.upper()
-    )
+    realized_mask = (rows["side_norm"] == "SELL") & rows["realized_pnl_num"].notna()
+    closed_symbols = set(rows[realized_mask]["symbol"].astype(str).str.upper())
     if not closed_symbols:
         return empty_closed_trades()
 
     closed: list[dict[str, Any]] = []
-    for symbol, group in rows[rows["symbol"].astype(str).str.upper().isin(closed_symbols)].groupby(rows["symbol"].astype(str).str.upper()):
+    rows["symbol_norm"] = rows["symbol"].astype(str).str.upper()
+    for symbol, group in rows[rows["symbol_norm"].isin(closed_symbols)].groupby("symbol_norm"):
         buys = group[group["side_norm"] == "BUY"].copy()
-        sells = group[group["side_norm"] == "SELL"].copy()
-        if sells.empty:
+        realized_sells = group[realized_mask.reindex(group.index, fill_value=False)].copy()
+        if realized_sells.empty:
             continue
-        realized = float(group["realized_pnl_num"].fillna(0.0).sum())
-        commission = float(group["commission_num"].fillna(0.0).sum())
-        sell_qty = float(sells["quantity_num"].fillna(0.0).sum())
+        realized = float(realized_sells["realized_pnl_num"].fillna(0.0).sum())
+        commission = float(realized_sells["commission_num"].fillna(0.0).sum())
+        sell_qty = float(realized_sells["quantity_num"].fillna(0.0).sum())
 
         def weighted_price(frame: pd.DataFrame) -> float | None:
             valid = frame[(frame["quantity_num"] > 0) & frame["price_num"].notna()]
@@ -704,9 +701,9 @@ def closed_trades_from_commission_reports(executions: pd.DataFrame, selected_dat
             return float((valid["quantity_num"] * valid["price_num"]).sum() / qty_sum)
 
         entry_time = iso_time(buys["execution_time"].min()) if not buys.empty else ""
-        exit_time = iso_time(sells["execution_time"].max())
+        exit_time = iso_time(realized_sells["execution_time"].max())
         buy_exec_ids = [str(x) for x in buys.get("execution_id", pd.Series(dtype=str)).dropna().tolist() if str(x)]
-        sell_exec_ids = [str(x) for x in sells.get("execution_id", pd.Series(dtype=str)).dropna().tolist() if str(x)]
+        sell_exec_ids = [str(x) for x in realized_sells.get("execution_id", pd.Series(dtype=str)).dropna().tolist() if str(x)]
         closed.append(
             {
                 "symbol": symbol,
@@ -715,7 +712,7 @@ def closed_trades_from_commission_reports(executions: pd.DataFrame, selected_dat
                 "exit_time": exit_time,
                 "quantity": sell_qty,
                 "entry_price": weighted_price(buys),
-                "exit_price": weighted_price(sells),
+                "exit_price": weighted_price(realized_sells),
                 "realized_pnl": realized,
                 "commission": commission,
                 "net_pnl": realized - commission,

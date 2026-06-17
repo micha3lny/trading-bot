@@ -203,6 +203,36 @@ class SQLiteRuntimeStore:
             if str(symbol or "").strip()
         }
 
+    def reconcile_active_positions_to_broker_snapshot(self, positions: dict[str, float] | None) -> dict[str, Any]:
+        """Constrain current active position rows to a fresh broker snapshot.
+
+        This is intentionally scoped to symbols SQLite currently marks active. A
+        broker snapshot can contain symbols whose executions have not been
+        ingested yet; those should not be synthesized here. The goal is to clear
+        or trim stale active rows once broker truth says they are flat/reduced.
+        """
+        self.set_broker_net_positions(positions)
+        if self._broker_net_positions is None:
+            return {"broker_constrained": False, "symbols_processed": 0}
+        rows = self.query(
+            """
+            SELECT DISTINCT UPPER(symbol) AS symbol
+            FROM positions
+            WHERE COALESCE(active, 0) = 1
+              AND COALESCE(symbol, '') != ''
+            ORDER BY UPPER(symbol)
+            """
+        )
+        symbols = [str(row.get("symbol") or "").upper() for row in rows if row.get("symbol")]
+        if not symbols:
+            return {
+                "broker_constrained": True,
+                "symbols_processed": 0,
+                "open_symbols_count": 0,
+                "suppressed_historical_open_symbols_count": 0,
+            }
+        return self.rebuild_positions_from_executions(symbols, broker_net_positions=self._broker_net_positions)
+
     @contextmanager
     def transaction(self):
         outermost = self._transaction_depth == 0

@@ -175,8 +175,8 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
         self.assertAlmostEqual(fifo.iloc[0]["realized_pnl"], 5.0)
         self.assertEqual(broker_truth.iloc[0]["source"], "IBKR_COMMISSION_REPORT_REALIZED_PNL")
         self.assertAlmostEqual(broker_truth.iloc[0]["realized_pnl"], -2.25)
-        self.assertAlmostEqual(broker_truth.iloc[0]["commission"], 1.1)
-        self.assertAlmostEqual(broker_truth.iloc[0]["net_pnl"], -3.35)
+        self.assertAlmostEqual(broker_truth.iloc[0]["commission"], 0.6)
+        self.assertAlmostEqual(broker_truth.iloc[0]["net_pnl"], -2.85)
 
     def test_closed_trade_comparison_detects_pnl_mismatch(self) -> None:
         broker = pd.DataFrame([

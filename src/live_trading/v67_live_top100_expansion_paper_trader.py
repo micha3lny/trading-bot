@@ -5680,13 +5680,25 @@ def main() -> int:
             if loop_now - last_portfolio_record >= args.portfolio_interval_seconds:
                 try:
                     latest_portfolio_rows = ibkr_portfolio_position_rows(ib)
+                    latest_broker_qty_by_symbol = {row["symbol"]: float(row["quantity"]) for row in latest_portfolio_rows}
                     safe_sqlite_call(
                         getattr(recorder, "sqlite_store", None),
                         "set_broker_net_positions",
-                        {row["symbol"]: float(row["quantity"]) for row in latest_portfolio_rows},
+                        latest_broker_qty_by_symbol,
                     )
                     record_account_snapshot(ib, recorder)
                     new_fills = record_recent_fills(ib, recorder, seen_fills)
+                    sqlite_position_reconcile = safe_sqlite_call(
+                        getattr(recorder, "sqlite_store", None),
+                        "reconcile_active_positions_to_broker_snapshot",
+                        latest_broker_qty_by_symbol,
+                    )
+                    if sqlite_position_reconcile and sqlite_position_reconcile.get("suppressed_historical_open_symbols_count"):
+                        print(
+                            f"{now_utc()} SQLITE_POSITION_BROKER_SNAPSHOT_RECONCILE "
+                            f"result={json.dumps(sqlite_position_reconcile, sort_keys=True, default=str)}",
+                            flush=True,
+                        )
                     lifecycle_fills_updated = enrich_lifecycle_with_fills(recorder)
                     entry_fills_verified = sync_managed_entry_fill_verification(recorder, managed_positions)
                     fill_diagnostics_updated = process_fill_lifecycle_diagnostics(

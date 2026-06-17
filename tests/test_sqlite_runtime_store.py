@@ -476,6 +476,27 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_broker_snapshot_reconcile_clears_extra_active_symbol(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B_CPSH", "strategy_name": "v67", "session_date": today, "symbol": "CPSH", "side": "BOT", "quantity": 7, "price": 10, "executed_at": f"{today}T13:30:00+00:00"})
+                active_before = store.query("SELECT * FROM positions WHERE symbol = 'CPSH' AND COALESCE(active, 0) = 1")
+
+                result = store.reconcile_active_positions_to_broker_snapshot({})
+                active_after = store.query("SELECT * FROM positions WHERE symbol = 'CPSH' AND COALESCE(active, 0) = 1")
+                suppressed = store.query("SELECT * FROM positions WHERE symbol = 'CPSH' AND status = 'BROKER_UNCONFIRMED_OPEN_LOT'")
+
+                self.assertEqual(len(active_before), 1)
+                self.assertEqual(active_after, [])
+                self.assertEqual(result["broker_constrained"], True)
+                self.assertEqual(len(suppressed), 1)
+                self.assertEqual(suppressed[0]["active"], 0)
+                self.assertAlmostEqual(suppressed[0]["quantity"], 7)
+            finally:
+                store.close()
+
     def test_upsert_execution_respects_store_broker_flat_target(self) -> None:
         today = date.today().isoformat()
         with tempfile.TemporaryDirectory() as tmp:
