@@ -30,6 +30,7 @@ BROKER_EXECUTION_COLUMNS = [
     "exchange",
     "currency",
     "execution_client_id",
+    "realized_pnl",
     "source",
 ]
 
@@ -171,6 +172,10 @@ def normalize_execution_record(row: dict[str, Any], *, source: str = "csv") -> d
     quantity = abs(to_float(pick(row, "quantity", "qty", "shares"), 0.0) or 0.0)
     price = to_float(pick(row, "price", "tprice", "tradeprice", "fillprice", "transactionprice"), None)
     commission = to_float(pick(row, "commission", "commfee", "commissionfee", "ibkrcomm", "commissionamount"), None)
+    realized_pnl = to_float(
+        pick(row, "realizedpnl", "realized pnl", "realized p/l", "realizedpl", "realizedp&l"),
+        None,
+    )
     execution_time = pick(row, "executiontime", "datetime", "date/time", "time", "tradedatetime", "date")
     return {
         "execution_time": iso_time(execution_time),
@@ -186,6 +191,7 @@ def normalize_execution_record(row: dict[str, Any], *, source: str = "csv") -> d
         "exchange": str(pick(row, "exchange", "listingexchange") or "").strip(),
         "currency": str(pick(row, "currency", "currencyprimary", "fxcurrency") or "").strip(),
         "execution_client_id": str(pick(row, "clientid", "client id", "executionclientid") or "").strip(),
+        "realized_pnl": realized_pnl,
         "source": source,
     }
 
@@ -270,6 +276,7 @@ def load_sqlite_executions(sqlite_path: str | Path, selected_date: str) -> pd.Da
                 "exchange": str(row.get("exchange") or ""),
                 "currency": str(row.get("commission_currency") or raw.get("currency") or ""),
                 "execution_client_id": str(raw.get("clientId") or raw.get("client_id") or ""),
+                "realized_pnl": to_float(row.get("realized_pnl"), None),
                 "source": "sqlite",
             }
         )
@@ -451,6 +458,7 @@ def fetch_ibkr_executions_diagnostic(host: str, port: int, client_id: int, selec
                             "exchange": getattr(execution, "exchange", None),
                             "currency": getattr(commission_report, "currency", None),
                             "clientId": getattr(execution, "clientId", None),
+                            "realized_pnl": getattr(commission_report, "realizedPNL", None),
                         },
                         source=method,
                     )
@@ -644,6 +652,78 @@ def reconstruct_closed_trades_fifo(executions: pd.DataFrame, selected_date: str)
             remaining_sell -= match_qty
             if float(lot["remaining_qty"]) <= 1e-9:
                 lots.pop(0)
+    return pd.DataFrame(closed, columns=BROKER_CLOSED_TRADE_COLUMNS)
+
+
+def closed_trades_from_commission_reports(executions: pd.DataFrame, selected_date: str) -> pd.DataFrame:
+    """Build broker-truth realized trades from IBKR commissionReport.realizedPNL.
+
+    IBKR's commission report is the broker source of truth for realized PnL. FIFO
+    reconstruction is useful as an estimate, but it can disagree with broker lot
+    matching for carried positions, corporate actions, or adjusted bases.
+    """
+    if executions.empty or "realized_pnl" not in executions.columns:
+        return empty_closed_trades()
+    rows = executions.copy()
+    rows["_date"] = rows["execution_time"].map(date_part)
+    rows = rows[rows["_date"] == selected_date].copy()
+    if rows.empty:
+        return empty_closed_trades()
+    rows["realized_pnl_num"] = pd.to_numeric(rows["realized_pnl"], errors="coerce")
+    rows["commission_num"] = pd.to_numeric(rows["commission"], errors="coerce").abs()
+    rows["quantity_num"] = pd.to_numeric(rows["quantity"], errors="coerce").abs().fillna(0.0)
+    rows["price_num"] = pd.to_numeric(rows["price"], errors="coerce")
+    rows["side_norm"] = rows["side"].map(normalize_side)
+
+    closed_symbols = set(
+        rows[
+            (rows["side_norm"] == "SELL")
+            & rows["realized_pnl_num"].notna()
+        ]["symbol"].astype(str).str.upper()
+    )
+    if not closed_symbols:
+        return empty_closed_trades()
+
+    closed: list[dict[str, Any]] = []
+    for symbol, group in rows[rows["symbol"].astype(str).str.upper().isin(closed_symbols)].groupby(rows["symbol"].astype(str).str.upper()):
+        buys = group[group["side_norm"] == "BUY"].copy()
+        sells = group[group["side_norm"] == "SELL"].copy()
+        if sells.empty:
+            continue
+        realized = float(group["realized_pnl_num"].fillna(0.0).sum())
+        commission = float(group["commission_num"].fillna(0.0).sum())
+        sell_qty = float(sells["quantity_num"].fillna(0.0).sum())
+
+        def weighted_price(frame: pd.DataFrame) -> float | None:
+            valid = frame[(frame["quantity_num"] > 0) & frame["price_num"].notna()]
+            if valid.empty:
+                return None
+            qty_sum = float(valid["quantity_num"].sum())
+            if qty_sum <= 0:
+                return None
+            return float((valid["quantity_num"] * valid["price_num"]).sum() / qty_sum)
+
+        entry_time = iso_time(buys["execution_time"].min()) if not buys.empty else ""
+        exit_time = iso_time(sells["execution_time"].max())
+        buy_exec_ids = [str(x) for x in buys.get("execution_id", pd.Series(dtype=str)).dropna().tolist() if str(x)]
+        sell_exec_ids = [str(x) for x in sells.get("execution_id", pd.Series(dtype=str)).dropna().tolist() if str(x)]
+        closed.append(
+            {
+                "symbol": symbol,
+                "trade_id": f"ibkr_realized:{selected_date}:{symbol}",
+                "entry_time": entry_time,
+                "exit_time": exit_time,
+                "quantity": sell_qty,
+                "entry_price": weighted_price(buys),
+                "exit_price": weighted_price(sells),
+                "realized_pnl": realized,
+                "commission": commission,
+                "net_pnl": realized - commission,
+                "source": "IBKR_COMMISSION_REPORT_REALIZED_PNL",
+                "entry_execution_id": "|".join(buy_exec_ids),
+                "exit_execution_id": "|".join(sell_exec_ids),
+            }
+        )
     return pd.DataFrame(closed, columns=BROKER_CLOSED_TRADE_COLUMNS)
 
 

@@ -30,6 +30,7 @@ from src.dashboard.broker_reality import (  # noqa: E402
     empty_closed_trades,
     fetch_ibkr_executions_diagnostic,
     fetch_ibkr_live_portfolio,
+    closed_trades_from_commission_reports,
     load_sqlite_active_positions,
     load_sqlite_closed_trades,
     load_sqlite_executions,
@@ -1077,6 +1078,7 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
     broker_executions = empty_broker_executions()
     raw_broker_executions = empty_broker_executions()
     broker_closed_trades = empty_closed_trades()
+    broker_fifo_estimated_trades = empty_closed_trades()
     broker_status = "CSV_REQUIRED_FOR_HISTORICAL_DATE"
     broker_execution_diagnostics = {
         "selected_date": selected_date,
@@ -1173,10 +1175,17 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
         st.exception(exc)
 
     try:
-        broker_closed_trades = reconstruct_closed_trades_fifo(broker_executions, selected_date)
+        broker_closed_trades = closed_trades_from_commission_reports(broker_executions, selected_date)
     except Exception as exc:
         broker_closed_trades = empty_closed_trades()
-        st.error("Broker closed trade FIFO reconstruction failed")
+        st.error("Broker closed trade realized PnL reconstruction from IBKR commission reports failed")
+        st.exception(exc)
+
+    try:
+        broker_fifo_estimated_trades = reconstruct_closed_trades_fifo(broker_executions, selected_date)
+    except Exception as exc:
+        broker_fifo_estimated_trades = empty_closed_trades()
+        st.error("Broker FIFO estimated trade reconstruction failed")
         st.exception(exc)
 
     try:
@@ -1247,12 +1256,15 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
     st.divider()
     st.subheader("Broker Closed Trades / Realized Trades")
     if broker_closed_trades.empty:
-        st.info("No broker closed trades reconstructed for selected date.")
+        st.info("No broker realized closed trades from IBKR commission reports for selected date.")
         if not broker_executions.empty:
-            st.caption("FIFO reconstruction needs matching BUY and SELL executions in the loaded broker execution set.")
+            st.caption("Broker truth requires commissionReport.realizedPNL. FIFO estimate is shown separately when available.")
     else:
-        st.caption("source=BROKER_FIFO_RECONSTRUCTED")
+        st.caption("source=IBKR_COMMISSION_REPORT_REALIZED_PNL")
         st.dataframe(broker_closed_trades, width="stretch", hide_index=True)
+    with st.expander("Estimated FIFO closed trades (not broker truth)", expanded=False):
+        st.caption("source=BROKER_FIFO_RECONSTRUCTED; use only as an estimate/diagnostic, not realized broker PnL.")
+        dataframe_or_info(broker_fifo_estimated_trades, "No FIFO-estimated closed trades available.")
 
     st.divider()
     st.subheader("Reconciliation Summary")
@@ -1380,6 +1392,7 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
         st.write("raw_broker_executions_rows", len(raw_broker_executions))
         st.write("broker_execution_diagnostics", broker_execution_diagnostics)
         st.write("broker_closed_trades_rows", len(broker_closed_trades))
+        st.write("broker_fifo_estimated_trades_rows", len(broker_fifo_estimated_trades))
         st.write("sqlite_closed_trades_rows", len(sqlite_closed_trades))
         st.write("sqlite_executions_type", type(sqlite_executions))
         st.write("sqlite_executions_rows", len(sqlite_executions))

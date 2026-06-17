@@ -12,6 +12,7 @@ from src.dashboard.broker_reality import (
     compare_positions,
     compare_closed_trades,
     ensure_asyncio_event_loop,
+    closed_trades_from_commission_reports,
     load_sqlite_executions,
     load_sqlite_closed_trades,
     load_sqlite_trade_pnl,
@@ -143,6 +144,39 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
         self.assertAlmostEqual(trades.iloc[0]["realized_pnl"], 5.0)
         self.assertAlmostEqual(trades.iloc[0]["commission"], 1.1)
         self.assertAlmostEqual(trades.iloc[0]["net_pnl"], 3.9)
+
+    def test_broker_closed_trades_use_commission_report_realized_pnl(self) -> None:
+        executions = pd.DataFrame([
+            {
+                "execution_time": "2026-06-17T13:30:00+00:00",
+                "symbol": "AKTX",
+                "side": "BUY",
+                "quantity": 5,
+                "price": 10.0,
+                "commission": 0.5,
+                "realized_pnl": 0.0,
+                "execution_id": "B1",
+            },
+            {
+                "execution_time": "2026-06-17T14:00:00+00:00",
+                "symbol": "AKTX",
+                "side": "SELL",
+                "quantity": 5,
+                "price": 11.0,
+                "commission": 0.6,
+                "realized_pnl": -2.25,
+                "execution_id": "S1",
+            },
+        ])
+
+        fifo = reconstruct_closed_trades_fifo(executions, "2026-06-17")
+        broker_truth = closed_trades_from_commission_reports(executions, "2026-06-17")
+
+        self.assertAlmostEqual(fifo.iloc[0]["realized_pnl"], 5.0)
+        self.assertEqual(broker_truth.iloc[0]["source"], "IBKR_COMMISSION_REPORT_REALIZED_PNL")
+        self.assertAlmostEqual(broker_truth.iloc[0]["realized_pnl"], -2.25)
+        self.assertAlmostEqual(broker_truth.iloc[0]["commission"], 1.1)
+        self.assertAlmostEqual(broker_truth.iloc[0]["net_pnl"], -3.35)
 
     def test_closed_trade_comparison_detects_pnl_mismatch(self) -> None:
         broker = pd.DataFrame([
