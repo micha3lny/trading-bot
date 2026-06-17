@@ -181,10 +181,12 @@ def fill_row_from_ibkr_fill(fill: Any) -> dict[str, Any]:
     contract = fill.contract
     execution = fill.execution
     commission_report = getattr(fill, "commissionReport", None)
+    recorded_at = now_utc()
     raw = {
         "contract": raw_object(contract),
         "execution": raw_object(execution),
         "commissionReport": raw_object(commission_report),
+        "execution_insert_time": recorded_at,
     }
     commission = safe_float(getattr(commission_report, "commission", None))
     return {
@@ -205,21 +207,51 @@ def fill_row_from_ibkr_fill(fill: Any) -> dict[str, Any]:
         "slippage_bps": "",
         "raw_json": json.dumps(raw, default=str, ensure_ascii=False),
         "executed_at": str(getattr(execution, "time", "") or ""),
-        "recorded_at": now_utc(),
+        "recorded_at": recorded_at,
     }
 
 
 def commission_report_row(commission_report: Any) -> dict[str, Any]:
     commission = safe_float(getattr(commission_report, "commission", None))
     source = "ibkr" if commission is not None and commission != 0 else "missing"
+    recorded_at = now_utc()
     return {
         "execution_id": str(getattr(commission_report, "execId", "") or ""),
         "commission": commission if source == "ibkr" else "",
         "commission_currency": str(getattr(commission_report, "currency", "") or ""),
         "realized_pnl": safe_float(getattr(commission_report, "realizedPNL", None)),
         "commission_source": source,
-        "raw_json": json.dumps({"commissionReport": raw_object(commission_report)}, default=str, ensure_ascii=False),
+        "raw_json": json.dumps(
+            {
+                "commissionReport": raw_object(commission_report),
+                "commission_report_time": recorded_at,
+                "realized_pnl_ready_time": recorded_at if safe_float(getattr(commission_report, "realizedPNL", None)) is not None else "",
+            },
+            default=str,
+            ensure_ascii=False,
+        ),
+        "recorded_at": recorded_at,
     }
+
+
+def merge_raw_json(existing: Any, incoming: Any) -> str:
+    def parse(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        if not value:
+            return {}
+        try:
+            parsed = json.loads(str(value))
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    merged = parse(existing)
+    incoming_parsed = parse(incoming)
+    for key, value in incoming_parsed.items():
+        if value not in (None, ""):
+            merged[key] = value
+    return json.dumps(merged, default=str, ensure_ascii=False)
 
 
 def merge_fill_rows(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
@@ -227,7 +259,8 @@ def merge_fill_rows(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[
     for key in FILL_FIELDS:
         if key == "recorded_at" and existing.get("recorded_at"):
             continue
-        if key == "raw_json" and existing.get("raw_json"):
+        if key == "raw_json":
+            merged["raw_json"] = merge_raw_json(existing.get("raw_json"), incoming.get("raw_json"))
             continue
         value = incoming.get(key)
         if value not in (None, ""):

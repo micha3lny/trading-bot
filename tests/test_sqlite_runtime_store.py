@@ -162,15 +162,20 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             try:
                 store.upsert_execution({"execution_id": "B1", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "RKLB", "side": "BOT", "quantity": 2, "price": 10, "executed_at": "2026-05-29T13:30:00+00:00", "commission_source": "missing"})
                 store.upsert_execution({"execution_id": "S1", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "RKLB", "side": "SLD", "quantity": 2, "price": 12, "executed_at": "2026-05-29T13:40:00+00:00", "commission_source": "missing"})
-                self.assertEqual(store.query("SELECT commission FROM trades")[0]["commission"], 0.0)
+                pending_trade = store.query("SELECT status, commission, raw_json FROM trades")[0]
+                self.assertEqual(pending_trade["status"], "COMMISSION_PENDING")
+                self.assertEqual(pending_trade["commission"], 0.0)
+                self.assertIn("pending_commission_count", str(pending_trade["raw_json"]))
 
                 store.upsert_execution({"execution_id": "B1", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "RKLB", "side": "BOT", "quantity": 2, "price": 10, "executed_at": "2026-05-29T13:30:00+00:00", "commission": 0.35, "commission_source": "ibkr"})
                 store.upsert_execution({"execution_id": "S1", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "RKLB", "side": "SLD", "quantity": 2, "price": 12, "executed_at": "2026-05-29T13:40:00+00:00", "commission": 0.36, "commission_source": "ibkr"})
 
-                trade = store.query("SELECT gross_pnl, commission, net_pnl FROM trades")[0]
+                trade = store.query("SELECT status, gross_pnl, commission, net_pnl, raw_json FROM trades")[0]
+                self.assertEqual(trade["status"], "CLOSED")
                 self.assertAlmostEqual(trade["gross_pnl"], 4.0)
                 self.assertAlmostEqual(trade["commission"], 0.71)
                 self.assertAlmostEqual(trade["net_pnl"], 3.29)
+                self.assertIn("closed_trade_finalized_time", str(trade["raw_json"]))
             finally:
                 store.close()
 

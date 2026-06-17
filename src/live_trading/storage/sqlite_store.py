@@ -740,6 +740,14 @@ class SQLiteRuntimeStore:
             "commission_source": row.get("commission_source"),
             "raw_json": row.get("raw_json") or row,
         }
+        raw = parse_jsonish(data.get("raw_json"))
+        if not raw.get("execution_insert_time") and data.get("recorded_at"):
+            raw["execution_insert_time"] = data.get("recorded_at")
+        if data.get("commission_source") == "ibkr" and not raw.get("commission_report_time"):
+            raw["commission_report_time"] = row.get("commission_report_time") or data.get("recorded_at")
+        if data.get("realized_pnl") is not None and not raw.get("realized_pnl_ready_time"):
+            raw["realized_pnl_ready_time"] = row.get("realized_pnl_ready_time") or raw.get("commission_report_time") or data.get("recorded_at")
+        data["raw_json"] = raw
         columns = list(data.keys())
         with self.transaction():
             self._upsert("executions", data, ["execution_id"], columns)
@@ -915,10 +923,37 @@ class SQLiteRuntimeStore:
                 exit_date = str(row.get("session_date") or "") or iso_date_part(sell_time) or latest_session
                 buy_fraction = matched_qty / (safe_float(lot.get("original_qty")) or matched_qty or 1.0)
                 sell_fraction = matched_qty / qty if qty else 1.0
+                buy_commission_confirmed = str(lot.get("commission_source") or "").lower() == "ibkr"
+                sell_commission_confirmed = str(row.get("commission_source") or "").lower() == "ibkr"
+                buy_commission_missing = str(lot.get("commission_source") or "").lower() == "missing"
+                sell_commission_missing = str(row.get("commission_source") or "").lower() == "missing"
                 commission = execution_commission(lot, buy_fraction) + execution_commission(row, sell_fraction)
                 gross = (sell_price - buy_price) * matched_qty
                 trade_id = self._closed_trade_id_for_pair(lot, row, matched_qty)
                 strategy = str(lot.get("strategy_name") or row.get("strategy_name") or latest_strategy or "unknown")
+                buy_raw = parse_jsonish(lot.get("raw_json"))
+                sell_raw = parse_jsonish(row.get("raw_json"))
+                pending_commission_count = int(buy_commission_missing) + int(sell_commission_missing)
+                sell_realized_ready = safe_float(row.get("realized_pnl")) is not None
+                pending_realized_pnl_count = 0 if sell_realized_ready else 1
+                trade_status = "CLOSED" if pending_commission_count == 0 else "COMMISSION_PENDING"
+                pnl_status = "REALIZED_PNL_READY" if sell_realized_ready else "PNL_PENDING"
+                if pending_commission_count == 0 and buy_commission_confirmed and sell_commission_confirmed:
+                    commission_status = "OK"
+                elif pending_commission_count == 0:
+                    commission_status = "UNKNOWN"
+                else:
+                    commission_status = "PARTIAL" if pending_commission_count == 1 else "MISSING"
+                commission_report_times = [
+                    str(value)
+                    for value in (buy_raw.get("commission_report_time"), sell_raw.get("commission_report_time"))
+                    if value not in (None, "")
+                ]
+                realized_pnl_ready_times = [
+                    str(value)
+                    for value in (buy_raw.get("realized_pnl_ready_time"), sell_raw.get("realized_pnl_ready_time"))
+                    if value not in (None, "")
+                ]
                 raw = {
                     "reconstruction_source": "sqlite_execution_reducer",
                     "buy_execution_id": lot.get("execution_id"),
@@ -928,10 +963,24 @@ class SQLiteRuntimeStore:
                     "sell_original_quantity": qty,
                     "entry_executed_at": buy_time,
                     "exit_executed_at": sell_time,
+                    "execution_insert_time": sell_raw.get("execution_insert_time") or row.get("recorded_at"),
+                    "entry_execution_insert_time": buy_raw.get("execution_insert_time") or lot.get("recorded_at"),
+                    "exit_execution_insert_time": sell_raw.get("execution_insert_time") or row.get("recorded_at"),
+                    "commission_report_time": max(commission_report_times) if commission_report_times else "",
+                    "entry_commission_report_time": buy_raw.get("commission_report_time") or "",
+                    "exit_commission_report_time": sell_raw.get("commission_report_time") or "",
+                    "realized_pnl_ready_time": max(realized_pnl_ready_times) if realized_pnl_ready_times else "",
+                    "closed_trade_finalized_time": reducer_started_at if trade_status == "CLOSED" else "",
+                    "broker_realized_execution_count": int(sell_realized_ready),
+                    "sqlite_realized_execution_count": int(sell_realized_ready),
+                    "pending_commission_count": pending_commission_count,
+                    "pending_realized_pnl_count": pending_realized_pnl_count,
+                    "pnl_status": pnl_status,
+                    "commission_status": commission_status,
                     "entry_date": entry_date,
                     "exit_date": exit_date,
-                    "buy_commission_confirmed": str(lot.get("commission_source") or "").lower() == "ibkr",
-                    "sell_commission_confirmed": str(row.get("commission_source") or "").lower() == "ibkr",
+                    "buy_commission_confirmed": buy_commission_confirmed,
+                    "sell_commission_confirmed": sell_commission_confirmed,
                 }
                 existing_trade = self.query("SELECT * FROM trades WHERE trade_id = ?", [trade_id])
                 existing_raw = parse_jsonish(existing_trade[0].get("raw_json")) if existing_trade else {}
@@ -950,7 +999,7 @@ class SQLiteRuntimeStore:
                         "strategy_name": strategy,
                         "session_date": entry_date,
                         "symbol": symbol,
-                        "status": "CLOSED",
+                        "status": trade_status,
                         "entry_fill_time": buy_time,
                         "exit_fill_time": sell_time,
                         "closed_at": sell_time,
