@@ -152,6 +152,21 @@ class IbkrCommissionLedgerTests(unittest.TestCase):
             self.assertEqual(store.upsert_count, 1)
             self.assertEqual(len(read_fills(recorder)), 1)
 
+    def test_startup_seen_complete_fill_repairs_sqlite_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(Path(tmp), session_date="2026-05-22")
+            fill = fake_fill("E1", commission=0.42)
+            record_recent_fills(FakeIB([fill]), recorder, seen=set())
+            store = CountingStore()
+            setattr(recorder, "sqlite_store", store)
+            seen = {"E1"}
+
+            self.assertEqual(record_recent_fills(FakeIB([fill]), recorder, seen=seen), 0)
+            self.assertEqual(record_recent_fills(FakeIB([fill]), recorder, seen=seen), 0)
+
+            self.assertEqual(store.upsert_count, 1)
+            self.assertEqual(len(read_fills(recorder)), 1)
+
     def test_commission_report_event_handler_accepts_ib_insync_event_args(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             recorder = LiveDataRecorder(Path(tmp), session_date="2026-05-22")

@@ -904,7 +904,14 @@ class SQLiteRuntimeStore:
         execution_rows = self.query(
             f"""
             SELECT
-                COUNT(*) AS execution_count,
+                SUM(CASE
+                    WHEN COALESCE(execution_id, '') = ''
+                         OR COALESCE(symbol, '') = ''
+                         OR COALESCE(side, '') = ''
+                         OR quantity IS NULL
+                         OR price IS NULL
+                    THEN 1 ELSE 0 END
+                ) AS pending_execution_count,
                 SUM(CASE
                     WHEN COALESCE(commission_source, '') != 'ibkr'
                          OR commission IS NULL
@@ -948,7 +955,7 @@ class SQLiteRuntimeStore:
         trade_row = trade_rows[0] if trade_rows else {}
         return {
             "session_date": session_date or "",
-            "pending_execution_count": int(exec_row.get("execution_count") or 0),
+            "pending_execution_count": int(exec_row.get("pending_execution_count") or 0),
             "pending_commission_count": int(exec_row.get("pending_commission_count") or 0),
             "pending_realized_pnl_count": int(exec_row.get("pending_realized_pnl_count") or 0),
             "pending_trade_finalization_count": int(trade_row.get("pending_trade_finalization_count") or 0),

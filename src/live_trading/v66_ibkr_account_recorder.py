@@ -355,6 +355,32 @@ def existing_fills_by_execution_id(recorder: LiveDataRecorder) -> dict[str, dict
     return out
 
 
+def sqlite_synced_complete_fill_keys(recorder: LiveDataRecorder) -> set[str]:
+    state = getattr(recorder, "_sqlite_synced_complete_fill_keys", None)
+    if not isinstance(state, set):
+        state = set()
+        setattr(recorder, "_sqlite_synced_complete_fill_keys", state)
+    return state
+
+
+def sync_complete_fill_to_sqlite_once(recorder: LiveDataRecorder, row: dict[str, Any]) -> None:
+    execution_id = str(row.get("execution_id") or "").strip()
+    if not execution_id:
+        return
+    sqlite_store = getattr(recorder, "sqlite_store", None)
+    if sqlite_store is None:
+        return
+    synced = sqlite_synced_complete_fill_keys(recorder)
+    if execution_id in synced:
+        return
+    try:
+        sqlite_store.upsert_execution(row)
+    except Exception as exc:
+        print(f"{now_utc()} SQLITE_WRITE_FAILED method=upsert_execution error={exc!r}", flush=True)
+        return
+    synced.add(execution_id)
+
+
 def record_commission_report(recorder: LiveDataRecorder, commission_report: Any) -> str:
     row = commission_report_row(commission_report)
     execution_id = row.get("execution_id")
@@ -365,11 +391,15 @@ def record_commission_report(recorder: LiveDataRecorder, commission_report: Any)
     for idx, existing in enumerate(rows):
         if str(existing.get("execution_id") or "").strip() == str(execution_id):
             if fill_row_already_commission_complete(existing, row):
+                sync_complete_fill_to_sqlite_once(recorder, existing)
                 return "duplicate"
             merged = merge_fill_rows(existing, row)
             rows[idx] = merged
             write_csv_rows_atomic(path, rows, FILL_FIELDS)
-            safe_sqlite_call(getattr(recorder, "sqlite_store", None), "upsert_execution", merged)
+            if merged.get("commission_source") == "ibkr":
+                sync_complete_fill_to_sqlite_once(recorder, merged)
+            else:
+                safe_sqlite_call(getattr(recorder, "sqlite_store", None), "upsert_execution", merged)
             if merged.get("commission_source") == "ibkr":
                 rate_limited_recorder_log(
                     recorder,
@@ -425,10 +455,14 @@ def record_recent_fills(ib: IB, recorder: LiveDataRecorder, seen: set[str]) -> i
             row = fill_row_from_ibkr_fill(fill)
             existing = existing_by_exec.get(str(row.get("execution_id") or "").strip())
             if key in seen and existing is not None and fill_row_already_commission_complete(existing, row):
+                sync_complete_fill_to_sqlite_once(recorder, existing)
                 continue
             status = upsert_fill_row(recorder, row)
             if status != "duplicate":
-                safe_sqlite_call(sqlite_store, "upsert_execution", row)
+                if row.get("commission_source") == "ibkr":
+                    sync_complete_fill_to_sqlite_once(recorder, row)
+                else:
+                    safe_sqlite_call(sqlite_store, "upsert_execution", row)
                 existing_by_exec[str(row.get("execution_id") or "").strip()] = row
             if status != "duplicate":
                 if row.get("commission_source") != "ibkr":

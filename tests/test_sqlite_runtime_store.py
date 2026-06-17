@@ -580,6 +580,7 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 self.assertEqual(trade["status"], "PNL_PENDING")
                 self.assertEqual(json.loads(trade["raw_json"])["pending_realized_pnl_count"], 1)
                 pending = store.runtime_pending_counts(today)
+                self.assertEqual(pending["pending_execution_count"], 0)
                 self.assertEqual(pending["pending_realized_pnl_count"], 1)
                 self.assertEqual(pending["pending_trade_finalization_count"], 1)
 
@@ -599,6 +600,7 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 trade = store.query("SELECT status, raw_json FROM trades WHERE symbol = 'PNDX'")[0]
                 self.assertEqual(trade["status"], "CLOSED")
                 self.assertEqual(json.loads(trade["raw_json"])["pending_realized_pnl_count"], 0)
+                self.assertEqual(store.runtime_pending_counts(today)["pending_execution_count"], 0)
                 self.assertEqual(store.runtime_pending_counts(today)["pending_trade_finalization_count"], 0)
             finally:
                 store.close()
