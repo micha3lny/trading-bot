@@ -72,6 +72,20 @@ class FakeEventIB:
         self.commissionReportEvent = FakeEvent()
 
 
+class CountingStore:
+    def __init__(self) -> None:
+        self.upsert_count = 0
+
+    def mark_operation_status(self, *args, **kwargs):
+        return None
+
+    def upsert_execution(self, _row):
+        self.upsert_count += 1
+
+    def runtime_pending_counts(self):
+        return {}
+
+
 def read_fills(recorder: LiveDataRecorder) -> list[dict]:
     with recorder.path("fills.csv").open(errors="replace") as fh:
         return list(csv.DictReader(fh))
@@ -108,6 +122,35 @@ class IbkrCommissionLedgerTests(unittest.TestCase):
             self.assertEqual(rows[0]["commission"], "0.42")
             self.assertEqual(rows[0]["commission_source"], "ibkr")
             self.assertEqual(rows[0]["realized_pnl"], "1.23")
+
+    def test_duplicate_commission_report_is_ignored_after_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(Path(tmp), session_date="2026-05-22")
+            record_recent_fills(FakeIB([fake_fill("E1", commission=None)]), recorder, seen=set())
+            report = SimpleNamespace(execId="E1", commission=0.42, currency="USD", realizedPNL=1.23)
+
+            self.assertEqual(record_commission_report(recorder, report), "matched")
+            self.assertEqual(record_commission_report(recorder, report), "duplicate")
+
+            rows = read_fills(recorder)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["commission"], "0.42")
+            self.assertEqual(rows[0]["commission_source"], "ibkr")
+
+    def test_replayed_complete_fill_is_skipped_before_sqlite_upsert(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(Path(tmp), session_date="2026-05-22")
+            store = CountingStore()
+            setattr(recorder, "sqlite_store", store)
+            fill = fake_fill("E1", commission=0.42)
+            seen: set[str] = set()
+
+            self.assertEqual(record_recent_fills(FakeIB([fill]), recorder, seen=seen), 1)
+            for _ in range(5):
+                self.assertEqual(record_recent_fills(FakeIB([fill]), recorder, seen=seen), 0)
+
+            self.assertEqual(store.upsert_count, 1)
+            self.assertEqual(len(read_fills(recorder)), 1)
 
     def test_commission_report_event_handler_accepts_ib_insync_event_args(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -576,6 +576,45 @@ class SQLiteRuntimeStore:
             clean,
         )
 
+    def _execution_rows_equivalent(self, existing: dict[str, Any] | None, incoming: dict[str, Any]) -> bool:
+        if not existing:
+            return False
+        stable_fields = [
+            "execution_id",
+            "trade_id",
+            "order_key",
+            "order_id",
+            "perm_id",
+            "strategy_name",
+            "session_date",
+            "symbol",
+            "side",
+            "quantity",
+            "price",
+            "exchange",
+            "liquidity",
+            "executed_at",
+            "commission",
+            "commission_currency",
+            "realized_pnl",
+            "commission_source",
+        ]
+        for field in stable_fields:
+            left = existing.get(field)
+            right = incoming.get(field)
+            if field in {"quantity", "price", "commission", "realized_pnl"}:
+                left_float = safe_float(left)
+                right_float = safe_float(right)
+                if left_float is None or right_float is None:
+                    if ("" if left in (None, "") else str(left)) != ("" if right in (None, "") else str(right)):
+                        return False
+                elif abs(left_float - right_float) > 1e-9:
+                    return False
+            else:
+                if ("" if left in (None, "") else str(left)) != ("" if right in (None, "") else str(right)):
+                    return False
+        return True
+
     def record_runtime_event(self, **kwargs: Any) -> int:
         now = kwargs.get("event_time") or utc_now_iso()
         event_type = str(kwargs.get("event_type") or kwargs.get("event") or "UNKNOWN")
@@ -788,6 +827,14 @@ class SQLiteRuntimeStore:
         data["raw_json"] = raw
         columns = list(data.keys())
         with self.transaction():
+            existing = self.query("SELECT * FROM executions WHERE execution_id = ?", [execution_id])
+            if existing:
+                current = existing[0]
+                for field in ("trade_id", "order_key", "strategy_name", "session_date", "order_id", "perm_id"):
+                    if data.get(field) in (None, "") and current.get(field) not in (None, ""):
+                        data[field] = current.get(field)
+            if self._execution_rows_equivalent(existing[0] if existing else None, data):
+                return
             self._upsert("executions", data, ["execution_id"], columns)
             self._reconcile_trade_state_after_execution(data)
 

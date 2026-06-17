@@ -465,6 +465,8 @@ def process_history_collector_commands(*, runtime_state: dict[str, Any], max_com
                 return 0
             return 0
         event = "HISTORY_COLLECTOR_DONE" if rc == 0 else "HISTORY_COLLECTOR_FAILED"
+        if rc == 75:
+            event = "HISTORY_COLLECTOR_LOCK_HELD"
         if duration is None:
             _log(event, command_id=cmd.get("id"), returncode=rc)
         else:

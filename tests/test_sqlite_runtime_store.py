@@ -76,6 +76,39 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_duplicate_complete_execution_does_not_rerun_reducer_or_clear_trade_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            calls: list[str] = []
+            original = store._reconcile_trade_state_after_execution
+
+            def tracking_reducer(data):
+                calls.append(str(data.get("execution_id")))
+                return original(data)
+
+            store._reconcile_trade_state_after_execution = tracking_reducer  # type: ignore[method-assign]
+            try:
+                row = {
+                    "execution_id": "E1",
+                    "trade_id": "T1",
+                    "symbol": "RKLB",
+                    "side": "BOT",
+                    "quantity": 10,
+                    "price": 10,
+                    "commission": 0.35,
+                    "commission_source": "ibkr",
+                    "executed_at": "2026-05-29T13:30:00+00:00",
+                }
+                store.upsert_execution(row)
+                store.upsert_execution({**row, "trade_id": None, "recorded_at": "2026-05-29T13:31:00+00:00"})
+
+                rows = store.query("SELECT trade_id, commission, commission_source FROM executions WHERE execution_id = 'E1'")
+                self.assertEqual(rows[0]["trade_id"], "T1")
+                self.assertEqual(rows[0]["commission_source"], "ibkr")
+                self.assertEqual(calls, ["E1"])
+            finally:
+                store.close()
+
     def test_bot_fill_creates_open_position(self) -> None:
         today = date.today().isoformat()
         with tempfile.TemporaryDirectory() as tmp:

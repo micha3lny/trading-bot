@@ -273,6 +273,56 @@ def merge_fill_rows(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[
     return merged
 
 
+def _as_text(value: Any) -> str:
+    return "" if value in (None, "") else str(value)
+
+
+def _same_floatish(left: Any, right: Any) -> bool:
+    left_float = safe_float(left)
+    right_float = safe_float(right)
+    if left_float is None or right_float is None:
+        return _as_text(left) == _as_text(right)
+    return abs(left_float - right_float) <= 1e-9
+
+
+def fill_row_already_commission_complete(existing: dict[str, Any], incoming: dict[str, Any]) -> bool:
+    """Return true when an incoming replay does not add new fill/commission facts.
+
+    IBKR can replay executions/commission reports after reconnect or restart. The
+    replay has a fresh local recorded_at/raw_json timestamp, so a raw row compare
+    would keep rewriting fills.csv and retriggering SQLite reduction forever.
+    """
+    if str(existing.get("commission_source") or "").lower() != "ibkr":
+        return False
+    if str(incoming.get("commission_source") or "").lower() != "ibkr":
+        return False
+    stable_fields = [
+        "execution_id",
+        "symbol",
+        "action",
+        "quantity",
+        "fill_price",
+        "order_id",
+        "perm_id",
+        "exchange",
+        "liquidity",
+        "commission",
+        "commission_currency",
+        "realized_pnl",
+        "commission_source",
+    ]
+    for field in stable_fields:
+        incoming_value = incoming.get(field)
+        if incoming_value in (None, "") and field not in {"commission", "commission_currency", "realized_pnl", "commission_source"}:
+            continue
+        if field in {"quantity", "fill_price", "commission", "realized_pnl"}:
+            if not _same_floatish(existing.get(field), incoming_value):
+                return False
+        elif _as_text(existing.get(field)) != _as_text(incoming_value):
+            return False
+    return True
+
+
 def upsert_fill_row(recorder: LiveDataRecorder, row: dict[str, Any]) -> str:
     execution_id = str(row.get("execution_id") or "").strip()
     if not execution_id:
@@ -281,6 +331,8 @@ def upsert_fill_row(recorder: LiveDataRecorder, row: dict[str, Any]) -> str:
     rows = read_csv_rows(path)
     for idx, existing in enumerate(rows):
         if str(existing.get("execution_id") or "").strip() == execution_id:
+            if fill_row_already_commission_complete(existing, row):
+                return "duplicate"
             merged = merge_fill_rows(existing, row)
             if merged == existing:
                 return "duplicate"
@@ -293,6 +345,16 @@ def upsert_fill_row(recorder: LiveDataRecorder, row: dict[str, Any]) -> str:
     return "inserted"
 
 
+def existing_fills_by_execution_id(recorder: LiveDataRecorder) -> dict[str, dict[str, Any]]:
+    rows = read_csv_rows(recorder.path("fills.csv"))
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        execution_id = str(row.get("execution_id") or "").strip()
+        if execution_id:
+            out[execution_id] = row
+    return out
+
+
 def record_commission_report(recorder: LiveDataRecorder, commission_report: Any) -> str:
     row = commission_report_row(commission_report)
     execution_id = row.get("execution_id")
@@ -302,6 +364,8 @@ def record_commission_report(recorder: LiveDataRecorder, commission_report: Any)
     rows = read_csv_rows(path)
     for idx, existing in enumerate(rows):
         if str(existing.get("execution_id") or "").strip() == str(execution_id):
+            if fill_row_already_commission_complete(existing, row):
+                return "duplicate"
             merged = merge_fill_rows(existing, row)
             rows[idx] = merged
             write_csv_rows_atomic(path, rows, FILL_FIELDS)
@@ -355,11 +419,17 @@ def record_recent_fills(ib: IB, recorder: LiveDataRecorder, seen: set[str]) -> i
             fills = ib.reqExecutions(ExecutionFilter())
         except Exception:
             fills = ib.fills()
+        existing_by_exec = existing_fills_by_execution_id(recorder)
         for fill in fills:
             key = fill_key(fill)
             row = fill_row_from_ibkr_fill(fill)
+            existing = existing_by_exec.get(str(row.get("execution_id") or "").strip())
+            if key in seen and existing is not None and fill_row_already_commission_complete(existing, row):
+                continue
             status = upsert_fill_row(recorder, row)
-            safe_sqlite_call(sqlite_store, "upsert_execution", row)
+            if status != "duplicate":
+                safe_sqlite_call(sqlite_store, "upsert_execution", row)
+                existing_by_exec[str(row.get("execution_id") or "").strip()] = row
             if status != "duplicate":
                 if row.get("commission_source") != "ibkr":
                     rate_limited_recorder_log(
