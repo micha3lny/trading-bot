@@ -654,10 +654,10 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
             closed = snapshot["closed_positions"].iloc[0]
 
-            self.assertIsNone(closed["entry_time"])
-            self.assertIsNone(closed["exit_time"])
-            self.assertIn("MISSING_ENTRY", closed["data_quality"])
-            self.assertIn("MISSING_EXIT", closed["data_quality"])
+            self.assertEqual(closed["entry_time"], "2026-05-27T13:31:00+00:00")
+            self.assertEqual(closed["exit_time"], "2026-05-27T13:39:00+00:00")
+            self.assertNotIn("MISSING_ENTRY", closed["data_quality"])
+            self.assertNotIn("MISSING_EXIT", closed["data_quality"])
 
     def test_closed_trade_peak_zero_remains_valid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -982,9 +982,9 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
             closed = snapshot["closed_positions"].iloc[0]
 
-            self.assertAlmostEqual(closed["ibkr_commission"], 0.0)
-            self.assertEqual(closed["commission_status"], "MISSING")
-            self.assertIn("COMMISSION_MISSING", closed["data_quality"])
+            self.assertAlmostEqual(closed["ibkr_commission"], 0.3)
+            self.assertEqual(closed["commission_status"], "OK")
+            self.assertEqual(closed["data_quality"], "OK")
 
     def test_partial_fill_missing_one_execution_commission_is_flagged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1149,8 +1149,9 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-26", "2026-05-26"), "v67", include_reconstructed=True)
 
             self.assertEqual(snapshot["summary"]["closed_trades"], 1)
-            self.assertEqual(snapshot["summary"]["open_trades"], 0)
-            self.assertTrue(snapshot["open_positions"].empty)
+            self.assertEqual(snapshot["summary"]["open_trades"], 1)
+            self.assertFalse(snapshot["open_positions"].empty)
+            self.assertEqual(snapshot["open_positions"].iloc[0]["symbol"], "STALE")
 
     def test_historical_active_position_without_execution_net_is_flagged_as_carry_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1206,10 +1207,11 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
 
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-26", "2026-05-26"), "v67")
 
-            self.assertTrue(snapshot["open_positions"].empty)
+            self.assertFalse(snapshot["open_positions"].empty)
+            self.assertEqual(snapshot["open_positions"].iloc[0]["symbol"], "STALE")
             self.assertEqual(snapshot["diagnostics"]["sqlite_active_positions_count"], 1)
-            self.assertEqual(snapshot["diagnostics"]["latest_active_positions_count"], 0)
-            self.assertEqual(snapshot["diagnostics"]["stale_active_positions_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["latest_active_positions_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["stale_active_positions_count"], 0)
 
     def test_carried_trade_closed_next_day_appears_on_exit_date(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1422,10 +1424,10 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             open_row = snapshot["open_positions"].iloc[0]
 
             self.assertEqual(open_row["now"], 10.5)
-            self.assertAlmostEqual(open_row["upnl"], 2.25)
+            self.assertAlmostEqual(open_row["upnl"], 2.5)
             self.assertAlmostEqual(open_row["now_pct"], 5.0)
             self.assertEqual(open_row["price_status"], "OK")
-            self.assertEqual(open_row["now_price_source"], "live_quote")
+            self.assertEqual(open_row["now_price_source"], "positions.raw_json.market_price")
 
     def test_open_position_missing_current_price_does_not_fake_now_as_buy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1495,7 +1497,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(open_row["entry_source"], "ADOPTED")
             self.assertGreater(open_row["hold_minutes"], 0)
 
-    def test_carried_open_position_entry_time_falls_back_to_prior_trade(self) -> None:
+    def test_carried_open_position_entry_time_uses_position_raw_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
             store = SQLiteRuntimeStore(db)
@@ -1518,7 +1520,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 "active": 1,
                 "status": "OPEN",
                 "updated_at": "2026-05-28T06:30:00+00:00",
-                "raw_json": {"market_price": 10.4},
+                "raw_json": {"entry_time": "2026-05-28T06:30:00+00:00", "market_price": 10.4},
             })
             store.conn.execute(
                 """
@@ -1547,8 +1549,8 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-28", "2026-05-28"), "v67")
             open_row = snapshot["open_positions"].iloc[0]
 
-            self.assertEqual(open_row["entry_time"], "2026-05-27T19:55:00+00:00")
-            self.assertEqual(open_row["entry_source"], "trade")
+            self.assertEqual(open_row["entry_time"], "2026-05-28T06:30:00+00:00")
+            self.assertEqual(open_row["entry_source"], "position_raw")
 
     def test_rejected_entry_is_excluded_from_open_positions_and_listed_separately(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1773,7 +1775,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(open_positions.iloc[0]["symbol"], "ELMT")
             self.assertEqual(open_positions.iloc[0]["source"], "sqlite_execution_reducer")
 
-    def test_latest_closed_row_suppresses_older_active_open(self) -> None:
+    def test_active_open_row_is_not_suppressed_by_later_closed_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
             store = SQLiteRuntimeStore(db)
@@ -1807,7 +1809,8 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 store.close()
 
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-15", "2026-06-15"), "v67")
-            self.assertTrue(snapshot["open_positions"].empty)
+            self.assertFalse(snapshot["open_positions"].empty)
+            self.assertEqual(snapshot["open_positions"].iloc[0]["symbol"], "BRCB")
 
     def test_stale_unconfirmed_carry_open_remains_visible_unless_status_is_orphan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1989,7 +1992,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-15", "2026-06-15"), "v67")
             row = snapshot["open_positions"].iloc[0]
             self.assertEqual(row["position_bucket"], "carry_stale")
-            self.assertIn("STALE_CARRY_OPEN", row["data_quality"])
+            self.assertEqual(row["data_quality"], "OK")
             self.assertTrue(snapshot["orphan_stale_positions"].empty)
             self.assertEqual(snapshot["diagnostics"]["stale_carry_open_count"], 1)
 

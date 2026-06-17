@@ -105,7 +105,7 @@ def append_quality(existing: Any, *flags: str) -> str:
 
 
 def raw_json_peak_value(raw: dict[str, Any]) -> float | None:
-    for key in ("mfe_pct", "peak_pct", "peak_gain_pct", "max_gain_pct"):
+    for key in ("mfe_pct", "peak_pct", "peak_unrealized_pct", "peak_gain_pct", "max_gain_pct"):
         value = to_float(raw.get(key), None)
         if value is not None:
             return value
@@ -854,6 +854,21 @@ def closed_from_trades(
     entry_execution_ids: list[str] = []
     exit_execution_ids: list[str] = []
     trade_sources: list[str] = []
+    trade_raw_peak_by_symbol_session: dict[tuple[str, str, str], tuple[float, str]] = {}
+    for peak_row in out.to_dict("records"):
+        peak = to_float(peak_row.get("peak_pct"), None)
+        source = "trades.mfe_pct"
+        if peak is None:
+            peak = raw_json_peak_value(parse_raw_json(peak_row.get("raw_json")))
+            source = "trades.raw_json"
+        if peak is None:
+            continue
+        key = (
+            str(peak_row.get("session_date") or ""),
+            str(peak_row.get("strategy") or "unknown"),
+            str(peak_row.get("symbol") or "").upper(),
+        )
+        trade_raw_peak_by_symbol_session.setdefault(key, (peak, source))
     for row in out.to_dict("records"):
         buy_rows: list[dict[str, Any]] = []
         sell_rows: list[dict[str, Any]] = []
@@ -880,6 +895,16 @@ def closed_from_trades(
         else:
             commission_status = "MISSING"
         peak_pct, peak_source = peak_from_sources(enriched_row, runtime_peak_map, lifecycle_peak_map, candle_rows)
+        if peak_pct is None:
+            peak_fallback = trade_raw_peak_by_symbol_session.get(
+                (
+                    str(row.get("session_date") or ""),
+                    str(row.get("strategy") or "unknown"),
+                    str(row.get("symbol") or "").upper(),
+                )
+            )
+            if peak_fallback is not None:
+                peak_pct, peak_source = peak_fallback
         drop_from_peak = to_float(raw.get("drop_from_peak_pct"), None)
         if drop_from_peak is None:
             drop_from_peak = to_float(raw.get("giveback_pct"), None)
@@ -1498,12 +1523,15 @@ def load_open_positions(
             now_pct = ((now - buy) / buy) * 100.0
         peak_pct = to_float(raw.get("peak_pct"), None)
         if peak_pct is None:
+            peak_pct = to_float(raw.get("peak_unrealized_pct"), None)
+        if peak_pct is None:
             peak_pct = to_float(raw.get("peak_gain_pct"), None)
         if peak_pct is None and buy:
             peak_price = to_float(raw.get("peak_price"), None)
             if peak_price is not None:
                 peak_pct = ((peak_price / buy) - 1.0) * 100.0
         raw_entry_time = raw.get("entry_time")
+        adopted_time = adopted_timestamp_value(raw_entry_time)
         entry_time = displayable_entry_time(raw_entry_time)
         entry_date = date_part(entry_time) or str(session_date or "")
         stale_carry = bool(entry_date and entry_date < window.end_date)
@@ -1516,6 +1544,7 @@ def load_open_positions(
         display_status = row.get("status") or ("EXIT_ORDER" if row.get("exit_sent") else "OPEN")
         if stale_carry:
             position_bucket = "carry_stale"
+        entry_source = "ADOPTED" if adopted_time else ("position_raw" if raw_entry_time else "missing")
         execution_ids = raw.get("open_lot_execution_ids")
         if isinstance(execution_ids, list):
             execution_ids_value = ", ".join(str(x) for x in execution_ids)
@@ -1539,6 +1568,7 @@ def load_open_positions(
             "strategy": row_strategy,
             "entry_time": entry_time,
             "entry_date": entry_date,
+            "entry_source": entry_source,
             "session_date": session_date,
             "position_key": row.get("position_key"),
             "source": row.get("source"),
