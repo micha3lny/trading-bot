@@ -43,6 +43,103 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
         )
         store.conn.commit()
 
+    def test_runtime_open_positions_use_sqlite_positions_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_date = utc_today()
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_position({
+                "session_date": session_date,
+                "strategy_name": "v67",
+                "symbol": "OPEN1",
+                "quantity": 5,
+                "avg_price": 10,
+                "active": 1,
+                "status": "OPEN",
+                "source": "live_buy",
+                "exit_sent": 1,
+                "updated_at": f"{session_date}T14:01:00+00:00",
+                "raw_json": {
+                    "entry_time": f"{session_date}T13:31:00+00:00",
+                    "market_price": 10.5,
+                    "market_price_at": f"{session_date}T14:00:00+00:00",
+                    "peak_pct": 8.0,
+                    "data_quality": "OK",
+                    "open_lot_execution_ids": ["B1", "B2"],
+                },
+            })
+            store.upsert_position({
+                "session_date": session_date,
+                "strategy_name": "v67",
+                "symbol": "OLDORPHAN",
+                "quantity": 1,
+                "avg_price": 10,
+                "active": 1,
+                "status": "ORPHAN_STALE_POSITION",
+                "updated_at": f"{session_date}T14:01:00+00:00",
+                "raw_json": {"market_price": 11},
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow(session_date, session_date), "v67")
+            open_positions = snapshot["open_positions"]
+
+            self.assertEqual(open_positions["symbol"].tolist(), ["OPEN1"])
+            row = open_positions.iloc[0]
+            self.assertAlmostEqual(row["now"], 10.5)
+            self.assertAlmostEqual(row["now_dollars"], 2.5)
+            self.assertAlmostEqual(row["now_pct"], 5.0)
+            self.assertAlmostEqual(row["peak_pct"], 8.0)
+            self.assertAlmostEqual(row["giveback_pct"], 3.0)
+            self.assertEqual(row["ibkr_confirmed"], "UNKNOWN")
+            self.assertEqual(row["source"], "live_buy")
+            self.assertEqual(row["exit_sent"], 1)
+            self.assertEqual(row["execution_ids"], "B1, B2")
+
+    def test_runtime_executions_use_sqlite_and_sort_descending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_date = utc_today()
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_execution({
+                "execution_id": "E1",
+                "session_date": session_date,
+                "strategy_name": "v67",
+                "symbol": "AAA",
+                "side": "BOT",
+                "quantity": 2,
+                "price": 10,
+                "executed_at": f"{session_date}T13:30:00+00:00",
+                "recorded_at": f"{session_date}T13:30:01+00:00",
+            })
+            store.upsert_execution({
+                "execution_id": "E2",
+                "session_date": session_date,
+                "strategy_name": "v67",
+                "symbol": "BBB",
+                "side": "SLD",
+                "quantity": 3,
+                "price": 11,
+                "executed_at": f"{session_date}T13:31:00+00:00",
+                "recorded_at": f"{session_date}T13:31:01+00:00",
+                "commission": 0.5,
+                "commission_source": "ibkr",
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow(session_date, session_date), "v67")
+            executions = snapshot["executions"]
+
+            self.assertEqual(executions["execution_id"].tolist()[:2], ["E2", "E1"])
+            latest = executions.iloc[0]
+            self.assertEqual(latest["side"], "SLD")
+            self.assertEqual(latest["qty"], 3)
+            self.assertEqual(latest["price"], 11)
+            self.assertEqual(latest["gross_value"], 33)
+            self.assertIn(latest["data_quality"], {"OK", "PNL_PENDING"})
+            pending = executions[executions["execution_id"] == "E1"].iloc[0]
+            self.assertEqual(pending["data_quality"], "COMMISSION_PENDING")
+
     def test_snapshot_reconstructs_closed_open_summary_and_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             session_date = utc_today()

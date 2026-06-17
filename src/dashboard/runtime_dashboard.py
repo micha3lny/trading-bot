@@ -441,66 +441,108 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
         st.info("No open positions in the selected window.")
         return
     cols = [
-        "symbol", "qty", "buy", "now", "upnl", "now_pct", "peak_pct", "giveback_pct",
-        "hold_minutes", "entry_time", "entry_source", "status", "strategy", "data_quality", "ibkr_confirmed",
+        "symbol", "qty", "entry_time", "buy", "now", "now_dollars", "now_pct", "peak_pct",
+        "giveback_pct", "status", "strategy", "data_quality", "ibkr_confirmed",
+        "last_update", "source", "exit_sent", "execution_ids",
     ]
     available = [col for col in cols if col in df.columns]
-    out = filter_table(df[available].copy(), prefix).sort_values(["upnl", "symbol"], na_position="last")
+    out = filter_table(df[available].copy(), prefix).sort_values(["now_dollars", "symbol"], na_position="last")
     if len(out) != len(df):
         st.warning(f"Table filters are hiding {len(df) - len(out)} of {len(df)} open-position rows.")
-    out["entry_time"] = out.apply(
-        lambda row: f"ADOPTED {display_time(row['entry_time'])}" if str(row.get("entry_source") or "").upper() == "ADOPTED" else display_time(row["entry_time"]),
-        axis=1,
-    )
-    for col in ("now", "upnl", "now_pct"):
-        out[col] = out[col].map(display_optional_number)
+    out["entry_time"] = out["entry_time"].map(display_time)
+    if "last_update" in out.columns:
+        out["last_update"] = out["last_update"].map(display_time)
+    for col in ("buy", "now", "now_dollars", "now_pct", "peak_pct", "giveback_pct"):
+        if col in out.columns:
+            out[col] = out[col].map(display_optional_number)
     out = out.rename(
         columns={
             "symbol": "Symbol",
             "qty": "Qty",
+            "entry_time": "Entry Time",
             "buy": "Buy",
             "now": "Now",
-            "upnl": "UPNL",
+            "now_dollars": "Now $",
             "now_pct": "Now %",
             "peak_pct": "Peak %",
             "giveback_pct": "Drop from Peak %",
-            "hold_minutes": "Min",
-            "entry_time": "Entry Time",
             "status": "Status",
             "strategy": "Strategy",
             "data_quality": "Data Quality",
             "ibkr_confirmed": "IBKR Confirmed",
+            "last_update": "Last Update",
+            "source": "Source",
+            "exit_sent": "Exit Sent",
+            "execution_ids": "Execution IDs",
         }
     )
-    display_cols = ["Symbol", "Qty", "Buy", "Now", "UPNL", "Now %", "Peak %", "Drop from Peak %", "Min", "Entry Time", "Status", "Strategy"]
-    if "Data Quality" in out.columns:
-        display_cols.append("Data Quality")
-    if "IBKR Confirmed" in out.columns:
-        display_cols.append("IBKR Confirmed")
+    display_cols = [
+        "Symbol", "Qty", "Entry Time", "Buy", "Now", "Now $", "Now %",
+        "Peak %", "Drop from Peak %", "Status", "Strategy", "Data Quality",
+        "IBKR Confirmed", "Last Update", "Source", "Exit Sent", "Execution IDs",
+    ]
+    display_cols = [col for col in display_cols if col in out.columns]
     out = out[display_cols]
     st.dataframe(
-        style_pnl(out, ["UPNL", "Now %"]),
+        style_pnl(out, ["Now $", "Now %"]),
+        width="stretch",
+        hide_index=True,
+    )
+
+
+def render_runtime_executions(df: pd.DataFrame) -> None:
+    st.subheader("Executions")
+    if df is None or df.empty:
+        st.info("No executions in the selected session window.")
+        return
+    cols = [
+        "time", "recorded_at", "symbol", "side", "qty", "price", "gross_value",
+        "exchange", "liquidity", "order_id", "perm_id", "execution_id", "trade_id",
+        "commission", "commission_currency", "realized_pnl", "commission_source",
+        "strategy", "session_date", "data_quality",
+    ]
+    available = [col for col in cols if col in df.columns]
+    out = filter_table(df[available].copy(), "runtime_exec")
+    if "time" in out.columns:
+        out["time"] = out["time"].map(display_time)
+    if "recorded_at" in out.columns:
+        out["recorded_at"] = out["recorded_at"].map(display_time)
+    for col in ("qty", "price", "gross_value", "commission", "realized_pnl"):
+        if col in out.columns:
+            out[col] = out[col].map(display_optional_number)
+    out = out.rename(
+        columns={
+            "time": "Time",
+            "recorded_at": "Recorded At",
+            "symbol": "Symbol",
+            "side": "Side",
+            "qty": "Qty",
+            "price": "Price",
+            "gross_value": "Gross Value",
+            "exchange": "Exchange",
+            "liquidity": "Liquidity",
+            "order_id": "Order ID",
+            "perm_id": "Perm ID",
+            "execution_id": "Exec ID",
+            "trade_id": "Trade ID",
+            "commission": "Commission",
+            "commission_currency": "Currency",
+            "realized_pnl": "Realized PnL",
+            "commission_source": "Commission Source",
+            "strategy": "Strategy",
+            "session_date": "Session Date",
+            "data_quality": "Data Quality",
+        }
+    )
+    st.dataframe(
+        style_pnl(out, ["Realized PnL"]),
         width="stretch",
         hide_index=True,
     )
 
 
 def render_open_position_sections(df: pd.DataFrame) -> None:
-    if df.empty or "position_bucket" not in df.columns:
-        render_open_positions(df)
-        return
-    today = df[df["position_bucket"].fillna("") == "today"].copy()
-    carry = df[df["position_bucket"].fillna("") == "carry_stale"].copy()
-    if today.empty:
-        st.subheader("Today Open Positions")
-        st.info("No today open positions in the selected window.")
-    else:
-        render_open_positions(today, title="Today Open Positions", prefix="today_open")
-    if carry.empty:
-        st.subheader("Carry / Stale Open Positions")
-        st.info("No carry/stale open positions requiring verification.")
-    else:
-        render_open_positions(carry, title="Carry / Stale Open Positions", prefix="carry_open")
+    render_open_positions(df, title="Open Positions", prefix="open")
 
 
 def render_raw_active_positions(df: pd.DataFrame) -> None:
@@ -944,6 +986,8 @@ def render_runtime_tab(sqlite_path: str, start_date: str, end_date: str, strateg
     st.divider()
     render_open_position_sections(snapshot["open_positions"])
     render_raw_active_positions(snapshot.get("raw_active_positions", pd.DataFrame()))
+    st.divider()
+    render_runtime_executions(snapshot.get("executions", pd.DataFrame()))
     st.divider()
     render_orphan_stale_positions(snapshot.get("orphan_stale_positions", pd.DataFrame()))
     render_excluded_open_positions(snapshot.get("excluded_open_positions", pd.DataFrame()))

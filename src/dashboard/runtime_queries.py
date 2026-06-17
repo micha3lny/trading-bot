@@ -276,22 +276,28 @@ def load_executions(conn: sqlite3.Connection, window: DateWindow, strategy: str 
         clause, params = "", []
     else:
         clause, params = " AND (COALESCE(e.strategy_name, 'unknown') = ? OR COALESCE(e.strategy_name, 'unknown') = 'unknown')", [strategy]
-    return read_sql(
+    rows = read_sql(
         conn,
         f"""
         SELECT
             execution_id,
             trade_id,
             COALESCE(strategy_name, 'unknown') AS strategy,
+            COALESCE(strategy_name, 'unknown') AS strategy_name,
             session_date,
             symbol,
+            side,
             side AS action,
+            quantity AS qty,
             quantity,
+            price,
             price AS fill_price,
+            quantity * price AS gross_value,
             order_id,
             perm_id,
             exchange,
             liquidity,
+            executed_at AS time,
             executed_at,
             recorded_at,
             commission,
@@ -301,10 +307,26 @@ def load_executions(conn: sqlite3.Connection, window: DateWindow, strategy: str 
             raw_json
         FROM executions e
         WHERE e.session_date BETWEEN ? AND ? {clause}
-        ORDER BY COALESCE(e.executed_at, e.recorded_at), e.execution_id
+        ORDER BY COALESCE(e.executed_at, e.recorded_at) DESC, e.execution_id DESC
         """,
         [window.start_date, window.end_date, *params],
     )
+    if rows.empty:
+        return rows
+    data_quality: list[str] = []
+    for row in rows.to_dict("records"):
+        side = str(row.get("side") or row.get("action") or "").upper()
+        commission = to_float(row.get("commission"), None)
+        commission_source = str(row.get("commission_source") or "").strip()
+        realized_pnl = to_float(row.get("realized_pnl"), None)
+        if side in {"SLD", "SELL"} and realized_pnl is None:
+            data_quality.append("PNL_PENDING")
+        elif (commission is None or abs(commission) < 1e-12) and not commission_source:
+            data_quality.append("COMMISSION_PENDING")
+        else:
+            data_quality.append("OK")
+    rows["data_quality"] = data_quality
+    return rows
 
 
 def confirmed_commission_maps(executions: pd.DataFrame) -> tuple[dict[str, float], dict[tuple[str, str, str], float]]:
@@ -1446,10 +1468,6 @@ def load_open_positions(
     )
     if rows.empty:
         return rows
-    lookup_window = expanded_lookup_window(window)
-    entry_by_execution = entry_execution_map(execution_lookup if execution_lookup is not None else executions)
-    entry_by_trade = trade_entry_map(conn, lookup_window, strategy)
-    entry_by_event = runtime_entry_event_map(conn, lookup_window, strategy)
     out: list[dict[str, Any]] = []
     for row in rows.to_dict("records"):
         row_strategy = str(row.get("strategy") or "unknown")
@@ -1465,62 +1483,46 @@ def load_open_positions(
             qty = to_float(row.get("ibkr_quantity"), 0.0)
         if qty is None:
             qty = 0.0
-        buy = to_float(row.get("avg_price") or raw.get("entry_price"), 0.0) or 0.0
-        now, now_price_source, price_time = raw_now_price(raw)
+        buy = to_float(row.get("avg_price"), None)
+        if buy is None:
+            buy = to_float(raw.get("entry_price"), None)
+        now = to_float(raw.get("market_price"), None)
+        now_price_source = str(raw.get("market_price_source") or ("positions.raw_json.market_price" if now is not None else "missing"))
+        price_time = raw.get("market_price_at")
         price_status = price_status_for(now, price_time, window)
-        entry_key = (session_date, row_strategy, symbol)
-        entry_lookup = lookup_by_position_key(entry_by_execution, session_date, row_strategy, symbol) or {}
-        entry_commission = to_float(raw.get("ibkr_commission"), None)
-        if entry_commission is None:
-            entry_commission = to_float(entry_lookup.get("entry_commission"), 0.0) or 0.0
         if now is None or not buy:
             upnl = None
             now_pct = None
         else:
-            upnl = (now - buy) * (qty or 0.0) - (entry_commission or 0.0)
+            upnl = (now - buy) * (qty or 0.0)
             now_pct = ((now - buy) / buy) * 100.0
-        peak_price_default = max(value for value in (buy, now) if value is not None) if buy or now is not None else None
-        peak_price = to_float(raw.get("peak_price"), peak_price_default)
-        peak_pct = to_float(raw.get("peak_gain_pct"), ((peak_price / buy - 1.0) * 100.0 if buy and peak_price else 0.0))
-        raw_entry_time = raw.get("entry_time") or raw.get("buy_time")
-        adopted_time = adopted_timestamp_value(raw_entry_time)
-        trade_entry_time = lookup_by_position_key(entry_by_trade, session_date, row_strategy, symbol)
-        event_entry_time = lookup_by_position_key(entry_by_event, session_date, row_strategy, symbol)
-        entry_time = (
-            trade_entry_time
-            or displayable_entry_time(raw_entry_time)
-            or event_entry_time
-            or entry_lookup.get("entry_time")
-            or row.get("updated_at")
-        )
+        peak_pct = to_float(raw.get("peak_pct"), None)
+        if peak_pct is None:
+            peak_pct = to_float(raw.get("peak_gain_pct"), None)
+        if peak_pct is None and buy:
+            peak_price = to_float(raw.get("peak_price"), None)
+            if peak_price is not None:
+                peak_pct = ((peak_price / buy) - 1.0) * 100.0
+        raw_entry_time = raw.get("entry_time")
+        entry_time = displayable_entry_time(raw_entry_time)
         entry_date = date_part(entry_time) or str(session_date or "")
         stale_carry = bool(entry_date and entry_date < window.end_date)
-        ibkr_confirmed = bool(
-            (ibkr_qty is not None and abs(ibkr_qty) > 1e-9)
-            or raw_bool(raw, "ibkr_confirmed", "ibkr_entry_confirmed", "entry_fill_verified", "ibkr_position_confirmed")
-        )
-        data_quality = "OK"
+        if ibkr_qty is None:
+            ibkr_confirmed: str | bool = "UNKNOWN"
+        else:
+            ibkr_confirmed = "TRUE" if abs((ibkr_qty or 0.0) - (qty or 0.0)) <= 1e-6 else "FALSE"
+        data_quality = str(raw.get("data_quality") or "OK")
         position_bucket = "today"
         display_status = row.get("status") or ("EXIT_ORDER" if row.get("exit_sent") else "OPEN")
         if stale_carry:
             position_bucket = "carry_stale"
-            data_quality = append_quality(data_quality, "STALE_CARRY_OPEN")
-            display_status = f"{display_status}|STALE_CARRY_OPEN"
-            if not ibkr_confirmed:
-                data_quality = append_quality(data_quality, "IBKR_UNCONFIRMED")
-        entry_source = (
-            "trade"
-            if trade_entry_time
-            else "ADOPTED"
-            if adopted_time
-            else "position_raw"
-            if raw_entry_time
-            else "runtime_event"
-            if event_entry_time
-            else "execution"
-            if entry_lookup.get("entry_time")
-            else "position_updated_at"
-        )
+        execution_ids = raw.get("open_lot_execution_ids")
+        if isinstance(execution_ids, list):
+            execution_ids_value = ", ".join(str(x) for x in execution_ids)
+        elif execution_ids is None:
+            execution_ids_value = ""
+        else:
+            execution_ids_value = str(execution_ids)
         hold_base = entry_time
         out.append({
             "symbol": row.get("symbol"),
@@ -1528,16 +1530,15 @@ def load_open_positions(
             "buy": buy,
             "now": now,
             "upnl": upnl,
+            "now_dollars": upnl,
             "now_pct": now_pct,
             "peak_pct": peak_pct,
-            "giveback_pct": (now_pct - peak_pct) if now_pct is not None and peak_pct is not None else None,
+            "giveback_pct": (peak_pct - now_pct) if now_pct is not None and peak_pct is not None else None,
             "hold_minutes": hold_minutes(hold_base),
-            "ibkr_commission": entry_commission or 0.0,
             "status": display_status,
             "strategy": row_strategy,
             "entry_time": entry_time,
             "entry_date": entry_date,
-            "entry_source": entry_source,
             "session_date": session_date,
             "position_key": row.get("position_key"),
             "source": row.get("source"),
@@ -1547,6 +1548,9 @@ def load_open_positions(
             "price_status": price_status,
             "now_price_source": now_price_source,
             "market_price_at": price_time,
+            "last_update": row.get("updated_at"),
+            "exit_sent": row.get("exit_sent"),
+            "execution_ids": execution_ids_value,
         })
     return pd.DataFrame(out)
 
