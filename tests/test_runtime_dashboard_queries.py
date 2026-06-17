@@ -140,6 +140,40 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             pending = executions[executions["execution_id"] == "E1"].iloc[0]
             self.assertEqual(pending["data_quality"], "COMMISSION_PENDING")
 
+    def test_closed_trades_exclude_pending_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_date = utc_today()
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            for trade_id, symbol, status in [
+                ("T_CLOSED", "DONE1", "CLOSED"),
+                ("T_COMM_PENDING", "WAITC", "COMMISSION_PENDING"),
+                ("T_PNL_PENDING", "WAITP", "PNL_PENDING"),
+            ]:
+                store.upsert_trade({
+                    "trade_id": trade_id,
+                    "session_date": session_date,
+                    "strategy_name": "v67",
+                    "symbol": symbol,
+                    "status": status,
+                    "entry_fill_time": f"{session_date}T13:30:00+00:00",
+                    "exit_fill_time": f"{session_date}T13:35:00+00:00",
+                    "entry_price": 10,
+                    "exit_price": 11,
+                    "quantity": 1,
+                    "gross_pnl": 1,
+                    "commission": 0.2,
+                    "net_pnl": 0.8,
+                })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow(session_date, session_date), "v67")
+
+            self.assertEqual(snapshot["closed_positions"]["symbol"].tolist(), ["DONE1"])
+            self.assertEqual(set(snapshot["pending_trades"]["symbol"].tolist()), {"WAITC", "WAITP"})
+            self.assertEqual(snapshot["summary"]["closed_trades"], 1)
+            self.assertEqual(snapshot["diagnostics"]["pending_trades_count"], 2)
+
     def test_snapshot_reconstructs_closed_open_summary_and_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             session_date = utc_today()

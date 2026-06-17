@@ -17,7 +17,8 @@ from src.live_trading.analytics.v67_daily_report import (
 from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, migrate_runtime_schema, resolve_sqlite_path
 
 
-CLOSED_STATUSES = {"CLOSED", "DONE", "EXIT_FILLED", "FLAT"}
+CLOSED_STATUSES = {"CLOSED"}
+PENDING_TRADE_STATUSES = {"COMMISSION_PENDING", "PNL_PENDING"}
 TERMINAL_POSITION_STATUSES = {"CLOSED", "FLAT", "FLAT_CONFIRMED", "ENTRY_REJECTED", "ENTRY_NOT_FILLED", "STALE_DUPLICATE_SUPPRESSED", "ORPHAN_STALE_POSITION"}
 OPEN_POSITION_STATUSES = {"OPEN", "EXIT_ORDER"}
 DEFAULT_RECORDER_ROOT = Path("data/live/recorder")
@@ -1618,6 +1619,45 @@ def load_raw_closed_trade_rows(conn: sqlite3.Connection, window: DateWindow, str
     )
 
 
+def load_pending_trades(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> pd.DataFrame:
+    clause, params = strategy_clause("t", strategy)
+    return read_sql(
+        conn,
+        f"""
+        SELECT
+            trade_id,
+            COALESCE(strategy_name, 'unknown') AS strategy,
+            session_date,
+            symbol,
+            status,
+            entry_fill_time AS entry_time,
+            exit_fill_time AS exit_time,
+            closed_at,
+            entry_price AS buy,
+            exit_price AS sell,
+            quantity AS qty,
+            gross_pnl AS gross,
+            commission,
+            net_pnl,
+            raw_json,
+            updated_at,
+            trade_reduction_version
+        FROM trades t
+        WHERE (
+            substr(t.exit_fill_time, 1, 10) BETWEEN ? AND ?
+            OR substr(t.closed_at, 1, 10) BETWEEN ? AND ?
+            OR (
+                COALESCE(t.exit_fill_time, t.closed_at) IS NULL
+                AND t.session_date BETWEEN ? AND ?
+            )
+        ) {clause}
+          AND UPPER(COALESCE(t.status, '')) IN ({",".join("?" for _ in PENDING_TRADE_STATUSES)})
+        ORDER BY COALESCE(t.updated_at, t.closed_at, t.exit_fill_time, t.entry_fill_time) DESC, t.symbol, t.trade_id
+        """,
+        [window.start_date, window.end_date, window.start_date, window.end_date, window.start_date, window.end_date, *params, *sorted(PENDING_TRADE_STATUSES)],
+    )
+
+
 def load_excluded_open_positions(
     conn: sqlite3.Connection,
     window: DateWindow,
@@ -2159,6 +2199,7 @@ def load_dashboard_snapshot(
             "orphan_stale_positions": empty,
             "rejected_entries": empty,
             "closed_positions": empty,
+            "pending_trades": empty,
             "exit_simulation": empty,
             "diagnostics": {},
             "executions": empty,
@@ -2179,6 +2220,7 @@ def load_dashboard_snapshot(
             include_reconstructed=include_reconstructed,
         )
         open_positions = load_open_positions(conn, window, strategy, executions, execution_lookup)
+        pending_trades = load_pending_trades(conn, window, strategy)
         raw_active_positions = load_raw_active_positions(conn, strategy)
         orphan_stale_positions = load_orphan_stale_positions(conn, window, strategy)
         excluded_open_positions = load_excluded_open_positions(conn, window, strategy, open_positions, orphan_stale_positions)
@@ -2226,6 +2268,7 @@ def load_dashboard_snapshot(
             diagnostics["oldest_orphan_stale_position_age_days"] = 0.0
             diagnostics["cleanup_recommendation"] = ""
         diagnostics["closed_trades_count"] = int(len(closed))
+        diagnostics["pending_trades_count"] = int(len(pending_trades))
         if not closed.empty and "runtime_pnl_trusted" in closed.columns:
             untrusted_closed = closed[~closed["runtime_pnl_trusted"].fillna(True).astype(bool)]
             diagnostics["untrusted_carry_closed_count"] = int(len(untrusted_closed))
@@ -2270,6 +2313,7 @@ def load_dashboard_snapshot(
             "excluded_open_positions": excluded_open_positions,
             "rejected_entries": rejected_entries,
             "closed_positions": closed,
+            "pending_trades": pending_trades,
             "exit_simulation": exit_simulation(closed),
             "diagnostics": diagnostics,
             "executions": executions,

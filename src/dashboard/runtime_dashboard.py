@@ -738,6 +738,52 @@ def render_closed_positions(df: pd.DataFrame) -> None:
             st.dataframe(debug, width="stretch", hide_index=True)
 
 
+def render_pending_trades(df: pd.DataFrame) -> None:
+    st.subheader("Pending Closed Trades")
+    if df.empty:
+        st.info("No pending commission/PnL trades in the selected window.")
+        return
+    cols = [
+        "symbol", "status", "qty", "buy", "sell", "gross", "commission", "net_pnl",
+        "entry_time", "exit_time", "closed_at", "strategy", "trade_id",
+        "updated_at", "trade_reduction_version",
+    ]
+    available = [col for col in cols if col in df.columns]
+    out = filter_table(df[available].copy(), "pending_trades")
+    if "updated_at" in out.columns:
+        out = out.sort_values(["updated_at", "symbol", "trade_id"], ascending=[False, True, True], na_position="last")
+    elif "exit_time" in out.columns:
+        out = out.sort_values(["exit_time", "symbol", "trade_id"], ascending=[False, True, True], na_position="last")
+    for time_col in ["entry_time", "exit_time", "closed_at", "updated_at"]:
+        if time_col in out.columns:
+            out[time_col] = out[time_col].map(display_time)
+    out = out.rename(
+        columns={
+            "symbol": "Symbol",
+            "status": "Status",
+            "qty": "Quantity",
+            "buy": "Buy",
+            "sell": "Sell",
+            "gross": "Gross",
+            "commission": "Commission",
+            "net_pnl": "Net",
+            "entry_time": "Entry Time",
+            "exit_time": "Exit Time",
+            "closed_at": "Closed At",
+            "strategy": "Strategy",
+            "trade_id": "Trade ID",
+            "updated_at": "Updated At",
+            "trade_reduction_version": "Reduction Version",
+        }
+    )
+    st.warning("Pending rows are excluded from Closed Positions and summary PnL until commission/PnL finalizes.")
+    st.dataframe(
+        style_pnl(out, [col for col in ["Gross", "Net"] if col in out.columns]),
+        width="stretch",
+        hide_index=True,
+    )
+
+
 def render_exit_simulation(df: pd.DataFrame) -> None:
     st.subheader("Exit Simulation")
     if df.empty:
@@ -993,6 +1039,8 @@ def render_runtime_tab(sqlite_path: str, start_date: str, end_date: str, strateg
     render_excluded_open_positions(snapshot.get("excluded_open_positions", pd.DataFrame()))
     st.divider()
     render_rejected_entries(snapshot.get("rejected_entries", pd.DataFrame()))
+    st.divider()
+    render_pending_trades(snapshot.get("pending_trades", pd.DataFrame()))
     st.divider()
     render_closed_positions(snapshot["closed_positions"])
     st.divider()
