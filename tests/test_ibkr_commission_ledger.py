@@ -54,6 +54,18 @@ class FakeIB:
         return list(self._fills)
 
 
+class DualSourceIB:
+    def __init__(self, req_fills: list[SimpleNamespace], fills: list[SimpleNamespace]) -> None:
+        self._req_fills = req_fills
+        self._fills = fills
+
+    def reqExecutions(self, _filter):
+        return list(self._req_fills)
+
+    def fills(self):
+        return list(self._fills)
+
+
 class FakeEvent:
     def __init__(self) -> None:
         self.handlers = []
@@ -151,6 +163,21 @@ class IbkrCommissionLedgerTests(unittest.TestCase):
 
             self.assertEqual(store.upsert_count, 1)
             self.assertEqual(len(read_fills(recorder)), 1)
+
+    def test_record_recent_fills_prefers_ib_fills_commission_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(Path(tmp), session_date="2026-05-22")
+            req_fill = fake_fill("E1", commission=None)
+            commissioned_fill = fake_fill("E1", commission=0.42)
+
+            count = record_recent_fills(DualSourceIB([req_fill], [commissioned_fill]), recorder, seen=set())
+
+            rows = read_fills(recorder)
+            self.assertEqual(count, 1)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["execution_id"], "E1")
+            self.assertEqual(rows[0]["commission"], "0.42")
+            self.assertEqual(rows[0]["commission_source"], "ibkr")
 
     def test_startup_seen_complete_fill_repairs_sqlite_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

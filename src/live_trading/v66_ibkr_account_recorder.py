@@ -170,6 +170,39 @@ def fill_key(fill) -> str:
     return str(getattr(execution, "execId", "")) or f"{getattr(execution, 'orderId', '')}-{getattr(execution, 'time', '')}"
 
 
+def fill_has_ibkr_commission(fill: Any) -> bool:
+    return commission_source_for_report(getattr(fill, "commissionReport", None)) == "ibkr"
+
+
+def merged_recent_fills(ib: IB) -> list[Any]:
+    """Fetch executions from both IBKR sources, preferring fills with commissions.
+
+    ib.reqExecutions() can return executions without commissionReport, while
+    ib.fills() often carries the commissionReport payload needed to finalize
+    closed trades. We keep reqExecutions as a fallback for coverage, but for the
+    same execId prefer whichever fill has confirmed IBKR commission data.
+    """
+    by_key: dict[str, Any] = {}
+    sources: list[list[Any]] = []
+    try:
+        sources.append(list(ib.reqExecutions(ExecutionFilter())))
+    except Exception:
+        pass
+    try:
+        sources.append(list(ib.fills()))
+    except Exception:
+        pass
+    for fills in sources:
+        for fill in fills:
+            key = fill_key(fill)
+            if not key:
+                continue
+            existing = by_key.get(key)
+            if existing is None or (fill_has_ibkr_commission(fill) and not fill_has_ibkr_commission(existing)):
+                by_key[key] = fill
+    return list(by_key.values())
+
+
 def commission_source_for_report(commission_report: Any) -> str:
     commission = safe_float(getattr(commission_report, "commission", None))
     if commission is None or commission == 0:
@@ -445,10 +478,7 @@ def record_recent_fills(ib: IB, recorder: LiveDataRecorder, seen: set[str]) -> i
     safe_sqlite_call(sqlite_store, "mark_operation_status", "fill_ingest", "running", started_at=started_at)
     count = 0
     try:
-        try:
-            fills = ib.reqExecutions(ExecutionFilter())
-        except Exception:
-            fills = ib.fills()
+        fills = merged_recent_fills(ib)
         existing_by_exec = existing_fills_by_execution_id(recorder)
         for fill in fills:
             key = fill_key(fill)
