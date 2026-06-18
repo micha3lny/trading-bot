@@ -649,6 +649,36 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_duplicate_execution_repairs_missing_active_position_when_broker_confirms_open(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                row = {
+                    "execution_id": "B_EQ_REPAIR",
+                    "strategy_name": "v67",
+                    "session_date": today,
+                    "symbol": "KOD",
+                    "side": "BOT",
+                    "quantity": 11,
+                    "price": 9.5,
+                    "executed_at": f"{today}T13:30:00+00:00",
+                    "commission": 0.5,
+                    "commission_source": "ibkr",
+                }
+                store.upsert_execution(row)
+                store.mark_position_flat(symbol="KOD", reason="test_missing_active_row", status="CLOSED")
+                self.assertEqual(store.query("SELECT * FROM positions WHERE symbol = 'KOD' AND COALESCE(active, 0) = 1"), [])
+
+                store.set_broker_net_positions({"KOD": 11})
+                store.upsert_execution(row)
+                active = store.query("SELECT * FROM positions WHERE symbol = 'KOD' AND COALESCE(active, 0) = 1")
+
+                self.assertEqual(len(active), 1)
+                self.assertEqual(active[0]["quantity"], 11)
+            finally:
+                store.close()
+
     def test_repair_rebuild_clears_active_position_without_execution_net(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")

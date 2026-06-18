@@ -13,6 +13,7 @@ from src.dashboard.broker_reality import (
     compare_closed_trades,
     ensure_asyncio_event_loop,
     closed_trades_from_commission_reports,
+    load_sqlite_active_positions,
     load_sqlite_executions,
     load_sqlite_closed_trades,
     load_sqlite_trade_pnl,
@@ -265,6 +266,42 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
         self.assertIn("sqlite_qty", mismatches.columns)
         self.assertIn("qty_difference", mismatches.columns)
         self.assertIn("cost_difference", mismatches.columns)
+
+    def test_sqlite_active_positions_prefers_latest_active_not_latest_closed_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_position({
+                    "position_key": "v67:2026-06-18:KOD",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-18",
+                    "symbol": "KOD",
+                    "status": "OPEN",
+                    "quantity": 11,
+                    "avg_price": 9.5,
+                    "active": 1,
+                    "updated_at": "2026-06-18T13:30:00+00:00",
+                })
+                store.upsert_position({
+                    "position_key": "v67:2026-06-18:KOD:closed-shadow",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-18",
+                    "symbol": "KOD",
+                    "status": "CLOSED",
+                    "quantity": 0,
+                    "avg_price": 9.6,
+                    "active": 0,
+                    "updated_at": "2026-06-18T13:31:00+00:00",
+                })
+            finally:
+                store.close()
+
+            rows = load_sqlite_active_positions(db, "2026-06-18")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows.iloc[0]["symbol"], "KOD")
+        self.assertEqual(rows.iloc[0]["quantity"], 11)
 
     def test_sqlite_execution_selected_date_filtering(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

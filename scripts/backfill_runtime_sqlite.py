@@ -20,6 +20,10 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def utc_session_date() -> str:
+    return datetime.now(timezone.utc).strftime("%F")
+
+
 def read_csv_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists() or path.stat().st_size <= 0:
         return []
@@ -342,7 +346,8 @@ def enrich_trades_from_runtime_events(store: SQLiteRuntimeStore, session_date: s
         SELECT trade_id, strategy_name, session_date, symbol, entry_fill_time, exit_fill_time,
                closed_at, entry_price, exit_price, raw_json
         FROM trades
-        WHERE session_date = ? AND UPPER(COALESCE(status, '')) IN ('CLOSED', 'DONE', 'EXIT_FILLED', 'FLAT')
+        WHERE session_date = ?
+          AND UPPER(COALESCE(status, '')) IN ('CLOSED', 'DONE', 'EXIT_FILLED', 'FLAT', 'COMMISSION_PENDING', 'PNL_PENDING')
         """,
         [session_date],
     )
@@ -451,14 +456,25 @@ def import_session(store: SQLiteRuntimeStore, session: Path, *, progress_interva
     existing_keys = load_existing_event_keys(store, session_date)
     print(f"BACKFILL_SQLITE_SESSION_START session={session_date}", flush=True)
 
+    execution_symbols: set[str] = set()
     for row in iter_csv_rows(session / "fills.csv"):
         row["session_date"] = session_date
         row.setdefault("strategy_name", "v67")
+        if row.get("symbol"):
+            execution_symbols.add(str(row.get("symbol") or "").upper())
         store.upsert_execution(row)
         counts["executions"] += 1
         if progress_interval > 0 and counts["executions"] % progress_interval == 0:
             print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=fills executions={counts['executions']}", flush=True)
     print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=fills executions={counts['executions']}", flush=True)
+    if execution_symbols and session_date == utc_session_date():
+        rebuild_result = store.rebuild_positions_from_executions(sorted(execution_symbols), allow_historical_open_lots=False)
+        print(
+            "BACKFILL_SQLITE_SESSION_PROGRESS "
+            f"session={session_date} artifact=position_reducer "
+            f"symbols={len(execution_symbols)} result={json.dumps(rebuild_result, sort_keys=True, default=str)}",
+            flush=True,
+        )
     reconstructed_trades = reconstruct_trades_from_execution_pairs(store, session_date)
     if reconstructed_trades:
         print(f"BACKFILL_SQLITE_SESSION_PROGRESS session={session_date} artifact=reconstructed_trades trades={reconstructed_trades}", flush=True)

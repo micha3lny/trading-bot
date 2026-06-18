@@ -78,7 +78,7 @@ class BackfillRuntimeSQLiteTests(unittest.TestCase):
                 second_runtime_events = store.query("SELECT COUNT(*) AS n FROM runtime_events")[0]["n"]
 
                 self.assertEqual(store.query("SELECT COUNT(*) AS n FROM executions")[0]["n"], 1)
-                self.assertEqual(store.query("SELECT COUNT(*) AS n FROM positions")[0]["n"], 1)
+                self.assertEqual(store.query("SELECT COUNT(*) AS n FROM positions WHERE active = 1")[0]["n"], 1)
                 self.assertEqual(store.query("SELECT COUNT(*) AS n FROM reconciliation_runs")[0]["n"], 1)
                 self.assertEqual(first_runtime_events, second_runtime_events)
             finally:
@@ -146,7 +146,7 @@ class BackfillRuntimeSQLiteTests(unittest.TestCase):
                 executions = store.query("SELECT execution_id, executed_at FROM executions ORDER BY execution_id")
 
                 self.assertEqual(len(trades), 1)
-                self.assertEqual(trades[0]["status"], "CLOSED")
+                self.assertEqual(trades[0]["status"], "COMMISSION_PENDING")
                 self.assertEqual(trades[0]["entry_fill_time"], "2026-05-27T13:31:00+00:00")
                 self.assertEqual(trades[0]["exit_fill_time"], "2026-05-27T13:41:00+00:00")
                 self.assertAlmostEqual(trades[0]["gross_pnl"], 2.0)

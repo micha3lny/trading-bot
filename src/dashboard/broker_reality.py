@@ -907,12 +907,12 @@ def load_sqlite_active_positions(sqlite_path: str | Path, selected_date: str) ->
                        ) AS rn
                 FROM positions
                 WHERE COALESCE(session_date, '') <= ?
+                  AND COALESCE(active, 0) = 1
+                  AND UPPER(COALESCE(status, '')) IN ('OPEN', 'EXIT_ORDER')
             )
             SELECT symbol, quantity, avg_price, ibkr_quantity, ibkr_avg_cost, status, active, source, updated_at, raw_json
             FROM ranked
             WHERE rn = 1
-              AND COALESCE(active, 0) = 1
-              AND UPPER(COALESCE(status, '')) IN ('OPEN', 'EXIT_ORDER')
             """,
             conn,
             params=[selected_date],

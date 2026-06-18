@@ -839,6 +839,12 @@ class SQLiteRuntimeStore:
                     if data.get(field) in (None, "") and current.get(field) not in (None, ""):
                         data[field] = current.get(field)
             if self._execution_rows_equivalent(existing[0] if existing else None, data):
+                if self._equivalent_execution_needs_position_reconcile(data):
+                    self.rebuild_symbol_trade_state(
+                        data["symbol"],
+                        allow_historical_open_lots=False,
+                        broker_net_positions=self._broker_net_positions,
+                    )
                 return
             self._upsert("executions", data, ["execution_id"], columns)
             self._reconcile_trade_state_after_execution(data)
@@ -981,6 +987,42 @@ class SQLiteRuntimeStore:
             print(line, flush=True)
             if not unified_logger_installed():
                 append_unified_log(line)
+
+    def _active_quantity_for_symbol(self, symbol: str) -> float:
+        symbol = str(symbol or "").upper().strip()
+        if not symbol:
+            return 0.0
+        rows = self.query(
+            """
+            SELECT SUM(COALESCE(quantity, 0)) AS quantity
+            FROM positions
+            WHERE UPPER(symbol) = ?
+              AND COALESCE(active, 0) = 1
+              AND UPPER(COALESCE(status, '')) IN ('OPEN', 'EXIT_ORDER')
+            """,
+            [symbol],
+        )
+        return safe_float(rows[0].get("quantity") if rows else 0.0) or 0.0
+
+    def _equivalent_execution_needs_position_reconcile(self, execution: dict[str, Any]) -> bool:
+        """Return True when a duplicate execution should repair missing active state.
+
+        Duplicate/equivalent execution rows usually skip the reducer to avoid
+        churn. During live broker reconciliation, though, the broker snapshot can
+        prove a symbol is open while SQLite has no matching active row. In that
+        case a re-seen execution is useful repair input and should rebuild the
+        symbol state.
+        """
+        if not self._broker_net_positions:
+            return False
+        symbol = str(execution.get("symbol") or "").upper().strip()
+        if not symbol:
+            return False
+        broker_qty = safe_float(self._broker_net_positions.get(symbol))
+        if broker_qty is None or broker_qty <= 1e-9:
+            return False
+        sqlite_qty = self._active_quantity_for_symbol(symbol)
+        return abs(sqlite_qty - broker_qty) > 1e-9
 
     def _closed_trade_id_for_pair(self, buy: dict[str, Any], sell: dict[str, Any], matched_qty: float) -> str:
         symbol = str(buy.get("symbol") or sell.get("symbol") or "").upper()
