@@ -126,6 +126,18 @@ def trading_days_ending(end_date: date, count: int) -> list[date]:
     return list(reversed(days))
 
 
+def trading_days_between(start_date: date, end_date: date) -> list[date]:
+    if start_date > end_date:
+        raise ValueError(f"start_date {start_date} is after end_date {end_date}")
+    days: list[date] = []
+    cur = start_date
+    while cur <= end_date:
+        if is_us_equity_trading_day(cur):
+            days.append(cur)
+        cur += timedelta(days=1)
+    return days
+
+
 def latest_available_session(history_dir: Path, session_type: str, end_date: date | None = None) -> date | None:
     root = history_dir / f"session_type={session_type.upper()}"
     if not root.exists():
@@ -295,13 +307,17 @@ def simulate_session(
         score_by_symbol[symbol] = float(score) if score is not None and not pd.isna(score) else 0.0
 
     frames: dict[str, pd.DataFrame] = {}
+    missing_history_symbols: list[str] = []
     for symbol in symbols:
         df = read_history(history_dir, symbol, session_date, session_type)
         if df.empty:
+            missing_history_symbols.append(symbol)
             continue
         df = df[(df["timestamp"] >= market_open) & (df["timestamp"] <= market_close)]
         if not df.empty:
             frames[symbol] = df
+        else:
+            missing_history_symbols.append(symbol)
 
     states = {symbol: SymbolState(symbol) for symbol in frames}
     open_positions: dict[str, ReplayPosition] = {}
@@ -313,7 +329,7 @@ def simulate_session(
             bars_by_time.setdefault(row["timestamp"], []).append((symbol, row))
 
     ready_events = 0
-    missing_history = len(symbols) - len(frames)
+    missing_history = len(missing_history_symbols)
     for ts in sorted(bars_by_time):
         current_time = pd.Timestamp(ts).to_pydatetime()
         if current_time.tzinfo is None:
@@ -466,6 +482,7 @@ def simulate_session(
         "top100_symbols": len(symbols),
         "symbols_with_history": len(frames),
         "missing_history": missing_history,
+        "_missing_history_symbols": missing_history_symbols,
         "ready_events": ready_events,
     }
     return trades, stats
@@ -480,8 +497,13 @@ def summarize_day(session_date: date, trades: list[ReplayTrade], stats: dict[str
     top_winners = ";".join(f"{t.symbol}:{t.net_pnl:.2f}" for t in sorted(trades, key=lambda item: item.net_pnl, reverse=True)[:5])
     top_losers = ";".join(f"{t.symbol}:{t.net_pnl:.2f}" for t in sorted(trades, key=lambda item: item.net_pnl)[:5])
     return {
-        **stats,
         "session_date": session_date.isoformat(),
+        "top100_source_date": stats.get("top100_source_date", ""),
+        "top100_path": stats.get("top100_path", ""),
+        "top100_symbols": stats.get("top100_symbols", 0),
+        "symbols_with_history": stats.get("symbols_with_history", 0),
+        "missing_history": stats.get("missing_history", 0),
+        "ready_events": stats.get("ready_events", 0),
         "trades": len(trades),
         "wins": len(winners),
         "losses": len(losers),
@@ -511,6 +533,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Replay current v67 live strategy on historical 1m parquet data.")
     parser.add_argument("--days", type=int, default=10)
+    parser.add_argument("--start-date", type=parse_date, default=None)
     parser.add_argument("--end-date", type=parse_date, default=None)
     parser.add_argument("--history-dir", type=Path, default=DEFAULT_HISTORY_DIR)
     parser.add_argument("--top100-dir", type=Path, default=DEFAULT_TOP100_DIR)
@@ -543,14 +566,26 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     end_date = args.end_date or latest_available_session(args.history_dir, args.session_type) or previous_us_equity_trading_day(datetime.now(timezone.utc).date())
-    sessions = trading_days_ending(end_date, max(1, int(args.days)))
+    if args.start_date is not None:
+        sessions = trading_days_between(args.start_date, end_date)
+    else:
+        sessions = trading_days_ending(end_date, max(1, int(args.days)))
 
     all_trades: list[ReplayTrade] = []
     daily_rows: list[dict[str, Any]] = []
+    missing_top100_rows: list[dict[str, Any]] = []
+    missing_history_rows: list[dict[str, Any]] = []
     for session_date in sessions:
         source_date = top100_source_date_for_session(session_date, args.top100_mode)
         top100_path, actual_source_date = find_top100_file(args.top100_dir, source_date)
         if top100_path is None:
+            missing_top100_rows.append(
+                {
+                    "session_date": session_date.isoformat(),
+                    "expected_top100_source_date": source_date.isoformat(),
+                    "top100_dir": str(args.top100_dir),
+                }
+            )
             row = {
                 "session_date": session_date.isoformat(),
                 "top100_source_date": source_date.isoformat(),
@@ -587,6 +622,16 @@ def main() -> int:
             session_type=args.session_type,
             args=args,
         )
+        for symbol in stats.get("_missing_history_symbols", []):
+            missing_history_rows.append(
+                {
+                    "session_date": session_date.isoformat(),
+                    "symbol": symbol,
+                    "expected_parquet": str(parquet_path(args.history_dir, symbol, session_date, args.session_type)),
+                    "top100_source_date": source_label,
+                    "top100_path": str(top100_path),
+                }
+            )
         all_trades.extend(trades)
         daily = summarize_day(session_date, trades, stats)
         daily["status"] = "ok"
@@ -594,24 +639,65 @@ def main() -> int:
         print(
             f"BACKTEST_DAY_DONE date={session_date} trades={len(trades)} "
             f"gross={daily['gross_pnl']:.2f} net={daily['net_pnl']:.2f} "
-            f"win_rate={daily['win_rate_pct']:.1f}% top100={top100_path}"
+            f"win_rate={daily['win_rate_pct']:.1f}% symbols_with_history={daily['symbols_with_history']} "
+            f"missing_history={daily['missing_history']} top100={top100_path}"
         )
+        if int(daily.get("symbols_with_history") or 0) == 0:
+            print(f"BACKTEST_NO_HISTORY date={session_date} missing_history={daily.get('missing_history')}")
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     trades_path = args.reports_dir / f"backtest_v67_replay_{stamp}.csv"
     summary_path = args.reports_dir / "backtest_v67_replay_daily_summary.csv"
+    missing_top100_path = args.reports_dir / "backtest_v67_replay_missing_top100.csv"
+    missing_history_path = args.reports_dir / "backtest_v67_replay_missing_history.csv"
+    overall_path = args.reports_dir / "backtest_v67_replay_overall_summary.csv"
     write_csv(trades_path, [trade.as_row() for trade in all_trades])
     write_csv(summary_path, daily_rows)
+    write_csv(missing_top100_path, missing_top100_rows)
+    write_csv(missing_history_path, missing_history_rows)
 
     total_gross = sum(trade.gross_pnl for trade in all_trades)
     total_commission = sum(trade.estimated_commission for trade in all_trades)
     total_net = sum(trade.net_pnl for trade in all_trades)
     winners = [trade for trade in all_trades if trade.net_pnl > 0]
+    daily_ok = [row for row in daily_rows if row.get("status") == "ok"]
+    best_day = max(daily_ok, key=lambda row: float(row.get("net_pnl") or 0.0), default=None)
+    worst_day = min(daily_ok, key=lambda row: float(row.get("net_pnl") or 0.0), default=None)
+    overall = {
+        "start_date": sessions[0].isoformat() if sessions else "",
+        "end_date": sessions[-1].isoformat() if sessions else "",
+        "sessions": len(sessions),
+        "sessions_with_no_history": sum(1 for row in daily_rows if int(row.get("symbols_with_history") or 0) == 0),
+        "missing_top100_dates": len(missing_top100_rows),
+        "missing_parquet_rows": len(missing_history_rows),
+        "total_trades": len(all_trades),
+        "wins": len(winners),
+        "losses": len(all_trades) - len(winners),
+        "win_rate_pct": round((len(winners) / len(all_trades) * 100.0) if all_trades else 0.0, 6),
+        "total_gross_pnl": round(total_gross, 6),
+        "total_estimated_commission": round(total_commission, 6),
+        "total_net_pnl": round(total_net, 6),
+        "average_daily_pnl": round((sum(float(row.get("net_pnl") or 0.0) for row in daily_ok) / len(daily_ok)) if daily_ok else 0.0, 6),
+        "best_day": best_day.get("session_date", "") if best_day else "",
+        "best_day_net_pnl": best_day.get("net_pnl", "") if best_day else "",
+        "worst_day": worst_day.get("session_date", "") if worst_day else "",
+        "worst_day_net_pnl": worst_day.get("net_pnl", "") if worst_day else "",
+    }
+    write_csv(overall_path, [overall])
+    if missing_top100_rows:
+        print(f"BACKTEST_MISSING_TOP100 count={len(missing_top100_rows)} csv={missing_top100_path}")
+    no_history_dates = [row["session_date"] for row in daily_rows if int(row.get("symbols_with_history") or 0) == 0]
+    if no_history_dates:
+        print(f"BACKTEST_ZERO_HISTORY_DATES count={len(no_history_dates)} dates={','.join(no_history_dates)}")
+    if missing_history_rows:
+        print(f"BACKTEST_MISSING_HISTORY rows={len(missing_history_rows)} csv={missing_history_path}")
     print(
         f"BACKTEST_DONE sessions={len(sessions)} trades={len(all_trades)} "
         f"gross={total_gross:.2f} estimated_commission={total_commission:.2f} "
         f"net={total_net:.2f} win_rate={(len(winners) / len(all_trades) * 100.0 if all_trades else 0.0):.1f}% "
-        f"trades_csv={trades_path} daily_summary={summary_path}"
+        f"avg_daily={overall['average_daily_pnl']:.2f} best_day={overall['best_day']}:{overall['best_day_net_pnl']} "
+        f"worst_day={overall['worst_day']}:{overall['worst_day_net_pnl']} "
+        f"trades_csv={trades_path} daily_summary={summary_path} overall_summary={overall_path}"
     )
     return 0
 
