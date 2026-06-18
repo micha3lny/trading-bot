@@ -1016,12 +1016,15 @@ def load_sqlite_trade_pnl(sqlite_path: str | Path, selected_date: str) -> pd.Dat
     return pd.DataFrame(
         [
             {
-                "trades": trades,
+                "trades": int(execution_pnl.get("closed_symbols") or 0),
+                "closed_symbols": int(execution_pnl.get("closed_symbols") or 0),
                 "sqlite_gross": float(execution_pnl.get("gross_pnl") or 0.0),
                 "sqlite_commission": float(execution_pnl.get("commissions") or 0.0),
                 "sqlite_net": float(execution_pnl.get("net_actual_pnl") or 0.0),
                 "reconciliation_sqlite_trade_source": "executions_realized_pnl",
                 "runtime_trade_source": "sqlite_executions",
+                "realized_pnl_semantics": "gross_before_commission",
+                "net_formula": "sum_realized_pnl_minus_commission",
                 "trusted_closed_count": trades - untrusted,
                 "untrusted_carry_count": untrusted,
                 "execution_rows": int(execution_pnl.get("execution_rows") or 0),

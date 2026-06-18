@@ -128,6 +128,7 @@ def collect_sample(args: argparse.Namespace) -> dict[str, Any]:
     extra_exec = sorted(sqlite_exec_ids - broker_exec_ids)
 
     status = runtime_status(sqlite_path, args.date)
+    sqlite_closed_symbols = int(sqlite_pnl_row.get("closed_symbols") or sqlite_pnl_row.get("trades") or 0)
     sample = {
         "sample_time": datetime.now(timezone.utc).isoformat(),
         "broker_position_status": broker_position_status,
@@ -146,7 +147,7 @@ def collect_sample(args: argparse.Namespace) -> dict[str, Any]:
         "missing_executions_in_sqlite": missing_exec,
         "extra_executions_in_sqlite": extra_exec,
         "broker_closed_symbols": len(broker_closed),
-        "sqlite_closed_symbols": len(sqlite_closed),
+        "sqlite_closed_symbols": sqlite_closed_symbols,
         "broker_closed_net": round(net_sum(broker_closed), 6),
         "sqlite_closed_net": round(float(sqlite_pnl_row.get("sqlite_net") or 0.0), 6),
         "closed_net_diff": round(net_sum(broker_closed) - float(sqlite_pnl_row.get("sqlite_net") or 0.0), 6),

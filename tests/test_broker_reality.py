@@ -406,7 +406,8 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
         row = pnl.iloc[0]
         self.assertEqual(row["reconciliation_sqlite_trade_source"], "executions_realized_pnl")
         self.assertEqual(row["runtime_trade_source"], "sqlite_executions")
-        self.assertEqual(row["trades"], 1)
+        self.assertEqual(row["trades"], 0)
+        self.assertEqual(row["closed_symbols"], 0)
         self.assertAlmostEqual(row["sqlite_gross"], 0.0)
         self.assertAlmostEqual(row["sqlite_net"], 0.0)
 
@@ -461,6 +462,9 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
             pnl = load_sqlite_trade_pnl(db, "2026-06-18").iloc[0]
 
         self.assertEqual(pnl["reconciliation_sqlite_trade_source"], "executions_realized_pnl")
+        self.assertEqual(pnl["realized_pnl_semantics"], "gross_before_commission")
+        self.assertEqual(pnl["net_formula"], "sum_realized_pnl_minus_commission")
+        self.assertEqual(pnl["closed_symbols"], 1)
         self.assertAlmostEqual(pnl["sqlite_gross"], 5.06)
         self.assertAlmostEqual(pnl["sqlite_commission"], 2.5)
         self.assertAlmostEqual(pnl["sqlite_net"], 2.56)
