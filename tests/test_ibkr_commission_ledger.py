@@ -87,12 +87,14 @@ class FakeEventIB:
 class CountingStore:
     def __init__(self) -> None:
         self.upsert_count = 0
+        self.rows = []
 
     def mark_operation_status(self, *args, **kwargs):
         return None
 
     def upsert_execution(self, _row):
         self.upsert_count += 1
+        self.rows.append(dict(_row))
 
     def runtime_pending_counts(self):
         return {}
@@ -212,6 +214,40 @@ class IbkrCommissionLedgerTests(unittest.TestCase):
             self.assertEqual(len(ib.commissionReportEvent.handlers), 1)
             self.assertEqual(rows[0]["commission"], "0.55")
             self.assertEqual(rows[0]["commission_source"], "ibkr")
+
+    def test_execution_after_commission_placeholder_syncs_canonical_sqlite_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(Path(tmp), session_date="2026-05-22")
+            store = CountingStore()
+            setattr(recorder, "sqlite_store", store)
+
+            self.assertEqual(
+                record_commission_report(
+                    recorder,
+                    SimpleNamespace(execId="E_PARTIAL", commission=0.42, currency="USD", realizedPNL=0.0),
+                ),
+                "placeholder",
+            )
+            count = record_recent_fills(
+                FakeIB([fake_fill("E_PARTIAL", symbol="FTCI", shares=98, price=2.34, commission=None)]),
+                recorder,
+                seen=set(),
+            )
+
+            rows = read_fills(recorder)
+            self.assertEqual(count, 1)
+            self.assertEqual(rows[0]["symbol"], "FTCI")
+            self.assertAlmostEqual(float(rows[0]["quantity"]), 98.0)
+            self.assertEqual(rows[0]["fill_price"], "2.34")
+            self.assertEqual(rows[0]["commission"], "0.42")
+            self.assertEqual(rows[0]["commission_source"], "ibkr")
+            self.assertGreaterEqual(store.upsert_count, 2)
+            self.assertEqual(store.rows[-1]["execution_id"], "E_PARTIAL")
+            self.assertEqual(store.rows[-1]["symbol"], "FTCI")
+            self.assertAlmostEqual(float(store.rows[-1]["quantity"]), 98.0)
+            self.assertEqual(store.rows[-1]["fill_price"], "2.34")
+            self.assertEqual(store.rows[-1]["commission"], "0.42")
+            self.assertEqual(store.rows[-1]["commission_source"], "ibkr")
 
     def test_daily_report_fill_ledger_uses_actual_commission(self) -> None:
         rows = [

@@ -388,12 +388,37 @@ def existing_fills_by_execution_id(recorder: LiveDataRecorder) -> dict[str, dict
     return out
 
 
+def fill_row_by_execution_id(recorder: LiveDataRecorder, execution_id: str) -> dict[str, Any] | None:
+    execution_id = str(execution_id or "").strip()
+    if not execution_id:
+        return None
+    return existing_fills_by_execution_id(recorder).get(execution_id)
+
+
 def sqlite_synced_complete_fill_keys(recorder: LiveDataRecorder) -> set[str]:
     state = getattr(recorder, "_sqlite_synced_complete_fill_keys", None)
     if not isinstance(state, set):
         state = set()
         setattr(recorder, "_sqlite_synced_complete_fill_keys", state)
     return state
+
+
+def sqlite_sync_key_for_fill(row: dict[str, Any]) -> str:
+    return "|".join(
+        str(row.get(field) or "")
+        for field in (
+            "execution_id",
+            "symbol",
+            "action",
+            "quantity",
+            "fill_price",
+            "order_id",
+            "perm_id",
+            "commission",
+            "commission_source",
+            "realized_pnl",
+        )
+    )
 
 
 def sync_complete_fill_to_sqlite_once(recorder: LiveDataRecorder, row: dict[str, Any]) -> None:
@@ -404,14 +429,15 @@ def sync_complete_fill_to_sqlite_once(recorder: LiveDataRecorder, row: dict[str,
     if sqlite_store is None:
         return
     synced = sqlite_synced_complete_fill_keys(recorder)
-    if execution_id in synced:
+    sync_key = sqlite_sync_key_for_fill(row)
+    if sync_key in synced:
         return
     try:
         sqlite_store.upsert_execution(row)
     except Exception as exc:
         print(f"{now_utc()} SQLITE_WRITE_FAILED method=upsert_execution error={exc!r}", flush=True)
         return
-    synced.add(execution_id)
+    synced.add(sync_key)
 
 
 def record_commission_report(recorder: LiveDataRecorder, commission_report: Any) -> str:
@@ -488,26 +514,27 @@ def record_recent_fills(ib: IB, recorder: LiveDataRecorder, seen: set[str]) -> i
                 sync_complete_fill_to_sqlite_once(recorder, existing)
                 continue
             status = upsert_fill_row(recorder, row)
+            canonical_row = fill_row_by_execution_id(recorder, str(row.get("execution_id") or "")) or row
             if status != "duplicate":
-                if row.get("commission_source") == "ibkr":
-                    sync_complete_fill_to_sqlite_once(recorder, row)
+                if canonical_row.get("commission_source") == "ibkr":
+                    sync_complete_fill_to_sqlite_once(recorder, canonical_row)
                 else:
-                    safe_sqlite_call(sqlite_store, "upsert_execution", row)
-                existing_by_exec[str(row.get("execution_id") or "").strip()] = row
+                    safe_sqlite_call(sqlite_store, "upsert_execution", canonical_row)
+                existing_by_exec[str(row.get("execution_id") or "").strip()] = canonical_row
             if status != "duplicate":
-                if row.get("commission_source") != "ibkr":
+                if canonical_row.get("commission_source") != "ibkr":
                     rate_limited_recorder_log(
                         recorder,
                         "FILLS_WITHOUT_COMMISSION",
-                        f"{now_utc()} FILLS_WITHOUT_COMMISSION execution_id={row.get('execution_id')} symbol={row.get('symbol')}",
-                        key=str(row.get("execution_id") or ""),
+                        f"{now_utc()} FILLS_WITHOUT_COMMISSION execution_id={canonical_row.get('execution_id')} symbol={canonical_row.get('symbol')}",
+                        key=str(canonical_row.get("execution_id") or ""),
                     )
                 else:
                     rate_limited_recorder_log(
                         recorder,
                         "COMMISSION_REPORT_MATCHED",
-                        f"{now_utc()} COMMISSION_REPORT_MATCHED execution_id={row.get('execution_id')}",
-                        key=str(row.get("execution_id") or ""),
+                        f"{now_utc()} COMMISSION_REPORT_MATCHED execution_id={canonical_row.get('execution_id')}",
+                        key=str(canonical_row.get("execution_id") or ""),
                     )
             if key in seen and status != "inserted":
                 continue
