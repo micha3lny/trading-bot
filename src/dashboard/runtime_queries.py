@@ -330,6 +330,38 @@ def load_executions(conn: sqlite3.Connection, window: DateWindow, strategy: str 
     return rows
 
 
+def load_execution_pnl_summary(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> dict[str, float]:
+    """Closed daily PnL source of truth from immutable IBKR executions."""
+    if not strategy or strategy == "All":
+        clause, params = "", []
+    else:
+        clause, params = " AND (COALESCE(e.strategy_name, 'unknown') = ? OR COALESCE(e.strategy_name, 'unknown') = 'unknown')", [strategy]
+    rows = read_sql(
+        conn,
+        f"""
+        SELECT
+            COUNT(*) AS execution_rows,
+            COUNT(DISTINCT COALESCE(symbol, '')) AS symbols,
+            SUM(COALESCE(realized_pnl, 0)) AS gross_realized,
+            SUM(COALESCE(commission, 0)) AS commissions
+        FROM executions e
+        WHERE COALESCE(e.session_date, '') BETWEEN ? AND ?
+        {clause}
+        """,
+        [window.start_date, window.end_date, *params],
+    )
+    row = rows.iloc[0].to_dict() if not rows.empty else {}
+    gross = float(row.get("gross_realized") or 0.0)
+    commissions = float(row.get("commissions") or 0.0)
+    return {
+        "execution_rows": float(row.get("execution_rows") or 0),
+        "symbols": float(row.get("symbols") or 0),
+        "gross_pnl": gross,
+        "commissions": commissions,
+        "net_actual_pnl": gross - commissions,
+    }
+
+
 def confirmed_commission_maps(executions: pd.DataFrame) -> tuple[dict[str, float], dict[tuple[str, str, str], float]]:
     if executions.empty or "commission" not in executions.columns:
         return {}, {}
@@ -2192,13 +2224,24 @@ def load_position_row_diagnostics(
     }
 
 
-def build_summary(open_positions: pd.DataFrame, closed_positions: pd.DataFrame) -> dict[str, float]:
+def build_summary(
+    open_positions: pd.DataFrame,
+    closed_positions: pd.DataFrame,
+    execution_pnl: dict[str, float] | None = None,
+) -> dict[str, Any]:
     trusted_closed = closed_positions
     if not closed_positions.empty and "runtime_pnl_trusted" in closed_positions.columns:
         trusted_closed = closed_positions[closed_positions["runtime_pnl_trusted"].fillna(True).astype(bool)]
-    gross = float(trusted_closed["gross"].fillna(0).sum()) if not trusted_closed.empty else 0.0
-    commissions = float(trusted_closed["ibkr_commission"].fillna(0).sum()) if not trusted_closed.empty else 0.0
-    net = float(trusted_closed["net_actual"].fillna(0).sum()) if not trusted_closed.empty else 0.0
+    if execution_pnl is None:
+        gross = float(trusted_closed["gross"].fillna(0).sum()) if not trusted_closed.empty else 0.0
+        commissions = float(trusted_closed["ibkr_commission"].fillna(0).sum()) if not trusted_closed.empty else 0.0
+        net = float(trusted_closed["net_actual"].fillna(0).sum()) if not trusted_closed.empty else 0.0
+        pnl_source = "trades"
+    else:
+        gross = float(execution_pnl.get("gross_pnl") or 0.0)
+        commissions = float(execution_pnl.get("commissions") or 0.0)
+        net = float(execution_pnl.get("net_actual_pnl") or 0.0)
+        pnl_source = "executions_realized_pnl"
     open_upnl = float(pd.to_numeric(open_positions["upnl"], errors="coerce").fillna(0).sum()) if not open_positions.empty else 0.0
     wins = trusted_closed[trusted_closed["gross"].fillna(0) > 0] if not trusted_closed.empty else trusted_closed
     win_rate = (len(wins) / len(trusted_closed) * 100.0) if len(trusted_closed) else 0.0
@@ -2216,6 +2259,9 @@ def build_summary(open_positions: pd.DataFrame, closed_positions: pd.DataFrame) 
         "expectancy": gross / len(trusted_closed) if len(trusted_closed) else 0.0,
         "closed_trades": float(len(closed_positions)),
         "open_trades": float(len(open_positions)),
+        "closed_pnl_source": pnl_source,
+        "execution_rows": float((execution_pnl or {}).get("execution_rows") or 0),
+        "execution_symbols": float((execution_pnl or {}).get("symbols") or 0),
     }
 
 
@@ -2292,6 +2338,7 @@ def load_dashboard_snapshot(
     try:
         conn.execute("BEGIN")
         executions = load_executions(conn, window, strategy)
+        execution_pnl = load_execution_pnl_summary(conn, window, strategy)
         execution_lookup = load_executions(conn, expanded_lookup_window(window), strategy)
         raw_closed_rows = load_raw_closed_trade_rows(conn, window, strategy)
         closed, closed_diag = load_closed_positions(
@@ -2380,6 +2427,12 @@ def load_dashboard_snapshot(
         trades_updated_last_60s = int(diagnostics.get("trades_updated_last_60s", 0) or 0)
         diagnostics["runtime_trust_status"] = "SQLITE_UNTRUSTED_REDUCER_ACTIVE" if trades_updated_last_60s > 0 else "SQLITE_PERSISTED_TRADES"
         diagnostics["broker_closed_trades_count"] = "N/A"
+        diagnostics["closed_pnl_source"] = "executions_realized_pnl"
+        diagnostics["execution_pnl_rows"] = int(execution_pnl.get("execution_rows") or 0)
+        diagnostics["execution_pnl_symbols"] = int(execution_pnl.get("symbols") or 0)
+        diagnostics["execution_gross_realized"] = float(execution_pnl.get("gross_pnl") or 0.0)
+        diagnostics["execution_commissions"] = float(execution_pnl.get("commissions") or 0.0)
+        diagnostics["execution_net_pnl"] = float(execution_pnl.get("net_actual_pnl") or 0.0)
         snapshot_version = (
             f"closed={len(closed)};"
             f"trades={diagnostics.get('trades_count', 0)};"
@@ -2387,7 +2440,7 @@ def load_dashboard_snapshot(
             f"last_reducer={diagnostics.get('last_reducer_run_at', '')}"
         )
         snapshot = {
-            "summary": build_summary(open_positions, closed),
+            "summary": build_summary(open_positions, closed, execution_pnl),
             "data_quality_summary": build_data_quality_summary(closed),
             "open_positions": open_positions,
             "raw_active_positions": raw_active_positions,

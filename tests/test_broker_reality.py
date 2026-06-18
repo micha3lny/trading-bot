@@ -404,12 +404,66 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
         self.assertAlmostEqual(closed.iloc[0]["realized_pnl"], 0.0)
         self.assertAlmostEqual(closed.iloc[0]["net_pnl"], 0.0)
         row = pnl.iloc[0]
-        self.assertEqual(row["reconciliation_sqlite_trade_source"], "runtime_trusted_closed_view")
-        self.assertEqual(row["runtime_trade_source"], "load_dashboard_snapshot")
-        self.assertEqual(row["trusted_closed_count"], 0)
-        self.assertEqual(row["untrusted_carry_count"], 1)
+        self.assertEqual(row["reconciliation_sqlite_trade_source"], "executions_realized_pnl")
+        self.assertEqual(row["runtime_trade_source"], "sqlite_executions")
+        self.assertEqual(row["trades"], 1)
         self.assertAlmostEqual(row["sqlite_gross"], 0.0)
         self.assertAlmostEqual(row["sqlite_net"], 0.0)
+
+    def test_sqlite_trade_pnl_uses_executions_not_inflated_trades(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_trade({
+                    "trade_id": "inflated:OUST",
+                    "session_date": "2026-06-18",
+                    "strategy_name": "v67",
+                    "symbol": "OUST",
+                    "status": "CLOSED",
+                    "exit_fill_time": "2026-06-18T14:45:00+00:00",
+                    "entry_price": 1.0,
+                    "exit_price": 12.0,
+                    "quantity": 22,
+                    "gross_pnl": 252.73,
+                    "commission": 1.0,
+                    "net_pnl": 251.73,
+                })
+                store.upsert_execution({
+                    "execution_id": "B_REAL",
+                    "session_date": "2026-06-18",
+                    "strategy_name": "v67",
+                    "symbol": "OUST",
+                    "side": "BOT",
+                    "quantity": 22,
+                    "price": 10,
+                    "commission": 1.0,
+                    "commission_source": "ibkr",
+                    "realized_pnl": 0.0,
+                    "executed_at": "2026-06-18T13:30:00+00:00",
+                })
+                store.upsert_execution({
+                    "execution_id": "S_REAL",
+                    "session_date": "2026-06-18",
+                    "strategy_name": "v67",
+                    "symbol": "OUST",
+                    "side": "SLD",
+                    "quantity": 22,
+                    "price": 10.1,
+                    "commission": 1.5,
+                    "commission_source": "ibkr",
+                    "realized_pnl": 5.06,
+                    "executed_at": "2026-06-18T14:45:00+00:00",
+                })
+            finally:
+                store.close()
+
+            pnl = load_sqlite_trade_pnl(db, "2026-06-18").iloc[0]
+
+        self.assertEqual(pnl["reconciliation_sqlite_trade_source"], "executions_realized_pnl")
+        self.assertAlmostEqual(pnl["sqlite_gross"], 5.06)
+        self.assertAlmostEqual(pnl["sqlite_commission"], 2.5)
+        self.assertAlmostEqual(pnl["sqlite_net"], 2.56)
 
 
 if __name__ == "__main__":

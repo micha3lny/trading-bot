@@ -22,6 +22,7 @@ from src.dashboard.broker_reality import (
     load_sqlite_active_positions,
     load_sqlite_closed_trades,
     load_sqlite_executions,
+    load_sqlite_trade_pnl,
 )
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore, resolve_sqlite_path
 
@@ -108,6 +109,8 @@ def collect_sample(args: argparse.Namespace) -> dict[str, Any]:
     sqlite_positions = load_sqlite_active_positions(sqlite_path, args.date)
     sqlite_executions = load_sqlite_executions(sqlite_path, args.date)
     sqlite_closed = load_sqlite_closed_trades(sqlite_path, args.date)
+    sqlite_trade_pnl = load_sqlite_trade_pnl(sqlite_path, args.date)
+    sqlite_pnl_row = sqlite_trade_pnl.iloc[0].to_dict() if not sqlite_trade_pnl.empty else {}
 
     broker_pos = symbol_qty_map(broker_positions)
     sqlite_pos = symbol_qty_map(sqlite_positions)
@@ -145,8 +148,9 @@ def collect_sample(args: argparse.Namespace) -> dict[str, Any]:
         "broker_closed_symbols": len(broker_closed),
         "sqlite_closed_symbols": len(sqlite_closed),
         "broker_closed_net": round(net_sum(broker_closed), 6),
-        "sqlite_closed_net": round(net_sum(sqlite_closed), 6),
-        "closed_net_diff": round(net_sum(broker_closed) - net_sum(sqlite_closed), 6),
+        "sqlite_closed_net": round(float(sqlite_pnl_row.get("sqlite_net") or 0.0), 6),
+        "closed_net_diff": round(net_sum(broker_closed) - float(sqlite_pnl_row.get("sqlite_net") or 0.0), 6),
+        "sqlite_closed_pnl_source": sqlite_pnl_row.get("reconciliation_sqlite_trade_source", ""),
         "runtime_status": status,
         "broker_execution_diagnostics": {
             "fills_count": execution_result.diagnostics.get("fills_count"),
@@ -186,6 +190,8 @@ def print_sample(sample: dict[str, Any], *, verbose: bool = False) -> None:
     print("\nCLOSED:")
     print(f"Broker closed symbols={sample['broker_closed_symbols']} net={sample['broker_closed_net']}")
     print(f"SQLite closed symbols={sample['sqlite_closed_symbols']} net={sample['sqlite_closed_net']}")
+    if sample.get("sqlite_closed_pnl_source"):
+        print(f"SQLite closed pnl source={sample['sqlite_closed_pnl_source']}")
     print(f"Closed net diff={sample['closed_net_diff']}")
 
     print("\nSQLITE RUNTIME STATUS:")

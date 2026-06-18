@@ -12,7 +12,7 @@ from typing import Any
 
 import pandas as pd
 
-from src.dashboard.runtime_queries import DateWindow, load_dashboard_snapshot, parse_raw_json, to_float
+from src.dashboard.runtime_queries import DateWindow, load_dashboard_snapshot, load_execution_pnl_summary, parse_raw_json, to_float
 from src.live_trading.storage.sqlite_store import resolve_sqlite_path
 
 
@@ -981,20 +981,51 @@ def load_sqlite_trade_pnl(sqlite_path: str | Path, selected_date: str) -> pd.Dat
     path = Path(resolve_sqlite_path(sqlite_path))
     if not path.exists():
         return pd.DataFrame()
-    snapshot = load_dashboard_snapshot(path, DateWindow(selected_date, selected_date), "All", include_reconstructed=False)
-    summary = snapshot.get("summary", {})
-    diagnostics = snapshot.get("diagnostics", {})
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    try:
+        execution_pnl = load_execution_pnl_summary(conn, DateWindow(selected_date, selected_date), "All")
+        trusted_rows = pd.read_sql_query(
+            """
+            SELECT
+                COUNT(*) AS trades,
+                SUM(CASE
+                    WHEN COALESCE(raw_json, '') LIKE '%CARRY_BASIS_UNVERIFIED%'
+                      OR COALESCE(raw_json, '') LIKE '%carry_basis_unverified%'
+                    THEN 1 ELSE 0 END
+                ) AS untrusted_carry_count
+            FROM trades
+            WHERE (
+                substr(exit_fill_time, 1, 10) = ?
+                OR substr(closed_at, 1, 10) = ?
+                OR (
+                    COALESCE(exit_fill_time, closed_at) IS NULL
+                    AND session_date = ?
+                )
+            )
+              AND UPPER(COALESCE(status, '')) = 'CLOSED'
+            """,
+            conn,
+            params=[selected_date, selected_date, selected_date],
+        )
+    finally:
+        conn.close()
+    trade_row = trusted_rows.iloc[0].to_dict() if not trusted_rows.empty else {}
+    trades = int(trade_row.get("trades") or 0)
+    untrusted = int(trade_row.get("untrusted_carry_count") or 0)
     return pd.DataFrame(
         [
             {
-                "trades": int(summary.get("closed_trades") or 0),
-                "sqlite_gross": float(summary.get("gross_pnl") or 0.0),
-                "sqlite_commission": float(summary.get("commissions") or 0.0),
-                "sqlite_net": float(summary.get("net_actual_pnl") or 0.0),
-                "reconciliation_sqlite_trade_source": "runtime_trusted_closed_view",
-                "runtime_trade_source": "load_dashboard_snapshot",
-                "trusted_closed_count": int(summary.get("closed_trades") or 0) - int(diagnostics.get("untrusted_carry_closed_count") or 0),
-                "untrusted_carry_count": int(diagnostics.get("untrusted_carry_closed_count") or 0),
+                "trades": trades,
+                "sqlite_gross": float(execution_pnl.get("gross_pnl") or 0.0),
+                "sqlite_commission": float(execution_pnl.get("commissions") or 0.0),
+                "sqlite_net": float(execution_pnl.get("net_actual_pnl") or 0.0),
+                "reconciliation_sqlite_trade_source": "executions_realized_pnl",
+                "runtime_trade_source": "sqlite_executions",
+                "trusted_closed_count": trades - untrusted,
+                "untrusted_carry_count": untrusted,
+                "execution_rows": int(execution_pnl.get("execution_rows") or 0),
+                "execution_symbols": int(execution_pnl.get("symbols") or 0),
             }
         ]
     )
