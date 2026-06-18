@@ -605,7 +605,7 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_upsert_execution_respects_store_broker_flat_target(self) -> None:
+    def test_upsert_execution_does_not_use_stale_broker_flat_target(self) -> None:
         today = date.today().isoformat()
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
@@ -616,10 +616,36 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 active = store.query("SELECT * FROM positions WHERE symbol = 'FLATX' AND COALESCE(active, 0) = 1")
                 suppressed = store.query("SELECT * FROM positions WHERE symbol = 'FLATX' AND status = 'BROKER_UNCONFIRMED_OPEN_LOT'")
 
+                self.assertEqual(len(active), 1)
+                self.assertEqual(active[0]["quantity"], 4)
+                self.assertEqual(suppressed, [])
+
+                store.reconcile_active_positions_to_broker_snapshot({})
+                active = store.query("SELECT * FROM positions WHERE symbol = 'FLATX' AND COALESCE(active, 0) = 1")
+                suppressed = store.query("SELECT * FROM positions WHERE symbol = 'FLATX' AND status = 'BROKER_UNCONFIRMED_OPEN_LOT'")
+
                 self.assertEqual(active, [])
                 self.assertEqual(len(suppressed), 1)
                 self.assertEqual(suppressed[0]["active"], 0)
                 self.assertAlmostEqual(suppressed[0]["quantity"], 4)
+            finally:
+                store.close()
+
+    def test_broker_snapshot_rebuilds_inactive_symbol_present_at_broker(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B_REAPPEAR", "strategy_name": "v67", "session_date": today, "symbol": "RXT", "side": "BOT", "quantity": 58, "price": 10, "executed_at": f"{today}T13:30:00+00:00"})
+                store.reconcile_active_positions_to_broker_snapshot({})
+                self.assertEqual(store.query("SELECT * FROM positions WHERE symbol = 'RXT' AND COALESCE(active, 0) = 1"), [])
+
+                result = store.reconcile_active_positions_to_broker_snapshot({"RXT": 58})
+                active = store.query("SELECT * FROM positions WHERE symbol = 'RXT' AND COALESCE(active, 0) = 1")
+
+                self.assertIn("RXT", result["open_symbols"])
+                self.assertEqual(len(active), 1)
+                self.assertEqual(active[0]["quantity"], 58)
             finally:
                 store.close()
 

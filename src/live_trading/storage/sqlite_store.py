@@ -223,7 +223,12 @@ class SQLiteRuntimeStore:
             ORDER BY UPPER(symbol)
             """
         )
-        symbols = [str(row.get("symbol") or "").upper() for row in rows if row.get("symbol")]
+        symbols = {str(row.get("symbol") or "").upper() for row in rows if row.get("symbol")}
+        symbols.update(
+            symbol
+            for symbol, quantity in self._broker_net_positions.items()
+            if symbol and abs(float(quantity or 0.0)) > 1e-9
+        )
         if not symbols:
             return {
                 "broker_constrained": True,
@@ -231,7 +236,7 @@ class SQLiteRuntimeStore:
                 "open_symbols_count": 0,
                 "suppressed_historical_open_symbols_count": 0,
             }
-        return self.rebuild_positions_from_executions(symbols, broker_net_positions=self._broker_net_positions)
+        return self.rebuild_positions_from_executions(sorted(symbols), broker_net_positions=self._broker_net_positions)
 
     @contextmanager
     def transaction(self):
@@ -969,7 +974,7 @@ class SQLiteRuntimeStore:
             self.rebuild_symbol_trade_state(
                 symbol,
                 allow_historical_open_lots=False,
-                broker_net_positions=self._broker_net_positions,
+                broker_net_positions=None,
             )
         except Exception as exc:
             line = f"{utc_now_iso()} SQLITE_WRITE_FAILED method=rebuild_symbol_trade_state error={exc!r}"
