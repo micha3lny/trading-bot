@@ -285,8 +285,14 @@ def simulate_session(
         opening_range_seconds=int(args.opening_range_seconds),
     )
     symbols = top100["symbol"].astype(str).str.upper().tolist()
-    rank_by_symbol = {str(row.symbol).upper(): int(row.rank) if not pd.isna(row.rank) else None for row in top100.itertuples()}
-    score_by_symbol = {str(row.symbol).upper(): float(row._top100_score or 0.0) for row in top100.itertuples()}
+    rank_by_symbol: dict[str, int | None] = {}
+    score_by_symbol: dict[str, float] = {}
+    for _, row in top100.iterrows():
+        symbol = str(row.get("symbol", "")).upper()
+        rank = row.get("rank")
+        rank_by_symbol[symbol] = int(rank) if rank is not None and not pd.isna(rank) else None
+        score = row.get("_top100_score", 0.0)
+        score_by_symbol[symbol] = float(score) if score is not None and not pd.isna(score) else 0.0
 
     frames: dict[str, pd.DataFrame] = {}
     for symbol in symbols:
