@@ -316,6 +316,8 @@ def load_executions(conn: sqlite3.Connection, window: DateWindow, strategy: str 
             commission_currency,
             realized_pnl,
             commission_source,
+            exit_reason,
+            exit_reason_source,
             raw_json
         FROM executions e
         WHERE e.session_date BETWEEN ? AND ? {clause}
@@ -1441,6 +1443,17 @@ def closed_from_trades(
         if not exit_reason:
             exit_reason = exit_reason_from_payload(raw, "")
             exit_reason_source = "trades.raw_json" if exit_reason else ""
+        if not exit_reason and sell_execution:
+            exit_reason = normalize_exit_reason(sell_execution.get("exit_reason"))
+            exit_reason_source = str(sell_execution.get("exit_reason_source") or "executions.exit_reason") if exit_reason else ""
+            if exit_reason:
+                matched_event = {
+                    "reason": exit_reason,
+                    "event_type": "SELL_EXECUTION",
+                    "event_time": sell_execution.get("executed_at") or sell_execution.get("recorded_at"),
+                    "order_id": sell_execution.get("order_id"),
+                    "source": "executions",
+                }
         if not exit_reason:
             exact_runtime_trade_key = (exit_date, f"trade:{row.get('trade_id')}", symbol)
             runtime_candidates = [
@@ -1812,8 +1825,6 @@ def load_closed_positions(
     runtime_symbol_peak_map = load_runtime_symbol_peak_map(conn, window, strategy)
     lifecycle_peak_map = load_lifecycle_peak_map(window)
     lifecycle_symbol_peak_map = load_lifecycle_symbol_peak_map(window)
-    runtime_exit_reason_map = load_runtime_exit_reason_map(conn, window, strategy)
-    lifecycle_exit_reason_map = load_lifecycle_exit_reason_map(window)
     candle_rows: dict[tuple[str, str], pd.DataFrame] = {}
     trades = closed_from_trades(
         conn,
@@ -1823,8 +1834,8 @@ def load_closed_positions(
         runtime_peak_map,
         lifecycle_peak_map,
         candle_rows,
-        runtime_exit_reason_map=runtime_exit_reason_map,
-        lifecycle_exit_reason_map=lifecycle_exit_reason_map,
+        runtime_exit_reason_map={},
+        lifecycle_exit_reason_map={},
     )
     reconstructed = pd.DataFrame()
     reconstructed_count = 0

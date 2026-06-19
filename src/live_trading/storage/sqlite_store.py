@@ -153,6 +153,15 @@ def normalized_execution_side(value: Any) -> str:
     return text
 
 
+def normalized_identifier(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "nan", "null", "0.0"}:
+        return ""
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text
+
+
 def position_source_priority(source: Any, raw_json: Any = None, ibkr_quantity: Any = None) -> int:
     source_text = str(source or "").strip().lower()
     raw = parse_jsonish(raw_json)
@@ -404,6 +413,7 @@ class SQLiteRuntimeStore:
             CREATE TABLE IF NOT EXISTS orders (
                 order_key TEXT PRIMARY KEY,
                 trade_id TEXT,
+                position_key TEXT,
                 strategy_name TEXT,
                 session_date TEXT,
                 symbol TEXT,
@@ -420,6 +430,8 @@ class SQLiteRuntimeStore:
                 acknowledged_at TEXT,
                 cancelled_at TEXT,
                 filled_at TEXT,
+                exit_reason TEXT,
+                exit_reason_source TEXT,
                 raw_json TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_orders_trade_id ON orders(trade_id);
@@ -448,6 +460,8 @@ class SQLiteRuntimeStore:
                 commission_currency TEXT,
                 realized_pnl REAL,
                 commission_source TEXT,
+                exit_reason TEXT,
+                exit_reason_source TEXT,
                 raw_json TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_executions_session_date ON executions(session_date);
@@ -605,6 +619,11 @@ class SQLiteRuntimeStore:
         )
         self._ensure_column("trades", "updated_at", "TEXT")
         self._ensure_column("trades", "trade_reduction_version", "INTEGER DEFAULT 1")
+        self._ensure_column("orders", "position_key", "TEXT")
+        self._ensure_column("orders", "exit_reason", "TEXT")
+        self._ensure_column("orders", "exit_reason_source", "TEXT")
+        self._ensure_column("executions", "exit_reason", "TEXT")
+        self._ensure_column("executions", "exit_reason_source", "TEXT")
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -646,6 +665,8 @@ class SQLiteRuntimeStore:
             "commission_currency",
             "realized_pnl",
             "commission_source",
+            "exit_reason",
+            "exit_reason_source",
         ]
         for field in stable_fields:
             left = existing.get(field)
@@ -843,6 +864,21 @@ class SQLiteRuntimeStore:
         execution_id = str(row.get("execution_id") or "").strip()
         if not execution_id:
             raise ValueError("execution row missing execution_id")
+        raw = parse_jsonish(row.get("raw_json"))
+        side = row.get("side") or row.get("action") or ""
+        exit_reason = row.get("exit_reason") or raw.get("exit_reason")
+        exit_reason_source = row.get("exit_reason_source") or raw.get("exit_reason_source")
+        matched_order: dict[str, Any] | None = None
+        if normalized_execution_side(side) == "SELL" and not exit_reason:
+            matched_order = self._exit_order_intent_for_execution(row)
+            if matched_order:
+                order_raw = parse_jsonish(matched_order.get("raw_json"))
+                exit_reason = matched_order.get("exit_reason") or order_raw.get("exit_reason")
+                exit_reason_source = matched_order.get("exit_reason_source") or order_raw.get("exit_reason_source") or "orders"
+                if not row.get("trade_id") and matched_order.get("trade_id"):
+                    row = {**row, "trade_id": matched_order.get("trade_id")}
+                if not row.get("order_key") and matched_order.get("order_key"):
+                    row = {**row, "order_key": matched_order.get("order_key")}
         data = {
             "execution_id": execution_id,
             "trade_id": row.get("trade_id"),
@@ -863,9 +899,18 @@ class SQLiteRuntimeStore:
             "commission_currency": row.get("commission_currency"),
             "realized_pnl": safe_float(row.get("realized_pnl")),
             "commission_source": row.get("commission_source"),
+            "exit_reason": exit_reason,
+            "exit_reason_source": exit_reason_source,
             "raw_json": row.get("raw_json") or row,
         }
         raw = parse_jsonish(data.get("raw_json"))
+        if exit_reason and not raw.get("exit_reason"):
+            raw["exit_reason"] = exit_reason
+        if exit_reason_source and not raw.get("exit_reason_source"):
+            raw["exit_reason_source"] = exit_reason_source
+        if matched_order:
+            raw.setdefault("exit_reason_order_key", matched_order.get("order_key"))
+            raw.setdefault("exit_reason_order_id", matched_order.get("order_id"))
         if not raw.get("execution_insert_time") and data.get("recorded_at"):
             raw["execution_insert_time"] = data.get("recorded_at")
         if data.get("commission_source") == "ibkr" and not raw.get("commission_report_time"):
@@ -878,7 +923,7 @@ class SQLiteRuntimeStore:
             existing = self.query("SELECT * FROM executions WHERE execution_id = ?", [execution_id])
             if existing:
                 current = existing[0]
-                for field in ("trade_id", "order_key", "strategy_name", "session_date", "order_id", "perm_id"):
+                for field in ("trade_id", "order_key", "strategy_name", "session_date", "order_id", "perm_id", "exit_reason", "exit_reason_source"):
                     if data.get(field) in (None, "") and current.get(field) not in (None, ""):
                         data[field] = current.get(field)
             if self._execution_rows_equivalent(existing[0] if existing else None, data):
@@ -948,6 +993,83 @@ class SQLiteRuntimeStore:
         payload["updated_at"] = now
         payload.update(details)
         self.set_runtime_state(name, status, payload, updated_at=now)
+
+    def _exit_order_intent_for_execution(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        order_id = normalized_identifier(row.get("order_id"))
+        perm_id = normalized_identifier(row.get("perm_id"))
+        symbol = str(row.get("symbol") or "").upper().strip()
+        params: list[Any] = []
+        predicates: list[str] = []
+        if order_id:
+            predicates.append("COALESCE(order_id, '') = ?")
+            params.append(order_id)
+        if perm_id:
+            predicates.append("COALESCE(perm_id, '') = ?")
+            params.append(perm_id)
+        if not predicates:
+            return None
+        symbol_clause = ""
+        if symbol:
+            symbol_clause = " AND UPPER(COALESCE(symbol, '')) = ?"
+            params.append(symbol)
+        rows = self.query(
+            f"""
+            SELECT *
+            FROM orders
+            WHERE ({' OR '.join(predicates)})
+              {symbol_clause}
+              AND UPPER(COALESCE(side, '')) IN ('SELL', 'SLD')
+              AND COALESCE(exit_reason, '') != ''
+            ORDER BY COALESCE(submitted_at, acknowledged_at, filled_at, '') DESC
+            LIMIT 1
+            """,
+            params,
+        )
+        return rows[0] if rows else None
+
+    def record_exit_order_intent(
+        self,
+        *,
+        order_id: Any,
+        symbol: str,
+        exit_reason: str,
+        quantity: Any = None,
+        submitted_at: str | None = None,
+        trade_id: str = "",
+        position_key: str = "",
+        strategy_name: str = "",
+        session_date: str = "",
+        raw_json: Any = None,
+    ) -> str:
+        submitted_at = submitted_at or utc_now_iso()
+        raw = parse_jsonish(raw_json)
+        raw.update(
+            {
+                "exit_reason": exit_reason,
+                "exit_reason_source": "exit_order_submit",
+                "exit_reason_persisted_at": submitted_at,
+            }
+        )
+        return self.upsert_order(
+            {
+                "order_key": f"exit:{normalized_identifier(order_id) or uuid.uuid4().hex}",
+                "trade_id": trade_id,
+                "position_key": position_key,
+                "strategy_name": strategy_name or "unknown",
+                "session_date": session_date or session_date_utc(),
+                "symbol": str(symbol or "").upper(),
+                "side": "SELL",
+                "order_type": "MKT",
+                "quantity": quantity,
+                "status": "SUBMITTED",
+                "ibkr_status": "Submitted",
+                "order_id": normalized_identifier(order_id),
+                "submitted_at": submitted_at,
+                "exit_reason": exit_reason,
+                "exit_reason_source": "exit_order_submit",
+                "raw_json": raw,
+            }
+        )
 
     def runtime_pending_counts(self, session_date: str | None = None) -> dict[str, Any]:
         where = ""
@@ -1288,7 +1410,7 @@ class SQLiteRuntimeStore:
                    COALESCE(strategy_name, 'unknown') AS strategy_name,
                    session_date, symbol, side, quantity, price, exchange, liquidity,
                    executed_at, recorded_at, commission, commission_currency,
-                   realized_pnl, commission_source, raw_json
+                   realized_pnl, commission_source, exit_reason, exit_reason_source, raw_json
             FROM executions
             WHERE UPPER(symbol) = ? {strategy_clause}
             ORDER BY COALESCE(executed_at, recorded_at, ''), execution_id
@@ -1381,6 +1503,10 @@ class SQLiteRuntimeStore:
                     "reconstruction_source": "sqlite_execution_reducer",
                     "buy_execution_id": lot.get("execution_id"),
                     "sell_execution_id": row.get("execution_id"),
+                    "sell_order_id": row.get("order_id"),
+                    "sell_perm_id": row.get("perm_id"),
+                    "exit_reason": row.get("exit_reason") or sell_raw.get("exit_reason") or "",
+                    "exit_reason_source": row.get("exit_reason_source") or sell_raw.get("exit_reason_source") or "",
                     "matched_quantity": matched_qty,
                     "buy_original_quantity": safe_float(lot.get("original_qty")) or matched_qty,
                     "sell_original_quantity": qty,
@@ -1413,9 +1539,11 @@ class SQLiteRuntimeStore:
                 preserved: dict[str, Any] = {}
                 if existing_trade:
                     current = existing_trade[0]
-                    for key in ("mfe_pct", "mae_pct", "exit_reason", "entry_signal_time", "entry_order_time", "exit_signal_time", "exit_order_time"):
+                    for key in ("mfe_pct", "mae_pct", "entry_signal_time", "entry_order_time", "exit_signal_time", "exit_order_time"):
                         if current.get(key) not in (None, ""):
                             preserved[key] = current.get(key)
+                    if not raw.get("exit_reason") and current.get("exit_reason") not in (None, ""):
+                        preserved["exit_reason"] = current.get("exit_reason")
                 self.upsert_trade(
                     {
                         "trade_id": trade_id,
@@ -1433,6 +1561,7 @@ class SQLiteRuntimeStore:
                         "gross_pnl": gross,
                         "commission": commission,
                         "net_pnl": gross - commission,
+                        "exit_reason": raw.get("exit_reason") or "",
                         "ibkr_entry_confirmed": True,
                         "ibkr_exit_confirmed": True,
                         "ibkr_position_flat_confirmed": True,
@@ -1700,6 +1829,7 @@ class SQLiteRuntimeStore:
         data = {
             "order_key": order_key,
             "trade_id": row.get("trade_id"),
+            "position_key": row.get("position_key"),
             "strategy_name": row.get("strategy_name"),
             "session_date": row.get("session_date") or session_date_utc(),
             "symbol": row.get("symbol"),
@@ -1716,6 +1846,8 @@ class SQLiteRuntimeStore:
             "acknowledged_at": row.get("acknowledged_at"),
             "cancelled_at": row.get("cancelled_at"),
             "filled_at": row.get("filled_at"),
+            "exit_reason": row.get("exit_reason"),
+            "exit_reason_source": row.get("exit_reason_source"),
             "raw_json": row.get("raw_json") or row,
         }
         self._upsert("orders", data, ["order_key"], list(data.keys()))
@@ -1750,9 +1882,9 @@ class SQLiteRuntimeStore:
             "gross_pnl": safe_float(row.get("gross_pnl")),
             "commission": safe_float(row.get("commission")),
             "net_pnl": safe_float(row.get("net_pnl")),
-            "mfe_pct": safe_float(row.get("mfe_pct")),
-            "mae_pct": safe_float(row.get("mae_pct")),
-            "exit_reason": row.get("exit_reason"),
+                        "mfe_pct": safe_float(row.get("mfe_pct")),
+                        "mae_pct": safe_float(row.get("mae_pct")),
+                        "exit_reason": row.get("exit_reason") or parse_jsonish(row.get("raw_json")).get("exit_reason"),
             "ibkr_entry_confirmed": bool_int(row.get("ibkr_entry_confirmed")),
             "ibkr_exit_confirmed": bool_int(row.get("ibkr_exit_confirmed")),
             "ibkr_position_flat_confirmed": bool_int(row.get("ibkr_position_flat_confirmed")),

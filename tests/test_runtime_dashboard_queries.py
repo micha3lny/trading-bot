@@ -2195,7 +2195,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["diagnostics"]["untrusted_carry_closed_count"], 1)
             self.assertEqual(snapshot["diagnostics"]["untrusted_carry_closed_symbols"], "OUST")
 
-    def test_closed_exit_reason_from_runtime_event(self) -> None:
+    def test_closed_exit_reason_ignores_runtime_event_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
             store = SQLiteRuntimeStore(db)
@@ -2230,7 +2230,8 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
 
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-18", "2026-06-18"), "v67")
 
-            self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason"], "trailing_stop")
+            self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason"], "unknown_exit_reason")
+            self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason_source"], "missing_explicit_exit_event")
 
     def test_closed_exit_reason_ignores_entry_qualification_reason(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2277,9 +2278,9 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
 
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-18", "2026-06-18"), "v67")
 
-            self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason"], "trailing_stop")
+            self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason"], "unknown_exit_reason")
 
-    def test_closed_exit_reason_from_trade_lifecycle_csv(self) -> None:
+    def test_closed_exit_reason_ignores_trade_lifecycle_csv_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
             recorder_root = Path(tmp) / "recorder"
@@ -2323,7 +2324,8 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                 else:
                     os.environ["TRADING_BOT_RECORDER_DIR"] = previous
 
-            self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason"], "eod_flatten")
+            self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason"], "unknown_exit_reason")
+            self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason_source"], "missing_explicit_exit_event")
 
     def test_intraday_exit_does_not_inherit_later_eod_flatten_reason(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2372,37 +2374,21 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason"], "unknown_exit_reason")
             self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason_source"], "missing_explicit_exit_event")
 
-    def test_closed_exit_reason_matches_lifecycle_by_sell_order_id(self) -> None:
+    def test_closed_exit_reason_from_persisted_sell_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
-            recorder_root = Path(tmp) / "recorder"
-            session_dir = recorder_root / "2026-06-18"
-            session_dir.mkdir(parents=True)
-            with (session_dir / "trade_lifecycle.csv").open("w", newline="", encoding="utf-8") as fh:
-                writer = csv.DictWriter(fh, fieldnames=["recorded_at", "strategy", "event", "symbol", "order_id", "execution_id", "reason"])
-                writer.writeheader()
-                writer.writerow({
-                    "recorded_at": "2026-06-18T13:00:00+00:00",
-                    "strategy": "v67",
-                    "event": "SELL_ORDER_SENT",
-                    "symbol": "OCUL",
-                    "order_id": "4242",
-                    "execution_id": "",
-                    "reason": "trailing_stop",
-                })
-                writer.writerow({
-                    "recorded_at": "2026-06-18T19:45:00+00:00",
-                    "strategy": "v67",
-                    "event": "EOD_FLATTEN_SUBMIT",
-                    "symbol": "OCUL",
-                    "order_id": "9999",
-                    "execution_id": "",
-                    "reason": "eod_flatten",
-                })
-            previous = os.environ.get("TRADING_BOT_RECORDER_DIR")
-            os.environ["TRADING_BOT_RECORDER_DIR"] = str(recorder_root)
             try:
                 store = SQLiteRuntimeStore(db)
+                store.record_exit_order_intent(
+                    order_id="4242",
+                    symbol="OCUL",
+                    exit_reason="trailing_stop",
+                    quantity=2,
+                    submitted_at="2026-06-18T13:00:00+00:00",
+                    trade_id="T_OCUL_ORDER_REASON",
+                    strategy_name="v67",
+                    session_date="2026-06-18",
+                )
                 store.upsert_trade({
                     "trade_id": "T_OCUL_ORDER_REASON",
                     "strategy_name": "v67",
@@ -2439,14 +2425,12 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
 
                 snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-18", "2026-06-18"), "v67")
             finally:
-                if previous is None:
-                    os.environ.pop("TRADING_BOT_RECORDER_DIR", None)
-                else:
-                    os.environ["TRADING_BOT_RECORDER_DIR"] = previous
+                pass
 
             row = snapshot["closed_positions"].iloc[0]
             self.assertEqual(row["exit_reason"], "trailing_stop")
-            self.assertEqual(row["matched_event_type"], "SELL_ORDER_SENT")
+            self.assertEqual(row["exit_reason_source"], "exit_order_submit")
+            self.assertEqual(row["matched_event_type"], "SELL_EXECUTION")
             self.assertEqual(row["matched_order_id"], "4242")
 
     def test_unknown_same_day_closed_trade_strategy_is_inferred_from_executions(self) -> None:

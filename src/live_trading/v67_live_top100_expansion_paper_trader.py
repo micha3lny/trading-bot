@@ -1414,6 +1414,26 @@ def send_exit_order(ib: IB, recorder: LiveDataRecorder, pos: ManagedPosition, re
     order.outsideRth = False
     trade = ib.placeOrder(pos.contract, order)
     order_id = trade.order.orderId
+    submitted_at = now_utc()
+    position_key = f"{STRATEGY_NAME}:{getattr(recorder, 'session_date', '')}:{pos.symbol}"
+    safe_sqlite_call(
+        getattr(recorder, "sqlite_store", None),
+        "record_exit_order_intent",
+        order_id=order_id,
+        symbol=pos.symbol,
+        exit_reason=reason,
+        quantity=pos.quantity,
+        submitted_at=submitted_at,
+        position_key=position_key,
+        strategy_name=STRATEGY_NAME,
+        session_date=getattr(recorder, "session_date", None),
+        raw_json={
+            "source": "send_exit_order",
+            "entry_price": pos.entry_price,
+            "peak_price": pos.peak_price,
+            "entry_time": pos.entry_time,
+        },
+    )
     pnl_pct = ((price / pos.entry_price - 1.0) * 100.0) if price and pos.entry_price > 0 else None
     record_lifecycle_with_formal(
         recorder,

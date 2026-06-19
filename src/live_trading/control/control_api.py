@@ -37,6 +37,26 @@ def _log(event: str, **fields: Any) -> None:
     print(f"{_now_utc()} CONTROL_API_{event}" + (f" {tail}" if tail else ""), flush=True)
 
 
+def _record_exit_order_intent(recorder: Any, *, order_id: Any, symbol: str, quantity: Any, reason: str, pos: Any = None, raw_json: JsonDict | None = None) -> None:
+    store = getattr(recorder, "sqlite_store", None)
+    if store is None:
+        return
+    try:
+        store.record_exit_order_intent(
+            order_id=order_id,
+            symbol=symbol,
+            exit_reason=reason,
+            quantity=quantity,
+            submitted_at=_now_utc(),
+            position_key=f"{getattr(pos, 'strategy_name', '') or 'unknown'}:{getattr(recorder, 'session_date', '')}:{symbol}" if pos is not None else "",
+            strategy_name=getattr(pos, "strategy_name", "") or "unknown",
+            session_date=getattr(recorder, "session_date", ""),
+            raw_json=raw_json or {},
+        )
+    except Exception as exc:
+        _log("EXIT_REASON_INTENT_WRITE_FAILED", symbol=symbol, order_id=order_id, error=repr(exc))
+
+
 @dataclass
 class ControlApiContext:
     ib: Any
@@ -637,6 +657,16 @@ def process_control_api_commands(
             setattr(pos, "exit_sent", True)
             setattr(pos, "last_exit_order_ts", datetime.now(timezone.utc).timestamp())
         _log("FLATTEN_SENT", symbol=symbol, action=action, quantity=qty, order_id=order_id, command_id=command_id)
+        if action == "SELL":
+            _record_exit_order_intent(
+                recorder,
+                order_id=order_id,
+                symbol=symbol,
+                quantity=qty,
+                reason="control_api_queue_main_loop",
+                pos=pos,
+                raw_json={**_public_command_payload(cmd), "order_id": order_id, "status": status, "source": "control_api"},
+            )
         record_lifecycle_fn(recorder, "MANUAL_FLATTEN_SENT", symbol, action=action, quantity=qty, order_id=order_id, reason="control_api_queue_main_loop", entry_price=getattr(pos, "entry_price", None) if pos is not None else None, peak_price=getattr(pos, "peak_price", None) if pos is not None else None, raw_json={**_public_command_payload(cmd), "order_id": order_id, "status": status})
         if persist_managed_positions_fn is not None:
             try:

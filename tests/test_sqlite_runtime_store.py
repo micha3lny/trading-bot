@@ -241,6 +241,32 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_exit_order_intent_propagates_to_execution_and_closed_trade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B_REASON", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "WHY", "side": "BOT", "quantity": 2, "price": 10, "executed_at": "2026-05-29T13:30:00+00:00", "commission": 0.35, "commission_source": "ibkr"})
+                store.record_exit_order_intent(
+                    order_id="7788",
+                    symbol="WHY",
+                    exit_reason="v46_wide_trail_trailing_stop",
+                    quantity=2,
+                    submitted_at="2026-05-29T13:39:59+00:00",
+                    strategy_name="v67",
+                    session_date="2026-05-29",
+                )
+                store.upsert_execution({"execution_id": "S_REASON", "strategy_name": "v67", "session_date": "2026-05-29", "symbol": "WHY", "side": "SLD", "quantity": 2, "price": 12, "order_id": "7788", "executed_at": "2026-05-29T13:40:00+00:00", "commission": 0.36, "commission_source": "ibkr", "realized_pnl": 4.0})
+
+                execution = store.query("SELECT exit_reason, exit_reason_source FROM executions WHERE execution_id = 'S_REASON'")[0]
+                trade = store.query("SELECT status, exit_reason FROM trades WHERE symbol = 'WHY'")[0]
+
+                self.assertEqual(execution["exit_reason"], "v46_wide_trail_trailing_stop")
+                self.assertEqual(execution["exit_reason_source"], "exit_order_submit")
+                self.assertEqual(trade["status"], "CLOSED")
+                self.assertEqual(trade["exit_reason"], "v46_wide_trail_trailing_stop")
+            finally:
+                store.close()
+
     def test_commission_update_keeps_trade_count_stable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
