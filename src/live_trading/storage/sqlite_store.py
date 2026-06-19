@@ -2083,6 +2083,12 @@ def safe_sqlite_call(store: SQLiteRuntimeStore | None, method: str, *args: Any, 
         return None
     try:
         return getattr(store, method)(*args, **kwargs)
+    except (KeyboardInterrupt, SystemExit):
+        line = f"{utc_now_iso()} SQLITE_CALL_INTERRUPTED method={method}"
+        print(line, flush=True)
+        if not unified_logger_installed():
+            append_unified_log(line)
+        raise
     except Exception as exc:
         line = f"{utc_now_iso()} SQLITE_WRITE_FAILED method={method} error={exc!r}"
         print(line, flush=True)

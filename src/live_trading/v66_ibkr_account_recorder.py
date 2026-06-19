@@ -558,6 +558,19 @@ def record_recent_fills(ib: IB, recorder: LiveDataRecorder, seen: set[str]) -> i
             finalized_pending_trades=finalized_pending or {},
         )
         return count
+    except (KeyboardInterrupt, SystemExit):
+        try:
+            safe_sqlite_call(
+                sqlite_store,
+                "mark_operation_status",
+                "fill_ingest",
+                "interrupted",
+                started_at=started_at,
+                new_fills=count,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        raise
     except Exception as exc:
         safe_sqlite_call(
             sqlite_store,

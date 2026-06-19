@@ -109,6 +109,11 @@ class CountingStore:
         return {"pending_before": 1, "pending_after": 0, "resolved": 1}
 
 
+class InterruptingPendingCountStore(CountingStore):
+    def runtime_pending_counts(self):
+        raise KeyboardInterrupt
+
+
 def read_fills(recorder: LiveDataRecorder) -> list[dict]:
     with recorder.path("fills.csv").open(errors="replace") as fh:
         return list(csv.DictReader(fh))
@@ -160,6 +165,19 @@ class IbkrCommissionLedgerTests(unittest.TestCase):
             self.assertTrue(store.status_calls)
             self.assertEqual(store.status_calls[-1][1]["pending_counts"], {})
             self.assertEqual(store.status_calls[-1][1]["finalized_pending_trades"]["resolved"], 1)
+
+    def test_record_recent_fills_marks_interrupted_on_keyboard_interrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(Path(tmp), session_date="2026-05-22")
+            store = InterruptingPendingCountStore()
+            recorder.sqlite_store = store
+
+            with self.assertRaises(KeyboardInterrupt):
+                record_recent_fills(FakeIB([fake_fill("E1", commission=0.35)]), recorder, seen=set())
+
+            statuses = [call[0][1] for call in store.status_calls if len(call[0]) >= 2]
+            self.assertIn("running", statuses)
+            self.assertIn("interrupted", statuses)
 
     def test_duplicate_commission_report_is_ignored_after_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

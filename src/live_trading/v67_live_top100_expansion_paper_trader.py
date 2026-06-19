@@ -5902,13 +5902,14 @@ def main() -> int:
         normal_exit = True
         shutdown.log_main_loop_exit(reason="duration_elapsed", exit_code=0)
 
-    except SystemExit:
+    except SystemExit as exc:
         if shutdown.reason == "unknown":
-            shutdown.set_reason("system_exit", exit_code=0)
+            code = exc.code if isinstance(exc.code, int) else 0
+            shutdown.set_reason("system_exit", exit_code=code)
         raise
     except KeyboardInterrupt:
         shutdown.set_reason("keyboard_interrupt", exit_code=130)
-        raise
+        raise SystemExit(130)
     except Exception:
         shutdown.set_reason("exception", exit_code=1)
         raise
@@ -5948,7 +5949,7 @@ if __name__ == "__main__":
             _ACTIVE_SHUTDOWN_DIAGNOSTICS.log_exit(reason="keyboard_interrupt", exit_code=130)
         else:
             log_event("BOT", "BOT_STOP", reason="keyboard_interrupt", exit_code=130)
-        raise
+        raise SystemExit(130)
     except Exception as exc:
         if _ACTIVE_SHUTDOWN_DIAGNOSTICS is not None:
             _ACTIVE_SHUTDOWN_DIAGNOSTICS.log_exit(reason="exception", exit_code=1)
