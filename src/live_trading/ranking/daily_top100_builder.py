@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -141,19 +142,37 @@ def parse_partition_date(path: Path) -> date | None:
         return None
 
 
-def prior_session_paths(history_dir: str | Path, symbol: str, session_date: date, session_type: str = "RTH") -> list[Path]:
-    symbol_dir = Path(history_dir) / f"session_type={session_type.upper()}" / f"symbol={symbol.upper()}"
-    dated: list[tuple[date, Path]] = []
-    for path in symbol_dir.glob("year=*/month=*/day=*.parquet"):
-        parsed = parse_partition_date(path)
-        if parsed is not None and parsed < session_date:
-            dated.append((parsed, path))
-    return [p for _, p in sorted(dated, reverse=True)]
+def prior_session_paths(
+    history_dir: str | Path,
+    symbol: str,
+    session_date: date,
+    session_type: str = "RTH",
+    limit: int | None = None,
+) -> list[Path]:
+    """Return recent prior session files without recursively scanning symbol history.
+
+    The Top100 builder runs across the full universe, so a per-symbol recursive
+    glob becomes expensive as the parquet archive grows. Daily ranking only
+    needs recent trading sessions for multi-day context, so probe exact
+    partition paths for prior US equity trading days.
+    """
+    target = max(0, int(limit)) if limit is not None else 5
+    max_checks = max(target * 6, 30)
+    paths: list[Path] = []
+    cursor = session_date
+    checks = 0
+    while checks < max_checks and (limit is None or len(paths) < target):
+        cursor = previous_us_equity_trading_day(cursor)
+        checks += 1
+        path = parquet_path(history_dir, symbol, cursor, session_type)
+        if path.exists():
+            paths.append(path)
+    return paths
 
 
 def recent_prior_closes(history_dir: str | Path, symbol: str, session_date: date, limit: int, session_type: str = "RTH") -> list[float]:
     closes: list[float] = []
-    for path in prior_session_paths(history_dir, symbol, session_date, session_type)[: max(0, limit)]:
+    for path in prior_session_paths(history_dir, symbol, session_date, session_type, limit=max(0, limit)):
         try:
             df = normalize_history_df(pd.read_parquet(path))
         except Exception:
@@ -357,16 +376,49 @@ def build_daily_top(
     missing_symbols: list[str] = []
     rejected_rows: list[dict[str, str]] = []
     error_rows: list[dict[str, str]] = []
+    started = time.perf_counter()
+    current_read_seconds = 0.0
+    prior_read_seconds = 0.0
+    analyze_seconds = 0.0
+    last_progress_at = started
+    last_progress_processed = 0
+    total = len(tradeable_symbols)
+
+    def emit_progress(processed: int, *, force: bool = False) -> None:
+        nonlocal last_progress_at, last_progress_processed
+        now = time.perf_counter()
+        if processed == last_progress_processed:
+            return
+        if not force and processed < total and processed % 100 != 0 and now - last_progress_at < 60.0:
+            return
+        elapsed = max(0.001, now - started)
+        last_progress_at = now
+        last_progress_processed = processed
+        print(
+            f"DAILY_TOP100_PROGRESS processed={processed}/{total} valid={stats['valid']} "
+            f"missing={stats['missing']} rejected={stats['rejected']} errors={stats['errors']} "
+            f"elapsed_seconds={elapsed:.1f} symbols_per_second={processed / elapsed:.2f} "
+            f"current_read_seconds={current_read_seconds:.1f} prior_read_seconds={prior_read_seconds:.1f} "
+            f"analyze_seconds={analyze_seconds:.1f}",
+            flush=True,
+        )
+
     for idx, symbol in enumerate(tradeable_symbols, 1):
         try:
+            read_started = time.perf_counter()
             df = read_session(history_dir, symbol, ranking_date, session_type)
+            current_read_seconds += time.perf_counter() - read_started
             if df.empty:
                 stats["missing"] += 1
                 missing_symbols.append(symbol)
                 if stats["missing"] <= max(0, max_missing_log):
                     print(f"DAILY_TOP100_MISSING_DATA symbol={symbol} date={ranking_date.isoformat()}", flush=True)
+                emit_progress(idx)
                 continue
+            prior_started = time.perf_counter()
             prior_closes = recent_prior_closes(history_dir, symbol, ranking_date, prior_sessions, session_type)
+            prior_read_seconds += time.perf_counter() - prior_started
+            analyze_started = time.perf_counter()
             item, reject_reason = analyze_symbol(
                 symbol,
                 df,
@@ -376,11 +428,13 @@ def build_daily_top(
                 min_volume=min_volume,
                 min_dollar_volume=min_dollar_volume,
             )
+            analyze_seconds += time.perf_counter() - analyze_started
             if item is None:
                 stats["rejected"] += 1
                 rejected_rows.append({"symbol": symbol, "reason": reject_reason or "rejected"})
                 if stats["rejected"] <= max(0, max_reject_log):
                     print(f"DAILY_TOP100_REJECTED symbol={symbol} reason={reject_reason}", flush=True)
+                emit_progress(idx)
                 continue
             ranked.append(item)
             stats["valid"] += 1
@@ -388,11 +442,17 @@ def build_daily_top(
             stats["errors"] += 1
             error_rows.append({"symbol": symbol, "reason": repr(exc)})
             print(f"DAILY_TOP100_SYMBOL_ERROR symbol={symbol} error={exc!r}", flush=True)
-        if idx % 250 == 0:
-            print(f"DAILY_TOP100_PROGRESS processed={idx} valid={stats['valid']}", flush=True)
+        emit_progress(idx)
 
+    total_elapsed = max(0.001, time.perf_counter() - started)
+    emit_progress(total, force=True)
     ranked.sort(key=lambda item: (item.score, item.dollar_volume, item.intraday_high_pct), reverse=True)
     rows = [ranking_to_row(rank, item) for rank, item in enumerate(ranked[: max(0, top_n)], 1)]
+    stats["elapsed_seconds"] = total_elapsed  # type: ignore[assignment]
+    stats["symbols_per_second"] = total / total_elapsed if total else 0.0  # type: ignore[assignment]
+    stats["current_read_seconds"] = current_read_seconds  # type: ignore[assignment]
+    stats["prior_read_seconds"] = prior_read_seconds  # type: ignore[assignment]
+    stats["analyze_seconds"] = analyze_seconds  # type: ignore[assignment]
     stats["_missing_symbols"] = missing_symbols  # type: ignore[assignment]
     stats["_rejected_rows"] = rejected_rows  # type: ignore[assignment]
     stats["_error_rows"] = error_rows  # type: ignore[assignment]
@@ -590,7 +650,12 @@ def main() -> int:
         f"valid={stats['valid']} missing={stats['missing']} rejected={stats['rejected']} "
         f"errors={stats['errors']} excluded_ineligible_count={stats.get('excluded_ineligible', 0)} "
         f"excluded_ineligible_symbols={','.join([r.get('symbol', '') for r in stats.get('_excluded_ineligible_rows', [])][:20])} "
-        f"diagnostics_rows={diagnostics_rows} sqlite_rows={stored}",
+        f"diagnostics_rows={diagnostics_rows} sqlite_rows={stored} "
+        f"elapsed_seconds={float(stats.get('elapsed_seconds', 0.0)):.1f} "
+        f"symbols_per_second={float(stats.get('symbols_per_second', 0.0)):.2f} "
+        f"current_read_seconds={float(stats.get('current_read_seconds', 0.0)):.1f} "
+        f"prior_read_seconds={float(stats.get('prior_read_seconds', 0.0)):.1f} "
+        f"analyze_seconds={float(stats.get('analyze_seconds', 0.0)):.1f}",
         flush=True,
     )
     if len(rows) < int(args.top_n):
