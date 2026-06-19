@@ -726,10 +726,10 @@ def normalize_exit_reason(value: Any, event_type: str = "") -> str:
 
 
 def exit_reason_from_payload(payload: dict[str, Any], event_type: str = "") -> str:
+    exit_event = str(event_type or "").upper() in EXIT_REASON_EVENTS
     for key in (
         "exit_reason",
         "requested_exit_reason",
-        "reason",
         "close_reason",
         "flatten_reason",
         "order_purpose",
@@ -737,6 +737,10 @@ def exit_reason_from_payload(payload: dict[str, Any], event_type: str = "") -> s
         "trigger",
     ):
         reason = normalize_exit_reason(payload.get(key), event_type)
+        if reason:
+            return reason
+    if exit_event:
+        reason = normalize_exit_reason(payload.get("reason"), event_type)
         if reason:
             return reason
     raw = payload.get("raw_json")
@@ -773,7 +777,6 @@ def load_runtime_exit_reason_map(conn: sqlite3.Connection, window: DateWindow, s
         WHERE COALESCE(r.session_date, substr(r.event_time, 1, 10)) BETWEEN ? AND ? {clause}
           AND (
               r.event_type IN ({",".join("?" for _ in EXIT_REASON_EVENTS)})
-              OR COALESCE(r.reason, '') != ''
               OR COALESCE(r.raw_json, '') LIKE '%exit_reason%'
               OR COALESCE(r.raw_json, '') LIKE '%requested_exit_reason%'
           )
@@ -819,7 +822,8 @@ def load_lifecycle_exit_reason_map(window: DateWindow, root: Path | None = None)
                 rows = []
             for row in rows:
                 event_type = str(row.get("event") or row.get("event_type") or "").upper()
-                if event_type not in EXIT_REASON_EVENTS and not row.get("reason"):
+                raw = parse_raw_json(row.get("raw_json"))
+                if event_type not in EXIT_REASON_EVENTS and not raw.get("exit_reason") and not raw.get("requested_exit_reason"):
                     continue
                 symbol = str(row.get("symbol") or "").upper()
                 if not symbol:
@@ -842,7 +846,8 @@ def load_lifecycle_exit_reason_map(window: DateWindow, root: Path | None = None)
                 event_type = str(row.get("event_type") or row.get("type") or row.get("event") or "").upper()
                 legacy = str(row.get("legacy_event") or "").upper()
                 event_for_reason = legacy or event_type
-                if event_for_reason not in EXIT_REASON_EVENTS and not row.get("reason"):
+                raw = parse_raw_json(row.get("raw_json"))
+                if event_for_reason not in EXIT_REASON_EVENTS and not row.get("exit_reason") and not row.get("requested_exit_reason") and not raw.get("exit_reason") and not raw.get("requested_exit_reason"):
                     continue
                 symbol = str(row.get("symbol") or "").upper()
                 if not symbol:
@@ -1111,6 +1116,7 @@ def closed_from_trades(
     exit_execution_ids: list[str] = []
     trade_sources: list[str] = []
     exit_reasons: list[str] = []
+    exit_reason_sources: list[str] = []
     strategy_values: list[str] = []
     trade_raw_peak_by_symbol_session: dict[tuple[str, str, str], tuple[float, str]] = {}
     for peak_row in out.to_dict("records"):
@@ -1153,19 +1159,36 @@ def closed_from_trades(
         entry_execution_id = raw_trade_execution_id(raw, "entry")
         exit_execution_id = raw_trade_execution_id(raw, "exit")
         trade_source = str(raw.get("reconstruction_source") or raw.get("source") or "trades_table")
-        exit_reason = (
-            normalize_exit_reason(row.get("exit_reason"))
-            or exit_reason_from_payload(raw, "")
-            or runtime_exit_reason_map.get((exit_date, f"trade:{row.get('trade_id')}", symbol), "")
-            or runtime_exit_reason_map.get((exit_date, row_strategy, symbol), "")
-            or runtime_exit_reason_map.get((exit_date, "", symbol), "")
-            or runtime_exit_reason_map.get((str(row.get("session_date") or ""), row_strategy, symbol), "")
-            or runtime_exit_reason_map.get((str(row.get("session_date") or ""), "", symbol), "")
-            or lifecycle_exit_reason_map.get((exit_date, row_strategy, symbol), "")
-            or lifecycle_exit_reason_map.get((exit_date, "", symbol), "")
-            or lifecycle_exit_reason_map.get((str(row.get("session_date") or ""), row_strategy, symbol), "")
-            or lifecycle_exit_reason_map.get((str(row.get("session_date") or ""), "", symbol), "")
-        )
+        exit_reason = normalize_exit_reason(row.get("exit_reason"))
+        exit_reason_source = "trades.exit_reason" if exit_reason else ""
+        if not exit_reason:
+            exit_reason = exit_reason_from_payload(raw, "")
+            exit_reason_source = "trades.raw_json" if exit_reason else ""
+        if not exit_reason:
+            runtime_candidates = [
+                (exit_date, f"trade:{row.get('trade_id')}", symbol),
+                (exit_date, row_strategy, symbol),
+                (exit_date, "", symbol),
+                (str(row.get("session_date") or ""), row_strategy, symbol),
+                (str(row.get("session_date") or ""), "", symbol),
+            ]
+            for key in runtime_candidates:
+                exit_reason = runtime_exit_reason_map.get(key, "")
+                if exit_reason:
+                    exit_reason_source = "runtime_events"
+                    break
+        if not exit_reason:
+            lifecycle_candidates = [
+                (exit_date, row_strategy, symbol),
+                (exit_date, "", symbol),
+                (str(row.get("session_date") or ""), row_strategy, symbol),
+                (str(row.get("session_date") or ""), "", symbol),
+            ]
+            for key in lifecycle_candidates:
+                exit_reason = lifecycle_exit_reason_map.get(key, "")
+                if exit_reason:
+                    exit_reason_source = "trade_lifecycle/order_lifecycle"
+                    break
         persisted_commission = to_float(row.get("persisted_commission"), None)
         commission = abs(float(persisted_commission)) if persisted_commission is not None else 0.0
         raw_commission_status = str(raw.get("commission_status") or raw.get("commission_source") or "").upper()
@@ -1209,6 +1232,7 @@ def closed_from_trades(
         exit_execution_ids.append(exit_execution_id)
         trade_sources.append(trade_source)
         exit_reasons.append(exit_reason)
+        exit_reason_sources.append(exit_reason_source)
         strategy_values.append(row_strategy)
     out["ibkr_commission"] = commissions
     out["commission_status"] = commission_statuses
@@ -1256,6 +1280,7 @@ def closed_from_trades(
     out["exit_execution_id"] = exit_execution_ids
     out["source"] = trade_sources
     out["exit_reason"] = exit_reasons
+    out["exit_reason_source"] = exit_reason_sources
     out["strategy"] = strategy_values
     out["closed_source"] = "trades"
     out["gross"] = pd.to_numeric(out["gross"], errors="coerce").fillna(0.0)
@@ -1316,7 +1341,7 @@ def closed_from_trades(
             "runtime_pnl_trusted", "runtime_pnl_untrusted_reason",
             "entry_execution_count", "exit_execution_count", "confirmed_commission_execution_count",
             "expected_commission_execution_count", "peak_source", "peak_match_quality", "commission_source_detail",
-            "entry_execution_id", "exit_execution_id", "source", "closed_source", "updated_at", "trade_reduction_version",
+            "entry_execution_id", "exit_execution_id", "exit_reason_source", "source", "closed_source", "updated_at", "trade_reduction_version",
         ]
     ]
 

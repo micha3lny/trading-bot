@@ -804,7 +804,8 @@ def render_closed_positions(df: pd.DataFrame) -> None:
         "trade_id", "symbol", "entry_execution_id", "exit_execution_id", "source",
         "entry_execution_count", "exit_execution_count",
         "confirmed_commission_execution_count", "expected_commission_execution_count",
-        "peak_source", "peak_match_quality", "commission_source_detail", "closed_source", "data_quality",
+        "peak_source", "peak_match_quality", "exit_reason", "exit_reason_source",
+        "commission_source_detail", "closed_source", "data_quality",
     ]
     available_debug_cols = [col for col in debug_cols if col in df.columns]
     if available_debug_cols:
@@ -822,6 +823,8 @@ def render_closed_positions(df: pd.DataFrame) -> None:
                     "expected_commission_execution_count": "Expected Comm Execs",
                     "peak_source": "Peak Source",
                     "peak_match_quality": "Peak Match Quality",
+                    "exit_reason": "Exit Reason",
+                    "exit_reason_source": "Exit Reason Source",
                     "commission_source_detail": "Commission Source Detail",
                     "closed_source": "Closed Source",
                     "data_quality": "Data Quality",
