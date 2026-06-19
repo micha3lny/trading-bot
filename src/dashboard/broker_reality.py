@@ -13,7 +13,7 @@ from typing import Any
 import pandas as pd
 
 from src.dashboard.runtime_queries import DateWindow, load_dashboard_snapshot, load_execution_pnl_summary, parse_raw_json, to_float
-from src.live_trading.storage.sqlite_store import resolve_sqlite_path
+from src.live_trading.storage.sqlite_store import connect_sqlite, resolve_sqlite_path
 
 
 BROKER_EXECUTION_COLUMNS = [
@@ -241,8 +241,7 @@ def load_sqlite_executions(sqlite_path: str | Path, selected_date: str) -> pd.Da
     path = Path(resolve_sqlite_path(sqlite_path))
     if not path.exists():
         return empty_broker_executions()
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
+    conn = connect_sqlite(path, read_only=True)
     try:
         rows = pd.read_sql_query(
             """
@@ -894,8 +893,7 @@ def load_sqlite_active_positions(sqlite_path: str | Path, selected_date: str) ->
     path = Path(resolve_sqlite_path(sqlite_path))
     if not path.exists():
         return pd.DataFrame()
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
+    conn = connect_sqlite(path, read_only=True)
     try:
         rows = pd.read_sql_query(
             """
@@ -981,8 +979,7 @@ def load_sqlite_trade_pnl(sqlite_path: str | Path, selected_date: str) -> pd.Dat
     path = Path(resolve_sqlite_path(sqlite_path))
     if not path.exists():
         return pd.DataFrame()
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
+    conn = connect_sqlite(path, read_only=True)
     try:
         execution_pnl = load_execution_pnl_summary(conn, DateWindow(selected_date, selected_date), "All")
         trusted_rows = pd.read_sql_query(

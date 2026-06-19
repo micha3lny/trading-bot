@@ -14,7 +14,7 @@ from src.live_trading.analytics.v67_daily_report import (
     reconstruct_closed_trades_from_fills,
     simulate_exit_strategies,
 )
-from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, migrate_runtime_schema, resolve_sqlite_path
+from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, connect_sqlite, migrate_runtime_schema, resolve_sqlite_path
 
 
 CLOSED_STATUSES = {"CLOSED"}
@@ -23,6 +23,7 @@ TERMINAL_POSITION_STATUSES = {"CLOSED", "FLAT", "FLAT_CONFIRMED", "ENTRY_REJECTE
 OPEN_POSITION_STATUSES = {"OPEN", "EXIT_ORDER"}
 DEFAULT_RECORDER_ROOT = Path("data/live/recorder")
 DEFAULT_ORPHAN_STALE_DAYS = 7
+_MIGRATED_SQLITE_PATHS: set[str] = set()
 OPEN_POSITION_STATUS_SQL = """
 (
     UPPER(COALESCE(p.status, '')) IN ('OPEN', 'EXIT_ORDER')
@@ -45,10 +46,11 @@ def utc_today() -> str:
 
 def connect(sqlite_path: str | Path | None = None) -> sqlite3.Connection:
     path = Path(resolve_sqlite_path(sqlite_path or DEFAULT_SQLITE_PATH))
-    migrate_runtime_schema(path)
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    return conn
+    key = str(path)
+    if key not in _MIGRATED_SQLITE_PATHS:
+        migrate_runtime_schema(path)
+        _MIGRATED_SQLITE_PATHS.add(key)
+    return connect_sqlite(path, read_only=True)
 
 
 def read_sql(conn: sqlite3.Connection, sql: str, params: list[Any] | tuple[Any, ...] = ()) -> pd.DataFrame:

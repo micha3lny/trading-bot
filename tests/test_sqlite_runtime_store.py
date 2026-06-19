@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from scripts.cleanup_runtime_events import cleanup_runtime_events
-from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
+from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore, safe_sqlite_call
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.v66_ibkr_account_recorder import record_recent_fills
 
@@ -26,6 +26,18 @@ class FakeIB:
 class FailingStore:
     def upsert_execution(self, _row):
         raise RuntimeError("sqlite down")
+
+
+class BusyThenSuccessStore:
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.calls = 0
+
+    def upsert_market_data_session(self, _row):
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise sqlite3.OperationalError("database is locked")
+        return "OK"
 
 
 def fake_fill(exec_id: str, commission: float | None = None):
@@ -62,6 +74,22 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 self.assertEqual(store.query("PRAGMA journal_mode")[0]["journal_mode"].lower(), "wal")
             finally:
                 store.close()
+
+    def test_safe_sqlite_call_retries_transient_locked_database(self) -> None:
+        store = BusyThenSuccessStore(failures=2)
+
+        result = safe_sqlite_call(store, "upsert_market_data_session", {"symbol": "RKLB"})
+
+        self.assertEqual(result, "OK")
+        self.assertEqual(store.calls, 3)
+
+    def test_safe_sqlite_call_returns_none_after_locked_database_retries_exhausted(self) -> None:
+        store = BusyThenSuccessStore(failures=999)
+
+        result = safe_sqlite_call(store, "upsert_market_data_session", {"symbol": "RKLB"})
+
+        self.assertIsNone(result)
+        self.assertGreater(store.calls, 1)
 
     def test_upsert_execution_idempotent_and_commission_update(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

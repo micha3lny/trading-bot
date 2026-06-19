@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, resolve_sqlite_path  # noqa: E402
+from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, connect_sqlite, resolve_sqlite_path  # noqa: E402
 
 
 OPEN_STATUSES = ("OPEN", "EXIT_ORDER")
@@ -46,8 +46,7 @@ def active_rows(conn: sqlite3.Connection, selected_date: str) -> list[sqlite3.Ro
 
 
 def audit(sqlite_path: str | Path, selected_date: str) -> dict[str, Any]:
-    conn = sqlite3.connect(str(sqlite_path))
-    conn.row_factory = sqlite3.Row
+    conn = connect_sqlite(sqlite_path, read_only=True)
     try:
         rows = active_rows(conn, selected_date)
     finally:

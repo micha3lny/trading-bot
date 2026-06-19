@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.live_trading.storage.sqlite_store import parse_jsonish, resolve_sqlite_path, safe_float  # noqa: E402
+from src.live_trading.storage.sqlite_store import connect_sqlite, parse_jsonish, resolve_sqlite_path, safe_float  # noqa: E402
 
 
 def rows(conn: sqlite3.Connection, sql: str, params: list[Any]) -> list[dict[str, Any]]:
@@ -64,8 +64,7 @@ def main() -> int:
         raise SystemExit("No symbols provided")
     placeholders = ",".join("?" for _ in symbols)
     path = resolve_sqlite_path(args.sqlite_path)
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
+    conn = connect_sqlite(path, read_only=True)
 
     date_filter = ""
     params: list[Any] = symbols[:]

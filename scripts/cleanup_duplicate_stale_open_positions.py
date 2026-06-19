@@ -13,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, resolve_sqlite_path, utc_now_iso  # noqa: E402
+from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, connect_sqlite, resolve_sqlite_path, utc_now_iso  # noqa: E402
 
 
 OPEN_STATUSES = ("OPEN", "EXIT_ORDER")
@@ -93,8 +93,7 @@ def fetch_active(conn: sqlite3.Connection, selected_date: str) -> list[sqlite3.R
 
 
 def cleanup(sqlite_path: str | Path, selected_date: str, apply: bool = False, stale_days: int = DEFAULT_ORPHAN_STALE_DAYS) -> dict[str, Any]:
-    conn = sqlite3.connect(str(sqlite_path))
-    conn.row_factory = sqlite3.Row
+    conn = connect_sqlite(sqlite_path)
     now = utc_now_iso()
     suppressed_duplicates: list[dict[str, Any]] = []
     stale_unconfirmed: list[dict[str, Any]] = []

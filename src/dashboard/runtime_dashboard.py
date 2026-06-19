@@ -16,6 +16,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from src.live_trading.storage.sqlite_store import SQLITE_BUSY_TIMEOUT_MS, configure_sqlite_connection  # noqa: E402
+
 from src.dashboard.runtime_queries import (  # noqa: E402
     DateWindow,
     list_sessions,
@@ -165,9 +167,9 @@ def status_badge(label: str) -> None:
 def sqlite_connect_readonly(sqlite_path: str) -> sqlite3.Connection:
     path = Path(sqlite_path)
     uri = f"file:{path}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=5)
+    conn = sqlite3.connect(uri, uri=True, timeout=max(1.0, SQLITE_BUSY_TIMEOUT_MS / 1000.0))
     conn.row_factory = sqlite3.Row
-    return conn
+    return configure_sqlite_connection(conn, read_only=True)
 
 
 def sqlite_scalar(sqlite_path: str, sql: str, params: list[object] | None = None, default: object = 0) -> object:

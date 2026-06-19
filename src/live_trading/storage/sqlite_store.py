@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
@@ -13,6 +14,10 @@ from src.live_trading.unified_logger import append_unified_log, unified_logger_i
 
 
 DEFAULT_SQLITE_PATH = "data/runtime/trading_runtime.sqlite"
+SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("TRADING_BOT_SQLITE_BUSY_TIMEOUT_MS", "30000"))
+SQLITE_LOCK_RETRY_ATTEMPTS = int(os.environ.get("TRADING_BOT_SQLITE_LOCK_RETRY_ATTEMPTS", "6"))
+SQLITE_LOCK_RETRY_BASE_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_LOCK_RETRY_BASE_SECONDS", "0.05"))
+SQLITE_LOCK_RETRY_MAX_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_LOCK_RETRY_MAX_SECONDS", "1.0"))
 HIGH_FREQUENCY_RUNTIME_EVENT_THROTTLE_SECONDS = {
     "BUY_BLOCKED": 300,
     "RISK_GUARD_BLOCK_ENTRY": 300,
@@ -47,6 +52,32 @@ def open_sqlite_store(path: str | Path | None = None) -> SQLiteRuntimeStore | No
         if not unified_logger_installed():
             append_unified_log(line)
         return None
+
+
+def configure_sqlite_connection(conn: sqlite3.Connection, *, read_only: bool = False) -> sqlite3.Connection:
+    """Apply runtime pragmas to every SQLite connection.
+
+    WAL only helps if every process is patient enough to wait for short writer
+    windows. The busy timeout is intentionally applied to read-only dashboard
+    connections too, so they wait instead of failing during live trader commits.
+    """
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    if not read_only:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def connect_sqlite(path: str | Path, *, read_only: bool = False) -> sqlite3.Connection:
+    timeout_seconds = max(1.0, SQLITE_BUSY_TIMEOUT_MS / 1000.0)
+    if read_only:
+        uri = f"file:{Path(path)}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=timeout_seconds)
+    else:
+        conn = sqlite3.connect(str(path), timeout=timeout_seconds)
+    conn.row_factory = sqlite3.Row
+    return configure_sqlite_connection(conn, read_only=read_only)
 
 
 def migrate_runtime_schema(path: str | Path | None = None) -> None:
@@ -176,17 +207,29 @@ def clean_row(row: dict[str, Any], columns: Iterable[str]) -> dict[str, Any]:
     return out
 
 
+def is_sqlite_busy_error(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+        return True
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message or "database busy" in message
+
+
+def log_sqlite_line(line: str) -> None:
+    print(line, flush=True)
+    if not unified_logger_installed():
+        append_unified_log(line)
+
+
 class SQLiteRuntimeStore:
     def __init__(self, path: str | Path | None = None, *, init: bool = True) -> None:
         self.path = Path(resolve_sqlite_path(path))
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path))
-        self.conn.row_factory = sqlite3.Row
+        self.conn = connect_sqlite(self.path)
         self._transaction_depth = 0
         self._broker_net_positions: dict[str, float] | None = None
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
         if init:
             self.init_schema()
 
@@ -246,7 +289,7 @@ class SQLiteRuntimeStore:
         self._transaction_depth += 1
         try:
             yield
-        except Exception:
+        except BaseException:
             self._transaction_depth -= 1
             if outermost:
                 self.conn.rollback()
@@ -2081,17 +2124,22 @@ class SQLiteRuntimeStore:
 def safe_sqlite_call(store: SQLiteRuntimeStore | None, method: str, *args: Any, **kwargs: Any) -> Any:
     if store is None:
         return None
-    try:
-        return getattr(store, method)(*args, **kwargs)
-    except (KeyboardInterrupt, SystemExit):
-        line = f"{utc_now_iso()} SQLITE_CALL_INTERRUPTED method={method}"
-        print(line, flush=True)
-        if not unified_logger_installed():
-            append_unified_log(line)
-        raise
-    except Exception as exc:
-        line = f"{utc_now_iso()} SQLITE_WRITE_FAILED method={method} error={exc!r}"
-        print(line, flush=True)
-        if not unified_logger_installed():
-            append_unified_log(line)
-        return None
+    attempts = max(1, SQLITE_LOCK_RETRY_ATTEMPTS)
+    for attempt in range(1, attempts + 1):
+        try:
+            return getattr(store, method)(*args, **kwargs)
+        except (KeyboardInterrupt, SystemExit):
+            log_sqlite_line(f"{utc_now_iso()} SQLITE_CALL_INTERRUPTED method={method}")
+            raise
+        except Exception as exc:
+            if is_sqlite_busy_error(exc) and attempt < attempts:
+                delay = min(SQLITE_LOCK_RETRY_MAX_SECONDS, SQLITE_LOCK_RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+                log_sqlite_line(
+                    f"{utc_now_iso()} SQLITE_BUSY_RETRY method={method} attempt={attempt}/{attempts} "
+                    f"delay_seconds={delay:.3f} error={exc!r}"
+                )
+                time.sleep(delay)
+                continue
+            log_sqlite_line(f"{utc_now_iso()} SQLITE_WRITE_FAILED method={method} error={exc!r}")
+            return None
+    return None

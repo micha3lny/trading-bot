@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from src.live_trading.storage.sqlite_store import connect_sqlite
+
 
 class RankingStore:
     """Tiny SQLite store for daily ranking snapshots.
@@ -20,9 +22,7 @@ class RankingStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return connect_sqlite(self.path)
 
     def init_schema(self) -> None:
         with self.connect() as conn:
@@ -85,4 +85,3 @@ class RankingStore:
             params.append(int(limit))
         with self.connect() as conn:
             return [dict(row) for row in conn.execute(sql, params).fetchall()]
-

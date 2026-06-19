@@ -263,11 +263,10 @@ def load_sqlite_executions(sqlite_path: str | None, session_date: str) -> list[d
     if not path.exists():
         return []
     try:
-        from src.live_trading.storage.sqlite_store import migrate_runtime_schema
+        from src.live_trading.storage.sqlite_store import connect_sqlite, migrate_runtime_schema
 
         migrate_runtime_schema(path)
-        conn = sqlite3.connect(str(path))
-        conn.row_factory = sqlite3.Row
+        conn = connect_sqlite(path, read_only=True)
         rows = conn.execute(
             """
             SELECT execution_id, symbol, side AS action, quantity, price AS fill_price,
@@ -298,11 +297,10 @@ def load_sqlite_positions(sqlite_path: str | None, session_date: str) -> list[di
     if not path.exists():
         return []
     try:
-        from src.live_trading.storage.sqlite_store import migrate_runtime_schema
+        from src.live_trading.storage.sqlite_store import connect_sqlite, migrate_runtime_schema
 
         migrate_runtime_schema(path)
-        conn = sqlite3.connect(str(path))
-        conn.row_factory = sqlite3.Row
+        conn = connect_sqlite(path, read_only=True)
         rows = conn.execute(
             """
             SELECT *
