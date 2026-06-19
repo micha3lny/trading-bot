@@ -497,12 +497,22 @@ def process_history_collector_commands(*, runtime_state: dict[str, Any], max_com
                 f"mode={cmd.get('collector_mode', 'unknown')} slot={cmd.get('schedule_slot_utc')} returncode={rc}",
                 flush=True,
             )
+        if str(cmd.get("collector_mode") or "") in {"daily", "startup_repair"}:
+            catchup_event = "HISTORY_CATCHUP_DONE" if rc == 0 else "HISTORY_CATCHUP_FAILED"
+            print(
+                f"{_now_utc()} {catchup_event} command_id={cmd.get('id')} "
+                f"ranking_date={cmd.get('end_date')} mode={cmd.get('collector_mode')} "
+                f"returncode={rc} duration_seconds={duration if duration is not None else ''}",
+                flush=True,
+            )
         runtime_state["history_collector_process"] = None
         runtime_state["history_collector_running_command"] = None
         runtime_state["history_collector_started_monotonic"] = None
         runtime_state["history_collector_last_returncode"] = rc
+        runtime_state["history_collector_last_run_at"] = _now_utc()
         if rc == 0:
             runtime_state["history_collector_last_run_key"] = f"{cmd.get('end_date')}_{cmd.get('session_type')}"
+            runtime_state["history_collector_last_successful_run_at"] = runtime_state["history_collector_last_run_at"]
         elif str(cmd.get("collector_mode") or "") in {"daily", "startup_repair"}:
             queue = runtime_state.setdefault("history_collector_commands", [])
             if isinstance(queue, list):

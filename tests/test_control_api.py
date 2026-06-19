@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from src.live_trading.v67_live_top100_expansion_paper_trader import (
+    apply_top100_freshness_gate,
     enqueue_overnight_collector_if_due,
     enqueue_startup_history_repair_if_needed,
     history_parquet_path,
@@ -531,6 +532,29 @@ class ControlApiHelperTests(unittest.TestCase):
             self.assertIsNone(runtime_state.get("daily_top100_process"))
             self.assertEqual(runtime_state.get("daily_top100_build_run_keys"), set())
             self.assertIn("daily_top100_build_wait_logged_keys", runtime_state)
+
+    def test_stale_top100_blocks_entries_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            latest = root / "daily_top100_latest.csv"
+            latest.write_text("rank,symbol,score\n1,OLD,1\n", encoding="utf-8")
+            runtime_state = {"entries_blocked_reason": ""}
+            args = SimpleNamespace(
+                daily_top100_latest_output=str(latest),
+                daily_top100_output_dir=str(root),
+                daily_top100_top_n=1,
+                allow_stale_top100=False,
+            )
+
+            state = apply_top100_freshness_gate(
+                runtime_state,
+                args,
+                datetime(2026, 5, 27, tzinfo=timezone.utc).date(),
+            )
+
+            self.assertFalse(state["ready"])
+            self.assertTrue(runtime_state["top100_entries_blocked"])
+            self.assertEqual(runtime_state["entries_blocked_reason"], "stale_top100")
 
 
 if __name__ == "__main__":

@@ -3188,10 +3188,10 @@ def assess_history_completion(
 ) -> dict[str, Any]:
     symbols = load_history_universe_symbols(universe_csv)
     status = load_history_status(history_dir)
-    done_statuses = {"complete", "partial", "no_data"}
-    failed_statuses = {"failed"}
     parquet_files = 0
-    status_done = 0
+    complete_symbols = 0
+    partial_symbols = 0
+    no_data_symbols = 0
     failed = 0
     missing = 0
     for symbol in symbols:
@@ -3201,25 +3201,38 @@ def assess_history_completion(
             parquet_files += 1
         row = status.get(history_task_key(symbol, session_date, session_type))
         row_status = str(row.get("status") or "").lower() if isinstance(row, dict) else ""
-        if row_status in done_statuses:
-            status_done += 1
-        elif row_status in failed_statuses:
+        if has_parquet or row_status == "complete":
+            complete_symbols += 1
+        elif row_status == "partial":
+            partial_symbols += 1
+        elif row_status in {"no_data", "no_data_permanent"}:
+            no_data_symbols += 1
+        elif row_status in {"failed", "failed_permanent"}:
             failed += 1
-        if not has_parquet and row_status not in done_statuses:
+        if not has_parquet and row_status not in {"complete", "partial", "no_data", "no_data_permanent", "failed", "failed_permanent"}:
             missing += 1
     expected = len(symbols)
-    completed = expected - missing if expected else 0
-    completion_pct_value = round((completed / expected) * 100.0, 2) if expected else 100.0
+    terminal = complete_symbols + no_data_symbols
+    completion_pct_value = round((terminal / expected) * 100.0, 2) if expected else 100.0
+    ready = expected > 0 and missing == 0 and partial_symbols == 0 and failed == 0
+    readiness_status = "OK" if ready else ("PARTIAL" if terminal or partial_symbols else "NOT_READY")
     return {
         "date": session_date.isoformat(),
         "session_type": session_type.upper(),
         "expected_symbols": expected,
         "parquet_files": parquet_files,
-        "status_done": status_done,
+        "status_done": terminal,
+        "complete_symbols": complete_symbols,
+        "partial_symbols": partial_symbols,
+        "no_data_symbols": no_data_symbols,
         "failed": failed,
         "missing": missing,
-        "completed": completed,
+        "failed_symbols": failed,
+        "missing_symbols": missing,
+        "completed": terminal,
         "completion_pct": completion_pct_value,
+        "readiness_status": readiness_status,
+        "ready": ready,
     }
 
 
@@ -3229,6 +3242,7 @@ def latest_history_is_complete(
     session_date: date,
     session_type: str = "RTH",
     min_completion_pct: float = 100.0,
+    runtime_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     assessment = assess_history_completion(
         history_dir=getattr(args, "daily_top100_history_dir", DEFAULT_HISTORY_DIR),
@@ -3239,8 +3253,36 @@ def latest_history_is_complete(
     expected = int(assessment.get("expected_symbols") or 0)
     completion_pct_value = float(assessment.get("completion_pct") or 0.0)
     failed = int(assessment.get("failed") or 0)
-    complete = expected > 0 and completion_pct_value >= min_completion_pct and failed == 0
-    return {**assessment, "complete": complete, "min_completion_pct": min_completion_pct}
+    complete = (
+        bool(assessment.get("ready"))
+        and expected > 0
+        and completion_pct_value >= min_completion_pct
+        and failed == 0
+    )
+    latest_output = Path(getattr(args, "daily_top100_latest_output", "data/universe/daily_top100_latest.csv"))
+    latest_age = None
+    try:
+        if latest_output.exists():
+            latest_age = round(time.time() - latest_output.stat().st_mtime, 1)
+    except Exception:
+        latest_age = None
+    result = {**assessment, "complete": complete, "min_completion_pct": min_completion_pct, "latest_top100_file_age": latest_age}
+    last_collector_run = ""
+    last_successful_collector_run = ""
+    if runtime_state is not None:
+        last_collector_run = str(runtime_state.get("history_collector_last_run_at") or "")
+        last_successful_collector_run = str(runtime_state.get("history_collector_last_successful_run_at") or "")
+    print(
+        f"{now_utc()} HISTORY_READINESS_CHECK ranking_date={session_date.isoformat()} "
+        f"expected_symbols={result.get('expected_symbols')} complete_symbols={result.get('complete_symbols')} "
+        f"partial_symbols={result.get('partial_symbols')} missing_symbols={result.get('missing_symbols')} "
+        f"no_data_symbols={result.get('no_data_symbols')} failed_symbols={result.get('failed_symbols')} "
+        f"completion_pct={result.get('completion_pct')} readiness_status={result.get('readiness_status')} "
+        f"last_collector_run={last_collector_run} last_successful_collector_run={last_successful_collector_run} "
+        f"latest_top100_file_age={latest_age}",
+        flush=True,
+    )
+    return result
 
 
 def _history_command_priority(command: dict[str, Any]) -> int:
@@ -3250,6 +3292,95 @@ def _history_command_priority(command: dict[str, Any]) -> int:
     if mode == "backlog":
         return 10
     return 5
+
+
+def top100_freshness_state(args: argparse.Namespace, ranking_date: date) -> dict[str, Any]:
+    latest = Path(getattr(args, "daily_top100_latest_output", "data/universe/daily_top100_latest.csv"))
+    output_dir = Path(getattr(args, "daily_top100_output_dir", "data/universe"))
+    dated = output_dir / f"daily_top100_{ranking_date.isoformat()}.csv"
+    latest_exists = latest.exists()
+    dated_exists = dated.exists()
+    rows = 0
+    latest_matches_dated = False
+    if dated_exists:
+        try:
+            rows = len(pd.read_csv(dated))
+        except Exception:
+            rows = 0
+    if latest_exists and dated_exists:
+        try:
+            latest_matches_dated = latest.read_bytes() == dated.read_bytes()
+        except Exception:
+            latest_matches_dated = False
+    latest_age = None
+    try:
+        if latest_exists:
+            latest_age = round(time.time() - latest.stat().st_mtime, 1)
+    except Exception:
+        latest_age = None
+    required_rows = int(getattr(args, "daily_top100_top_n", 100) or 100)
+    ready = latest_exists and dated_exists and rows >= required_rows and latest_matches_dated
+    reason = "ok"
+    if not latest_exists:
+        reason = "latest_missing"
+    elif not dated_exists:
+        reason = "dated_missing"
+    elif rows < required_rows:
+        reason = "too_few_rows"
+    elif not latest_matches_dated:
+        reason = "latest_not_matching_ranking_date"
+    return {
+        "ready": ready,
+        "reason": reason,
+        "ranking_date": ranking_date.isoformat(),
+        "latest_output": str(latest),
+        "dated_output": str(dated),
+        "latest_exists": latest_exists,
+        "dated_exists": dated_exists,
+        "rows": rows,
+        "required_rows": required_rows,
+        "latest_matches_dated": latest_matches_dated,
+        "latest_top100_file_age": latest_age,
+    }
+
+
+def apply_top100_freshness_gate(runtime_state: dict[str, Any], args: argparse.Namespace, ranking_date: date) -> dict[str, Any]:
+    state = top100_freshness_state(args, ranking_date)
+    runtime_state["top100_freshness"] = state
+    allow_stale = bool(getattr(args, "allow_stale_top100", False))
+    if state["ready"]:
+        runtime_state["top100_entries_blocked"] = False
+        if runtime_state.get("entries_blocked_reason") == "stale_top100":
+            runtime_state["entries_blocked_reason"] = ""
+        return state
+    if allow_stale:
+        key = f"{state['ranking_date']}_{state['reason']}_allow"
+        logged = _runtime_set(runtime_state, "top100_stale_allow_logged")
+        if key not in logged:
+            logged.add(key)
+            print(
+                f"{now_utc()} DAILY_TOP100_USING_STALE_ALLOWED ranking_date={state['ranking_date']} "
+                f"reason={state['reason']} latest_output={state['latest_output']} dated_output={state['dated_output']} "
+                f"latest_top100_file_age={state['latest_top100_file_age']}",
+                flush=True,
+            )
+        runtime_state["top100_entries_blocked"] = False
+        return state
+    runtime_state["top100_entries_blocked"] = True
+    runtime_state["entries_blocked_reason"] = "stale_top100"
+    key = f"{state['ranking_date']}_{state['reason']}_blocked"
+    logged = _runtime_set(runtime_state, "top100_stale_block_logged")
+    if key not in logged:
+        logged.add(key)
+        print(
+            f"{now_utc()} DAILY_TOP100_USING_STALE_BLOCKED ranking_date={state['ranking_date']} "
+            f"reason={state['reason']} latest_output={state['latest_output']} dated_output={state['dated_output']} "
+            f"rows={state['rows']} required_rows={state['required_rows']} "
+            f"latest_matches_dated={int(bool(state['latest_matches_dated']))} "
+            f"latest_top100_file_age={state['latest_top100_file_age']}",
+            flush=True,
+        )
+    return state
 
 
 def enqueue_startup_history_repair_if_needed(
@@ -3360,7 +3491,7 @@ def enqueue_overnight_collector_if_due(runtime_state: dict[str, Any], args: argp
         latest_day = latest_completed_trading_day(now, getattr(args, "market_close_utc", "20:00"))
         end_date = latest_day.isoformat()
         min_pct = float(getattr(args, "startup_history_repair_min_completion_pct", 100.0))
-        latest_assessment = latest_history_is_complete(args=args, session_date=latest_day, min_completion_pct=min_pct)
+        latest_assessment = latest_history_is_complete(args=args, session_date=latest_day, min_completion_pct=min_pct, runtime_state=runtime_state)
         latest_complete = bool(latest_assessment.get("complete"))
         modes: list[str] = []
         if not latest_complete:
@@ -3374,6 +3505,31 @@ def enqueue_overnight_collector_if_due(runtime_state: dict[str, Any], args: argp
         key = f"{end_date}_{slot}_{'+'.join(modes)}"
         if key in run_keys:
             continue
+        if (
+            runtime_state.get("history_collector_process") is not None
+            and not latest_complete
+            and str((runtime_state.get("history_collector_running_command") or {}).get("collector_mode") or "") == "backlog"
+        ):
+            running = runtime_state.get("history_collector_running_command") or {}
+            proc = runtime_state.get("history_collector_process")
+            print(
+                f"{now_utc()} OVERNIGHT_COLLECTOR_BACKLOG_INTERRUPTED_FOR_LATEST_DAY "
+                f"latest_date={end_date} running_command_id={running.get('id')} "
+                f"completion_pct={latest_assessment.get('completion_pct')} missing={latest_assessment.get('missing')}",
+                flush=True,
+            )
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            runtime_state["history_collector_process"] = None
+            runtime_state["history_collector_running_command"] = None
+            runtime_state["history_collector_started_monotonic"] = None
+            runtime_state["history_collector_last_returncode"] = -9
         if runtime_state.get("history_collector_process") is not None or queue:
             if key not in skip_keys:
                 print(
@@ -3409,7 +3565,7 @@ def enqueue_overnight_collector_if_due(runtime_state: dict[str, Any], args: argp
                 "allow_live_session": False,
                 "plan_only": False,
                 "include_weekends": False,
-                "retry_failed": bool(getattr(args, "overnight_collector_retry_failed", False)),
+                "retry_failed": True if mode == "daily" else bool(getattr(args, "overnight_collector_retry_failed", False)),
             }
             queue.append(command)
             queued_commands.append(command)
@@ -3424,6 +3580,17 @@ def enqueue_overnight_collector_if_due(runtime_state: dict[str, Any], args: argp
                 f"latest_day_missing={latest_assessment.get('missing')} latest_day_failed={latest_assessment.get('failed')}",
                 flush=True,
             )
+            if command["collector_mode"] == "daily":
+                print(
+                    f"{now_utc()} HISTORY_CATCHUP_START command_id={command['id']} ranking_date={end_date} "
+                    f"expected_symbols={latest_assessment.get('expected_symbols')} "
+                    f"complete_symbols={latest_assessment.get('complete_symbols')} "
+                    f"partial_symbols={latest_assessment.get('partial_symbols')} "
+                    f"missing_symbols={latest_assessment.get('missing_symbols')} "
+                    f"no_data_symbols={latest_assessment.get('no_data_symbols')} "
+                    f"failed_symbols={latest_assessment.get('failed_symbols')}",
+                    flush=True,
+                )
 
 
 def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Namespace, now: datetime | None = None) -> None:
@@ -3444,6 +3611,10 @@ def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Nam
             runtime_state["top100_reload_requested"] = True
             runtime_state["top100_reload_path"] = command.get("latest_output")
             runtime_state["top100_reload_ranking_date"] = command.get("ranking_date")
+            try:
+                apply_top100_freshness_gate(runtime_state, args, date.fromisoformat(str(command.get("ranking_date"))))
+            except Exception as exc:
+                print(f"{now_utc()} DAILY_TOP100_FRESHNESS_CHECK_FAILED ranking_date={command.get('ranking_date')} error={exc!r}", flush=True)
         else:
             print(
                 f"{now_utc()} DAILY_TOP100_BUILD_FAILED ranking_date={command.get('ranking_date')} "
@@ -3466,7 +3637,7 @@ def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Nam
     if runtime_state.get("daily_top100_process") is not None:
         return
     min_pct = float(getattr(args, "startup_history_repair_min_completion_pct", 100.0))
-    assessment = latest_history_is_complete(args=args, session_date=date.fromisoformat(ranking_date), min_completion_pct=min_pct)
+    assessment = latest_history_is_complete(args=args, session_date=date.fromisoformat(ranking_date), min_completion_pct=min_pct, runtime_state=runtime_state)
     if not bool(assessment.get("complete")):
         last_key = f"{ranking_date}_{slot}_{assessment.get('completion_pct')}_{assessment.get('missing')}_{assessment.get('failed')}"
         wait_keys = _runtime_set(runtime_state, "daily_top100_build_wait_logged_keys")
@@ -3477,6 +3648,14 @@ def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Nam
                 f"ranking_date={ranking_date} completion_pct={assessment.get('completion_pct')} "
                 f"expected_symbols={assessment.get('expected_symbols')} parquet_files={assessment.get('parquet_files')} "
                 f"missing={assessment.get('missing')} failed={assessment.get('failed')} min_completion_pct={min_pct}",
+                flush=True,
+            )
+            print(
+                f"{now_utc()} DAILY_TOP100_BLOCKED_HISTORY_NOT_READY ranking_date={ranking_date} "
+                f"expected_symbols={assessment.get('expected_symbols')} complete_symbols={assessment.get('complete_symbols')} "
+                f"partial_symbols={assessment.get('partial_symbols')} missing_symbols={assessment.get('missing_symbols')} "
+                f"no_data_symbols={assessment.get('no_data_symbols')} failed_symbols={assessment.get('failed_symbols')} "
+                f"readiness_status={assessment.get('readiness_status')} latest_top100_file_age={assessment.get('latest_top100_file_age')}",
                 flush=True,
             )
         return
@@ -4955,7 +5134,7 @@ def main() -> int:
     parser.add_argument("--reconnect-wait-seconds", type=float, default=15.0)
     parser.add_argument("--reconnect-max-attempts", type=int, default=999999)
     parser.add_argument("--enable-overnight-automation", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--overnight-collector-times-utc", default="20:15,23:00,03:00,07:00")
+    parser.add_argument("--overnight-collector-times-utc", default="20:15,23:00,03:00,07:00,10:30")
     parser.add_argument("--overnight-backlog-collector-times-utc", default="07:00")
     parser.add_argument("--overnight-prioritize-previous-day", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overnight-collector-start-date", default="2026-01-01")
@@ -4970,13 +5149,14 @@ def main() -> int:
     parser.add_argument("--startup-history-repair-min-completion-pct", type=float, default=100.0)
     parser.add_argument("--startup-history-repair-max-tasks", type=int, default=3000)
     parser.add_argument("--startup-history-repair-retry-failed", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--daily-top100-build-utc", default="12:45")
+    parser.add_argument("--daily-top100-build-utc", default="11:30")
     parser.add_argument("--daily-top100-universe", default=DEFAULT_UNIVERSE)
     parser.add_argument("--daily-top100-history-dir", default=DEFAULT_HISTORY_DIR)
     parser.add_argument("--daily-top100-output-dir", default="data/universe")
     parser.add_argument("--daily-top100-latest-output", default="data/universe/daily_top100_latest.csv")
     parser.add_argument("--daily-top100-sqlite-path", default="data/runtime/rankings.sqlite")
     parser.add_argument("--daily-top100-top-n", type=int, default=100)
+    parser.add_argument("--allow-stale-top100", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--symbol-denylist", default=DEFAULT_SYMBOL_DENYLIST)
     parser.add_argument("--runtime-ineligible-path", default=DEFAULT_RUNTIME_INELIGIBLE)
     parser.add_argument("--log-dir", default=None)
@@ -5119,6 +5299,8 @@ def main() -> int:
         "top100_reload_last_error": "",
         "top100_reload_symbols": list(symbols),
         "top100_reload_diagnostics": {},
+        "top100_entries_blocked": False,
+        "top100_freshness": {},
         "market_closed_logged_dates": set(),
         "risk_guard_last_status": {
             "enabled": bool(args.risk_guard_enabled),
@@ -5139,6 +5321,8 @@ def main() -> int:
         "ibkr_disconnect_reason": "",
         "ibkr_disconnect_at": "",
     }
+    startup_ranking_date = latest_completed_trading_day(datetime.now(timezone.utc), getattr(args, "market_close_utc", "20:00"))
+    apply_top100_freshness_gate(runtime_state, args, startup_ranking_date)
     enqueue_startup_history_repair_if_needed(runtime_state, args)
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
@@ -5416,13 +5600,14 @@ def main() -> int:
             manual_entries_blocked = bool(runtime_state.get("entries_blocked", False))
             reconnect_entries_blocked = bool(runtime_state.get("reconnect_active", False))
             disk_entries_blocked = bool(runtime_state.get("disk_full_entries_blocked", False))
+            top100_entries_blocked = bool(runtime_state.get("top100_entries_blocked", False))
             if pending_eod_entries_blocked:
                 runtime_state["entries_blocked_reason"] = "pending_eod_flatten"
             elif disk_entries_blocked:
                 runtime_state["entries_blocked_reason"] = "disk_full_risk"
             elif runtime_state.get("entries_blocked_reason") == "disk_full_risk":
                 runtime_state["entries_blocked_reason"] = ""
-            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked or disk_entries_blocked or pending_eod_entries_blocked
+            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked or disk_entries_blocked or pending_eod_entries_blocked or top100_entries_blocked
             eod_active = args.enable_eod_flatten and (is_after_utc(args.eod_flatten_utc) or bool(runtime_state.get("manual_eod_flatten_requested", False)))
             if eod_active:
                 enforce_eod_flatten_if_due(
@@ -5443,6 +5628,7 @@ def main() -> int:
                     or reconnect_entries_blocked
                     or disk_entries_blocked
                     or pending_eod_entries_blocked
+                    or top100_entries_blocked
                 )
 
             mark_entry_block_state(runtime_state, entries_blocked, loop_now)
@@ -5950,8 +6136,9 @@ def main() -> int:
             manual_entries_blocked = bool(runtime_state.get("entries_blocked", False))
             reconnect_entries_blocked = bool(runtime_state.get("reconnect_active", False))
             disk_entries_blocked = bool(runtime_state.get("disk_full_entries_blocked", False))
+            top100_entries_blocked = bool(runtime_state.get("top100_entries_blocked", False))
             pending_eod_entries_blocked = bool(runtime_state.get("pending_eod_flatten"))
-            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked or disk_entries_blocked or pending_eod_entries_blocked
+            entries_blocked = time_entries_blocked or manual_entries_blocked or restart_entries_blocked or reconnect_entries_blocked or disk_entries_blocked or pending_eod_entries_blocked or top100_entries_blocked
             eod_active = args.enable_eod_flatten and (is_after_utc(args.eod_flatten_utc) or bool(runtime_state.get("manual_eod_flatten_requested", False)))
             risk_status = runtime_state.get("risk_guard_last_status") if isinstance(runtime_state.get("risk_guard_last_status"), dict) else {}
             risk_guard_block = bool((risk_status or {}).get("blocked"))
@@ -5975,6 +6162,7 @@ def main() -> int:
                 f"adopted={adopted_count} exits_sent={exit_count} managed_open={active_managed} entries_blocked={int(entries_blocked)} "
                 f"entries_blocked_reason={runtime_state.get('entries_blocked_reason') or ''} "
                 f"manual_block={int(manual_entries_blocked)} restart_block={int(restart_entries_blocked)} reconnect_block={int(reconnect_entries_blocked)} disk_block={int(disk_entries_blocked)} "
+                f"top100_block={int(top100_entries_blocked)} "
                 f"pending_eod_flatten={int(pending_eod_entries_blocked)} eod_recovery_active={int(bool(runtime_state.get('eod_recovery_active')))} "
                 f"last_eod_retry_age_seconds={last_eod_retry_age_text} eod_active={int(eod_active)} "
                 f"risk_guard_block={int(risk_guard_block)} risk_guard_reason={risk_guard_reason} "
