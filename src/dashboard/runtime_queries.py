@@ -87,6 +87,15 @@ def raw_trade_execution_id(raw: dict[str, Any], side: str) -> str:
     return ""
 
 
+def normalized_identifier(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "nan", "null", "0.0"}:
+        return ""
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text
+
+
 def raw_bool(raw: dict[str, Any], *keys: str) -> bool:
     for key in keys:
         value = raw.get(key)
@@ -708,6 +717,20 @@ EXIT_REASON_EVENTS = {
 def normalize_exit_reason(value: Any, event_type: str = "") -> str:
     text = str(value or "").strip()
     if text and text.lower() not in {"none", "nan", "null", "unknown"}:
+        normalized = text.lower().replace(" ", "_").replace("-", "_")
+        upper_text = text.upper()
+        if "TRAIL" in upper_text:
+            return "trailing_stop"
+        if "STOP_LOSS" in upper_text or normalized == "stop_loss":
+            return "stop_loss"
+        if "EOD" in upper_text:
+            return "eod_flatten"
+        if "MANUAL" in upper_text:
+            return "manual_flatten"
+        if "ORPHAN" in upper_text:
+            return "orphan_flatten"
+        if "RECONCILIATION" in upper_text:
+            return "reconciliation"
         return text
     event = str(event_type or "").upper()
     if event.startswith("EOD_FLATTEN"):
@@ -760,6 +783,9 @@ def put_exit_reason_event(
     event_type: str = "",
     source: str = "",
     trade_id: str = "",
+    order_id: Any = None,
+    perm_id: Any = None,
+    execution_id: Any = None,
 ) -> None:
     if not reason:
         return
@@ -770,10 +796,31 @@ def put_exit_reason_event(
         "event_type": str(event_type or ""),
         "source": source,
         "trade_id": str(trade_id or ""),
+        "order_id": normalized_identifier(order_id),
+        "perm_id": normalized_identifier(perm_id),
+        "execution_id": normalized_identifier(execution_id),
     }
-    identity = (item["reason"], item["event_time"], item["event_type"], item["source"], item["trade_id"])
+    identity = (
+        item["reason"],
+        item["event_time"],
+        item["event_type"],
+        item["source"],
+        item["trade_id"],
+        item["order_id"],
+        item["perm_id"],
+        item["execution_id"],
+    )
     if identity not in {
-        (str(existing.get("reason") or ""), existing.get("event_time"), str(existing.get("event_type") or ""), str(existing.get("source") or ""), str(existing.get("trade_id") or ""))
+        (
+            str(existing.get("reason") or ""),
+            existing.get("event_time"),
+            str(existing.get("event_type") or ""),
+            str(existing.get("source") or ""),
+            str(existing.get("trade_id") or ""),
+            normalized_identifier(existing.get("order_id")),
+            normalized_identifier(existing.get("perm_id")),
+            normalized_identifier(existing.get("execution_id")),
+        )
         for existing in events
     }:
         events.append(item)
@@ -790,6 +837,8 @@ def load_runtime_exit_reason_map(conn: sqlite3.Connection, window: DateWindow, s
             r.event_time,
             r.symbol,
             r.trade_id,
+            r.order_id,
+            r.execution_id,
             r.event_type,
             r.reason,
             r.raw_json
@@ -818,6 +867,9 @@ def load_runtime_exit_reason_map(conn: sqlite3.Connection, window: DateWindow, s
             continue
         strategy_name = str(row.get("strategy") or "unknown")
         trade_id = str(row.get("trade_id") or "")
+        order_id = row.get("order_id") or raw.get("order_id") or raw.get("ib_order_id")
+        perm_id = raw.get("perm_id") or raw.get("permId")
+        execution_id = row.get("execution_id") or raw.get("execution_id") or raw.get("execId")
         for key_strategy in (strategy_name, ""):
             put_exit_reason_event(
                 out,
@@ -827,6 +879,9 @@ def load_runtime_exit_reason_map(conn: sqlite3.Connection, window: DateWindow, s
                 event_type=event_type,
                 source="runtime_events",
                 trade_id=trade_id,
+                order_id=order_id,
+                perm_id=perm_id,
+                execution_id=execution_id,
             )
         if trade_id:
             put_exit_reason_event(
@@ -837,6 +892,9 @@ def load_runtime_exit_reason_map(conn: sqlite3.Connection, window: DateWindow, s
                 event_type=event_type,
                 source="runtime_events",
                 trade_id=trade_id,
+                order_id=order_id,
+                perm_id=perm_id,
+                execution_id=execution_id,
             )
     return out
 
@@ -866,6 +924,9 @@ def load_lifecycle_exit_reason_map(window: DateWindow, root: Path | None = None)
                     continue
                 reason = exit_reason_from_payload(row, event_type)
                 strategy_name = str(row.get("strategy") or "unknown")
+                order_id = row.get("order_id") or raw.get("order_id") or raw.get("ib_order_id")
+                perm_id = row.get("perm_id") or raw.get("perm_id") or raw.get("permId")
+                execution_id = row.get("execution_id") or raw.get("execution_id") or raw.get("execId")
                 for key_strategy in (strategy_name, ""):
                     put_exit_reason_event(
                         out,
@@ -875,6 +936,9 @@ def load_lifecycle_exit_reason_map(window: DateWindow, root: Path | None = None)
                         event_type=event_type,
                         source="trade_lifecycle.csv",
                         trade_id=str(row.get("trade_id") or ""),
+                        order_id=order_id,
+                        perm_id=perm_id,
+                        execution_id=execution_id,
                     )
         jsonl_path = session_dir / "order_lifecycle.jsonl"
         if jsonl_path.exists():
@@ -898,6 +962,14 @@ def load_lifecycle_exit_reason_map(window: DateWindow, root: Path | None = None)
                     continue
                 reason = exit_reason_from_payload(row, event_for_reason)
                 strategy_name = str(row.get("strategy_name") or row.get("strategy") or "unknown")
+                order_id = (
+                    row.get("ib_order_id")
+                    or row.get("order_id")
+                    or raw.get("ib_order_id")
+                    or raw.get("order_id")
+                )
+                perm_id = row.get("perm_id") or raw.get("perm_id") or raw.get("permId")
+                execution_id = row.get("execution_id") or raw.get("execution_id") or raw.get("execId")
                 for key_strategy in (strategy_name, ""):
                     put_exit_reason_event(
                         out,
@@ -907,12 +979,41 @@ def load_lifecycle_exit_reason_map(window: DateWindow, root: Path | None = None)
                         event_type=event_for_reason,
                         source="order_lifecycle.jsonl",
                         trade_id=str(row.get("trade_id") or ""),
+                        order_id=order_id,
+                        perm_id=perm_id,
+                        execution_id=execution_id,
                     )
     return out
 
 
-def exit_reason_event_matches_trade(event: dict[str, Any], exit_time: Any, *, exact_trade: bool = False) -> bool:
+def event_matches_exit_identifiers(
+    event: dict[str, Any],
+    *,
+    order_id: Any = None,
+    perm_id: Any = None,
+    execution_id: Any = None,
+) -> bool:
+    if normalized_identifier(order_id) and normalized_identifier(order_id) == normalized_identifier(event.get("order_id")):
+        return True
+    if normalized_identifier(perm_id) and normalized_identifier(perm_id) == normalized_identifier(event.get("perm_id")):
+        return True
+    if normalized_identifier(execution_id) and normalized_identifier(execution_id) == normalized_identifier(event.get("execution_id")):
+        return True
+    return False
+
+
+def exit_reason_event_matches_trade(
+    event: dict[str, Any],
+    exit_time: Any,
+    *,
+    exact_trade: bool = False,
+    order_id: Any = None,
+    perm_id: Any = None,
+    execution_id: Any = None,
+) -> bool:
     if exact_trade:
+        return True
+    if event_matches_exit_identifiers(event, order_id=order_id, perm_id=perm_id, execution_id=execution_id):
         return True
     event_type = str(event.get("event_type") or "").upper()
     event_dt = parse_dt(event.get("event_time"))
@@ -931,13 +1032,30 @@ def choose_exit_reason_event(
     exit_time: Any,
     *,
     exact_trade_key: tuple[str, str, str] | None = None,
+    order_id: Any = None,
+    perm_id: Any = None,
+    execution_id: Any = None,
 ) -> dict[str, Any] | None:
     for key in keys:
         events = reason_map.get(key, [])
         if not events:
             continue
         exact = exact_trade_key is not None and key == exact_trade_key
-        matching = [event for event in events if exit_reason_event_matches_trade(event, exit_time, exact_trade=exact)]
+        id_matching = [
+            event for event in events
+            if exact or event_matches_exit_identifiers(event, order_id=order_id, perm_id=perm_id, execution_id=execution_id)
+        ]
+        matching = id_matching or [
+            event for event in events
+            if exit_reason_event_matches_trade(
+                event,
+                exit_time,
+                exact_trade=exact,
+                order_id=order_id,
+                perm_id=perm_id,
+                execution_id=execution_id,
+            )
+        ]
         if not matching:
             continue
         exit_dt = parse_dt(exit_time)
@@ -1129,6 +1247,60 @@ def peak_from_sources(
     return None, "missing"
 
 
+def sell_execution_candidates(executions: pd.DataFrame) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]], dict[tuple[str, str], list[dict[str, Any]]]]:
+    if executions is None or executions.empty:
+        return {}, {}, {}
+    by_execution_id: dict[str, dict[str, Any]] = {}
+    by_trade_id: dict[str, list[dict[str, Any]]] = {}
+    by_symbol_date: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in executions.to_dict("records"):
+        side = str(row.get("side") or row.get("action") or "").upper()
+        if side not in {"SLD", "SELL"}:
+            continue
+        execution_id = normalized_identifier(row.get("execution_id"))
+        trade_id = normalized_identifier(row.get("trade_id"))
+        symbol = str(row.get("symbol") or "").upper()
+        execution_date = date_part(row.get("executed_at") or row.get("recorded_at") or row.get("session_date"))
+        if execution_id:
+            by_execution_id[execution_id] = row
+        if trade_id:
+            by_trade_id.setdefault(trade_id, []).append(row)
+        if symbol and execution_date:
+            by_symbol_date.setdefault((execution_date, symbol), []).append(row)
+    for rows in [*by_trade_id.values(), *by_symbol_date.values()]:
+        rows.sort(key=lambda item: parse_dt(item.get("executed_at") or item.get("recorded_at")) or datetime.min.replace(tzinfo=timezone.utc))
+    return by_execution_id, by_trade_id, by_symbol_date
+
+
+def closest_sell_execution(
+    row: dict[str, Any],
+    raw: dict[str, Any],
+    *,
+    by_execution_id: dict[str, dict[str, Any]],
+    by_trade_id: dict[str, list[dict[str, Any]]],
+    by_symbol_date: dict[tuple[str, str], list[dict[str, Any]]],
+) -> dict[str, Any]:
+    exit_execution_id = raw_trade_execution_id(raw, "exit")
+    if exit_execution_id and exit_execution_id in by_execution_id:
+        return by_execution_id[exit_execution_id]
+    trade_id = normalized_identifier(row.get("trade_id"))
+    exit_time = row.get("exit_time") or row.get("closed_at")
+    exit_dt = parse_dt(exit_time)
+    candidates = by_trade_id.get(trade_id, []) if trade_id else []
+    if not candidates:
+        symbol = str(row.get("symbol") or "").upper()
+        exit_date = date_part(exit_time) or date_part(row.get("closed_at")) or str(row.get("session_date") or "")
+        candidates = by_symbol_date.get((exit_date, symbol), [])
+    if not candidates:
+        return {}
+    if exit_dt is None:
+        return candidates[-1]
+    return min(
+        candidates,
+        key=lambda item: abs((exit_dt - (parse_dt(item.get("executed_at") or item.get("recorded_at")) or exit_dt)).total_seconds()),
+    )
+
+
 def closed_from_trades(
     conn: sqlite3.Connection,
     window: DateWindow,
@@ -1205,7 +1377,11 @@ def closed_from_trades(
     trade_sources: list[str] = []
     exit_reasons: list[str] = []
     exit_reason_sources: list[str] = []
+    matched_event_types: list[str] = []
+    matched_event_times: list[str] = []
+    matched_order_ids: list[str] = []
     strategy_values: list[str] = []
+    by_exit_execution_id, sell_executions_by_trade_id, sell_executions_by_symbol_date = sell_execution_candidates(executions)
     trade_raw_peak_by_symbol_session: dict[tuple[str, str, str], tuple[float, str]] = {}
     for peak_row in out.to_dict("records"):
         peak = to_float(peak_row.get("peak_pct"), None)
@@ -1246,9 +1422,22 @@ def closed_from_trades(
                 raw["strategy_attribution_source"] = "executions_symbol_exit_date"
         entry_execution_id = raw_trade_execution_id(raw, "entry")
         exit_execution_id = raw_trade_execution_id(raw, "exit")
+        sell_execution = closest_sell_execution(
+            row,
+            raw,
+            by_execution_id=by_exit_execution_id,
+            by_trade_id=sell_executions_by_trade_id,
+            by_symbol_date=sell_executions_by_symbol_date,
+        )
+        sell_order_id = raw.get("exit_order_id") or raw.get("sell_order_id") or raw.get("order_id") or sell_execution.get("order_id")
+        sell_perm_id = raw.get("exit_perm_id") or raw.get("sell_perm_id") or raw.get("perm_id") or sell_execution.get("perm_id")
+        sell_execution_id = exit_execution_id or sell_execution.get("execution_id")
+        if sell_execution_id:
+            exit_execution_id = normalized_identifier(sell_execution_id)
         trade_source = str(raw.get("reconstruction_source") or raw.get("source") or "trades_table")
         exit_reason = normalize_exit_reason(row.get("exit_reason"))
         exit_reason_source = "trades.exit_reason" if exit_reason else ""
+        matched_event: dict[str, Any] | None = None
         if not exit_reason:
             exit_reason = exit_reason_from_payload(raw, "")
             exit_reason_source = "trades.raw_json" if exit_reason else ""
@@ -1266,6 +1455,9 @@ def closed_from_trades(
                 runtime_candidates,
                 exit_time,
                 exact_trade_key=exact_runtime_trade_key,
+                order_id=sell_order_id,
+                perm_id=sell_perm_id,
+                execution_id=sell_execution_id,
             )
             if matched_event:
                 exit_reason = str(matched_event.get("reason") or "")
@@ -1281,6 +1473,9 @@ def closed_from_trades(
                 lifecycle_exit_reason_map,
                 lifecycle_candidates,
                 exit_time,
+                order_id=sell_order_id,
+                perm_id=sell_perm_id,
+                execution_id=sell_execution_id,
             )
             if matched_event:
                 exit_reason = str(matched_event.get("reason") or "")
@@ -1332,6 +1527,9 @@ def closed_from_trades(
         trade_sources.append(trade_source)
         exit_reasons.append(exit_reason)
         exit_reason_sources.append(exit_reason_source)
+        matched_event_types.append(str((matched_event or {}).get("event_type") or ""))
+        matched_event_times.append(str((matched_event or {}).get("event_time") or ""))
+        matched_order_ids.append(str((matched_event or {}).get("order_id") or sell_order_id or ""))
         strategy_values.append(row_strategy)
     out["ibkr_commission"] = commissions
     out["commission_status"] = commission_statuses
@@ -1380,6 +1578,9 @@ def closed_from_trades(
     out["source"] = trade_sources
     out["exit_reason"] = exit_reasons
     out["exit_reason_source"] = exit_reason_sources
+    out["matched_event_type"] = matched_event_types
+    out["matched_event_time"] = matched_event_times
+    out["matched_order_id"] = matched_order_ids
     out["strategy"] = strategy_values
     out["closed_source"] = "trades"
     out["gross"] = pd.to_numeric(out["gross"], errors="coerce").fillna(0.0)
@@ -1440,7 +1641,8 @@ def closed_from_trades(
             "runtime_pnl_trusted", "runtime_pnl_untrusted_reason",
             "entry_execution_count", "exit_execution_count", "confirmed_commission_execution_count",
             "expected_commission_execution_count", "peak_source", "peak_match_quality", "commission_source_detail",
-            "entry_execution_id", "exit_execution_id", "exit_reason_source", "source", "closed_source", "updated_at", "trade_reduction_version",
+            "entry_execution_id", "exit_execution_id", "exit_reason_source", "matched_event_type",
+            "matched_event_time", "matched_order_id", "source", "closed_source", "updated_at", "trade_reduction_version",
         ]
     ]
 

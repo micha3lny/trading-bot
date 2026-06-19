@@ -724,7 +724,8 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     cols = [
         "symbol", "entry_date", "exit_date", "qty", "ibkr_commission", "commission_status", "buy", "sell", "gross", "net_actual", "net_pct", "peak_pct",
         "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
-        "entry_time", "exit_time", "data_quality", "partial_rows",
+        "entry_time", "exit_time", "exit_reason_source", "matched_event_type",
+        "matched_event_time", "matched_order_id", "data_quality", "partial_rows",
     ]
     available = [col for col in cols if col in df.columns]
     out = filter_table(df[available].copy(), prefix).sort_values(["net_actual", "symbol"], na_position="last")
@@ -732,6 +733,8 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
         out["entry_time"] = out["entry_time"].map(display_time)
     if "exit_time" in out.columns:
         out["exit_time"] = out["exit_time"].map(display_time)
+    if "matched_event_time" in out.columns:
+        out["matched_event_time"] = out["matched_event_time"].map(display_time)
     for col in ("peak_pct", "drop_from_peak_pct", "hold_minutes"):
         if col in out.columns:
             out[col] = out[col].map(display_number_or_missing)
@@ -754,6 +757,10 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
             "exit_reason": "Exit Reason",
             "entry_time": "Entry Time",
             "exit_time": "Exit Time",
+            "exit_reason_source": "Exit Reason Source",
+            "matched_event_type": "Matched Event Type",
+            "matched_event_time": "Matched Event Time",
+            "matched_order_id": "Matched Order ID",
             "data_quality": "Data Quality",
             "strategy": "Strategy",
             "partial_rows": "Partial Rows",
@@ -761,7 +768,9 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     )
     display_cols = [
         "Symbol", "Quantity", "IBKR Comm", "Commission Status", "Buy", "Sell", "Gross", "Net", "Net %",
-        "Peak %", "Drop from Peak %", "Min", "Exit Reason", "Entry Date", "Exit Date", "Entry Time", "Exit Time", "Strategy",
+        "Peak %", "Drop from Peak %", "Min", "Exit Reason", "Exit Reason Source",
+        "Matched Event Type", "Matched Event Time", "Matched Order ID",
+        "Entry Date", "Exit Date", "Entry Time", "Exit Time", "Strategy",
         "Data Quality", "Partial Rows",
     ]
     return out[[col for col in display_cols if col in out.columns]]
@@ -805,6 +814,7 @@ def render_closed_positions(df: pd.DataFrame) -> None:
         "entry_execution_count", "exit_execution_count",
         "confirmed_commission_execution_count", "expected_commission_execution_count",
         "peak_source", "peak_match_quality", "exit_reason", "exit_reason_source",
+        "matched_event_type", "matched_event_time", "matched_order_id",
         "commission_source_detail", "closed_source", "data_quality",
     ]
     available_debug_cols = [col for col in debug_cols if col in df.columns]
@@ -825,6 +835,9 @@ def render_closed_positions(df: pd.DataFrame) -> None:
                     "peak_match_quality": "Peak Match Quality",
                     "exit_reason": "Exit Reason",
                     "exit_reason_source": "Exit Reason Source",
+                    "matched_event_type": "Matched Event Type",
+                    "matched_event_time": "Matched Event Time",
+                    "matched_order_id": "Matched Order ID",
                     "commission_source_detail": "Commission Source Detail",
                     "closed_source": "Closed Source",
                     "data_quality": "Data Quality",

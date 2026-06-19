@@ -2372,6 +2372,83 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason"], "unknown_exit_reason")
             self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason_source"], "missing_explicit_exit_event")
 
+    def test_closed_exit_reason_matches_lifecycle_by_sell_order_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            recorder_root = Path(tmp) / "recorder"
+            session_dir = recorder_root / "2026-06-18"
+            session_dir.mkdir(parents=True)
+            with (session_dir / "trade_lifecycle.csv").open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["recorded_at", "strategy", "event", "symbol", "order_id", "execution_id", "reason"])
+                writer.writeheader()
+                writer.writerow({
+                    "recorded_at": "2026-06-18T13:00:00+00:00",
+                    "strategy": "v67",
+                    "event": "SELL_ORDER_SENT",
+                    "symbol": "OCUL",
+                    "order_id": "4242",
+                    "execution_id": "",
+                    "reason": "trailing_stop",
+                })
+                writer.writerow({
+                    "recorded_at": "2026-06-18T19:45:00+00:00",
+                    "strategy": "v67",
+                    "event": "EOD_FLATTEN_SUBMIT",
+                    "symbol": "OCUL",
+                    "order_id": "9999",
+                    "execution_id": "",
+                    "reason": "eod_flatten",
+                })
+            previous = os.environ.get("TRADING_BOT_RECORDER_DIR")
+            os.environ["TRADING_BOT_RECORDER_DIR"] = str(recorder_root)
+            try:
+                store = SQLiteRuntimeStore(db)
+                store.upsert_trade({
+                    "trade_id": "T_OCUL_ORDER_REASON",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-18",
+                    "symbol": "OCUL",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-06-18T12:30:00+00:00",
+                    "exit_fill_time": "2026-06-18T13:17:22+00:00",
+                    "entry_price": 10,
+                    "exit_price": 10.5,
+                    "quantity": 2,
+                    "gross_pnl": 1,
+                    "commission": 1,
+                    "net_pnl": 0,
+                    "raw_json": {"sell_execution_id": "SELL-OCUL-1"},
+                })
+                store.upsert_execution({
+                    "execution_id": "SELL-OCUL-1",
+                    "trade_id": "T_OCUL_ORDER_REASON",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-18",
+                    "symbol": "OCUL",
+                    "side": "SLD",
+                    "quantity": 2,
+                    "price": 10.5,
+                    "order_id": "4242",
+                    "executed_at": "2026-06-18T13:17:22+00:00",
+                    "recorded_at": "2026-06-18T13:17:22+00:00",
+                    "commission": 1,
+                    "commission_source": "ibkr",
+                    "realized_pnl": 1,
+                })
+                store.close()
+
+                snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-18", "2026-06-18"), "v67")
+            finally:
+                if previous is None:
+                    os.environ.pop("TRADING_BOT_RECORDER_DIR", None)
+                else:
+                    os.environ["TRADING_BOT_RECORDER_DIR"] = previous
+
+            row = snapshot["closed_positions"].iloc[0]
+            self.assertEqual(row["exit_reason"], "trailing_stop")
+            self.assertEqual(row["matched_event_type"], "SELL_ORDER_SENT")
+            self.assertEqual(row["matched_order_id"], "4242")
+
     def test_unknown_same_day_closed_trade_strategy_is_inferred_from_executions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
