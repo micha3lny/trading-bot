@@ -3223,6 +3223,35 @@ def assess_history_completion(
     }
 
 
+def latest_history_is_complete(
+    *,
+    args: argparse.Namespace,
+    session_date: date,
+    session_type: str = "RTH",
+    min_completion_pct: float = 100.0,
+) -> dict[str, Any]:
+    assessment = assess_history_completion(
+        history_dir=getattr(args, "daily_top100_history_dir", DEFAULT_HISTORY_DIR),
+        universe_csv=getattr(args, "daily_top100_universe", DEFAULT_UNIVERSE),
+        session_date=session_date,
+        session_type=session_type,
+    )
+    expected = int(assessment.get("expected_symbols") or 0)
+    completion_pct_value = float(assessment.get("completion_pct") or 0.0)
+    failed = int(assessment.get("failed") or 0)
+    complete = expected > 0 and completion_pct_value >= min_completion_pct and failed == 0
+    return {**assessment, "complete": complete, "min_completion_pct": min_completion_pct}
+
+
+def _history_command_priority(command: dict[str, Any]) -> int:
+    mode = str(command.get("collector_mode") or "")
+    if mode in {"daily", "startup_repair"}:
+        return 0
+    if mode == "backlog":
+        return 10
+    return 5
+
+
 def enqueue_startup_history_repair_if_needed(
     runtime_state: dict[str, Any],
     args: argparse.Namespace,
@@ -3257,13 +3286,25 @@ def enqueue_startup_history_repair_if_needed(
     if not isinstance(queue, list):
         queue = []
         runtime_state["history_collector_commands"] = queue
-    if runtime_state.get("history_collector_process") is not None or queue:
+    if runtime_state.get("history_collector_process") is not None:
         print(
             f"{now_utc()} STARTUP_HISTORY_REPAIR_SKIPPED date={assessment['date']} "
-            f"reason=collector_already_running_or_queued pending={len(queue)}",
+            f"reason=collector_already_running pending={len(queue)}",
             flush=True,
         )
-        return {**assessment, "queued": False, "reason": "collector_already_running_or_queued"}
+        return {**assessment, "queued": False, "reason": "collector_already_running"}
+    existing_latest = any(
+        str(cmd.get("end_date")) == str(assessment["date"]) and str(cmd.get("collector_mode")) in {"daily", "startup_repair"}
+        for cmd in queue
+        if isinstance(cmd, dict)
+    )
+    if existing_latest:
+        print(
+            f"{now_utc()} STARTUP_HISTORY_REPAIR_SKIPPED date={assessment['date']} "
+            f"reason=latest_day_already_queued pending={len(queue)}",
+            flush=True,
+        )
+        return {**assessment, "queued": False, "reason": "latest_day_already_queued"}
     command_id = f"startup_history_repair_{assessment['date'].replace('-', '')}"
     command = {
         "id": command_id,
@@ -3284,7 +3325,8 @@ def enqueue_startup_history_repair_if_needed(
         "include_weekends": False,
         "retry_failed": retry_failed,
     }
-    queue.append(command)
+    queue.insert(0, command)
+    queue.sort(key=_history_command_priority)
     print(
         f"{now_utc()} STARTUP_HISTORY_REPAIR_QUEUED command_id={command_id} "
         f"start={command['start_date']} end={command['end_date']} missing={assessment['missing']} "
@@ -3315,10 +3357,18 @@ def enqueue_overnight_collector_if_due(runtime_state: dict[str, Any], args: argp
     for slot in slots:
         if not is_utc_slot_due(now, slot):
             continue
-        end_date = latest_completed_trading_day(now, getattr(args, "market_close_utc", "20:00")).isoformat()
-        modes = ["daily"]
-        if slot in backlog_slots:
+        latest_day = latest_completed_trading_day(now, getattr(args, "market_close_utc", "20:00"))
+        end_date = latest_day.isoformat()
+        min_pct = float(getattr(args, "startup_history_repair_min_completion_pct", 100.0))
+        latest_assessment = latest_history_is_complete(args=args, session_date=latest_day, min_completion_pct=min_pct)
+        latest_complete = bool(latest_assessment.get("complete"))
+        modes: list[str] = []
+        if not latest_complete:
+            modes.append("daily")
+        elif slot in backlog_slots:
             modes.append("backlog")
+        if not modes:
+            continue
         if not prioritize_previous_day:
             modes = ["backlog"]
         key = f"{end_date}_{slot}_{'+'.join(modes)}"
@@ -3363,12 +3413,15 @@ def enqueue_overnight_collector_if_due(runtime_state: dict[str, Any], args: argp
             }
             queue.append(command)
             queued_commands.append(command)
+        queue.sort(key=_history_command_priority)
         run_keys.add(key)
         skip_keys.discard(key)
         for command in queued_commands:
             print(
                 f"{now_utc()} OVERNIGHT_COLLECTOR_QUEUED command_id={command['id']} mode={command['collector_mode']} "
-                f"slot={slot} start={command['start_date']} end={end_date} max_tasks={command['max_tasks']}",
+                f"slot={slot} start={command['start_date']} end={end_date} max_tasks={command['max_tasks']} "
+                f"latest_day_complete={int(latest_complete)} latest_day_completion_pct={latest_assessment.get('completion_pct')} "
+                f"latest_day_missing={latest_assessment.get('missing')} latest_day_failed={latest_assessment.get('failed')}",
                 flush=True,
             )
 
@@ -3411,6 +3464,21 @@ def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Nam
     if key in run_keys:
         return
     if runtime_state.get("daily_top100_process") is not None:
+        return
+    min_pct = float(getattr(args, "startup_history_repair_min_completion_pct", 100.0))
+    assessment = latest_history_is_complete(args=args, session_date=date.fromisoformat(ranking_date), min_completion_pct=min_pct)
+    if not bool(assessment.get("complete")):
+        last_key = f"{ranking_date}_{slot}_{assessment.get('completion_pct')}_{assessment.get('missing')}_{assessment.get('failed')}"
+        wait_keys = _runtime_set(runtime_state, "daily_top100_build_wait_logged_keys")
+        if last_key not in wait_keys:
+            wait_keys.add(last_key)
+            print(
+                f"{now_utc()} DAILY_TOP100_BUILD_SKIPPED reason=latest_history_incomplete "
+                f"ranking_date={ranking_date} completion_pct={assessment.get('completion_pct')} "
+                f"expected_symbols={assessment.get('expected_symbols')} parquet_files={assessment.get('parquet_files')} "
+                f"missing={assessment.get('missing')} failed={assessment.get('failed')} min_completion_pct={min_pct}",
+                flush=True,
+            )
         return
 
     output_dir = Path(getattr(args, "daily_top100_output_dir", "data/universe"))

@@ -503,6 +503,29 @@ def process_history_collector_commands(*, runtime_state: dict[str, Any], max_com
         runtime_state["history_collector_last_returncode"] = rc
         if rc == 0:
             runtime_state["history_collector_last_run_key"] = f"{cmd.get('end_date')}_{cmd.get('session_type')}"
+        elif str(cmd.get("collector_mode") or "") in {"daily", "startup_repair"}:
+            queue = runtime_state.setdefault("history_collector_commands", [])
+            if isinstance(queue, list):
+                before = len(queue)
+                end_date = str(cmd.get("end_date") or "")
+                queue[:] = [
+                    queued
+                    for queued in queue
+                    if not (
+                        isinstance(queued, dict)
+                        and str(queued.get("collector_mode") or "") == "backlog"
+                        and str(queued.get("end_date") or "") == end_date
+                    )
+                ]
+                dropped = before - len(queue)
+                if dropped:
+                    _log(
+                        "HISTORY_COLLECTOR_BACKLOG_DROPPED_LATEST_INCOMPLETE",
+                        latest_date=end_date,
+                        dropped=dropped,
+                        failed_command_id=cmd.get("id"),
+                        returncode=rc,
+                    )
 
     queue = runtime_state.setdefault("history_collector_commands", [])
     if not queue:

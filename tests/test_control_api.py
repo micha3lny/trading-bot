@@ -12,6 +12,7 @@ from src.live_trading.v67_live_top100_expansion_paper_trader import (
     enqueue_startup_history_repair_if_needed,
     history_parquet_path,
     history_task_key,
+    process_daily_top100_build,
 )
 from src.live_trading.control.control_api import (
     _bool_value,
@@ -327,11 +328,52 @@ class ControlApiHelperTests(unittest.TestCase):
         )
 
         queue = runtime_state["history_collector_commands"]
-        self.assertEqual([cmd["collector_mode"] for cmd in queue], ["daily", "backlog"])
+        self.assertEqual([cmd["collector_mode"] for cmd in queue], ["daily"])
         self.assertEqual(queue[0]["start_date"], "2026-05-20")
         self.assertEqual(queue[0]["end_date"], "2026-05-20")
-        self.assertEqual(queue[1]["start_date"], "2026-04-20")
-        self.assertEqual(queue[1]["end_date"], "2026-05-20")
+
+    def test_overnight_backlog_runs_only_after_latest_day_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            universe = root / "universe.csv"
+            universe.write_text("symbol\nAAA\nBBB\n", encoding="utf-8")
+            history_dir = root / "history" / "universe_1m"
+            status = {
+                history_task_key("AAA", datetime(2026, 5, 20, tzinfo=timezone.utc).date()): {"status": "complete"},
+                history_task_key("BBB", datetime(2026, 5, 20, tzinfo=timezone.utc).date()): {"status": "no_data"},
+            }
+            (root / "history").mkdir(parents=True, exist_ok=True)
+            (root / "history" / "collector_status.json").write_text(json.dumps(status), encoding="utf-8")
+            runtime_state = {}
+            args = SimpleNamespace(
+                enable_overnight_automation=True,
+                overnight_collector_times_utc="07:00",
+                overnight_backlog_collector_times_utc="07:00",
+                overnight_prioritize_previous_day=True,
+                market_close_utc="20:00",
+                overnight_collector_start_date="2026-01-01",
+                overnight_backlog_lookback_days=30,
+                overnight_daily_collector_max_tasks=3000,
+                overnight_collector_max_tasks=3000,
+                overnight_collector_max_attempts=5,
+                history_collector_client_id=168,
+                overnight_collector_retry_failed=False,
+                startup_history_repair_min_completion_pct=100.0,
+                daily_top100_history_dir=str(history_dir),
+                daily_top100_universe=str(universe),
+            )
+
+            enqueue_overnight_collector_if_due(
+                runtime_state,
+                args,
+                now=datetime(2026, 5, 21, 7, 1, tzinfo=timezone.utc),
+            )
+
+            queue = runtime_state["history_collector_commands"]
+            self.assertEqual(len(queue), 1)
+            self.assertEqual(queue[0]["collector_mode"], "backlog")
+            self.assertEqual(queue[0]["start_date"], "2026-04-20")
+            self.assertEqual(queue[0]["end_date"], "2026-05-20")
 
     def test_overnight_scheduler_skips_holiday_monday_to_previous_friday(self) -> None:
         runtime_state = {}
@@ -357,10 +399,9 @@ class ControlApiHelperTests(unittest.TestCase):
         )
 
         queue = runtime_state["history_collector_commands"]
-        self.assertEqual([cmd["collector_mode"] for cmd in queue], ["daily", "backlog"])
+        self.assertEqual([cmd["collector_mode"] for cmd in queue], ["daily"])
         self.assertEqual(queue[0]["start_date"], "2026-05-22")
         self.assertEqual(queue[0]["end_date"], "2026-05-22")
-        self.assertEqual(queue[1]["end_date"], "2026-05-22")
 
     def test_overnight_backlog_can_fall_back_to_configured_start_date(self) -> None:
         runtime_state = {}
@@ -458,6 +499,38 @@ class ControlApiHelperTests(unittest.TestCase):
             self.assertFalse(result["queued"])
             self.assertEqual(result["reason"], "complete")
             self.assertNotIn("history_collector_commands", runtime_state)
+
+    def test_daily_top100_build_waits_for_latest_history_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            universe = root / "universe.csv"
+            universe.write_text("symbol\nAAA\nBBB\n", encoding="utf-8")
+            history_dir = root / "history" / "universe_1m"
+            history_parquet_path(history_dir, "AAA", datetime(2026, 5, 27, tzinfo=timezone.utc).date()).parent.mkdir(parents=True, exist_ok=True)
+            history_parquet_path(history_dir, "AAA", datetime(2026, 5, 27, tzinfo=timezone.utc).date()).write_bytes(b"x")
+            runtime_state = {}
+            args = SimpleNamespace(
+                enable_overnight_automation=True,
+                daily_top100_build_utc="12:45",
+                market_close_utc="20:00",
+                startup_history_repair_min_completion_pct=100.0,
+                daily_top100_history_dir=str(history_dir),
+                daily_top100_universe=str(universe),
+                daily_top100_output_dir=str(root / "universe_out"),
+                daily_top100_latest_output=str(root / "daily_top100_latest.csv"),
+                daily_top100_top_n=100,
+                daily_top100_sqlite_path=str(root / "rankings.sqlite"),
+            )
+
+            process_daily_top100_build(
+                runtime_state,
+                args,
+                now=datetime(2026, 5, 28, 12, 46, tzinfo=timezone.utc),
+            )
+
+            self.assertIsNone(runtime_state.get("daily_top100_process"))
+            self.assertEqual(runtime_state.get("daily_top100_build_run_keys"), set())
+            self.assertIn("daily_top100_build_wait_logged_keys", runtime_state)
 
 
 if __name__ == "__main__":

@@ -607,6 +607,14 @@ def main() -> int:
             f"include_weekends={bool(args.include_weekends)} output_dir={output_dir}",
             flush=True,
         )
+        is_single_latest_day = start == end
+        if is_single_latest_day:
+            print(
+                f"{now_iso()} HISTORY_COLLECTOR_LATEST_DAY_START date={start.isoformat()} "
+                f"expected_symbols={len(tasks)} pending={len(pending)} skipped_existing={plan['complete']} "
+                f"missing={plan['pending']} blocked_by_attempts={plan['blocked_by_attempts']}",
+                flush=True,
+            )
 
         if args.plan_only:
             write_json_atomic(status_path, status)
@@ -623,6 +631,13 @@ def main() -> int:
                 f"failed=0 retries=0 parquet_files_written=0 output_dir={output_dir}",
                 flush=True,
             )
+            if is_single_latest_day:
+                print(
+                    f"{now_iso()} HISTORY_COLLECTOR_LATEST_DAY_DONE date={start.isoformat()} "
+                    f"files_written=0 symbols_complete=0 symbols_partial=0 symbols_no_data=0 symbols_failed=0 "
+                    f"parquet_files={parquet_files} completion_pct={completion_pct(parquet_files, len(tasks))}",
+                    flush=True,
+                )
             safe_sqlite_call(
                 sqlite_store,
                 "record_collector_run",
@@ -662,6 +677,13 @@ def main() -> int:
                 f"failed=0 retries=0 parquet_files_written=0 output_dir={output_dir}",
                 flush=True,
             )
+            if is_single_latest_day:
+                print(
+                    f"{now_iso()} HISTORY_COLLECTOR_LATEST_DAY_DONE date={start.isoformat()} "
+                    f"files_written=0 symbols_complete=0 symbols_partial=0 symbols_no_data=0 symbols_failed=0 "
+                    f"parquet_files={parquet_files} completion_pct={completion_pct(parquet_files, len(tasks))}",
+                    flush=True,
+                )
             safe_sqlite_call(
                 sqlite_store,
                 "record_collector_run",
@@ -800,6 +822,14 @@ def main() -> int:
             f"parquet_files_written={parquet_files_written} output_dir={output_dir}",
             flush=True,
         )
+        if is_single_latest_day:
+            print(
+                f"{now_iso()} HISTORY_COLLECTOR_LATEST_DAY_DONE date={start.isoformat()} "
+                f"files_written={parquet_files_written} symbols_complete={completed} symbols_partial={partial} "
+                f"symbols_no_data={no_data} symbols_failed={failed} parquet_files={parquet_files} "
+                f"completion_pct={completion_pct(parquet_files, len(tasks))}",
+                flush=True,
+            )
         safe_sqlite_call(
             sqlite_store,
             "record_collector_run",
