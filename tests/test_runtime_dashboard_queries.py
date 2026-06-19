@@ -2325,6 +2325,53 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
 
             self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason"], "eod_flatten")
 
+    def test_intraday_exit_does_not_inherit_later_eod_flatten_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            recorder_root = Path(tmp) / "recorder"
+            session_dir = recorder_root / "2026-06-18"
+            session_dir.mkdir(parents=True)
+            with (session_dir / "trade_lifecycle.csv").open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["recorded_at", "strategy", "event", "symbol", "reason"])
+                writer.writeheader()
+                writer.writerow({
+                    "recorded_at": "2026-06-18T19:45:00+00:00",
+                    "strategy": "v67",
+                    "event": "EOD_FLATTEN_SUBMIT",
+                    "symbol": "OCUL",
+                    "reason": "eod_flatten",
+                })
+            previous = os.environ.get("TRADING_BOT_RECORDER_DIR")
+            os.environ["TRADING_BOT_RECORDER_DIR"] = str(recorder_root)
+            try:
+                store = SQLiteRuntimeStore(db)
+                store.upsert_trade({
+                    "trade_id": "T_INTRADAY_NOT_EOD",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-18",
+                    "symbol": "OCUL",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-06-18T13:05:00+00:00",
+                    "exit_fill_time": "2026-06-18T13:17:22+00:00",
+                    "entry_price": 10,
+                    "exit_price": 10.5,
+                    "quantity": 2,
+                    "gross_pnl": 1,
+                    "commission": 1,
+                    "net_pnl": 0,
+                })
+                store.close()
+
+                snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-18", "2026-06-18"), "v67")
+            finally:
+                if previous is None:
+                    os.environ.pop("TRADING_BOT_RECORDER_DIR", None)
+                else:
+                    os.environ["TRADING_BOT_RECORDER_DIR"] = previous
+
+            self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason"], "unknown_exit_reason")
+            self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason_source"], "missing_explicit_exit_event")
+
     def test_unknown_same_day_closed_trade_strategy_is_inferred_from_executions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
