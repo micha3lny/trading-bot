@@ -242,6 +242,35 @@ class StartupReconciliationTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_broker_position_matching_sqlite_active_is_not_orphan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            recorder.sqlite_store = store
+            try:
+                store.upsert_position({
+                    "position_key": "v67:2026-06-19:AVLN",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-19",
+                    "symbol": "AVLN",
+                    "status": "OPEN",
+                    "quantity": 3,
+                    "avg_price": 10.0,
+                    "active": 1,
+                    "updated_at": "2026-06-19T13:30:00+00:00",
+                })
+                ib = FakeIB(portfolio=[FakePortfolioItem("AVLN", 3)])
+                runtime_state = {}
+
+                result = startup_reconcile_runtime_state(ib, recorder, {}, {}, runtime_state)
+
+                self.assertEqual(len(ib.placed_orders), 0)
+                self.assertEqual(result["orphans"], [])
+                self.assertEqual(runtime_state["startup_reconciliation_sqlite_active_count"], 1)
+                self.assertEqual(runtime_state["startup_reconciliation_sqlite_active_symbols"], ["AVLN"])
+            finally:
+                store.close()
+
     def test_ibkr_flat_after_verified_entry_without_sell_fill_is_unverified_close(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             recorder = recorder_in_tmp(tmp)
@@ -284,17 +313,36 @@ class StartupReconciliationTests(unittest.TestCase):
             events = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl")).load_events()
             self.assertFalse(any(row["event_type"] == LifecycleEventType.EXIT_ORDER_SUBMITTED.value for row in events))
 
-    def test_ibkr_orphan_whole_share_flattens_and_does_not_block(self) -> None:
+    def test_ibkr_orphan_whole_share_left_untouched_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             recorder = recorder_in_tmp(tmp)
             ib = FakeIB(portfolio=[FakePortfolioItem("AVLN", 3)])
             runtime_state = {}
 
-            result = startup_reconcile_runtime_state(ib, recorder, {}, {}, runtime_state)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                result = startup_reconcile_runtime_state(ib, recorder, {}, {}, runtime_state)
+
+            self.assertEqual(len(ib.placed_orders), 0)
+            self.assertFalse(runtime_state["entries_blocked"])
+            self.assertIn("AVLN", result["orphans"])
+            self.assertIn("AVLN", result["untouched_orphans"])
+            self.assertIn("STARTUP_RECONCILIATION_ORPHAN_LEFT_UNTOUCHED", out.getvalue())
+            events = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl")).load_events()
+            self.assertFalse(any(row["event_type"] == "EXIT_ORDER_SUBMITTED" for row in events))
+
+    def test_ibkr_orphan_whole_share_flatten_requires_explicit_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            ib = FakeIB(portfolio=[FakePortfolioItem("AVLN", 3)])
+            runtime_state = {}
+
+            result = startup_reconcile_runtime_state(ib, recorder, {}, {}, runtime_state, submit_orphan_flatten=True)
 
             self.assertEqual(len(ib.placed_orders), 1)
             self.assertFalse(runtime_state["entries_blocked"])
             self.assertIn("AVLN", result["orphans"])
+            self.assertEqual(result["untouched_orphans"], [])
             events = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl")).load_events()
             self.assertTrue(any(row["event_type"] == "EXIT_ORDER_SUBMITTED" for row in events))
 
@@ -304,7 +352,7 @@ class StartupReconciliationTests(unittest.TestCase):
             ib = FakeIBWithSubmittedOpenTrades(portfolio=[FakePortfolioItem("AVLN", 3)])
             runtime_state = {}
 
-            result = startup_reconcile_runtime_state(ib, recorder, {}, {}, runtime_state)
+            result = startup_reconcile_runtime_state(ib, recorder, {}, {}, runtime_state, submit_orphan_flatten=True)
 
             self.assertEqual(len(ib.placed_orders), 1)
             self.assertEqual(len(ib.cancelled_orders), 0)

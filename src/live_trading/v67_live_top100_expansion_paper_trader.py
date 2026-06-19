@@ -1536,6 +1536,23 @@ def sqlite_active_position_count(recorder: LiveDataRecorder) -> int | None:
         return None
 
 
+def sqlite_active_position_symbols(recorder: LiveDataRecorder) -> set[str]:
+    rows = safe_sqlite_call(
+        getattr(recorder, "sqlite_store", None),
+        "query",
+        """
+        SELECT DISTINCT UPPER(symbol) AS symbol
+        FROM positions
+        WHERE COALESCE(active, 0) = 1
+          AND UPPER(COALESCE(status, '')) IN ('OPEN', 'EXIT_ORDER', 'RECONCILING')
+          AND COALESCE(symbol, '') != ''
+        """,
+    )
+    if not rows:
+        return set()
+    return {str(row.get("symbol") or "").upper() for row in rows if str(row.get("symbol") or "").strip()}
+
+
 def startup_reconcile_runtime_state(
     ib: IB,
     recorder: LiveDataRecorder,
@@ -1544,7 +1561,7 @@ def startup_reconcile_runtime_state(
     runtime_state: dict[str, Any],
     *,
     cancel_stale_orders: bool = True,
-    submit_orphan_flatten: bool = True,
+    submit_orphan_flatten: bool = False,
     log_prefix: str = "STARTUP_RECONCILIATION",
     reason_prefix: str = "startup_reconciliation",
 ) -> dict[str, Any]:
@@ -1559,8 +1576,10 @@ def startup_reconcile_runtime_state(
     ibkr_qty_by_symbol = {row["symbol"]: float(row["quantity"]) for row in ibkr_rows}
     ibkr_row_by_symbol = {row["symbol"]: row for row in ibkr_rows}
     sqlite_active_count = sqlite_active_position_count(recorder)
+    sqlite_active_symbols = sqlite_active_position_symbols(recorder)
     runtime_state["startup_reconciliation_broker_open_count"] = len(ibkr_rows)
     runtime_state["startup_reconciliation_sqlite_active_count"] = sqlite_active_count
+    runtime_state["startup_reconciliation_sqlite_active_symbols"] = sorted(sqlite_active_symbols)
     if not managed_positions and not ibkr_rows and sqlite_active_count == 0 and reducer_positions:
         print(
             f"{now_utc()} {log_prefix}_STALE_LOCAL_STATE_IGNORED "
@@ -1572,6 +1591,7 @@ def startup_reconcile_runtime_state(
     closed_local: list[str] = []
     drift_symbols: list[str] = []
     orphans: list[str] = []
+    untouched_orphans: list[str] = []
     fractional_orphans: list[str] = []
     whole_share_orphans: list[str] = []
     pending_orders: list[str] = []
@@ -1681,7 +1701,8 @@ def startup_reconcile_runtime_state(
                     flush=True,
                 )
 
-    for symbol in sorted(set(ibkr_qty_by_symbol) - {s for s, p in managed_positions.items() if p.active}):
+    local_known_symbols = {s for s, p in managed_positions.items() if p.active} | sqlite_active_symbols
+    for symbol in sorted(set(ibkr_qty_by_symbol) - local_known_symbols):
         row = ibkr_row_by_symbol[symbol]
         ibkr_qty = float(row["quantity"])
         orphans.append(symbol)
@@ -1726,6 +1747,14 @@ def startup_reconcile_runtime_state(
                     submitted_flatten_order_ids.add(submitted_order_id)
             else:
                 runtime_state["startup_reconciliation_fractional_manual_required"] = True
+        else:
+            untouched_orphans.append(symbol)
+            runtime_state["startup_reconciliation_orphan_flatten_blocked"] = True
+            print(
+                f"{now_utc()} {log_prefix}_ORPHAN_LEFT_UNTOUCHED symbol={symbol} "
+                f"quantity={ibkr_qty:.4f} reason=restart_safe_no_auto_flatten",
+                flush=True,
+            )
 
     for trade in open_ibkr_order_trades(ib):
         order_id = order_trade_id(trade)
@@ -1793,6 +1822,7 @@ def startup_reconcile_runtime_state(
     runtime_state["startup_reconciliation_done"] = True
     runtime_state["startup_reconciliation_clean"] = bool(clean)
     runtime_state["startup_reconciliation_orphans"] = sorted(orphans)
+    runtime_state["startup_reconciliation_untouched_orphans"] = sorted(untouched_orphans)
     runtime_state["startup_reconciliation_fractional_orphans"] = sorted(fractional_orphans)
     runtime_state["startup_reconciliation_whole_share_orphans"] = sorted(whole_share_orphans)
     runtime_state["startup_reconciliation_closed_local"] = sorted(closed_local)
@@ -1846,6 +1876,7 @@ def startup_reconcile_runtime_state(
         "clean": clean,
         "closed_local": sorted(closed_local),
         "orphans": sorted(orphans),
+        "untouched_orphans": sorted(untouched_orphans),
         "fractional_orphans": sorted(fractional_orphans),
         "whole_share_orphans": sorted(whole_share_orphans),
         "drift_symbols": sorted(drift_symbols),
