@@ -1437,13 +1437,10 @@ def closed_from_trades(
         if sell_execution_id:
             exit_execution_id = normalized_identifier(sell_execution_id)
         trade_source = str(raw.get("reconstruction_source") or raw.get("source") or "trades_table")
-        exit_reason = normalize_exit_reason(row.get("exit_reason"))
-        exit_reason_source = "trades.exit_reason" if exit_reason else ""
         matched_event: dict[str, Any] | None = None
-        if not exit_reason:
-            exit_reason = exit_reason_from_payload(raw, "")
-            exit_reason_source = "trades.raw_json" if exit_reason else ""
-        if not exit_reason and sell_execution:
+        exit_reason = ""
+        exit_reason_source = ""
+        if sell_execution:
             exit_reason = normalize_exit_reason(sell_execution.get("exit_reason"))
             exit_reason_source = str(sell_execution.get("exit_reason_source") or "executions.exit_reason") if exit_reason else ""
             if exit_reason:
@@ -1454,6 +1451,9 @@ def closed_from_trades(
                     "order_id": sell_execution.get("order_id"),
                     "source": "executions",
                 }
+        if not exit_reason:
+            exit_reason = normalize_exit_reason(row.get("exit_reason"))
+            exit_reason_source = "trades.exit_reason" if exit_reason else ""
         if not exit_reason:
             exact_runtime_trade_key = (exit_date, f"trade:{row.get('trade_id')}", symbol)
             runtime_candidates = [

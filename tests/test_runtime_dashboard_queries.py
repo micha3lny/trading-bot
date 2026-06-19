@@ -2433,6 +2433,56 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(row["matched_event_type"], "SELL_EXECUTION")
             self.assertEqual(row["matched_order_id"], "4242")
 
+    def test_closed_exit_reason_prefers_execution_over_trade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_trade({
+                    "trade_id": "T_REASON_PRIORITY",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-18",
+                    "symbol": "PRIO",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-06-18T12:30:00+00:00",
+                    "exit_fill_time": "2026-06-18T13:17:22+00:00",
+                    "entry_price": 10,
+                    "exit_price": 10.5,
+                    "quantity": 2,
+                    "gross_pnl": 1,
+                    "commission": 1,
+                    "net_pnl": 0,
+                    "exit_reason": "eod_flatten",
+                    "raw_json": {"sell_execution_id": "SELL-PRIO-1", "exit_reason": "manual_flatten"},
+                })
+                store.upsert_execution({
+                    "execution_id": "SELL-PRIO-1",
+                    "trade_id": "T_REASON_PRIORITY",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-18",
+                    "symbol": "PRIO",
+                    "side": "SLD",
+                    "quantity": 2,
+                    "price": 10.5,
+                    "order_id": "5151",
+                    "executed_at": "2026-06-18T13:17:22+00:00",
+                    "recorded_at": "2026-06-18T13:17:22+00:00",
+                    "commission": 1,
+                    "commission_source": "ibkr",
+                    "realized_pnl": 1,
+                    "exit_reason": "trailing_stop",
+                    "exit_reason_source": "executions.exit_reason",
+                })
+                store.close()
+
+                snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-18", "2026-06-18"), "v67")
+            finally:
+                pass
+
+            row = snapshot["closed_positions"].iloc[0]
+            self.assertEqual(row["exit_reason"], "trailing_stop")
+            self.assertEqual(row["exit_reason_source"], "executions.exit_reason")
+
     def test_unknown_same_day_closed_trade_strategy_is_inferred_from_executions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
