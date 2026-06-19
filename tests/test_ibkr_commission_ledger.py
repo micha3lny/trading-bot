@@ -88,8 +88,12 @@ class CountingStore:
     def __init__(self) -> None:
         self.upsert_count = 0
         self.rows = []
+        self.finalize_count = 0
+        self.pending_counts = {}
+        self.status_calls = []
 
     def mark_operation_status(self, *args, **kwargs):
+        self.status_calls.append((args, kwargs))
         return None
 
     def upsert_execution(self, _row):
@@ -97,7 +101,12 @@ class CountingStore:
         self.rows.append(dict(_row))
 
     def runtime_pending_counts(self):
-        return {}
+        return dict(self.pending_counts)
+
+    def finalize_pending_trades(self):
+        self.finalize_count += 1
+        self.pending_counts = {}
+        return {"pending_before": 1, "pending_after": 0, "resolved": 1}
 
 
 def read_fills(recorder: LiveDataRecorder) -> list[dict]:
@@ -136,6 +145,21 @@ class IbkrCommissionLedgerTests(unittest.TestCase):
             self.assertEqual(rows[0]["commission"], "0.42")
             self.assertEqual(rows[0]["commission_source"], "ibkr")
             self.assertEqual(rows[0]["realized_pnl"], "1.23")
+
+    def test_record_recent_fills_finalizes_stale_pending_trades_after_ingest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(Path(tmp), session_date="2026-05-22")
+            store = CountingStore()
+            store.pending_counts = {"pending_trade_finalization_count": 1}
+            recorder.sqlite_store = store
+
+            count = record_recent_fills(FakeIB([fake_fill("E1", commission=0.35)]), recorder, seen=set())
+
+            self.assertEqual(count, 1)
+            self.assertEqual(store.finalize_count, 1)
+            self.assertTrue(store.status_calls)
+            self.assertEqual(store.status_calls[-1][1]["pending_counts"], {})
+            self.assertEqual(store.status_calls[-1][1]["finalized_pending_trades"]["resolved"], 1)
 
     def test_duplicate_commission_report_is_ignored_after_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

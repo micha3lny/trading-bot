@@ -972,6 +972,125 @@ class SQLiteRuntimeStore:
             "pending_trade_finalization_count": int(trade_row.get("pending_trade_finalization_count") or 0),
         }
 
+    def pending_trade_finalization_diagnostics(self, session_date: str | None = None) -> list[dict[str, Any]]:
+        """Explain why pending closed trade rows are not finalized.
+
+        Pending trade rows can outlive execution ingestion when the trade was
+        first reduced before commission reports arrived. This diagnostic reads
+        the reducer's raw execution-pair metadata and compares it with the
+        current executions table so operators can distinguish a real missing
+        commission from a stale trade row that simply needs a symbol rebuild.
+        """
+        where = "WHERE UPPER(COALESCE(status, '')) IN ('COMMISSION_PENDING', 'PNL_PENDING', 'RECONCILE_PENDING')"
+        params: list[Any] = []
+        if session_date:
+            where += """
+              AND (
+                  substr(exit_fill_time, 1, 10) = ?
+                  OR substr(closed_at, 1, 10) = ?
+                  OR (
+                      COALESCE(exit_fill_time, closed_at) IS NULL
+                      AND session_date = ?
+                  )
+              )
+            """
+            params.extend([session_date, session_date, session_date])
+        trades = self.query(
+            f"""
+            SELECT trade_id, symbol, status, session_date, entry_fill_time,
+                   exit_fill_time, closed_at, raw_json
+            FROM trades
+            {where}
+            ORDER BY COALESCE(exit_fill_time, closed_at, ''), symbol, trade_id
+            """,
+            params,
+        )
+        diagnostics: list[dict[str, Any]] = []
+        for trade in trades:
+            raw = parse_jsonish(trade.get("raw_json"))
+            buy_execution_id = str(raw.get("buy_execution_id") or raw.get("entry_execution_id") or "").strip()
+            sell_execution_id = str(raw.get("sell_execution_id") or raw.get("exit_execution_id") or "").strip()
+            exec_rows: dict[str, dict[str, Any]] = {}
+            ids = [execution_id for execution_id in (buy_execution_id, sell_execution_id) if execution_id]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                exec_rows = {
+                    str(row.get("execution_id") or ""): row
+                    for row in self.query(
+                        f"""
+                        SELECT execution_id, symbol, side, commission, commission_source,
+                               realized_pnl, executed_at, recorded_at
+                        FROM executions
+                        WHERE execution_id IN ({placeholders})
+                        """,
+                        ids,
+                    )
+                }
+            blockers: list[str] = []
+            buy_exec = exec_rows.get(buy_execution_id) if buy_execution_id else None
+            sell_exec = exec_rows.get(sell_execution_id) if sell_execution_id else None
+            if buy_execution_id and buy_exec is None:
+                blockers.append("BUY_EXECUTION_MISSING")
+            if sell_execution_id and sell_exec is None:
+                blockers.append("SELL_EXECUTION_MISSING")
+            if buy_exec is not None:
+                buy_source = str(buy_exec.get("commission_source") or "")
+                if buy_source != "ibkr" or safe_float(buy_exec.get("commission")) is None:
+                    blockers.append("BUY_COMMISSION_NOT_IBKR")
+            else:
+                buy_source = ""
+            if sell_exec is not None:
+                sell_source = str(sell_exec.get("commission_source") or "")
+                if sell_source != "ibkr" or safe_float(sell_exec.get("commission")) is None:
+                    blockers.append("SELL_COMMISSION_NOT_IBKR")
+                if safe_float(sell_exec.get("realized_pnl")) is None:
+                    blockers.append("SELL_REALIZED_PNL_MISSING")
+            else:
+                sell_source = ""
+            if not blockers:
+                blockers.append("STALE_PENDING_TRADE_NEEDS_REBUILD")
+            diagnostics.append(
+                {
+                    "trade_id": trade.get("trade_id"),
+                    "symbol": trade.get("symbol"),
+                    "status": trade.get("status"),
+                    "entry_fill_time": trade.get("entry_fill_time"),
+                    "exit_fill_time": trade.get("exit_fill_time") or trade.get("closed_at"),
+                    "buy_execution_id": buy_execution_id,
+                    "sell_execution_id": sell_execution_id,
+                    "buy_commission_source": buy_source,
+                    "buy_commission": buy_exec.get("commission") if buy_exec else None,
+                    "sell_commission_source": sell_source,
+                    "sell_commission": sell_exec.get("commission") if sell_exec else None,
+                    "sell_realized_pnl": sell_exec.get("realized_pnl") if sell_exec else None,
+                    "blockers": ",".join(blockers),
+                }
+            )
+        return diagnostics
+
+    def finalize_pending_trades(self, session_date: str | None = None) -> dict[str, Any]:
+        """Rebuild symbols that still have pending trade rows.
+
+        This is intentionally conservative: it does not invent fills or
+        commissions. It re-runs the deterministic execution reducer for the
+        affected symbols, then returns before/after diagnostics so callers can
+        see which condition remains if a trade is still pending.
+        """
+        before = self.pending_trade_finalization_diagnostics(session_date)
+        symbols = sorted({str(row.get("symbol") or "").upper() for row in before if str(row.get("symbol") or "").strip()})
+        if symbols:
+            self.rebuild_positions_from_executions(symbols, allow_historical_open_lots=False, broker_net_positions=self._broker_net_positions)
+        after = self.pending_trade_finalization_diagnostics(session_date)
+        return {
+            "session_date": session_date or "",
+            "symbols_processed": symbols,
+            "pending_before": len(before),
+            "pending_after": len(after),
+            "resolved": max(0, len(before) - len(after)),
+            "before": before,
+            "after": after,
+        }
+
     def _reconcile_trade_state_after_execution(self, execution: dict[str, Any]) -> None:
         try:
             symbol = str(execution.get("symbol") or "").upper().strip()

@@ -246,6 +246,24 @@ def runtime_status(sqlite_path: str, selected_date: str) -> dict[str, Any]:
     return flat
 
 
+def pending_trade_diagnostics(sqlite_path: str, selected_date: str, *, finalize: bool = False) -> dict[str, Any]:
+    store = SQLiteRuntimeStore(sqlite_path)
+    try:
+        if finalize:
+            return store.finalize_pending_trades(selected_date)
+        rows = store.pending_trade_finalization_diagnostics(selected_date)
+        return {
+            "session_date": selected_date,
+            "pending_before": len(rows),
+            "pending_after": len(rows),
+            "resolved": 0,
+            "before": rows,
+            "after": rows,
+        }
+    finally:
+        store.close()
+
+
 def collect_sample(args: argparse.Namespace) -> dict[str, Any]:
     sqlite_path = resolve_sqlite_path(args.sqlite_path)
     broker_positions, broker_position_status = fetch_ibkr_live_portfolio(
@@ -290,6 +308,7 @@ def collect_sample(args: argparse.Namespace) -> dict[str, Any]:
     extra_exec = sorted(sqlite_exec_ids - broker_exec_ids)
 
     status = runtime_status(sqlite_path, args.date)
+    pending_diag = pending_trade_diagnostics(sqlite_path, args.date, finalize=bool(args.finalize_pending_trades))
     sqlite_closed_symbols = int(sqlite_pnl_row.get("closed_symbols") or sqlite_pnl_row.get("trades") or 0)
     sample = {
         "sample_time": datetime.now(timezone.utc).isoformat(),
@@ -319,7 +338,9 @@ def collect_sample(args: argparse.Namespace) -> dict[str, Any]:
         "closed_pnl_formula_comparison": formula_comparison,
         "closed_symbol_diffs": symbol_diffs,
         "closed_diff_limit": max(int(args.closed_diff_limit), 0),
+        "pending_diag_limit": max(int(args.pending_diag_limit), 0),
         "runtime_status": status,
+        "pending_trade_diagnostics": pending_diag,
         "broker_execution_diagnostics": {
             "fills_count": execution_result.diagnostics.get("fills_count"),
             "req_executions_count": execution_result.diagnostics.get("req_executions_count"),
@@ -397,6 +418,22 @@ def print_sample(sample: dict[str, Any], *, verbose: bool = False) -> None:
 
     print("\nSQLITE RUNTIME STATUS:")
     print(json.dumps(sample["runtime_status"], indent=2, sort_keys=True))
+    pending_diag = sample.get("pending_trade_diagnostics") or {}
+    pending_after = list(pending_diag.get("after") or [])
+    if pending_diag:
+        print("\nPENDING TRADE FINALIZATION DIAGNOSTICS:")
+        print(
+            f"pending_before={pending_diag.get('pending_before', 0)} "
+            f"pending_after={pending_diag.get('pending_after', 0)} "
+            f"resolved={pending_diag.get('resolved', 0)}"
+        )
+        for row in pending_after[: int(sample.get("pending_diag_limit", 20))]:
+            print(
+                f"{row.get('symbol')} status={row.get('status')} blockers={row.get('blockers')} "
+                f"buy_exec={row.get('buy_execution_id')} buy_comm_source={row.get('buy_commission_source')} buy_comm={row.get('buy_commission')} "
+                f"sell_exec={row.get('sell_execution_id')} sell_comm_source={row.get('sell_commission_source')} "
+                f"sell_comm={row.get('sell_commission')} sell_realized_pnl={row.get('sell_realized_pnl')}"
+            )
     if sample["transient_in_progress"]:
         print("TRANSIENT_IN_PROGRESS=True")
     if verbose:
@@ -437,6 +474,8 @@ def main() -> int:
     parser.add_argument("--qty-tolerance", type=float, default=1e-6)
     parser.add_argument("--pnl-tolerance", type=float, default=0.01)
     parser.add_argument("--closed-diff-limit", type=int, default=25)
+    parser.add_argument("--pending-diag-limit", type=int, default=20)
+    parser.add_argument("--finalize-pending-trades", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 

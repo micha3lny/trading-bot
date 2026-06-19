@@ -605,6 +605,97 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_finalize_pending_trades_rebuilds_stale_commission_pending_row(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({
+                    "execution_id": "B_STALE_PENDING",
+                    "strategy_name": "v67",
+                    "session_date": today,
+                    "symbol": "STPN",
+                    "side": "BOT",
+                    "quantity": 2,
+                    "price": 10,
+                    "commission": 0.4,
+                    "commission_source": "ibkr",
+                    "executed_at": f"{today}T13:30:00+00:00",
+                })
+                store.upsert_execution({
+                    "execution_id": "S_STALE_PENDING",
+                    "strategy_name": "v67",
+                    "session_date": today,
+                    "symbol": "STPN",
+                    "side": "SLD",
+                    "quantity": 2,
+                    "price": 11,
+                    "commission": 0.5,
+                    "commission_source": "ibkr",
+                    "realized_pnl": 2.0,
+                    "executed_at": f"{today}T13:40:00+00:00",
+                })
+                trade = store.query("SELECT trade_id, status, raw_json FROM trades WHERE symbol = 'STPN'")[0]
+                self.assertEqual(trade["status"], "CLOSED")
+                raw = json.loads(trade["raw_json"])
+                raw["pending_commission_count"] = 1
+                store.execute(
+                    "UPDATE trades SET status = 'COMMISSION_PENDING', raw_json = ? WHERE trade_id = ?",
+                    [json.dumps(raw), trade["trade_id"]],
+                )
+
+                before = store.pending_trade_finalization_diagnostics(today)
+                self.assertEqual(before[0]["blockers"], "STALE_PENDING_TRADE_NEEDS_REBUILD")
+                result = store.finalize_pending_trades(today)
+                after_trade = store.query("SELECT status, commission, net_pnl, raw_json FROM trades WHERE symbol = 'STPN'")[0]
+
+                self.assertEqual(result["pending_before"], 1)
+                self.assertEqual(result["pending_after"], 0)
+                self.assertEqual(after_trade["status"], "CLOSED")
+                self.assertAlmostEqual(after_trade["commission"], 0.9)
+                self.assertAlmostEqual(after_trade["net_pnl"], 1.1)
+                self.assertEqual(json.loads(after_trade["raw_json"])["pending_commission_count"], 0)
+            finally:
+                store.close()
+
+    def test_pending_trade_diagnostics_identifies_missing_entry_commission(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({
+                    "execution_id": "B_MISSING_COMM",
+                    "strategy_name": "v67",
+                    "session_date": today,
+                    "symbol": "MISP",
+                    "side": "BOT",
+                    "quantity": 1,
+                    "price": 10,
+                    "commission_source": "missing",
+                    "executed_at": f"{today}T13:30:00+00:00",
+                })
+                store.upsert_execution({
+                    "execution_id": "S_MISSING_COMM",
+                    "strategy_name": "v67",
+                    "session_date": today,
+                    "symbol": "MISP",
+                    "side": "SLD",
+                    "quantity": 1,
+                    "price": 11,
+                    "commission": 0.5,
+                    "commission_source": "ibkr",
+                    "realized_pnl": 1.0,
+                    "executed_at": f"{today}T13:40:00+00:00",
+                })
+
+                diag = store.pending_trade_finalization_diagnostics(today)
+
+                self.assertEqual(len(diag), 1)
+                self.assertIn("BUY_COMMISSION_NOT_IBKR", diag[0]["blockers"])
+                self.assertEqual(diag[0]["buy_execution_id"], "B_MISSING_COMM")
+            finally:
+                store.close()
+
     def test_upsert_execution_does_not_use_stale_broker_flat_target(self) -> None:
         today = date.today().isoformat()
         with tempfile.TemporaryDirectory() as tmp:

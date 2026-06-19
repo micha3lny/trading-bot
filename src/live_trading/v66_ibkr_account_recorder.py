@@ -540,7 +540,13 @@ def record_recent_fills(ib: IB, recorder: LiveDataRecorder, seen: set[str]) -> i
                 continue
             seen.add(key)
             count += 1
-        pending = safe_sqlite_call(sqlite_store, "runtime_pending_counts")
+        pending = safe_sqlite_call(sqlite_store, "runtime_pending_counts") or {}
+        finalized_pending = {}
+        if int((pending or {}).get("pending_trade_finalization_count") or 0) > 0:
+            finalized_pending = safe_sqlite_call(sqlite_store, "finalize_pending_trades") or {}
+            refreshed_pending = safe_sqlite_call(sqlite_store, "runtime_pending_counts")
+            if refreshed_pending is not None:
+                pending = refreshed_pending
         safe_sqlite_call(
             sqlite_store,
             "mark_operation_status",
@@ -549,6 +555,7 @@ def record_recent_fills(ib: IB, recorder: LiveDataRecorder, seen: set[str]) -> i
             started_at=started_at,
             new_fills=count,
             pending_counts=pending or {},
+            finalized_pending_trades=finalized_pending or {},
         )
         return count
     except Exception as exc:
