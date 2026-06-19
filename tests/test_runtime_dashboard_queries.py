@@ -2195,6 +2195,143 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["diagnostics"]["untrusted_carry_closed_count"], 1)
             self.assertEqual(snapshot["diagnostics"]["untrusted_carry_closed_symbols"], "OUST")
 
+    def test_closed_exit_reason_from_runtime_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_trade({
+                    "trade_id": "T_EXIT_REASON_RUNTIME",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-18",
+                    "symbol": "TRAIL",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-06-18T13:30:00+00:00",
+                    "exit_fill_time": "2026-06-18T13:45:00+00:00",
+                    "entry_price": 10,
+                    "exit_price": 11,
+                    "quantity": 5,
+                    "gross_pnl": 5,
+                    "commission": 1,
+                    "net_pnl": 4,
+                })
+                store.record_runtime_event(
+                    event_time="2026-06-18T13:44:59+00:00",
+                    event_type="SELL_ORDER_SENT",
+                    strategy_name="v67",
+                    session_date="2026-06-18",
+                    symbol="TRAIL",
+                    trade_id="T_EXIT_REASON_RUNTIME",
+                    reason="trailing_stop",
+                    raw_json={"reason": "trailing_stop"},
+                )
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-18", "2026-06-18"), "v67")
+
+            self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason"], "trailing_stop")
+
+    def test_closed_exit_reason_from_trade_lifecycle_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            recorder_root = Path(tmp) / "recorder"
+            session_dir = recorder_root / "2026-06-18"
+            session_dir.mkdir(parents=True)
+            with (session_dir / "trade_lifecycle.csv").open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["recorded_at", "strategy", "event", "symbol", "reason"])
+                writer.writeheader()
+                writer.writerow({
+                    "recorded_at": "2026-06-18T19:45:00+00:00",
+                    "strategy": "v67",
+                    "event": "EOD_FLATTEN_SUBMIT",
+                    "symbol": "EODX",
+                    "reason": "eod_flatten",
+                })
+            previous = os.environ.get("TRADING_BOT_RECORDER_DIR")
+            os.environ["TRADING_BOT_RECORDER_DIR"] = str(recorder_root)
+            try:
+                store = SQLiteRuntimeStore(db)
+                store.upsert_trade({
+                    "trade_id": "T_EXIT_REASON_LIFECYCLE",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-18",
+                    "symbol": "EODX",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-06-18T13:30:00+00:00",
+                    "exit_fill_time": "2026-06-18T19:45:01+00:00",
+                    "entry_price": 10,
+                    "exit_price": 9.5,
+                    "quantity": 2,
+                    "gross_pnl": -1,
+                    "commission": 1,
+                    "net_pnl": -2,
+                })
+                store.close()
+
+                snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-18", "2026-06-18"), "v67")
+            finally:
+                if previous is None:
+                    os.environ.pop("TRADING_BOT_RECORDER_DIR", None)
+                else:
+                    os.environ["TRADING_BOT_RECORDER_DIR"] = previous
+
+            self.assertEqual(snapshot["closed_positions"].iloc[0]["exit_reason"], "eod_flatten")
+
+    def test_unknown_same_day_closed_trade_strategy_is_inferred_from_executions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_trade({
+                    "trade_id": "T_MPLT",
+                    "strategy_name": "unknown",
+                    "session_date": "2026-06-18",
+                    "symbol": "MPLT",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-06-18T13:31:00+00:00",
+                    "exit_fill_time": "2026-06-18T13:45:00+00:00",
+                    "entry_price": 10,
+                    "exit_price": 11,
+                    "quantity": 1,
+                    "gross_pnl": 1,
+                    "commission": 0.5,
+                    "net_pnl": 0.5,
+                    "raw_json": {},
+                })
+                store.upsert_execution({
+                    "execution_id": "B_MPLT",
+                    "trade_id": "T_MPLT",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-18",
+                    "symbol": "MPLT",
+                    "side": "BOT",
+                    "quantity": 1,
+                    "price": 10,
+                    "executed_at": "2026-06-18T13:31:00+00:00",
+                    "commission_source": "ibkr",
+                    "commission": 0.25,
+                })
+                store.upsert_execution({
+                    "execution_id": "S_MPLT",
+                    "trade_id": "T_MPLT",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-18",
+                    "symbol": "MPLT",
+                    "side": "SLD",
+                    "quantity": 1,
+                    "price": 11,
+                    "executed_at": "2026-06-18T13:45:00+00:00",
+                    "commission_source": "ibkr",
+                    "commission": 0.25,
+                })
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-18", "2026-06-18"), "All")
+
+            self.assertEqual(snapshot["closed_positions"].iloc[0]["strategy"], "v67")
+
 
 if __name__ == "__main__":
     unittest.main()

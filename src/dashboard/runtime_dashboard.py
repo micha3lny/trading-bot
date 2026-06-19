@@ -22,6 +22,7 @@ from src.dashboard.runtime_queries import (  # noqa: E402
     DateWindow,
     list_sessions,
     list_strategies,
+    hold_minutes,
     load_dashboard_snapshot,
     utc_today,
 )
@@ -658,24 +659,82 @@ def render_rejected_entries(df: pd.DataFrame) -> None:
     st.dataframe(out, width="stretch", hide_index=True)
 
 
-def render_closed_positions(df: pd.DataFrame) -> None:
-    st.subheader("Closed Positions")
+def closed_normal_mask(df: pd.DataFrame) -> pd.Series:
     if df.empty:
-        st.info("No confirmed closed trades in trades table.")
-        return
+        return pd.Series(dtype=bool)
+    strategy = df.get("strategy", pd.Series("", index=df.index)).fillna("").astype(str).str.lower()
+    quality = df.get("data_quality", pd.Series("", index=df.index)).fillna("").astype(str)
+    trusted = df.get("runtime_pnl_trusted", pd.Series(True, index=df.index)).fillna(True).astype(bool)
+    carried = quality.str.contains("CARRIED_POSITION_CLOSED_TODAY|CARRY_BASIS_UNVERIFIED", regex=True, na=False)
+    return trusted & (strategy != "unknown") & ~carried
+
+
+def aggregate_closed_positions(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    rows: list[dict[str, object]] = []
+    group_cols = ["symbol", "strategy", "entry_date", "exit_date", "exit_reason"]
+    for _, group in df.groupby(group_cols, dropna=False, sort=False):
+        records = group.to_dict("records")
+        qty = pd.to_numeric(group.get("qty"), errors="coerce").fillna(0.0).abs()
+        qty_sum = float(qty.sum())
+        gross = pd.to_numeric(group.get("gross"), errors="coerce").sum(min_count=1)
+        net = pd.to_numeric(group.get("net_actual"), errors="coerce").sum(min_count=1)
+        commission = pd.to_numeric(group.get("ibkr_commission"), errors="coerce").fillna(0.0).sum()
+        buy_values = pd.to_numeric(group.get("buy"), errors="coerce")
+        sell_values = pd.to_numeric(group.get("sell"), errors="coerce")
+        buy = float((buy_values * qty).sum() / qty_sum) if qty_sum else None
+        sell = float((sell_values * qty).sum() / qty_sum) if qty_sum else None
+        denominator = (buy or 0.0) * qty_sum
+        net_pct = float((net / denominator) * 100.0) if denominator and pd.notna(net) else None
+        entry_times = [x for x in group.get("entry_time", pd.Series(dtype=object)).tolist() if x]
+        exit_times = [x for x in group.get("exit_time", pd.Series(dtype=object)).tolist() if x]
+        peak = pd.to_numeric(group.get("peak_pct"), errors="coerce").max()
+        drop = pd.to_numeric(group.get("drop_from_peak_pct"), errors="coerce").min()
+        hold = hold_minutes(min(entry_times) if entry_times else None, max(exit_times) if exit_times else None)
+        first = records[0]
+        qualities = sorted({str(x) for x in group.get("data_quality", pd.Series(dtype=str)).dropna().tolist() if str(x)})
+        statuses = sorted({str(x) for x in group.get("commission_status", pd.Series(dtype=str)).dropna().tolist() if str(x)})
+        rows.append(
+            {
+                **first,
+                "qty": qty_sum,
+                "buy": buy,
+                "sell": sell,
+                "gross": gross,
+                "net_actual": net,
+                "net_pct": net_pct,
+                "pnl_pct": net_pct,
+                "ibkr_commission": commission,
+                "peak_pct": peak if pd.notna(peak) else None,
+                "drop_from_peak_pct": drop if pd.notna(drop) else None,
+                "hold_minutes": hold,
+                "entry_time": min(entry_times) if entry_times else first.get("entry_time"),
+                "exit_time": max(exit_times) if exit_times else first.get("exit_time"),
+                "commission_status": "OK" if statuses == ["OK"] else (";".join(statuses) if statuses else ""),
+                "data_quality": "; ".join(qualities) if qualities else "OK",
+                "partial_rows": len(group),
+                "trade_ids": ", ".join(str(x) for x in group.get("trade_id", pd.Series(dtype=str)).dropna().tolist() if str(x)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     cols = [
         "symbol", "entry_date", "exit_date", "qty", "ibkr_commission", "commission_status", "buy", "sell", "gross", "net_actual", "net_pct", "peak_pct",
         "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
-        "entry_time", "exit_time", "data_quality",
+        "entry_time", "exit_time", "data_quality", "partial_rows",
     ]
-    out = filter_table(df[cols].copy(), "closed").sort_values(["net_actual", "symbol"], na_position="last")
-    if len(out) != len(df):
-        st.warning(f"Table filters are hiding {len(df) - len(out)} of {len(df)} closed-trade rows.")
-    out["entry_time"] = out["entry_time"].map(display_time)
-    out["exit_time"] = out["exit_time"].map(display_time)
-    out["peak_pct"] = out["peak_pct"].map(display_number_or_missing)
-    out["drop_from_peak_pct"] = out["drop_from_peak_pct"].map(display_number_or_missing)
-    out["hold_minutes"] = out["hold_minutes"].map(display_number_or_missing)
+    available = [col for col in cols if col in df.columns]
+    out = filter_table(df[available].copy(), prefix).sort_values(["net_actual", "symbol"], na_position="last")
+    if "entry_time" in out.columns:
+        out["entry_time"] = out["entry_time"].map(display_time)
+    if "exit_time" in out.columns:
+        out["exit_time"] = out["exit_time"].map(display_time)
+    for col in ("peak_pct", "drop_from_peak_pct", "hold_minutes"):
+        if col in out.columns:
+            out[col] = out[col].map(display_number_or_missing)
     out = out.rename(
         columns={
             "symbol": "Symbol",
@@ -697,20 +756,50 @@ def render_closed_positions(df: pd.DataFrame) -> None:
             "exit_time": "Exit Time",
             "data_quality": "Data Quality",
             "strategy": "Strategy",
+            "partial_rows": "Partial Rows",
         }
     )
-    out = out[
-        [
-            "Symbol", "Quantity", "IBKR Comm", "Commission Status", "Buy", "Sell", "Gross", "Net", "Net %",
-            "Peak %", "Drop from Peak %", "Min", "Exit Reason", "Entry Date", "Exit Date", "Entry Time", "Exit Time", "Strategy",
-            "Data Quality",
-        ]
+    display_cols = [
+        "Symbol", "Quantity", "IBKR Comm", "Commission Status", "Buy", "Sell", "Gross", "Net", "Net %",
+        "Peak %", "Drop from Peak %", "Min", "Exit Reason", "Entry Date", "Exit Date", "Entry Time", "Exit Time", "Strategy",
+        "Data Quality", "Partial Rows",
     ]
-    st.dataframe(
-        style_pnl(out, ["Gross", "Net", "Net %"]),
-        width="stretch",
-        hide_index=True,
-    )
+    return out[[col for col in display_cols if col in out.columns]]
+
+
+def render_closed_positions(df: pd.DataFrame) -> None:
+    st.subheader("Closed Positions")
+    if df.empty:
+        st.info("No confirmed closed trades in trades table.")
+        return
+    normal = df[closed_normal_mask(df)].copy()
+    diagnostics = df[~closed_normal_mask(df)].copy()
+    if diagnostics.empty:
+        st.caption("Showing normal strategy closed trades only.")
+    else:
+        st.warning(f"{len(diagnostics)} carried/unattributed closed rows are excluded from the main strategy table and shown below.")
+    if normal.empty:
+        st.info("No normal attributed strategy closed trades. See carry/unattributed diagnostics below.")
+    aggregate = aggregate_closed_positions(normal)
+    out = format_closed_positions(aggregate, "closed") if not aggregate.empty else pd.DataFrame()
+    if not out.empty:
+        st.dataframe(
+            style_pnl(out, ["Gross", "Net", "Net %"]),
+            width="stretch",
+            hide_index=True,
+        )
+    if not normal.empty:
+        with st.expander("Closed trade partial execution details", expanded=False):
+            details = format_closed_positions(normal, "closed_details")
+            st.dataframe(style_pnl(details, ["Gross", "Net", "Net %"]), width="stretch", hide_index=True)
+    if not diagnostics.empty:
+        st.subheader("Carry / Unattributed Closed Diagnostics")
+        diag_out = format_closed_positions(diagnostics, "closed_carry_diag")
+        st.dataframe(
+            style_pnl(diag_out, ["Gross", "Net", "Net %"]),
+            width="stretch",
+            hide_index=True,
+        )
     debug_cols = [
         "trade_id", "symbol", "entry_execution_id", "exit_execution_id", "source",
         "entry_execution_count", "exit_execution_count",
