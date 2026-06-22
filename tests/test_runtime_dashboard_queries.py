@@ -96,6 +96,68 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(row["exit_sent"], 1)
             self.assertEqual(row["execution_ids"], "B1, B2")
 
+    def test_closed_trade_excursion_columns_and_missing_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_trade({
+                    "trade_id": "T_EXCURSION_OK",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-18",
+                    "symbol": "EXOK",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-06-18T13:30:00+00:00",
+                    "exit_fill_time": "2026-06-18T13:45:00+00:00",
+                    "closed_at": "2026-06-18T13:45:00+00:00",
+                    "entry_price": 10,
+                    "exit_price": 11,
+                    "quantity": 2,
+                    "gross_pnl": 2,
+                    "commission": 0,
+                    "net_pnl": 2,
+                    "mfe_pct": 25,
+                    "mae_pct": -5,
+                    "peak_price": 12.5,
+                    "low_price": 9.5,
+                    "peak_unrealized_pnl": 5,
+                    "max_adverse_unrealized_pnl": -1,
+                    "giveback_from_peak": 3,
+                    "raw_json": {"commission_status": "OK"},
+                })
+                store.upsert_trade({
+                    "trade_id": "T_EXCURSION_MISSING",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-18",
+                    "symbol": "EXMISS",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-06-18T13:35:00+00:00",
+                    "exit_fill_time": "2026-06-18T13:50:00+00:00",
+                    "closed_at": "2026-06-18T13:50:00+00:00",
+                    "entry_price": 20,
+                    "exit_price": 19,
+                    "quantity": 1,
+                    "gross_pnl": -1,
+                    "commission": 0,
+                    "net_pnl": -1,
+                    "raw_json": {"commission_status": "OK"},
+                })
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-18", "2026-06-18"), "v67")
+            closed = snapshot["closed_positions"].set_index("symbol")
+
+            self.assertAlmostEqual(closed.loc["EXOK", "mae_pct"], -5)
+            self.assertAlmostEqual(closed.loc["EXOK", "peak_price"], 12.5)
+            self.assertAlmostEqual(closed.loc["EXOK", "low_price"], 9.5)
+            self.assertAlmostEqual(closed.loc["EXOK", "peak_unrealized_pnl"], 5)
+            self.assertAlmostEqual(closed.loc["EXOK", "max_adverse_unrealized_pnl"], -1)
+            self.assertAlmostEqual(closed.loc["EXOK", "giveback_from_peak"], 3)
+            self.assertEqual(snapshot["data_quality_summary"]["mfe_missing"], 1)
+            self.assertEqual(snapshot["data_quality_summary"]["mae_missing"], 1)
+            self.assertEqual(snapshot["data_quality_summary"]["peak_price_missing"], 1)
+
     def test_runtime_executions_use_sqlite_and_sort_descending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             session_date = utc_today()

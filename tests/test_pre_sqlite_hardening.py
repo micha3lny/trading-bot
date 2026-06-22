@@ -257,8 +257,12 @@ class PreSqliteHardeningTests(unittest.TestCase):
             self.assertEqual(raw["market_price_source"], "live_ticker")
             self.assertAlmostEqual(raw["unrealized_pnl"], 1.5)
             self.assertAlmostEqual(raw["unrealized_pct"], 5.0)
-            self.assertAlmostEqual(raw["peak_pct"], 0.0)
-            self.assertAlmostEqual(raw["peak_unrealized_pct"], 0.0)
+            self.assertAlmostEqual(raw["peak_pct"], 5.0)
+            self.assertAlmostEqual(raw["peak_unrealized_pct"], 5.0)
+            self.assertAlmostEqual(raw["mfe_pct"], 5.0)
+            self.assertAlmostEqual(raw["mae_pct"], 0.0)
+            self.assertAlmostEqual(raw["peak_unrealized_pnl"], 1.5)
+            self.assertAlmostEqual(raw["max_adverse_unrealized_pnl"], 0.0)
             self.assertEqual(file_payload["positions"]["CRBP"]["market_price"], 10.5)
 
     def test_live_market_metrics_update_canonical_reducer_position(self) -> None:

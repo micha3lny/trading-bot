@@ -1336,6 +1336,12 @@ def closed_from_trades(
             commission AS persisted_commission,
             net_pnl AS persisted_net_pnl,
             mfe_pct AS peak_pct,
+            mae_pct,
+            peak_price,
+            low_price,
+            peak_unrealized_pnl,
+            max_adverse_unrealized_pnl,
+            giveback_from_peak,
             exit_reason,
             raw_json,
             updated_at,
@@ -1578,6 +1584,16 @@ def closed_from_trades(
     out["runtime_pnl_trusted"] = runtime_pnl_trusted
     out["runtime_pnl_untrusted_reason"] = untrusted_reasons
     out["peak_pct"] = peak_values
+    for excursion_col in (
+        "mae_pct",
+        "peak_price",
+        "low_price",
+        "peak_unrealized_pnl",
+        "max_adverse_unrealized_pnl",
+        "giveback_from_peak",
+    ):
+        if excursion_col in out.columns:
+            out[excursion_col] = pd.to_numeric(out[excursion_col], errors="coerce")
     out["peak_source"] = peak_sources
     out["peak_match_quality"] = peak_match_qualities
     out["drop_from_peak_pct"] = drop_values
@@ -1648,7 +1664,8 @@ def closed_from_trades(
     return out[
         [
             "trade_id", "symbol", "qty", "ibkr_commission", "buy", "sell", "gross", "net_actual", "net_pct", "pnl_pct", "peak_pct",
-            "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
+            "mae_pct", "peak_price", "low_price", "peak_unrealized_pnl", "max_adverse_unrealized_pnl",
+            "giveback_from_peak", "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
             "entry_time", "exit_time", "commission_status", "data_quality", "session_date",
             "entry_date", "exit_date", "carried_closed_today",
             "runtime_pnl_trusted", "runtime_pnl_untrusted_reason",
@@ -2901,11 +2918,17 @@ def build_data_quality_summary(closed_positions: pd.DataFrame) -> dict[str, int]
             "commission_missing": 0,
             "peak_ok": 0,
             "peak_missing": 0,
+            "mfe_missing": 0,
+            "mae_missing": 0,
+            "peak_price_missing": 0,
             "data_quality_warning_count": 0,
         }
     commission_status = closed_positions.get("commission_status", pd.Series(dtype=str)).fillna("").astype(str)
     peak_source = closed_positions.get("peak_source", pd.Series(dtype=str)).fillna("").astype(str)
     data_quality = closed_positions.get("data_quality", pd.Series(dtype=str)).fillna("OK").astype(str)
+    mfe_values = pd.to_numeric(closed_positions.get("peak_pct", pd.Series(dtype=float)), errors="coerce")
+    mae_values = pd.to_numeric(closed_positions.get("mae_pct", pd.Series(dtype=float)), errors="coerce")
+    peak_prices = pd.to_numeric(closed_positions.get("peak_price", pd.Series(dtype=float)), errors="coerce")
     return {
         "closed_trades_count": int(len(closed_positions)),
         "commission_ok": int((commission_status == "OK").sum()),
@@ -2913,6 +2936,9 @@ def build_data_quality_summary(closed_positions: pd.DataFrame) -> dict[str, int]
         "commission_missing": int((commission_status == "MISSING").sum()),
         "peak_ok": int((peak_source != "missing").sum()),
         "peak_missing": int((peak_source == "missing").sum()),
+        "mfe_missing": int(mfe_values.isna().sum()),
+        "mae_missing": int(mae_values.isna().sum()),
+        "peak_price_missing": int(peak_prices.isna().sum()),
         "data_quality_warning_count": int((data_quality != "OK").sum()),
     }
 

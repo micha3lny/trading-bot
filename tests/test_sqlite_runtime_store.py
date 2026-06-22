@@ -545,6 +545,67 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_closed_trade_reducer_persists_excursion_fallbacks(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B_EXC", "strategy_name": "v67", "session_date": today, "symbol": "EXC", "side": "BOT", "quantity": 5, "price": 10, "executed_at": f"{today}T13:30:00+00:00"})
+                store.upsert_execution({"execution_id": "S_EXC", "strategy_name": "v67", "session_date": today, "symbol": "EXC", "side": "SLD", "quantity": 5, "price": 12, "executed_at": f"{today}T13:45:00+00:00"})
+
+                closed = store.query("SELECT * FROM trades WHERE symbol = 'EXC' AND status = 'CLOSED'")
+
+                self.assertEqual(len(closed), 1)
+                self.assertAlmostEqual(closed[0]["mfe_pct"], 20.0)
+                self.assertAlmostEqual(closed[0]["mae_pct"], 0.0)
+                self.assertAlmostEqual(closed[0]["peak_price"], 12.0)
+                self.assertAlmostEqual(closed[0]["low_price"], 10.0)
+                self.assertAlmostEqual(closed[0]["peak_unrealized_pnl"], 10.0)
+                self.assertAlmostEqual(closed[0]["max_adverse_unrealized_pnl"], 0.0)
+                self.assertAlmostEqual(closed[0]["giveback_from_peak"], 0.0)
+            finally:
+                store.close()
+
+    def test_closed_trade_reducer_uses_live_position_excursion_snapshot(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({"execution_id": "B_LIVE_EXC", "strategy_name": "v67", "session_date": today, "symbol": "LIVEEXC", "side": "BOT", "quantity": 5, "price": 10, "executed_at": f"{today}T13:30:00+00:00"})
+                store.upsert_position({
+                    "position_key": f"v67:{today}:LIVEEXC",
+                    "strategy_name": "v67",
+                    "session_date": today,
+                    "symbol": "LIVEEXC",
+                    "status": "OPEN",
+                    "quantity": 5,
+                    "avg_price": 10,
+                    "active": 1,
+                    "updated_at": f"{today}T13:40:00+00:00",
+                    "raw_json": {
+                        "entry_price": 10,
+                        "peak_price": 13,
+                        "low_price": 9,
+                        "peak_unrealized_pnl": 15,
+                        "max_adverse_unrealized_pnl": -5,
+                        "open_lot_execution_ids": ["B_LIVE_EXC"],
+                    },
+                })
+                store.upsert_execution({"execution_id": "S_LIVE_EXC", "strategy_name": "v67", "session_date": today, "symbol": "LIVEEXC", "side": "SLD", "quantity": 5, "price": 11, "executed_at": f"{today}T13:45:00+00:00"})
+
+                closed = store.query("SELECT * FROM trades WHERE symbol = 'LIVEEXC' AND status = 'CLOSED'")
+
+                self.assertEqual(len(closed), 1)
+                self.assertAlmostEqual(closed[0]["mfe_pct"], 30.0)
+                self.assertAlmostEqual(closed[0]["mae_pct"], -10.0)
+                self.assertAlmostEqual(closed[0]["peak_price"], 13.0)
+                self.assertAlmostEqual(closed[0]["low_price"], 9.0)
+                self.assertAlmostEqual(closed[0]["peak_unrealized_pnl"], 15.0)
+                self.assertAlmostEqual(closed[0]["max_adverse_unrealized_pnl"], -5.0)
+                self.assertAlmostEqual(closed[0]["giveback_from_peak"], 10.0)
+            finally:
+                store.close()
+
     def test_reducer_keeps_current_lot_and_suppresses_old_unmatched_lot(self) -> None:
         today = date.today().isoformat()
         with tempfile.TemporaryDirectory() as tmp:

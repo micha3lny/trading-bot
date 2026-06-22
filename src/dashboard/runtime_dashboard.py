@@ -572,7 +572,9 @@ def render_data_quality_summary(summary: dict) -> None:
     cols[2].metric("Comm Partial", int(summary.get("commission_partial", 0)))
     cols[3].metric("Comm Missing", int(summary.get("commission_missing", 0)))
     cols[4].metric("Peak Missing", int(summary.get("peak_missing", 0)))
-    cols[5].metric("Warnings", int(summary.get("data_quality_warning_count", 0)))
+    cols[5].metric("MAE Missing", int(summary.get("mae_missing", 0)))
+    cols[6].metric("Peak Price Missing", int(summary.get("peak_price_missing", 0)))
+    cols[7].metric("Warnings", int(summary.get("data_quality_warning_count", 0)))
 
 
 def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", prefix: str = "open") -> None:
@@ -833,6 +835,12 @@ def aggregate_closed_positions(df: pd.DataFrame) -> pd.DataFrame:
         entry_times = [x for x in group.get("entry_time", pd.Series(dtype=object)).tolist() if x]
         exit_times = [x for x in group.get("exit_time", pd.Series(dtype=object)).tolist() if x]
         peak = pd.to_numeric(group.get("peak_pct"), errors="coerce").max()
+        mae = pd.to_numeric(group.get("mae_pct"), errors="coerce").min()
+        peak_price = pd.to_numeric(group.get("peak_price"), errors="coerce").max()
+        low_price = pd.to_numeric(group.get("low_price"), errors="coerce").min()
+        peak_upnl = pd.to_numeric(group.get("peak_unrealized_pnl"), errors="coerce").sum(min_count=1)
+        max_adverse_upnl = pd.to_numeric(group.get("max_adverse_unrealized_pnl"), errors="coerce").sum(min_count=1)
+        giveback = pd.to_numeric(group.get("giveback_from_peak"), errors="coerce").sum(min_count=1)
         drop = pd.to_numeric(group.get("drop_from_peak_pct"), errors="coerce").min()
         hold = hold_minutes(min(entry_times) if entry_times else None, max(exit_times) if exit_times else None)
         first = records[0]
@@ -850,6 +858,12 @@ def aggregate_closed_positions(df: pd.DataFrame) -> pd.DataFrame:
                 "pnl_pct": net_pct,
                 "ibkr_commission": commission,
                 "peak_pct": peak if pd.notna(peak) else None,
+                "mae_pct": mae if pd.notna(mae) else None,
+                "peak_price": peak_price if pd.notna(peak_price) else None,
+                "low_price": low_price if pd.notna(low_price) else None,
+                "peak_unrealized_pnl": peak_upnl if pd.notna(peak_upnl) else None,
+                "max_adverse_unrealized_pnl": max_adverse_upnl if pd.notna(max_adverse_upnl) else None,
+                "giveback_from_peak": giveback if pd.notna(giveback) else None,
                 "drop_from_peak_pct": drop if pd.notna(drop) else None,
                 "hold_minutes": hold,
                 "entry_time": min(entry_times) if entry_times else first.get("entry_time"),
@@ -866,7 +880,8 @@ def aggregate_closed_positions(df: pd.DataFrame) -> pd.DataFrame:
 def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     cols = [
         "symbol", "entry_date", "exit_date", "qty", "ibkr_commission", "commission_status", "buy", "sell", "gross", "net_actual", "net_pct", "peak_pct",
-        "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
+        "mae_pct", "peak_price", "low_price", "peak_unrealized_pnl", "max_adverse_unrealized_pnl",
+        "giveback_from_peak", "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
         "entry_time", "exit_time", "exit_reason_source", "matched_event_type",
         "matched_event_time", "matched_order_id", "data_quality", "partial_rows",
     ]
@@ -878,7 +893,17 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
         out["exit_time"] = out["exit_time"].map(display_time)
     if "matched_event_time" in out.columns:
         out["matched_event_time"] = out["matched_event_time"].map(display_time)
-    for col in ("peak_pct", "drop_from_peak_pct", "hold_minutes"):
+    for col in (
+        "peak_pct",
+        "mae_pct",
+        "peak_price",
+        "low_price",
+        "peak_unrealized_pnl",
+        "max_adverse_unrealized_pnl",
+        "giveback_from_peak",
+        "drop_from_peak_pct",
+        "hold_minutes",
+    ):
         if col in out.columns:
             out[col] = out[col].map(display_number_or_missing)
     out = out.rename(
@@ -895,6 +920,12 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
             "net_actual": "Net",
             "net_pct": "Net %",
             "peak_pct": "Peak %",
+            "mae_pct": "MAE %",
+            "peak_price": "Peak Price",
+            "low_price": "Low Price",
+            "peak_unrealized_pnl": "Peak UPNL",
+            "max_adverse_unrealized_pnl": "Max Adverse UPNL",
+            "giveback_from_peak": "Giveback $",
             "drop_from_peak_pct": "Drop from Peak %",
             "hold_minutes": "Min",
             "exit_reason": "Exit Reason",

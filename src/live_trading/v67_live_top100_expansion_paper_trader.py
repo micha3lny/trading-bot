@@ -103,6 +103,12 @@ class ManagedPosition:
     entry_price: float
     entry_time: str
     peak_price: float
+    low_price: float | None = None
+    mfe_pct: float | None = None
+    mae_pct: float | None = None
+    peak_unrealized_pnl: float | None = None
+    max_adverse_unrealized_pnl: float | None = None
+    last_update_time: str | None = None
     active: bool = True
     exit_sent: bool = False
     source: str = "live_buy"
@@ -960,14 +966,34 @@ def load_exit_sent_symbols(recorder: LiveDataRecorder) -> set[str]:
     return symbols
 
 
+def update_managed_position_excursion(pos: ManagedPosition, market_price: float | None = None, *, observed_at: str | None = None) -> None:
+    price = safe_float(market_price)
+    if pos.low_price is None or pos.low_price <= 0:
+        pos.low_price = pos.entry_price
+    if pos.peak_price <= 0:
+        pos.peak_price = pos.entry_price
+    if price is not None and price > 0:
+        pos.peak_price = max(pos.peak_price, price)
+        pos.low_price = min(pos.low_price or price, price)
+    if pos.entry_price > 0:
+        pos.mfe_pct = (pos.peak_price / pos.entry_price - 1.0) * 100.0
+        if pos.low_price is not None and pos.low_price > 0:
+            pos.mae_pct = (pos.low_price / pos.entry_price - 1.0) * 100.0
+        pos.peak_unrealized_pnl = (pos.peak_price - pos.entry_price) * pos.quantity
+        if pos.low_price is not None:
+            pos.max_adverse_unrealized_pnl = (pos.low_price - pos.entry_price) * pos.quantity
+    pos.last_update_time = observed_at or now_utc()
+
+
 def managed_position_payload(pos: ManagedPosition, market_price_info: dict[str, Any] | None = None) -> dict[str, Any]:
     market_price = safe_float((market_price_info or {}).get("market_price"))
+    update_managed_position_excursion(pos, market_price, observed_at=(market_price_info or {}).get("market_price_at"))
     unrealized_pnl = None
     unrealized_pct = None
     peak_pct = None
     drop_from_peak_pct = None
     if pos.entry_price:
-        peak_pct = (pos.peak_price / pos.entry_price - 1.0) * 100.0
+        peak_pct = pos.mfe_pct if pos.mfe_pct is not None else (pos.peak_price / pos.entry_price - 1.0) * 100.0
         if market_price is not None:
             unrealized_pnl = (market_price - pos.entry_price) * pos.quantity
             unrealized_pct = (market_price / pos.entry_price - 1.0) * 100.0
@@ -978,8 +1004,13 @@ def managed_position_payload(pos: ManagedPosition, market_price_info: dict[str, 
         "entry_price": pos.entry_price,
         "entry_time": pos.entry_time,
         "peak_price": pos.peak_price,
+        "low_price": pos.low_price,
+        "mfe_pct": pos.mfe_pct,
+        "mae_pct": pos.mae_pct,
         "peak_pct": peak_pct,
         "peak_unrealized_pct": peak_pct,
+        "peak_unrealized_pnl": pos.peak_unrealized_pnl,
+        "max_adverse_unrealized_pnl": pos.max_adverse_unrealized_pnl,
         "unrealized_pnl": unrealized_pnl,
         "unrealized_pct": unrealized_pct,
         "drop_from_peak_pct": drop_from_peak_pct,
@@ -990,7 +1021,8 @@ def managed_position_payload(pos: ManagedPosition, market_price_info: dict[str, 
         "last_exit_order_ts": pos.last_exit_order_ts,
         "eod_retry_count": pos.eod_retry_count,
         "entry_fill_verified": pos.entry_fill_verified,
-        "last_update": (market_price_info or {}).get("market_price_at") or now_utc(),
+        "last_update": pos.last_update_time or (market_price_info or {}).get("market_price_at") or now_utc(),
+        "last_update_time": pos.last_update_time,
     }
     if market_price_info:
         payload.update({k: v for k, v in market_price_info.items() if v is not None})
@@ -1147,6 +1179,12 @@ def restore_managed_positions(
                 entry_price=float(entry),
                 entry_time=str(row.get("entry_time") or f"restored:{now_utc()}"),
                 peak_price=float(peak or entry),
+                low_price=safe_float(row.get("low_price")) or float(entry),
+                mfe_pct=safe_float(row.get("mfe_pct") or row.get("peak_pct") or row.get("peak_unrealized_pct")),
+                mae_pct=safe_float(row.get("mae_pct")),
+                peak_unrealized_pnl=safe_float(row.get("peak_unrealized_pnl")),
+                max_adverse_unrealized_pnl=safe_float(row.get("max_adverse_unrealized_pnl")),
+                last_update_time=str(row.get("last_update_time") or row.get("last_update") or "") or None,
                 active=safe_bool(row.get("active"), True),
                 exit_sent=exit_sent,
                 source=str(row.get("source") or "restored"),
@@ -3015,7 +3053,11 @@ def manage_exits(
             continue
 
         old_peak = pos.peak_price
+        if pos.low_price is None or pos.low_price <= 0:
+            pos.low_price = pos.entry_price
         pos.peak_price = max(pos.peak_price, price)
+        pos.low_price = min(pos.low_price, price)
+        update_managed_position_excursion(pos, price, observed_at=now_utc())
         if pos.peak_price != old_peak:
             record_lifecycle(recorder, "PEAK_UPDATED", symbol, price=price, entry_price=pos.entry_price, peak_price=pos.peak_price)
 

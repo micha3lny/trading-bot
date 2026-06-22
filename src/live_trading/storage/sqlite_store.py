@@ -234,6 +234,28 @@ def execution_commission(row: dict[str, Any], fraction: float = 1.0) -> float:
     return abs(value) * max(0.0, fraction)
 
 
+def first_safe_float(*values: Any) -> float | None:
+    for value in values:
+        parsed = safe_float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def pct_from_prices(price: float | None, entry_price: float | None) -> float | None:
+    if price is None or entry_price is None or entry_price <= 0:
+        return None
+    return ((price / entry_price) - 1.0) * 100.0
+
+
+def raw_float_any(raw: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = first_safe_float(raw.get(key))
+        if value is not None:
+            return value
+    return None
+
+
 def reconstructed_trade_id(entry_date: str, exit_date: str, symbol: str, buy_exec_id: str, sell_exec_id: str) -> str:
     return f"reconstructed:{entry_date}:{exit_date}:{str(symbol or '').upper()}:{buy_exec_id}:{sell_exec_id}"
 
@@ -428,6 +450,11 @@ class SQLiteRuntimeStore:
                 net_pnl REAL,
                 mfe_pct REAL,
                 mae_pct REAL,
+                peak_price REAL,
+                low_price REAL,
+                peak_unrealized_pnl REAL,
+                max_adverse_unrealized_pnl REAL,
+                giveback_from_peak REAL,
                 exit_reason TEXT,
                 ibkr_entry_confirmed INTEGER DEFAULT 0,
                 ibkr_exit_confirmed INTEGER DEFAULT 0,
@@ -651,6 +678,11 @@ class SQLiteRuntimeStore:
         )
         self._ensure_column("trades", "updated_at", "TEXT")
         self._ensure_column("trades", "trade_reduction_version", "INTEGER DEFAULT 1")
+        self._ensure_column("trades", "peak_price", "REAL")
+        self._ensure_column("trades", "low_price", "REAL")
+        self._ensure_column("trades", "peak_unrealized_pnl", "REAL")
+        self._ensure_column("trades", "max_adverse_unrealized_pnl", "REAL")
+        self._ensure_column("trades", "giveback_from_peak", "REAL")
         self._ensure_column("orders", "position_key", "TEXT")
         self._ensure_column("orders", "exit_reason", "TEXT")
         self._ensure_column("orders", "exit_reason_source", "TEXT")
@@ -1412,6 +1444,100 @@ class SQLiteRuntimeStore:
         self.execute(f"DELETE FROM trades WHERE trade_id IN ({placeholders})", duplicate_ids)
         return len(duplicate_ids)
 
+    def _latest_position_excursion_raw(self, symbol: str, buy_execution_id: Any = None) -> dict[str, Any]:
+        symbol = str(symbol or "").upper().strip()
+        if not symbol:
+            return {}
+        rows = self.query(
+            """
+            SELECT raw_json
+            FROM positions
+            WHERE UPPER(symbol) = ?
+            ORDER BY COALESCE(active, 0) DESC, COALESCE(updated_at, '') DESC, rowid DESC
+            LIMIT 10
+            """,
+            [symbol],
+        )
+        buy_execution_id = str(buy_execution_id or "")
+        fallback: dict[str, Any] = {}
+        for row in rows:
+            raw = parse_jsonish(row.get("raw_json"))
+            if not raw:
+                continue
+            if not fallback:
+                fallback = raw
+            open_ids = {str(value) for value in raw.get("open_lot_execution_ids") or []}
+            if buy_execution_id and buy_execution_id in open_ids:
+                return raw
+        return fallback
+
+    @staticmethod
+    def _trade_excursion_stats(
+        *,
+        entry_price: float | None,
+        exit_price: float | None,
+        quantity: float | None,
+        net_pnl: float | None,
+        raw_sources: Iterable[dict[str, Any]],
+    ) -> dict[str, float | None]:
+        if entry_price is None or entry_price <= 0:
+            return {
+                "mfe_pct": None,
+                "mae_pct": None,
+                "peak_price": None,
+                "low_price": None,
+                "peak_unrealized_pnl": None,
+                "max_adverse_unrealized_pnl": None,
+                "giveback_from_peak": None,
+            }
+        peak_candidates = [entry_price]
+        low_candidates = [entry_price]
+        if exit_price is not None and exit_price > 0:
+            peak_candidates.append(exit_price)
+            low_candidates.append(exit_price)
+        raw_peak_pnl: float | None = None
+        raw_adverse_pnl: float | None = None
+        raw_mfe_pct: float | None = None
+        raw_mae_pct: float | None = None
+        for raw in raw_sources:
+            if not raw:
+                continue
+            peak = raw_float_any(raw, "peak_price", "peak_price_since_entry", "high_watermark", "mfe_price")
+            low = raw_float_any(raw, "low_price", "low_price_since_entry", "low_watermark", "mae_price")
+            raw_mfe_pct = first_safe_float(raw_mfe_pct, raw_float_any(raw, "mfe_pct", "peak_pct", "peak_unrealized_pct", "peak_gain_pct", "max_gain_pct"))
+            raw_mae_pct = first_safe_float(raw_mae_pct, raw_float_any(raw, "mae_pct", "low_pct", "max_adverse_pct", "max_adverse_unrealized_pct"))
+            raw_peak_pnl = first_safe_float(raw_peak_pnl, raw_float_any(raw, "peak_unrealized_pnl", "max_unrealized_pnl"))
+            raw_adverse_pnl = first_safe_float(raw_adverse_pnl, raw_float_any(raw, "max_adverse_unrealized_pnl", "mae_unrealized_pnl", "min_unrealized_pnl"))
+            if peak is not None and peak > 0:
+                peak_candidates.append(peak)
+            if low is not None and low > 0:
+                low_candidates.append(low)
+        if raw_mfe_pct is not None:
+            peak_candidates.append(entry_price * (1.0 + raw_mfe_pct / 100.0))
+        if raw_mae_pct is not None:
+            low_candidates.append(entry_price * (1.0 + raw_mae_pct / 100.0))
+        peak_price = max(peak_candidates) if peak_candidates else None
+        low_price = min(low_candidates) if low_candidates else None
+        mfe_pct = pct_from_prices(peak_price, entry_price)
+        mae_pct = pct_from_prices(low_price, entry_price)
+        qty = quantity or 0.0
+        price_peak_pnl = (peak_price - entry_price) * qty if peak_price is not None else None
+        price_adverse_pnl = (low_price - entry_price) * qty if low_price is not None else None
+        peak_unrealized_pnl = max(value for value in (raw_peak_pnl, price_peak_pnl) if value is not None) if raw_peak_pnl is not None or price_peak_pnl is not None else None
+        max_adverse_unrealized_pnl = min(value for value in (raw_adverse_pnl, price_adverse_pnl) if value is not None) if raw_adverse_pnl is not None or price_adverse_pnl is not None else None
+        giveback_from_peak = None
+        if peak_unrealized_pnl is not None and net_pnl is not None:
+            giveback_from_peak = peak_unrealized_pnl - net_pnl
+        return {
+            "mfe_pct": mfe_pct,
+            "mae_pct": mae_pct,
+            "peak_price": peak_price,
+            "low_price": low_price,
+            "peak_unrealized_pnl": peak_unrealized_pnl,
+            "max_adverse_unrealized_pnl": max_adverse_unrealized_pnl,
+            "giveback_from_peak": giveback_from_peak,
+        }
+
     def rebuild_symbol_trade_state(
         self,
         symbol: str,
@@ -1500,10 +1626,19 @@ class SQLiteRuntimeStore:
                 sell_commission_missing = str(row.get("commission_source") or "").lower() == "missing"
                 commission = execution_commission(lot, buy_fraction) + execution_commission(row, sell_fraction)
                 gross = (sell_price - buy_price) * matched_qty
+                net_pnl = gross - commission
                 trade_id = self._closed_trade_id_for_pair(lot, row, matched_qty)
                 strategy = str(lot.get("strategy_name") or row.get("strategy_name") or latest_strategy or "unknown")
                 buy_raw = parse_jsonish(lot.get("raw_json"))
                 sell_raw = parse_jsonish(row.get("raw_json"))
+                position_raw = self._latest_position_excursion_raw(symbol, lot.get("execution_id"))
+                excursion = self._trade_excursion_stats(
+                    entry_price=buy_price,
+                    exit_price=sell_price,
+                    quantity=matched_qty,
+                    net_pnl=net_pnl,
+                    raw_sources=(position_raw, buy_raw, sell_raw),
+                )
                 pending_commission_count = int(buy_commission_missing) + int(sell_commission_missing)
                 sell_realized_expected = sell_commission_confirmed or sell_commission_missing
                 sell_realized_ready = safe_float(row.get("realized_pnl")) is not None
@@ -1558,6 +1693,13 @@ class SQLiteRuntimeStore:
                     "pending_realized_pnl_count": pending_realized_pnl_count,
                     "pnl_status": pnl_status,
                     "commission_status": commission_status,
+                    "mfe_pct": excursion.get("mfe_pct"),
+                    "mae_pct": excursion.get("mae_pct"),
+                    "peak_price": excursion.get("peak_price"),
+                    "low_price": excursion.get("low_price"),
+                    "peak_unrealized_pnl": excursion.get("peak_unrealized_pnl"),
+                    "max_adverse_unrealized_pnl": excursion.get("max_adverse_unrealized_pnl"),
+                    "giveback_from_peak": excursion.get("giveback_from_peak"),
                     "entry_date": entry_date,
                     "exit_date": exit_date,
                     "buy_commission_confirmed": buy_commission_confirmed,
@@ -1571,7 +1713,19 @@ class SQLiteRuntimeStore:
                 preserved: dict[str, Any] = {}
                 if existing_trade:
                     current = existing_trade[0]
-                    for key in ("mfe_pct", "mae_pct", "entry_signal_time", "entry_order_time", "exit_signal_time", "exit_order_time"):
+                    for key in (
+                        "mfe_pct",
+                        "mae_pct",
+                        "peak_price",
+                        "low_price",
+                        "peak_unrealized_pnl",
+                        "max_adverse_unrealized_pnl",
+                        "giveback_from_peak",
+                        "entry_signal_time",
+                        "entry_order_time",
+                        "exit_signal_time",
+                        "exit_order_time",
+                    ):
                         if current.get(key) not in (None, ""):
                             preserved[key] = current.get(key)
                     if not raw.get("exit_reason") and current.get("exit_reason") not in (None, ""):
@@ -1592,7 +1746,14 @@ class SQLiteRuntimeStore:
                         "remaining_quantity": 0,
                         "gross_pnl": gross,
                         "commission": commission,
-                        "net_pnl": gross - commission,
+                        "net_pnl": net_pnl,
+                        "mfe_pct": excursion.get("mfe_pct"),
+                        "mae_pct": excursion.get("mae_pct"),
+                        "peak_price": excursion.get("peak_price"),
+                        "low_price": excursion.get("low_price"),
+                        "peak_unrealized_pnl": excursion.get("peak_unrealized_pnl"),
+                        "max_adverse_unrealized_pnl": excursion.get("max_adverse_unrealized_pnl"),
+                        "giveback_from_peak": excursion.get("giveback_from_peak"),
                         "exit_reason": raw.get("exit_reason") or "",
                         "ibkr_entry_confirmed": True,
                         "ibkr_exit_confirmed": True,
@@ -1738,6 +1899,13 @@ class SQLiteRuntimeStore:
             entry_time = execution_sort_time(first_lot)
             entry_date = str(first_lot.get("session_date") or "") or iso_date_part(entry_time) or latest_session
             strategy = str(first_lot.get("strategy_name") or latest_strategy or "unknown")
+            open_excursion = self._trade_excursion_stats(
+                entry_price=avg_price,
+                exit_price=latest_price,
+                quantity=open_qty,
+                net_pnl=(latest_price - avg_price) * open_qty if latest_price is not None and avg_price is not None else None,
+                raw_sources=[parse_jsonish(lot.get("raw_json")) for lot in open_lots],
+            )
             self.mark_position_flat(symbol=symbol, reason="sqlite_execution_reducer_superseded_open_lot", status="CLOSED")
             self.upsert_position(
                 {
@@ -1761,6 +1929,15 @@ class SQLiteRuntimeStore:
                         "market_price": latest_price,
                         "market_price_at": last_event_time,
                         "market_price_source": "execution_reducer",
+                        "peak_price": open_excursion.get("peak_price"),
+                        "low_price": open_excursion.get("low_price"),
+                        "mfe_pct": open_excursion.get("mfe_pct"),
+                        "mae_pct": open_excursion.get("mae_pct"),
+                        "peak_pct": open_excursion.get("mfe_pct"),
+                        "peak_unrealized_pct": open_excursion.get("mfe_pct"),
+                        "peak_unrealized_pnl": open_excursion.get("peak_unrealized_pnl"),
+                        "max_adverse_unrealized_pnl": open_excursion.get("max_adverse_unrealized_pnl"),
+                        "last_update_time": last_event_time,
                         "broker_target_quantity": broker_target_qty,
                         "open_lot_execution_ids": [lot.get("execution_id") for lot in open_lots],
                     },
@@ -1914,9 +2091,14 @@ class SQLiteRuntimeStore:
             "gross_pnl": safe_float(row.get("gross_pnl")),
             "commission": safe_float(row.get("commission")),
             "net_pnl": safe_float(row.get("net_pnl")),
-                        "mfe_pct": safe_float(row.get("mfe_pct")),
-                        "mae_pct": safe_float(row.get("mae_pct")),
-                        "exit_reason": row.get("exit_reason") or parse_jsonish(row.get("raw_json")).get("exit_reason"),
+            "mfe_pct": safe_float(row.get("mfe_pct")),
+            "mae_pct": safe_float(row.get("mae_pct")),
+            "peak_price": safe_float(row.get("peak_price")),
+            "low_price": safe_float(row.get("low_price")),
+            "peak_unrealized_pnl": safe_float(row.get("peak_unrealized_pnl")),
+            "max_adverse_unrealized_pnl": safe_float(row.get("max_adverse_unrealized_pnl")),
+            "giveback_from_peak": safe_float(row.get("giveback_from_peak")),
+            "exit_reason": row.get("exit_reason") or parse_jsonish(row.get("raw_json")).get("exit_reason"),
             "ibkr_entry_confirmed": bool_int(row.get("ibkr_entry_confirmed")),
             "ibkr_exit_confirmed": bool_int(row.get("ibkr_exit_confirmed")),
             "ibkr_position_flat_confirmed": bool_int(row.get("ibkr_position_flat_confirmed")),
