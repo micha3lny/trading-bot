@@ -211,6 +211,129 @@ def parquet_files_for_session(history_dir: str | Path, session_date: str, sessio
     return sorted(root.glob(f"symbol=*/year={dt.year:04d}/month={dt.month:02d}/day={dt.day:02d}.parquet"))
 
 
+def history_parquet_path(history_dir: str | Path, symbol: str, session_date: str, session_type: str = "RTH") -> Path:
+    dt = pd.to_datetime(session_date).date()
+    return (
+        Path(history_dir)
+        / f"session_type={session_type.upper()}"
+        / f"symbol={str(symbol).upper()}"
+        / f"year={dt.year:04d}"
+        / f"month={dt.month:02d}"
+        / f"day={dt.day:02d}.parquet"
+    )
+
+
+def history_task_key(symbol: str, session_date: str, session_type: str = "RTH") -> str:
+    return f"{str(symbol).upper()}_{session_date}_{session_type.upper()}"
+
+
+def load_json_file(path: str | Path, default: object) -> object:
+    p = Path(path)
+    if not p.exists():
+        return default
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def load_universe_symbols(path: str | Path) -> list[str]:
+    p = Path(path)
+    if not p.exists():
+        return []
+    try:
+        df = pd.read_csv(p)
+    except Exception:
+        return []
+    if "symbol" not in df.columns:
+        return []
+    return (
+        df["symbol"]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+        .replace("", pd.NA)
+        .dropna()
+        .drop_duplicates()
+        .tolist()
+    )
+
+
+def load_history_readiness_summary(
+    *,
+    history_dir: str | Path,
+    universe_path: str | Path,
+    status_dir: str | Path,
+    session_date: str,
+    session_type: str = "RTH",
+) -> dict[str, object]:
+    symbols = load_universe_symbols(universe_path)
+    status_rows = load_json_file(Path(status_dir) / "collector_status.json", {})
+    if not isinstance(status_rows, dict):
+        status_rows = {}
+    complete = partial = no_data = failed = missing = 0
+    for symbol in symbols:
+        path = history_parquet_path(history_dir, symbol, session_date, session_type)
+        row = status_rows.get(history_task_key(symbol, session_date, session_type)) or {}
+        row_status = str(row.get("status") or "").lower() if isinstance(row, dict) else ""
+        if path.exists() and path.stat().st_size > 0:
+            complete += 1
+        elif row_status == "complete":
+            complete += 1
+        elif row_status == "partial":
+            partial += 1
+        elif row_status in {"no_data", "no_data_permanent"}:
+            no_data += 1
+        elif row_status in {"failed", "failed_permanent"}:
+            failed += 1
+        else:
+            missing += 1
+    expected = len(symbols)
+    terminal = complete + no_data
+    completion_pct = round((terminal / expected) * 100.0, 2) if expected else 0.0
+    ready = expected > 0 and missing == 0 and partial == 0 and failed == 0
+    status = "OK" if ready else ("PARTIAL" if terminal or partial or failed else "MISSING")
+    return {
+        "expected_symbols": expected,
+        "complete_symbols": complete,
+        "partial_symbols": partial,
+        "no_data_symbols": no_data,
+        "failed_symbols": failed,
+        "missing_symbols": missing,
+        "terminal_symbols": terminal,
+        "completion_pct": completion_pct,
+        "status": status,
+    }
+
+
+def load_top100_diagnostics_summary(output_dir: str | Path, session_date: str) -> dict[str, object]:
+    path = Path(output_dir) / f"daily_top100_{session_date}_diagnostics.csv"
+    if not path.exists():
+        return {
+            "path": str(path),
+            "rows": 0,
+            "missing": 0,
+            "rejected": 0,
+            "error": 0,
+            "excluded_ineligible": 0,
+            "status": "MISSING",
+        }
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return {"path": str(path), "rows": 0, "missing": 0, "rejected": 0, "error": 0, "excluded_ineligible": 0, "status": "ERROR"}
+    statuses = df.get("status", pd.Series(dtype=str)).astype(str).str.lower()
+    return {
+        "path": str(path),
+        "rows": int(len(df)),
+        "missing": int((statuses == "missing").sum()),
+        "rejected": int((statuses == "rejected").sum()),
+        "error": int((statuses == "error").sum()),
+        "excluded_ineligible": int((statuses == "excluded_ineligible").sum()),
+        "status": "OK",
+    }
+
+
 def infer_top100_source_date(latest_path: str | Path) -> str:
     latest = Path(latest_path)
     if not latest.exists():
@@ -1565,8 +1688,9 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
         ).isoformat()
         previous_session = previous_us_equity_trading_day(pd.to_datetime(readiness_date).date()).isoformat()
         history_dir = st.text_input("Universe 1m parquet dir", value="data/history/universe_1m", key="ops_history_dir")
+        universe_csv = st.text_input("Universe CSV", value="data/universe/v68_final_daytrading_universe.csv", key="ops_universe_csv")
+        collector_status_dir = st.text_input("Collector status dir", value="data/history", key="ops_collector_status_dir")
         top100_latest = st.text_input("Top100 latest CSV", value="data/universe/daily_top100_latest.csv", key="ops_top100_latest")
-        expected_parquet_min = int(st.number_input("Universe parquet expected minimum", value=2000, min_value=1, step=100, key="ops_expected_parquet"))
         expected_top100 = int(st.number_input("Top100 expected symbols", value=100, min_value=1, step=1, key="ops_expected_top100"))
         control_api_url = st.text_input("Control API base URL", value="http://127.0.0.1:8767", key="ops_control_api_url").rstrip("/")
         col1, col2, col3, col4 = st.columns(4)
@@ -1595,13 +1719,21 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
 
     parquet_files = parquet_files_for_session(history_dir, previous_session)
     parquet_count = len(parquet_files)
-    universe_status = "OK" if parquet_count >= expected_parquet_min else ("PARTIAL" if parquet_count > 0 else "MISSING")
+    history_readiness = load_history_readiness_summary(
+        history_dir=history_dir,
+        universe_path=universe_csv,
+        status_dir=collector_status_dir,
+        session_date=previous_session,
+        session_type="RTH",
+    )
+    universe_status = str(history_readiness.get("status") or "UNKNOWN")
 
     top100 = load_top100_readiness(
         top100_latest,
         expected_symbols=expected_top100,
         expected_source_session_date=previous_session,
     )
+    top100_diag = load_top100_diagnostics_summary(Path(top100_latest).parent, previous_session)
     eod = load_eod_readiness(sqlite_path, readiness_date)
     try:
         ops_snapshot = load_dashboard_snapshot(sqlite_path, DateWindow(readiness_date, readiness_date), "All")
@@ -1658,12 +1790,16 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
     with row2[0]:
         render_readiness_card(
             "Universe data readiness",
-            f"{parquet_count}/{expected_parquet_min}",
+            f"{history_readiness.get('complete_symbols', 0)}/{history_readiness.get('expected_symbols', 0)}",
             universe_status,
             [
                 f"selected_date={readiness_date}",
                 f"previous_completed_session={previous_session}",
                 f"history_dir={history_dir}",
+                f"collector_status_dir={collector_status_dir}",
+                f"complete={history_readiness.get('complete_symbols')} no_data={history_readiness.get('no_data_symbols')} "
+                f"partial={history_readiness.get('partial_symbols')} missing={history_readiness.get('missing_symbols')} "
+                f"failed={history_readiness.get('failed_symbols')} completion_pct={history_readiness.get('completion_pct')}",
             ],
         )
     with row2[1]:
@@ -1676,6 +1812,8 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
                 f"modified_at={top100.get('modified_at')}",
                 f"top100_source_session_date={top100.get('top100_source_session_date')}",
                 f"expected_source_session_date={top100.get('expected_source_session_date')}",
+                f"diagnostics: missing={top100_diag.get('missing')} rejected={top100_diag.get('rejected')} "
+                f"error={top100_diag.get('error')} excluded_ineligible={top100_diag.get('excluded_ineligible')}",
             ],
         )
 
@@ -1735,7 +1873,9 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
                 "broker_status_message": broker_status_message,
                 "sqlite_active_positions": sqlite_active,
                 "parquet_count": parquet_count,
+                "history_readiness": history_readiness,
                 "top100": top100,
+                "top100_diagnostics": top100_diag,
                 "eod": eod,
                 "orphan_stale_position_count": orphan_stale_count,
                 "orphan_stale_positions": orphan_stale_positions.to_dict("records") if isinstance(orphan_stale_positions, pd.DataFrame) else [],
