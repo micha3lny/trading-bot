@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -18,6 +21,30 @@ SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("TRADING_BOT_SQLITE_BUSY_TIMEOUT_MS"
 SQLITE_LOCK_RETRY_ATTEMPTS = int(os.environ.get("TRADING_BOT_SQLITE_LOCK_RETRY_ATTEMPTS", "6"))
 SQLITE_LOCK_RETRY_BASE_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_LOCK_RETRY_BASE_SECONDS", "0.05"))
 SQLITE_LOCK_RETRY_MAX_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_LOCK_RETRY_MAX_SECONDS", "1.0"))
+SQLITE_WRITER_QUEUE_MAXSIZE = int(os.environ.get("TRADING_BOT_SQLITE_WRITER_QUEUE_MAXSIZE", "10000"))
+SQLITE_WRITER_CRITICAL_TIMEOUT_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRITER_CRITICAL_TIMEOUT_SECONDS", "2.0"))
+SQLITE_WRITER_BEST_EFFORT_TIMEOUT_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRITER_BEST_EFFORT_TIMEOUT_SECONDS", "0.01"))
+SQLITE_WRITER_JOIN_TIMEOUT_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRITER_JOIN_TIMEOUT_SECONDS", "5.0"))
+CRITICAL_SQLITE_WRITE_METHODS = {
+    "upsert_execution",
+    "upsert_order",
+    "upsert_trade",
+    "upsert_position",
+    "record_reconciliation_run",
+    "mark_operation_status",
+    "finalize_pending_trades",
+    "rebuild_positions_from_executions",
+    "reconcile_active_positions_to_broker_snapshot",
+    "mark_position_flat",
+    "mark_all_positions_flat",
+}
+BEST_EFFORT_SQLITE_WRITE_METHODS = {
+    "record_runtime_event",
+    "record_risk_event",
+    "upsert_market_data_session",
+    "upsert_symbol_daily_feature",
+    "record_collector_run",
+}
 HIGH_FREQUENCY_RUNTIME_EVENT_THROTTLE_SECONDS = {
     "BUY_BLOCKED": 300,
     "RISK_GUARD_BLOCK_ENTRY": 300,
@@ -43,9 +70,14 @@ def resolve_sqlite_path(path: str | Path | None = None) -> str:
     return str(path or os.environ.get("TRADING_BOT_SQLITE_PATH") or DEFAULT_SQLITE_PATH)
 
 
-def open_sqlite_store(path: str | Path | None = None) -> SQLiteRuntimeStore | None:
+def open_sqlite_store(path: str | Path | None = None, *, use_writer_queue: bool | None = None) -> SQLiteRuntimeStore | SQLiteWriteQueue | None:
     try:
-        return SQLiteRuntimeStore(resolve_sqlite_path(path))
+        resolved = resolve_sqlite_path(path)
+        if use_writer_queue is None:
+            use_writer_queue = os.environ.get("TRADING_BOT_SQLITE_WRITER_QUEUE", "0").strip().lower() in {"1", "true", "yes", "on"}
+        if use_writer_queue:
+            return SQLiteWriteQueue(resolved)
+        return SQLiteRuntimeStore(resolved)
     except Exception as exc:
         line = f"{utc_now_iso()} SQLITE_WRITE_FAILED method=init error={exc!r}"
         print(line, flush=True)
@@ -2253,9 +2285,231 @@ class SQLiteRuntimeStore:
         return rows[0] if rows else None
 
 
-def safe_sqlite_call(store: SQLiteRuntimeStore | None, method: str, *args: Any, **kwargs: Any) -> Any:
+@dataclass
+class SQLiteWriteRequest:
+    method: str
+    args: tuple[Any, ...]
+    kwargs: dict[str, Any]
+    priority: str
+    wait_for_ack: bool
+    timeout_seconds: float
+    enqueued_at: float = field(default_factory=time.monotonic)
+    done: threading.Event = field(default_factory=threading.Event)
+    result: Any = None
+    exception: BaseException | None = None
+
+
+class SQLiteWriteQueue:
+    """Single-writer proxy for runtime SQLite writes.
+
+    The live trading path should not contend with collector/dashboard/top100
+    writes using multiple write connections. This proxy owns one write
+    connection in a dedicated thread. Critical ledger calls wait briefly for an
+    acknowledgement; diagnostics/market-data calls are best-effort and can be
+    dropped when the queue is overloaded.
+    """
+
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        maxsize: int = SQLITE_WRITER_QUEUE_MAXSIZE,
+        critical_timeout_seconds: float = SQLITE_WRITER_CRITICAL_TIMEOUT_SECONDS,
+        best_effort_timeout_seconds: float = SQLITE_WRITER_BEST_EFFORT_TIMEOUT_SECONDS,
+    ) -> None:
+        self.path = Path(resolve_sqlite_path(path))
+        self.maxsize = int(maxsize)
+        self.critical_timeout_seconds = float(critical_timeout_seconds)
+        self.best_effort_timeout_seconds = float(best_effort_timeout_seconds)
+        self._queue: queue.Queue[SQLiteWriteRequest | None] = queue.Queue(maxsize=max(1, self.maxsize))
+        self._closed = threading.Event()
+        self._ready = threading.Event()
+        self._status_lock = threading.Lock()
+        self._status: dict[str, Any] = {
+            "queue_depth": 0,
+            "max_queue_size": self.maxsize,
+            "dropped_writes": 0,
+            "write_count": 0,
+            "failed_writes": 0,
+            "last_write_latency_ms": None,
+            "last_write_method": "",
+            "last_write_error": "",
+            "last_write_at": "",
+            "writer_alive": 0,
+        }
+        self._thread = threading.Thread(target=self._run, name="sqlite-runtime-writer", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout=critical_timeout_seconds):
+            raise TimeoutError("SQLite writer queue did not initialize")
+
+    def _set_status(self, **updates: Any) -> None:
+        with self._status_lock:
+            self._status.update(updates)
+            self._status["queue_depth"] = self._queue.qsize()
+            self._status["writer_alive"] = int(self._thread.is_alive())
+
+    def status(self) -> dict[str, Any]:
+        with self._status_lock:
+            out = dict(self._status)
+        out["queue_depth"] = self._queue.qsize()
+        out["writer_alive"] = int(self._thread.is_alive())
+        return out
+
+    def _run(self) -> None:
+        store: SQLiteRuntimeStore | None = None
+        try:
+            store = SQLiteRuntimeStore(self.path)
+            self._ready.set()
+            while True:
+                request = self._queue.get()
+                if request is None:
+                    self._queue.task_done()
+                    break
+                started = time.monotonic()
+                try:
+                    request.result = safe_sqlite_call(store, request.method, *request.args, **request.kwargs)
+                except BaseException as exc:
+                    request.exception = exc
+                finally:
+                    latency_ms = round((time.monotonic() - started) * 1000.0, 3)
+                    with self._status_lock:
+                        if request.exception is None:
+                            self._status["write_count"] = int(self._status.get("write_count", 0) or 0) + 1
+                            self._status["last_write_error"] = ""
+                        else:
+                            self._status["failed_writes"] = int(self._status.get("failed_writes", 0) or 0) + 1
+                        self._status["last_write_latency_ms"] = latency_ms
+                        self._status["last_write_method"] = request.method
+                        self._status["last_write_at"] = utc_now_iso()
+                        self._status["queue_depth"] = self._queue.qsize()
+                        self._status["writer_alive"] = int(self._thread.is_alive())
+                    request.done.set()
+                    self._queue.task_done()
+        except BaseException as exc:
+            self._set_status(last_write_error=repr(exc), failed_writes=int(self._status.get("failed_writes", 0) or 0) + 1, writer_alive=0)
+            self._ready.set()
+            log_sqlite_line(f"{utc_now_iso()} SQLITE_WRITER_CRASH error={exc!r}")
+        finally:
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:
+                    pass
+            self._closed.set()
+
+    def _priority_for(self, method: str, priority: str | None = None) -> str:
+        if priority:
+            return priority
+        if method in CRITICAL_SQLITE_WRITE_METHODS:
+            return "critical"
+        if method in BEST_EFFORT_SQLITE_WRITE_METHODS:
+            return "best_effort"
+        return "critical"
+
+    def call(
+        self,
+        method: str,
+        *args: Any,
+        priority: str | None = None,
+        wait_for_ack: bool | None = None,
+        timeout_seconds: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        if self._closed.is_set():
+            log_sqlite_line(f"{utc_now_iso()} SQLITE_WRITE_FAILED method={method} error=RuntimeError('writer queue closed')")
+            return None
+        effective_priority = self._priority_for(method, priority)
+        if wait_for_ack is None:
+            wait_for_ack = effective_priority == "critical"
+        if timeout_seconds is None:
+            timeout_seconds = self.critical_timeout_seconds if wait_for_ack else self.best_effort_timeout_seconds
+        request = SQLiteWriteRequest(
+            method=method,
+            args=tuple(args),
+            kwargs=dict(kwargs),
+            priority=effective_priority,
+            wait_for_ack=bool(wait_for_ack),
+            timeout_seconds=float(timeout_seconds),
+        )
+        try:
+            self._queue.put(request, timeout=max(0.0, float(timeout_seconds)))
+        except queue.Full:
+            with self._status_lock:
+                self._status["dropped_writes"] = int(self._status.get("dropped_writes", 0) or 0) + 1
+                self._status["queue_depth"] = self._queue.qsize()
+                self._status["last_write_error"] = f"queue_full:{method}"
+            log_sqlite_line(f"{utc_now_iso()} SQLITE_WRITE_DROPPED method={method} priority={effective_priority} reason=queue_full")
+            return None
+        self._set_status(queue_depth=self._queue.qsize())
+        if not wait_for_ack:
+            return "queued"
+        if not request.done.wait(timeout=max(0.0, float(timeout_seconds))):
+            log_sqlite_line(
+                f"{utc_now_iso()} SQLITE_WRITE_ACK_TIMEOUT method={method} "
+                f"priority={effective_priority} timeout_seconds={timeout_seconds}"
+            )
+            return None
+        if request.exception is not None:
+            raise request.exception
+        return request.result
+
+    def __getattr__(self, method: str) -> Any:
+        if method.startswith("_"):
+            raise AttributeError(method)
+
+        def _call(*args: Any, **kwargs: Any) -> Any:
+            return self.call(method, *args, **kwargs)
+
+        return _call
+
+    def query(self, sql: str, params: Iterable[Any] | None = None) -> list[dict[str, Any]]:
+        with connect_sqlite(self.path, read_only=True) as conn:
+            cur = conn.execute(sql, tuple(params or ()))
+            return [dict(row) for row in cur.fetchall()]
+
+    def execute(self, sql: str, params: Iterable[Any] | None = None) -> sqlite3.Cursor:
+        return self.call("execute", sql, tuple(params or ()), priority="critical", wait_for_ack=True)
+
+    def close(self, *, drain: bool = True, timeout_seconds: float = SQLITE_WRITER_JOIN_TIMEOUT_SECONDS) -> None:
+        if drain:
+            deadline = time.monotonic() + max(0.0, timeout_seconds)
+            while self._queue.unfinished_tasks > 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self._thread.join(timeout=max(0.0, timeout_seconds))
+        self._closed.set()
+
+
+def safe_sqlite_call(
+    store: SQLiteRuntimeStore | SQLiteWriteQueue | None,
+    method: str,
+    *args: Any,
+    priority: str | None = None,
+    wait_for_ack: bool | None = None,
+    timeout_seconds: float | None = None,
+    **kwargs: Any,
+) -> Any:
     if store is None:
         return None
+    if isinstance(store, SQLiteWriteQueue):
+        try:
+            return store.call(
+                method,
+                *args,
+                priority=priority,
+                wait_for_ack=wait_for_ack,
+                timeout_seconds=timeout_seconds,
+                **kwargs,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            log_sqlite_line(f"{utc_now_iso()} SQLITE_CALL_INTERRUPTED method={method}")
+            raise
+        except Exception as exc:
+            log_sqlite_line(f"{utc_now_iso()} SQLITE_WRITE_FAILED method={method} error={exc!r}")
+            return None
     attempts = max(1, SQLITE_LOCK_RETRY_ATTEMPTS)
     for attempt in range(1, attempts + 1):
         try:

@@ -3675,6 +3675,7 @@ def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Nam
         "--latest-output", str(latest_output),
         "--diagnostics-output", str(diagnostics_output),
         "--top-n", str(int(getattr(args, "daily_top100_top_n", 100))),
+        "--disable-runtime-sqlite",
     ]
     sqlite_path = str(getattr(args, "daily_top100_sqlite_path", "data/runtime/rankings.sqlite"))
     if sqlite_path:
@@ -5083,6 +5084,7 @@ def main() -> int:
     parser.add_argument("--recorder-dir", default=DEFAULT_RECORDER_DIR)
     parser.add_argument("--sqlite-path", default=None)
     parser.add_argument("--disable-sqlite", action="store_true")
+    parser.add_argument("--sqlite-writer-queue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--restore-managed-json",
         action=argparse.BooleanOptionalAction,
@@ -5175,7 +5177,7 @@ def main() -> int:
     _ACTIVE_SHUTDOWN_DIAGNOSTICS = shutdown
     shutdown.install_signal_handlers()
     atexit.register(shutdown.atexit)
-    sqlite_store = None if args.disable_sqlite else open_sqlite_store(args.sqlite_path)
+    sqlite_store = None if args.disable_sqlite else open_sqlite_store(args.sqlite_path, use_writer_queue=bool(args.sqlite_writer_queue))
     setattr(recorder, "sqlite_store", sqlite_store)
     disk = shutil.disk_usage(str(Path(args.recorder_dir).parent if Path(args.recorder_dir).parent else Path(".")))
     log_event(
@@ -5301,6 +5303,7 @@ def main() -> int:
         "top100_reload_diagnostics": {},
         "top100_entries_blocked": False,
         "top100_freshness": {},
+        "sqlite_writer_status": {},
         "market_closed_logged_dates": set(),
         "risk_guard_last_status": {
             "enabled": bool(args.risk_guard_enabled),
@@ -6146,6 +6149,15 @@ def main() -> int:
             subscriptions_cap = max(0, int(getattr(args, "max_market_data_subscriptions", 100) or 0))
             subscription_diag = runtime_state.get("top100_reload_diagnostics") if isinstance(runtime_state.get("top100_reload_diagnostics"), dict) else {}
             subscription_cap_block = bool(subscription_diag.get("skipped_due_to_subscription_cap")) or (subscriptions_cap > 0 and len(tickers) >= subscriptions_cap)
+            sqlite_writer_status = {}
+            if sqlite_store is not None and hasattr(sqlite_store, "status"):
+                try:
+                    sqlite_writer_status = sqlite_store.status()
+                    runtime_state["sqlite_writer_status"] = sqlite_writer_status
+                except Exception as exc:
+                    sqlite_writer_status = {"last_write_error": repr(exc)}
+                    runtime_state["sqlite_writer_status"] = sqlite_writer_status
+            sqlite_last_error = str(sqlite_writer_status.get("last_write_error") or "").replace(" ", "_")
             last_eod_retry_age = pending_eod_retry_age_seconds(runtime_state, loop_now)
             last_eod_retry_age_text = "" if last_eod_retry_age is None else f"{last_eod_retry_age:.1f}"
             oldest_ready_age = runtime_state.get("oldest_ready_candidate_age_seconds")
@@ -6168,6 +6180,10 @@ def main() -> int:
                 f"risk_guard_block={int(risk_guard_block)} risk_guard_reason={risk_guard_reason} "
                 f"open_price_ok={open_price_ok} open_price_missing={open_price_missing} "
                 f"subscriptions_active={len(tickers)} subscriptions_cap={subscriptions_cap} subscription_cap_block={int(subscription_cap_block)} "
+                f"sqlite_queue_depth={int(sqlite_writer_status.get('queue_depth') or 0)} "
+                f"sqlite_dropped_writes={int(sqlite_writer_status.get('dropped_writes') or 0)} "
+                f"sqlite_last_write_latency_ms={sqlite_writer_status.get('last_write_latency_ms') or ''} "
+                f"sqlite_last_write_error={sqlite_last_error} "
                 f"ineligible_symbols={len(_runtime_set(runtime_state, 'ineligible_symbols'))} "
                 f"entry_rejected_count={int(runtime_state.get('entry_rejected_count') or 0)} "
                 f"process_uptime_seconds={process_uptime_seconds:.1f} "

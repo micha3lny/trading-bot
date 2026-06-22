@@ -742,6 +742,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
                     "pending_commands": pending,
                     "pending_history_collector_commands": pending_history,
                     "history_collector_running": history_running,
+                    "sqlite_writer_status": self.ctx.runtime_state.get("sqlite_writer_status") or {},
                 },
             )
             return

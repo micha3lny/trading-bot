@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from scripts.cleanup_runtime_events import cleanup_runtime_events
-from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore, safe_sqlite_call
+from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore, SQLiteWriteQueue, safe_sqlite_call
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.v66_ibkr_account_recorder import record_recent_fills
 
@@ -90,6 +90,50 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertGreater(store.calls, 1)
+
+    def test_sqlite_writer_queue_critical_write_waits_for_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "runtime.sqlite"
+            queue_store = SQLiteWriteQueue(db_path)
+            try:
+                result = safe_sqlite_call(
+                    queue_store,
+                    "upsert_execution",
+                    {"execution_id": "Q1", "symbol": "RKLB", "side": "BOT", "quantity": 10, "price": 10},
+                )
+                self.assertIsNone(result)
+                rows = queue_store.query("SELECT * FROM executions WHERE execution_id = 'Q1'")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["symbol"], "RKLB")
+                self.assertGreaterEqual(int(queue_store.status()["write_count"]), 1)
+            finally:
+                queue_store.close()
+
+    def test_sqlite_writer_queue_best_effort_write_can_be_queued_without_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "runtime.sqlite"
+            queue_store = SQLiteWriteQueue(db_path)
+            try:
+                result = safe_sqlite_call(
+                    queue_store,
+                    "record_runtime_event",
+                    event_time="2026-05-22T13:30:00+00:00",
+                    event_type="QUEUE_TEST",
+                    source="unit_test",
+                    wait_for_ack=False,
+                )
+                self.assertEqual(result, "queued")
+                queue_store.close()
+
+                store = SQLiteRuntimeStore(db_path)
+                try:
+                    rows = store.query("SELECT event_type, source FROM runtime_events WHERE event_type = 'QUEUE_TEST'")
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(rows[0]["source"], "unit_test")
+                finally:
+                    store.close()
+            finally:
+                queue_store.close(drain=False)
 
     def test_upsert_execution_idempotent_and_commission_update(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
