@@ -855,6 +855,103 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_broker_flat_sell_closes_position_even_when_buy_commission_missing(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({
+                    "execution_id": "B_FLAT_MISSING_BUY_COMM",
+                    "strategy_name": "v67",
+                    "session_date": today,
+                    "symbol": "FLATC",
+                    "side": "BOT",
+                    "quantity": 4,
+                    "price": 10,
+                    "commission_source": "missing",
+                    "executed_at": f"{today}T13:30:00+00:00",
+                })
+                active = store.query("SELECT * FROM positions WHERE symbol = 'FLATC' AND COALESCE(active, 0) = 1")
+                self.assertEqual(len(active), 1)
+
+                store.set_broker_net_positions({})
+                store.upsert_execution({
+                    "execution_id": "S_FLAT_MISSING_BUY_COMM",
+                    "strategy_name": "v67",
+                    "session_date": today,
+                    "symbol": "FLATC",
+                    "side": "SLD",
+                    "quantity": 4,
+                    "price": 11,
+                    "commission": 0.5,
+                    "commission_source": "ibkr",
+                    "realized_pnl": 4.0,
+                    "executed_at": f"{today}T13:40:00+00:00",
+                })
+
+                active = store.query("SELECT * FROM positions WHERE symbol = 'FLATC' AND COALESCE(active, 0) = 1")
+                trades = store.query("SELECT status, raw_json FROM trades WHERE symbol = 'FLATC'")
+                diag = store.pending_trade_finalization_diagnostics(today)
+
+                self.assertEqual(active, [])
+                self.assertEqual(len(trades), 1)
+                self.assertEqual(trades[0]["status"], "COMMISSION_PENDING")
+                self.assertIn("BUY_COMMISSION_NOT_IBKR", diag[0]["blockers"])
+            finally:
+                store.close()
+
+    def test_equivalent_sell_reconcile_clears_active_when_broker_is_flat(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                sell = {
+                    "execution_id": "S_EQ_FLAT",
+                    "strategy_name": "v67",
+                    "session_date": today,
+                    "symbol": "EQFLAT",
+                    "side": "SLD",
+                    "quantity": 2,
+                    "price": 11,
+                    "commission": 0.5,
+                    "commission_source": "ibkr",
+                    "realized_pnl": 2.0,
+                    "executed_at": f"{today}T13:40:00+00:00",
+                }
+                store.upsert_execution({
+                    "execution_id": "B_EQ_FLAT",
+                    "strategy_name": "v67",
+                    "session_date": today,
+                    "symbol": "EQFLAT",
+                    "side": "BOT",
+                    "quantity": 2,
+                    "price": 10,
+                    "commission_source": "missing",
+                    "executed_at": f"{today}T13:30:00+00:00",
+                })
+                store.upsert_execution(sell)
+                store.upsert_position({
+                    "position_key": f"v67:{today}:EQFLAT:stale",
+                    "strategy_name": "v67",
+                    "session_date": today,
+                    "symbol": "EQFLAT",
+                    "status": "OPEN",
+                    "quantity": 2,
+                    "avg_price": 10,
+                    "active": 1,
+                    "updated_at": f"{today}T13:45:00+00:00",
+                    "raw_json": {"entry_price": 10},
+                })
+                self.assertEqual(len(store.query("SELECT * FROM positions WHERE symbol = 'EQFLAT' AND COALESCE(active, 0) = 1")), 1)
+
+                store.set_broker_net_positions({})
+                store.upsert_execution(sell)
+
+                active = store.query("SELECT * FROM positions WHERE symbol = 'EQFLAT' AND COALESCE(active, 0) = 1")
+                self.assertEqual(active, [])
+            finally:
+                store.close()
+
     def test_upsert_execution_does_not_use_stale_broker_flat_target(self) -> None:
         today = date.today().isoformat()
         with tempfile.TemporaryDirectory() as tmp:

@@ -1325,10 +1325,12 @@ class SQLiteRuntimeStore:
             symbol = str(execution.get("symbol") or "").upper().strip()
             if not symbol:
                 return
+            side = normalized_execution_side(execution.get("side"))
+            broker_net_positions = self._broker_net_positions if side == "SELL" else None
             self.rebuild_symbol_trade_state(
                 symbol,
                 allow_historical_open_lots=False,
-                broker_net_positions=None,
+                broker_net_positions=broker_net_positions,
             )
         except Exception as exc:
             line = f"{utc_now_iso()} SQLITE_WRITE_FAILED method=rebuild_symbol_trade_state error={exc!r}"
@@ -1361,14 +1363,14 @@ class SQLiteRuntimeStore:
         case a re-seen execution is useful repair input and should rebuild the
         symbol state.
         """
-        if not self._broker_net_positions:
+        if self._broker_net_positions is None:
             return False
         symbol = str(execution.get("symbol") or "").upper().strip()
         if not symbol:
             return False
         broker_qty = safe_float(self._broker_net_positions.get(symbol))
-        if broker_qty is None or broker_qty <= 1e-9:
-            return False
+        if broker_qty is None:
+            broker_qty = 0.0
         sqlite_qty = self._active_quantity_for_symbol(symbol)
         return abs(sqlite_qty - broker_qty) > 1e-9
 
