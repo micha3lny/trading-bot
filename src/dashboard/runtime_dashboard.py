@@ -97,8 +97,22 @@ def is_current_window(window: DateWindow) -> bool:
 
 
 @st.cache_data(ttl=5)
-def load_live_snapshot(sqlite_path: str, start_date: str, end_date: str, strategy: str, include_reconstructed: bool) -> dict:
-    return load_dashboard_snapshot(sqlite_path, DateWindow(start_date, end_date), strategy, include_reconstructed=include_reconstructed)
+def load_live_snapshot(
+    sqlite_path: str,
+    start_date: str,
+    end_date: str,
+    strategy: str,
+    include_reconstructed: bool,
+    broker_portfolio_records: tuple[dict, ...] = (),
+) -> dict:
+    broker_portfolio = pd.DataFrame(list(broker_portfolio_records))
+    return load_dashboard_snapshot(
+        sqlite_path,
+        DateWindow(start_date, end_date),
+        strategy,
+        include_reconstructed=include_reconstructed,
+        broker_portfolio=broker_portfolio,
+    )
 
 
 @st.cache_data(ttl=3600)
@@ -570,7 +584,7 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
     cols = [
         "symbol", "qty", "entry_time", "buy", "now", "now_dollars", "now_pct", "peak_pct",
         "giveback_pct", "status", "strategy", "data_quality", "ibkr_confirmed",
-        "last_update", "source", "exit_sent", "execution_ids",
+        "price_status", "now_price_source", "market_price_at", "last_update", "source", "exit_sent", "execution_ids",
     ]
     available = [col for col in cols if col in df.columns]
     out = filter_table(df[available].copy(), prefix).sort_values(["now_dollars", "symbol"], na_position="last")
@@ -579,6 +593,8 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
     out["entry_time"] = out["entry_time"].map(display_time)
     if "last_update" in out.columns:
         out["last_update"] = out["last_update"].map(display_time)
+    if "market_price_at" in out.columns:
+        out["market_price_at"] = out["market_price_at"].map(display_time)
     for col in ("buy", "now", "now_dollars", "now_pct", "peak_pct", "giveback_pct"):
         if col in out.columns:
             out[col] = out[col].map(display_optional_number)
@@ -597,6 +613,9 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
             "strategy": "Strategy",
             "data_quality": "Data Quality",
             "ibkr_confirmed": "IBKR Confirmed",
+            "price_status": "Price Status",
+            "now_price_source": "Now Source",
+            "market_price_at": "Price Time",
             "last_update": "Last Update",
             "source": "Source",
             "exit_sent": "Exit Sent",
@@ -606,7 +625,8 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
     display_cols = [
         "Symbol", "Qty", "Entry Time", "Buy", "Now", "Now $", "Now %",
         "Peak %", "Drop from Peak %", "Status", "Strategy", "Data Quality",
-        "IBKR Confirmed", "Last Update", "Source", "Exit Sent", "Execution IDs",
+        "IBKR Confirmed", "Price Status", "Now Source", "Price Time",
+        "Last Update", "Source", "Exit Sent", "Execution IDs",
     ]
     display_cols = [col for col in display_cols if col in out.columns]
     out = out[display_cols]
@@ -1090,6 +1110,11 @@ def render_diagnostics(diag: dict) -> None:
     ]
     for col, (label, key) in zip(pos_cols, position_labels):
         col.metric(label, int(diag.get(key, 0)))
+    valuation_cols = st.columns(4)
+    valuation_cols[0].metric("Broker Valuation Symbols", int(diag.get("broker_portfolio_valuation_symbols", 0) or 0))
+    valuation_cols[1].metric("Price Mismatches", int(diag.get("dashboard_broker_price_mismatch_count", 0) or 0))
+    valuation_cols[2].metric("Max Price Diff", display_number_or_missing(diag.get("dashboard_broker_price_max_abs_diff"), decimals=4))
+    valuation_cols[3].metric("Broker Portfolio Rows", int(diag.get("runtime_broker_portfolio_rows", 0) or 0))
     closed_cols = st.columns(8)
     closed_labels = [
         ("Raw Closed", "raw_closed_trade_count"),
@@ -1236,7 +1261,27 @@ def render_runtime_tab(sqlite_path: str, start_date: str, end_date: str, strateg
     window = DateWindow(start_date, end_date)
     current = is_current_window(window)
     if current:
-        snapshot = load_live_snapshot(sqlite_path, start_date, end_date, strategy, include_reconstructed)
+        broker_portfolio = pd.DataFrame()
+        broker_status = "NOT_LOADED"
+        try:
+            host = str(st.session_state.get("broker_host") or "127.0.0.1")
+            port = int(st.session_state.get("broker_port") or 4002)
+            client_id = int(st.session_state.get("broker_client_id") or 177)
+            timeout = float(st.session_state.get("broker_timeout") or 4.0)
+            broker_portfolio, broker_status = fetch_ibkr_live_portfolio(host, port, client_id, timeout)
+        except Exception as exc:
+            broker_status = f"runtime_broker_portfolio_exception: {exc}"
+            broker_portfolio = pd.DataFrame()
+        snapshot = load_live_snapshot(
+            sqlite_path,
+            start_date,
+            end_date,
+            strategy,
+            include_reconstructed,
+            tuple(broker_portfolio.to_dict("records")) if not broker_portfolio.empty else (),
+        )
+        snapshot.setdefault("diagnostics", {})["runtime_broker_portfolio_status"] = broker_status
+        snapshot.setdefault("diagnostics", {})["runtime_broker_portfolio_rows"] = int(len(broker_portfolio))
     else:
         snapshot = load_historical_snapshot(sqlite_path, start_date, end_date, strategy, include_reconstructed)
 

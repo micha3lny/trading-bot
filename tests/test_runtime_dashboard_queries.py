@@ -1472,6 +1472,53 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(open_row["price_status"], "OK")
             self.assertEqual(open_row["now_price_source"], "positions.raw_json.market_price")
 
+    def test_open_position_prefers_broker_portfolio_price_for_mark_to_market(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_position({
+                "session_date": "2026-05-28",
+                "strategy_name": "v67",
+                "symbol": "ALOY",
+                "quantity": 5,
+                "avg_price": 10,
+                "active": 1,
+                "status": "OPEN",
+                "updated_at": "2026-05-28T13:40:00+00:00",
+                "raw_json": {
+                    "entry_time": "2026-05-28T13:31:00+00:00",
+                    "market_price": 10.0,
+                    "market_price_at": "2026-05-28T13:31:00+00:00",
+                    "market_price_source": "positions.raw_json.market_price",
+                },
+            })
+            store.close()
+
+            broker_portfolio = pd.DataFrame([
+                {
+                    "symbol": "ALOY",
+                    "quantity": 5,
+                    "market_price": 10.8,
+                    "unrealized_pnl": 4.0,
+                    "last_refresh_time": "2026-05-28T13:45:00+00:00",
+                }
+            ])
+            snapshot = load_dashboard_snapshot(
+                db,
+                DateWindow("2026-05-28", "2026-05-28"),
+                "v67",
+                broker_portfolio=broker_portfolio,
+            )
+            open_row = snapshot["open_positions"].iloc[0]
+
+            self.assertEqual(open_row["symbol"], "ALOY")
+            self.assertAlmostEqual(open_row["now"], 10.8)
+            self.assertAlmostEqual(open_row["upnl"], 4.0)
+            self.assertAlmostEqual(open_row["now_pct"], 8.0)
+            self.assertEqual(open_row["now_price_source"], "broker_portfolio.market_price")
+            self.assertEqual(open_row["price_status"], "OK")
+            self.assertEqual(snapshot["diagnostics"]["broker_portfolio_valuation_symbols"], 1)
+
     def test_open_position_missing_current_price_does_not_fake_now_as_buy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"

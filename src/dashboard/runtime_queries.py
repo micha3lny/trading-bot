@@ -2091,14 +2091,27 @@ def price_status_for(now: float | None, price_time: Any, window: DateWindow, sta
     return "OK"
 
 
+def broker_portfolio_by_symbol(broker_portfolio: pd.DataFrame | None) -> dict[str, dict[str, Any]]:
+    if broker_portfolio is None or broker_portfolio.empty or "symbol" not in broker_portfolio.columns:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for row in broker_portfolio.to_dict("records"):
+        symbol = str(row.get("symbol") or "").upper()
+        if symbol:
+            out[symbol] = row
+    return out
+
+
 def load_open_positions(
     conn: sqlite3.Connection,
     window: DateWindow,
     strategy: str | None,
     executions: pd.DataFrame | None = None,
     execution_lookup: pd.DataFrame | None = None,
+    broker_portfolio: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     clause, params = strategy_clause("p", strategy)
+    broker_rows = broker_portfolio_by_symbol(broker_portfolio)
     rows = read_sql(
         conn,
         f"""
@@ -2145,15 +2158,22 @@ def load_open_positions(
         buy = to_float(row.get("avg_price"), None)
         if buy is None:
             buy = to_float(raw.get("entry_price"), None)
-        now = to_float(raw.get("market_price"), None)
-        now_price_source = str(raw.get("market_price_source") or ("positions.raw_json.market_price" if now is not None else "missing"))
-        price_time = raw.get("market_price_at")
+        broker_row = broker_rows.get(symbol)
+        broker_now = to_float(broker_row.get("market_price"), None) if broker_row else None
+        broker_upnl = to_float(broker_row.get("unrealized_pnl"), None) if broker_row else None
+        now = broker_now
+        now_price_source = "broker_portfolio.market_price" if now is not None else ""
+        price_time = broker_row.get("last_refresh_time") if broker_row else None
+        if now is None:
+            now = to_float(raw.get("market_price"), None)
+            now_price_source = str(raw.get("market_price_source") or ("positions.raw_json.market_price" if now is not None else "missing"))
+            price_time = raw.get("market_price_at")
         price_status = price_status_for(now, price_time, window)
         if now is None or not buy:
             upnl = None
             now_pct = None
         else:
-            upnl = (now - buy) * (qty or 0.0)
+            upnl = broker_upnl if broker_upnl is not None else (now - buy) * (qty or 0.0)
             now_pct = ((now - buy) / buy) * 100.0
         peak_pct = to_float(raw.get("peak_pct"), None)
         if peak_pct is None:
@@ -2212,6 +2232,9 @@ def load_open_positions(
             "price_status": price_status,
             "now_price_source": now_price_source,
             "market_price_at": price_time,
+            "broker_market_price": broker_now,
+            "broker_unrealized_pnl": broker_upnl,
+            "dashboard_broker_price_diff": (now - broker_now) if now is not None and broker_now is not None else None,
             "last_update": row.get("updated_at"),
             "exit_sent": row.get("exit_sent"),
             "execution_ids": execution_ids_value,
@@ -2920,6 +2943,7 @@ def load_dashboard_snapshot(
     strategy: str | None = "All",
     *,
     include_reconstructed: bool = False,
+    broker_portfolio: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     path = Path(resolve_sqlite_path(sqlite_path))
     if not path.exists():
@@ -2952,7 +2976,7 @@ def load_dashboard_snapshot(
             execution_lookup,
             include_reconstructed=include_reconstructed,
         )
-        open_positions = load_open_positions(conn, window, strategy, executions, execution_lookup)
+        open_positions = load_open_positions(conn, window, strategy, executions, execution_lookup, broker_portfolio)
         pending_trades = load_pending_trades(conn, window, strategy)
         raw_active_positions = load_raw_active_positions(conn, strategy)
         orphan_stale_positions = load_orphan_stale_positions(conn, window, strategy)
@@ -3024,6 +3048,14 @@ def load_dashboard_snapshot(
         diagnostics["displayed_closed_trade_count"] = int(len(closed))
         diagnostics["dropped_closed_trade_count"] = int(len(dropped_closed_ids))
         diagnostics["dropped_closed_trade_ids"] = ",".join(dropped_closed_ids)
+        diagnostics["broker_portfolio_valuation_symbols"] = int(len(broker_portfolio_by_symbol(broker_portfolio)))
+        if not open_positions.empty and "dashboard_broker_price_diff" in open_positions.columns:
+            price_diffs = pd.to_numeric(open_positions["dashboard_broker_price_diff"], errors="coerce").dropna()
+            diagnostics["dashboard_broker_price_mismatch_count"] = int((price_diffs.abs() > 1e-9).sum())
+            diagnostics["dashboard_broker_price_max_abs_diff"] = float(price_diffs.abs().max()) if not price_diffs.empty else 0.0
+        else:
+            diagnostics["dashboard_broker_price_mismatch_count"] = 0
+            diagnostics["dashboard_broker_price_max_abs_diff"] = 0.0
         if not closed.empty and "carried_closed_today" in closed.columns:
             diagnostics["carried_closed_today_count"] = int(pd.Series(closed["carried_closed_today"]).fillna(False).astype(bool).sum())
         else:
