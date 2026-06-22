@@ -6,6 +6,7 @@ import pandas as pd
 
 from scripts.check_today_broker_sql import (
     closed_execution_symbol_set,
+    execution_closed_summary,
     execution_pnl_by_symbol,
     pnl_formula_comparison,
     pnl_formula_totals,
@@ -48,6 +49,25 @@ class CheckTodayBrokerSqlTests(unittest.TestCase):
         self.assertAlmostEqual(totals["net_if_realized_only"], 10.0)
         self.assertAlmostEqual(totals["net_if_realized_minus_sell_commission"], 8.0)
         self.assertAlmostEqual(totals["net_if_realized_minus_all_commission"], 7.0)
+
+    def test_execution_closed_summary_uses_realized_minus_sell_commission(self) -> None:
+        by_symbol = {
+            "AKTX": {
+                "closed_qty": 5.0,
+                "gross_realized": 10.0,
+                "sell_commission": 2.0,
+                "all_commission": 3.0,
+                "net_if_realized_only": 10.0,
+                "net_if_realized_minus_sell_commission": 8.0,
+                "net_if_realized_minus_all_commission": 7.0,
+            }
+        }
+
+        summary = execution_closed_summary(by_symbol)
+
+        self.assertEqual(summary["closed_symbols"], 1)
+        self.assertAlmostEqual(summary["closed_net"], 8.0)
+        self.assertEqual(summary["closed_pnl_source"], "executions_realized_pnl_minus_sell_commission")
 
     def test_symbol_diff_reports_each_formula(self) -> None:
         broker = {

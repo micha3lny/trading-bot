@@ -16,13 +16,10 @@ if str(ROOT) not in sys.path:
 import pandas as pd
 
 from src.dashboard.broker_reality import (
-    closed_trades_from_commission_reports,
     fetch_ibkr_executions_diagnostic,
     fetch_ibkr_live_portfolio,
     load_sqlite_active_positions,
-    load_sqlite_closed_trades,
     load_sqlite_executions,
-    load_sqlite_trade_pnl,
 )
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore, resolve_sqlite_path
 
@@ -56,14 +53,6 @@ def exec_ids(df: pd.DataFrame) -> set[str]:
     if df.empty or "execution_id" not in df.columns:
         return set()
     return {str(value) for value in df["execution_id"].dropna().tolist() if str(value)}
-
-
-def net_sum(df: pd.DataFrame) -> float:
-    if df.empty:
-        return 0.0
-    if "net_pnl" in df.columns:
-        return float(pd.to_numeric(df["net_pnl"], errors="coerce").fillna(0.0).sum())
-    return 0.0
 
 
 def normalize_exec_side(value: Any) -> str:
@@ -146,6 +135,15 @@ def pnl_formula_totals(by_symbol: dict[str, dict[str, float]]) -> dict[str, floa
         "net_if_realized_minus_all_commission",
     ]
     return {field: round(sum(float(row.get(field) or 0.0) for row in by_symbol.values()), 6) for field in fields}
+
+
+def execution_closed_summary(by_symbol: dict[str, dict[str, float]]) -> dict[str, float | int | str]:
+    totals = pnl_formula_totals(by_symbol)
+    return {
+        "closed_symbols": len(by_symbol),
+        "closed_net": round(float(totals["net_if_realized_minus_sell_commission"]), 6),
+        "closed_pnl_source": "executions_realized_pnl_minus_sell_commission",
+    }
 
 
 def pnl_formula_comparison(
@@ -280,15 +278,13 @@ def collect_sample(args: argparse.Namespace) -> dict[str, Any]:
         timeout=args.timeout,
     )
     broker_executions = execution_result.filtered_executions
-    broker_closed = closed_trades_from_commission_reports(broker_executions, args.date)
 
     sqlite_positions = load_sqlite_active_positions(sqlite_path, args.date)
     sqlite_executions = load_sqlite_executions(sqlite_path, args.date)
-    sqlite_closed = load_sqlite_closed_trades(sqlite_path, args.date)
-    sqlite_trade_pnl = load_sqlite_trade_pnl(sqlite_path, args.date)
-    sqlite_pnl_row = sqlite_trade_pnl.iloc[0].to_dict() if not sqlite_trade_pnl.empty else {}
     broker_pnl_by_symbol = execution_pnl_by_symbol(broker_executions)
     sqlite_pnl_by_symbol = execution_pnl_by_symbol(sqlite_executions)
+    broker_closed_summary = execution_closed_summary(broker_pnl_by_symbol)
+    sqlite_closed_summary = execution_closed_summary(sqlite_pnl_by_symbol)
     formula_comparison = pnl_formula_comparison(broker_pnl_by_symbol, sqlite_pnl_by_symbol)
     symbol_diffs = pnl_symbol_diffs(broker_pnl_by_symbol, sqlite_pnl_by_symbol)
 
@@ -309,7 +305,7 @@ def collect_sample(args: argparse.Namespace) -> dict[str, Any]:
 
     status = runtime_status(sqlite_path, args.date)
     pending_diag = pending_trade_diagnostics(sqlite_path, args.date, finalize=bool(args.finalize_pending_trades))
-    sqlite_closed_symbols = int(sqlite_pnl_row.get("closed_symbols") or sqlite_pnl_row.get("trades") or 0)
+    closed_net_diff = round(float(broker_closed_summary["closed_net"]) - float(sqlite_closed_summary["closed_net"]), 6)
     sample = {
         "sample_time": datetime.now(timezone.utc).isoformat(),
         "broker_position_status": broker_position_status,
@@ -327,12 +323,12 @@ def collect_sample(args: argparse.Namespace) -> dict[str, Any]:
         "executions_ok": not missing_exec and not extra_exec,
         "missing_executions_in_sqlite": missing_exec,
         "extra_executions_in_sqlite": extra_exec,
-        "broker_closed_symbols": len(broker_closed),
-        "sqlite_closed_symbols": sqlite_closed_symbols,
-        "broker_closed_net": round(net_sum(broker_closed), 6),
-        "sqlite_closed_net": round(float(sqlite_pnl_row.get("sqlite_net") or 0.0), 6),
-        "closed_net_diff": round(net_sum(broker_closed) - float(sqlite_pnl_row.get("sqlite_net") or 0.0), 6),
-        "sqlite_closed_pnl_source": sqlite_pnl_row.get("reconciliation_sqlite_trade_source", ""),
+        "broker_closed_symbols": int(broker_closed_summary["closed_symbols"]),
+        "sqlite_closed_symbols": int(sqlite_closed_summary["closed_symbols"]),
+        "broker_closed_net": float(broker_closed_summary["closed_net"]),
+        "sqlite_closed_net": float(sqlite_closed_summary["closed_net"]),
+        "closed_net_diff": closed_net_diff,
+        "sqlite_closed_pnl_source": sqlite_closed_summary["closed_pnl_source"],
         "broker_pnl_formulas": pnl_formula_totals(broker_pnl_by_symbol),
         "sqlite_pnl_formulas": pnl_formula_totals(sqlite_pnl_by_symbol),
         "closed_pnl_formula_comparison": formula_comparison,
