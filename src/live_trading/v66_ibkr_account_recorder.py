@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,12 @@ DEFAULT_CLIENT_ID = 66
 DEFAULT_RECORDER_DIR = "data/live/recorder"
 
 FILL_FIELDS = list(FillEvent.__dataclass_fields__.keys())
+TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+ALLOW_HISTORICAL_COMMISSION_REINGEST = (
+    str(os.environ.get("TRADING_BOT_ALLOW_HISTORICAL_COMMISSION_REINGEST", "0")).strip().lower()
+    in TRUTHY_ENV_VALUES
+)
+COMMISSION_REINGEST_MAX_EXECUTIONS = int(os.environ.get("TRADING_BOT_COMMISSION_REINGEST_MAX_EXECUTIONS", "100"))
 
 
 def now_utc() -> str:
@@ -483,12 +490,50 @@ def retry_missing_commission_reports_for_pending_trades(
     recorder: LiveDataRecorder,
     *,
     log_execution_limit: int = 5,
+    session_date: str | None = None,
+    include_historical: bool | None = None,
+    max_execution_ids: int | None = None,
 ) -> dict[str, Any]:
     sqlite_store = getattr(recorder, "sqlite_store", None)
-    pending_exec_ids = safe_sqlite_call(sqlite_store, "pending_buy_commission_execution_ids") or []
-    wanted = {str(exec_id or "").strip() for exec_id in pending_exec_ids if str(exec_id or "").strip()}
+    if include_historical is None:
+        include_historical = ALLOW_HISTORICAL_COMMISSION_REINGEST
+    if session_date is None:
+        session_date = str(getattr(recorder, "session_date", "") or "")
+    if max_execution_ids is None:
+        max_execution_ids = COMMISSION_REINGEST_MAX_EXECUTIONS
+    pending_rows = None
+    if sqlite_store is not None and hasattr(sqlite_store, "pending_buy_commission_executions"):
+        pending_rows = safe_sqlite_call(
+            sqlite_store,
+            "pending_buy_commission_executions",
+            None if include_historical else session_date,
+        )
+    if pending_rows is not None:
+        pending_exec_ids = [
+            str((row or {}).get("execution_id") or "").strip()
+            for row in pending_rows
+            if str((row or {}).get("execution_id") or "").strip()
+        ]
+    else:
+        pending_exec_ids = safe_sqlite_call(
+            sqlite_store,
+            "pending_buy_commission_execution_ids",
+            None if include_historical else session_date,
+        ) or []
+    wanted_all = sorted({str(exec_id or "").strip() for exec_id in pending_exec_ids if str(exec_id or "").strip()})
+    limited = 0
+    if max_execution_ids is not None and int(max_execution_ids) > 0 and len(wanted_all) > int(max_execution_ids):
+        limited = len(wanted_all) - int(max_execution_ids)
+        wanted_all = wanted_all[: int(max_execution_ids)]
+    wanted = set(wanted_all)
     if not wanted:
-        return {"requested": 0, "recovered": 0, "missing": 0}
+        return {
+            "requested": 0,
+            "recovered": 0,
+            "missing": 0,
+            "session_date": session_date or "",
+            "include_historical": bool(include_historical),
+        }
     fills_by_exec = {fill_key(fill): fill for fill in merged_recent_fills(ib)}
     recovered = 0
     still_missing: list[str] = []
@@ -509,12 +554,23 @@ def retry_missing_commission_reports_for_pending_trades(
             key=execution_id,
         )
     if still_missing:
-        print(
+        rate_limited_recorder_log(
+            recorder,
+            "COMMISSION_REPORT_REINGEST_MISSING",
             f"{now_utc()} COMMISSION_REPORT_REINGEST_MISSING count={len(still_missing)} "
-            f"sample_execution_ids={','.join(still_missing[:max(0, int(log_execution_limit))])}",
-            flush=True,
+            f"session_date={session_date or ''} include_historical={int(bool(include_historical))} "
+            f"limited={limited} sample_execution_ids={','.join(still_missing[:max(0, int(log_execution_limit))])}",
+            key=f"{session_date or 'all'}:{len(still_missing)}:{limited}",
+            window_seconds=300.0,
         )
-    return {"requested": len(wanted), "recovered": recovered, "missing": len(still_missing)}
+    return {
+        "requested": len(wanted),
+        "recovered": recovered,
+        "missing": len(still_missing),
+        "limited": limited,
+        "session_date": session_date or "",
+        "include_historical": bool(include_historical),
+    }
 
 
 def install_commission_report_handler(ib: IB, recorder: LiveDataRecorder) -> None:
@@ -543,6 +599,7 @@ def record_recent_fills(
     seen: set[str],
     *,
     allow_stale_commission_reingest: bool = True,
+    allow_historical_commission_reingest: bool | None = None,
 ) -> int:
     sqlite_store = getattr(recorder, "sqlite_store", None)
     started_at = now_utc()
@@ -589,7 +646,12 @@ def record_recent_fills(
         finalized_pending = {}
         if int((pending or {}).get("pending_trade_finalization_count") or 0) > 0:
             if allow_stale_commission_reingest:
-                commission_retry = retry_missing_commission_reports_for_pending_trades(ib, recorder)
+                commission_retry = retry_missing_commission_reports_for_pending_trades(
+                    ib,
+                    recorder,
+                    session_date=str(getattr(recorder, "session_date", "") or ""),
+                    include_historical=allow_historical_commission_reingest,
+                )
             else:
                 commission_retry = {
                     "requested": 0,

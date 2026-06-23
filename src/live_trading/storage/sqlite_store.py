@@ -1384,17 +1384,25 @@ class SQLiteRuntimeStore:
             "after": after,
         }
 
-    def pending_buy_commission_execution_ids(self, session_date: str | None = None) -> list[str]:
+    def pending_buy_commission_executions(self, session_date: str | None = None) -> list[dict[str, Any]]:
         diagnostics = self.pending_trade_finalization_diagnostics(session_date)
-        out: list[str] = []
+        out: list[dict[str, Any]] = []
         seen: set[str] = set()
         for row in diagnostics:
             blockers = {part.strip() for part in str(row.get("blockers") or "").split(",") if part.strip()}
             execution_id = str(row.get("buy_execution_id") or "").strip()
             if execution_id and "BUY_COMMISSION_NOT_IBKR" in blockers and execution_id not in seen:
-                out.append(execution_id)
+                out.append({
+                    "execution_id": execution_id,
+                    "session_date": row.get("session_date"),
+                    "symbol": row.get("symbol"),
+                    "trade_id": row.get("trade_id"),
+                })
                 seen.add(execution_id)
         return out
+
+    def pending_buy_commission_execution_ids(self, session_date: str | None = None) -> list[str]:
+        return [str(row.get("execution_id") or "") for row in self.pending_buy_commission_executions(session_date)]
 
     def _reconcile_trade_state_after_execution(self, execution: dict[str, Any]) -> None:
         try:
@@ -2767,8 +2775,13 @@ class SQLiteWriteQueue:
         self._status_lock = threading.Lock()
         self._status: dict[str, Any] = {
             "queue_depth": 0,
+            "max_queue_depth": 0,
             "max_queue_size": self.maxsize,
             "dropped_writes": 0,
+            "ack_timeouts_total": 0,
+            "ack_timeouts_by_method": {},
+            "last_ack_timeout_method": "",
+            "last_ack_timeout_at": "",
             "write_count": 0,
             "failed_writes": 0,
             "last_write_latency_ms": None,
@@ -2789,13 +2802,17 @@ class SQLiteWriteQueue:
     def _set_status(self, **updates: Any) -> None:
         with self._status_lock:
             self._status.update(updates)
-            self._status["queue_depth"] = self._queue.qsize()
+            queue_depth = self._queue.qsize()
+            self._status["queue_depth"] = queue_depth
+            self._status["max_queue_depth"] = max(int(self._status.get("max_queue_depth", 0) or 0), queue_depth)
             self._status["writer_alive"] = int(self._thread.is_alive())
 
     def status(self) -> dict[str, Any]:
         with self._status_lock:
             out = dict(self._status)
-        out["queue_depth"] = self._queue.qsize()
+        queue_depth = self._queue.qsize()
+        out["queue_depth"] = queue_depth
+        out["max_queue_depth"] = max(int(out.get("max_queue_depth", 0) or 0), queue_depth)
         out["writer_alive"] = int(self._thread.is_alive())
         current_started = out.get("current_write_monotonic")
         if isinstance(current_started, (int, float)) and current_started > 0:
@@ -2864,7 +2881,9 @@ class SQLiteWriteQueue:
                         self._status["current_write_monotonic"] = 0.0
                         self._status["current_write_duration_seconds"] = 0.0
                         self._status["oldest_queued_age_seconds"] = self._oldest_queued_age_seconds()
-                        self._status["queue_depth"] = self._queue.qsize()
+                        queue_depth = self._queue.qsize()
+                        self._status["queue_depth"] = queue_depth
+                        self._status["max_queue_depth"] = max(int(self._status.get("max_queue_depth", 0) or 0), queue_depth)
                         self._status["writer_alive"] = int(self._thread.is_alive())
                     request.done.set()
                     self._queue.task_done()
@@ -2925,7 +2944,9 @@ class SQLiteWriteQueue:
         except queue.Full:
             with self._status_lock:
                 self._status["dropped_writes"] = int(self._status.get("dropped_writes", 0) or 0) + 1
-                self._status["queue_depth"] = self._queue.qsize()
+                queue_depth = self._queue.qsize()
+                self._status["queue_depth"] = queue_depth
+                self._status["max_queue_depth"] = max(int(self._status.get("max_queue_depth", 0) or 0), queue_depth)
                 self._status["last_write_error"] = f"queue_full:{method}"
             log_sqlite_line(f"{utc_now_iso()} SQLITE_WRITE_DROPPED method={method} priority={effective_priority} reason=queue_full")
             return None
@@ -2933,20 +2954,38 @@ class SQLiteWriteQueue:
         if not wait_for_ack:
             return "queued"
         if not request.done.wait(timeout=max(0.0, float(timeout_seconds))):
+            with self._status_lock:
+                total = int(self._status.get("ack_timeouts_total", 0) or 0) + 1
+                by_method = dict(self._status.get("ack_timeouts_by_method") or {})
+                by_method[method] = int(by_method.get(method, 0) or 0) + 1
+                self._status["ack_timeouts_total"] = total
+                self._status["ack_timeouts_by_method"] = by_method
+                self._status["last_ack_timeout_method"] = method
+                self._status["last_ack_timeout_at"] = utc_now_iso()
             now = time.monotonic()
             last = float(self._timeout_log_last.get(method) or 0.0)
             if now - last >= SQLITE_WRITER_TIMEOUT_LOG_INTERVAL_SECONDS:
-                self._timeout_log_last[method] = now
                 status = self.status()
-                log_sqlite_line(
-                    f"{utc_now_iso()} SQLITE_WRITE_ACK_TIMEOUT method={method} "
-                    f"priority={effective_priority} timeout_seconds={timeout_seconds} "
-                    f"queue_depth={status.get('queue_depth')} oldest_queued_age_seconds={status.get('oldest_queued_age_seconds')} "
-                    f"current_write_method={status.get('current_write_method') or ''} "
-                    f"current_write_duration_seconds={status.get('current_write_duration_seconds') or 0} "
-                    f"last_write_method={status.get('last_write_method') or ''} "
-                    f"last_write_latency_ms={status.get('last_write_latency_ms') or ''}"
-                )
+                queue_depth = int(status.get("queue_depth") or 0)
+                dropped_writes = int(status.get("dropped_writes") or 0)
+                current_duration = float(status.get("current_write_duration_seconds") or 0.0)
+                should_log = queue_depth > 0 or dropped_writes > 0
+                if should_log:
+                    self._timeout_log_last[method] = now
+                    log_sqlite_line(
+                        f"{utc_now_iso()} SQLITE_WRITE_ACK_TIMEOUT method={method} "
+                        f"priority={effective_priority} timeout_seconds={timeout_seconds} "
+                        f"queue_depth={queue_depth} max_queue_depth={status.get('max_queue_depth') or 0} "
+                        f"oldest_queued_age_seconds={status.get('oldest_queued_age_seconds')} "
+                        f"current_write_method={status.get('current_write_method') or ''} "
+                        f"current_write_duration_seconds={current_duration} "
+                        f"dropped_writes={dropped_writes} "
+                        f"ack_timeouts_total={status.get('ack_timeouts_total') or 0} "
+                        f"ack_timeouts_by_method={json.dumps(status.get('ack_timeouts_by_method') or {}, sort_keys=True, separators=(',', ':'))} "
+                        f"last_write_method={status.get('last_write_method') or ''} "
+                        f"last_write_latency_ms={status.get('last_write_latency_ms') or ''} "
+                        f"last_error={str(status.get('last_write_error') or '').replace(' ', '_')}"
+                    )
             return None
         if request.exception is not None:
             raise request.exception

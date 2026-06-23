@@ -106,6 +106,9 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0]["symbol"], "RKLB")
                 self.assertGreaterEqual(int(queue_store.status()["write_count"]), 1)
+                self.assertIn("ack_timeouts_total", queue_store.status())
+                self.assertIn("ack_timeouts_by_method", queue_store.status())
+                self.assertIn("max_queue_depth", queue_store.status())
             finally:
                 queue_store.close()
 
@@ -160,6 +163,8 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 status = queue_store.status()
                 self.assertIn("oldest_queued_age_seconds", status)
                 self.assertIn("current_write_method", status)
+                self.assertIn("max_queue_depth", status)
+                self.assertGreaterEqual(int(status.get("max_queue_depth") or 0), 0)
             finally:
                 queue_store.close()
 

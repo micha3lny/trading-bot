@@ -6433,6 +6433,9 @@ def main() -> int:
                     sqlite_writer_status = {"last_write_error": repr(exc)}
                     runtime_state["sqlite_writer_status"] = sqlite_writer_status
             sqlite_last_error = str(sqlite_writer_status.get("last_write_error") or "").replace(" ", "_")
+            sqlite_ack_timeouts_by_method = str(
+                json.dumps(sqlite_writer_status.get("ack_timeouts_by_method") or {}, sort_keys=True, separators=(",", ":"))
+            ).replace(" ", "_")
             last_eod_retry_age = pending_eod_retry_age_seconds(runtime_state, loop_now)
             last_eod_retry_age_text = "" if last_eod_retry_age is None else f"{last_eod_retry_age:.1f}"
             oldest_ready_age = runtime_state.get("oldest_ready_candidate_age_seconds")
@@ -6456,10 +6459,13 @@ def main() -> int:
                 f"open_price_ok={open_price_ok} open_price_missing={open_price_missing} "
                 f"subscriptions_active={len(tickers)} subscriptions_cap={subscriptions_cap} subscription_cap_block={int(subscription_cap_block)} "
                 f"sqlite_queue_depth={int(sqlite_writer_status.get('queue_depth') or 0)} "
+                f"sqlite_max_queue_depth={int(sqlite_writer_status.get('max_queue_depth') or 0)} "
                 f"sqlite_oldest_queued_age_seconds={sqlite_writer_status.get('oldest_queued_age_seconds') or 0} "
                 f"sqlite_current_write_method={str(sqlite_writer_status.get('current_write_method') or '').replace(' ', '_')} "
                 f"sqlite_current_write_duration_seconds={sqlite_writer_status.get('current_write_duration_seconds') or 0} "
                 f"sqlite_dropped_writes={int(sqlite_writer_status.get('dropped_writes') or 0)} "
+                f"sqlite_ack_timeouts_total={int(sqlite_writer_status.get('ack_timeouts_total') or 0)} "
+                f"sqlite_ack_timeouts_by_method={sqlite_ack_timeouts_by_method} "
                 f"sqlite_last_write_latency_ms={sqlite_writer_status.get('last_write_latency_ms') or ''} "
                 f"sqlite_last_write_error={sqlite_last_error} "
                 f"ineligible_symbols={len(_runtime_set(runtime_state, 'ineligible_symbols'))} "

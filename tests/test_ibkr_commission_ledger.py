@@ -93,6 +93,7 @@ class CountingStore:
         self.pending_counts = {}
         self.status_calls = []
         self.pending_buy_ids = []
+        self.pending_buy_rows = None
         self.pending_buy_ids_calls = 0
 
     def mark_operation_status(self, *args, **kwargs):
@@ -111,7 +112,19 @@ class CountingStore:
         self.pending_counts = {}
         return {"pending_before": 1, "pending_after": 0, "resolved": 1}
 
-    def pending_buy_commission_execution_ids(self):
+    def pending_buy_commission_executions(self, session_date=None):
+        if self.pending_buy_rows is None:
+            return [
+                {"execution_id": execution_id, "session_date": session_date, "symbol": ""}
+                for execution_id in self.pending_buy_ids
+            ]
+        return [
+            dict(row)
+            for row in self.pending_buy_rows
+            if session_date is None or row.get("session_date") == session_date
+        ]
+
+    def pending_buy_commission_execution_ids(self, session_date=None):
         self.pending_buy_ids_calls += 1
         return list(self.pending_buy_ids)
 
@@ -318,6 +331,32 @@ class IbkrCommissionLedgerTests(unittest.TestCase):
             self.assertEqual(rows[0]["commission"], "0.37")
             self.assertEqual(rows[0]["commission_source"], "ibkr")
             self.assertEqual(store.rows[-1]["execution_id"], "BUY_PENDING_COMM")
+
+    def test_retry_missing_commission_reports_filters_to_current_session_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(Path(tmp), session_date="2026-05-22")
+            store = CountingStore()
+            store.pending_buy_rows = [
+                {"execution_id": "OLD_BUY_PENDING_COMM", "session_date": "2026-05-21", "symbol": "OUST"},
+                {"execution_id": "TODAY_BUY_PENDING_COMM", "session_date": "2026-05-22", "symbol": "RKLB"},
+            ]
+            setattr(recorder, "sqlite_store", store)
+
+            result = retry_missing_commission_reports_for_pending_trades(
+                FakeIB([
+                    fake_fill("OLD_BUY_PENDING_COMM", symbol="OUST", side="BOT", shares=2, price=10, commission=0.37),
+                    fake_fill("TODAY_BUY_PENDING_COMM", symbol="RKLB", side="BOT", shares=1, price=20, commission=0.22),
+                ]),
+                recorder,
+            )
+
+            rows = read_fills(recorder)
+            self.assertEqual(result["requested"], 1)
+            self.assertEqual(result["recovered"], 1)
+            self.assertEqual(result["session_date"], "2026-05-22")
+            self.assertFalse(result["include_historical"])
+            self.assertEqual([row["execution_id"] for row in rows], ["TODAY_BUY_PENDING_COMM"])
+            self.assertEqual(store.rows[-1]["execution_id"], "TODAY_BUY_PENDING_COMM")
             self.assertEqual(store.rows[-1]["commission_source"], "ibkr")
 
     def test_record_recent_fills_defers_stale_commission_reingest_when_disabled(self) -> None:
