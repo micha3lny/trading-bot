@@ -13,7 +13,7 @@ from typing import Any, Iterable
 
 import pandas as pd
 
-from src.live_trading.market_calendar import is_us_equity_trading_day
+from src.live_trading.market_calendar import is_us_equity_trading_day, previous_us_equity_trading_day
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore, open_sqlite_store, safe_float, safe_sqlite_call, utc_now_iso
 from src.live_trading.unified_logger import install_unified_logger
 
@@ -91,6 +91,81 @@ def read_lock_info(path: Path) -> str:
         return path.read_text(encoding="utf-8").strip().replace("\n", " | ")
     except Exception:
         return ""
+
+
+def parse_lock_info(path: Path) -> dict[str, Any]:
+    raw = read_lock_info(path)
+    out: dict[str, Any] = {"raw": raw}
+    for part in raw.replace("|", " ").split():
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        out[key.strip()] = value.strip()
+    pid = out.get("pid")
+    if pid:
+        try:
+            out["pid"] = int(pid)
+        except Exception:
+            pass
+    acquired_at = out.get("acquired_at")
+    if acquired_at:
+        try:
+            parsed = datetime.fromisoformat(str(acquired_at).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            out["acquired_at_dt"] = parsed.astimezone(timezone.utc)
+            out["age_seconds"] = max(0, int((now_utc() - out["acquired_at_dt"]).total_seconds()))
+        except Exception:
+            out["age_seconds"] = None
+    return out
+
+
+def pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def cleanup_stale_lock(path: Path, *, max_age_seconds: int) -> None:
+    if not path.exists():
+        return
+    info = parse_lock_info(path)
+    pid = info.get("pid")
+    age = info.get("age_seconds")
+    reason = ""
+    if isinstance(pid, int) and not pid_exists(pid):
+        reason = "pid_not_running"
+    elif not isinstance(pid, int) and isinstance(age, int) and age > int(max_age_seconds):
+        reason = "unparseable_pid_age_exceeded"
+    elif isinstance(pid, int) and isinstance(age, int) and age > int(max_age_seconds):
+        print(
+            f"{now_iso()} HISTORY_COLLECTOR_SKIPPED reason=lock_age_exceeded_pid_alive "
+            f"lock_path={path} pid={pid} age_seconds={age} max_age_seconds={int(max_age_seconds)}",
+            flush=True,
+        )
+        return
+    if not reason:
+        return
+    try:
+        path.unlink()
+        print(
+            f"{now_iso()} HISTORY_LOCK_STALE_REMOVED lock_path={path} reason={reason} "
+            f"pid={pid or ''} age_seconds={age if age is not None else ''}",
+            flush=True,
+        )
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        print(
+            f"{now_iso()} HISTORY_LOCK_STALE_REMOVE_FAILED lock_path={path} reason={reason} error={exc!r}",
+            flush=True,
+        )
 
 
 def acquire_lock(path: Path) -> Any | None:
@@ -427,6 +502,56 @@ def build_tasks(symbols: list[str], start: date, end: date, session_type: str, *
     return [CollectTask(symbol=s, session_date=d, session_type=session_type.upper()) for d in dates for s in symbols]
 
 
+def latest_completed_trading_day(now: datetime | None = None, market_close_utc: str = RTH_END_UTC) -> date:
+    now = now or now_utc()
+    today = now.date()
+    try:
+        close_h, close_m = [int(x) for x in market_close_utc.split(":", 1)]
+    except Exception:
+        close_h, close_m = 20, 0
+    close_dt = now.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
+    if is_us_equity_trading_day(today) and now >= close_dt:
+        return today
+    return previous_us_equity_trading_day(today)
+
+
+def recent_completed_sessions(latest_day: date, count: int) -> list[date]:
+    sessions: list[date] = []
+    cur = latest_day
+    while len(sessions) < max(1, int(count)):
+        if is_us_equity_trading_day(cur):
+            sessions.append(cur)
+        cur = previous_us_equity_trading_day(cur)
+    return sessions
+
+
+def session_readiness_counts(
+    symbols: list[str],
+    *,
+    session_date: date,
+    session_type: str,
+    status: dict[str, Any],
+    output_dir: Path,
+    existing_parquet_keys: set[str] | None,
+) -> dict[str, int]:
+    counts = {"expected": len(symbols), "complete": 0, "partial": 0, "no_data": 0, "missing": 0, "failed": 0}
+    for symbol in symbols:
+        task = CollectTask(symbol=symbol, session_date=session_date, session_type=session_type.upper())
+        row = status.get(task_key(task)) or {}
+        state = str(row.get("status") or "")
+        if task_is_complete(status, output_dir, task, existing_parquet_keys=existing_parquet_keys):
+            counts["complete"] += 1
+        elif state == "partial":
+            counts["partial"] += 1
+        elif state in {"no_data", "no_data_permanent"}:
+            counts["no_data"] += 1
+        elif state in {"failed", "failed_permanent"}:
+            counts["failed"] += 1
+        else:
+            counts["missing"] += 1
+    return counts
+
+
 def market_closed_dates(start: date, end: date, *, include_weekends: bool = False) -> list[date]:
     return [
         d
@@ -504,6 +629,9 @@ def main() -> int:
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--sync-status-from-parquet", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lock-path", default=DEFAULT_LOCK_PATH)
+    parser.add_argument("--stale-lock-max-age-seconds", type=int, default=14400)
+    parser.add_argument("--priority-recent-catchup", action="store_true")
+    parser.add_argument("--recent-sessions", type=int, default=5)
     parser.add_argument("--sqlite-path", default=None)
     parser.add_argument("--disable-sqlite", action="store_true")
     parser.add_argument("--log-dir", default=None)
@@ -540,6 +668,7 @@ def main() -> int:
     status_dir = Path(args.status_dir)
     status_path = status_dir / "collector_status.json"
     failures_path = status_dir / "collector_failures.json"
+    cleanup_stale_lock(Path(args.lock_path), max_age_seconds=int(args.stale_lock_max_age_seconds))
     lock_handle = acquire_lock(Path(args.lock_path))
     if lock_handle is None:
         lock_info = read_lock_info(Path(args.lock_path))
@@ -581,22 +710,91 @@ def main() -> int:
                 f"{now_iso()} HISTORY_COLLECTOR_SKIPPED_MARKET_CLOSED date={closed_date.isoformat()} session={args.session_type}",
                 flush=True,
             )
-        tasks = build_tasks(symbols, start, end, args.session_type, include_weekends=bool(args.include_weekends))
         existing_parquet_keys = collect_existing_parquet_keys(output_dir, args.session_type)
-        pending, plan = build_pending_tasks(
-            tasks,
-            status=status,
-            failures=failures,
-            output_dir=output_dir,
-            max_attempts=int(args.max_attempts),
-            retry_failed=bool(args.retry_failed),
-            existing_parquet_keys=existing_parquet_keys,
-            sync_existing_status=bool(args.sync_status_from_parquet),
-            update_blocked_status=not bool(args.plan_only),
-        )
+        priority_dates: list[date] = []
+        if bool(args.priority_recent_catchup) and not args.date:
+            latest_day = latest_completed_trading_day(current, RTH_END_UTC)
+            priority_dates = recent_completed_sessions(latest_day, int(args.recent_sessions))
+            print(
+                f"{now_iso()} HISTORY_PRIORITY_CATCHUP_START latest_completed_session={latest_day.isoformat()} "
+                f"recent_sessions={','.join(d.isoformat() for d in priority_dates)} expected_symbols={len(symbols)}",
+                flush=True,
+            )
+            priority_tasks: list[CollectTask] = []
+            priority_pending: list[CollectTask] = []
+            priority_plan = {"tasks": 0, "complete": 0, "pending": 0, "blocked_by_attempts": 0, "synced_existing": 0}
+            for session_date in priority_dates:
+                session_tasks = build_tasks(symbols, session_date, session_date, args.session_type, include_weekends=bool(args.include_weekends))
+                counts = session_readiness_counts(
+                    symbols,
+                    session_date=session_date,
+                    session_type=args.session_type,
+                    status=status,
+                    output_dir=output_dir,
+                    existing_parquet_keys=existing_parquet_keys,
+                )
+                session_pending, session_plan = build_pending_tasks(
+                    session_tasks,
+                    status=status,
+                    failures=failures,
+                    output_dir=output_dir,
+                    max_attempts=int(args.max_attempts),
+                    retry_failed=True,
+                    existing_parquet_keys=existing_parquet_keys,
+                    sync_existing_status=bool(args.sync_status_from_parquet),
+                    update_blocked_status=not bool(args.plan_only),
+                )
+                print(
+                    f"{now_iso()} HISTORY_PRIORITY_SESSION_CHECK date={session_date.isoformat()} "
+                    f"expected={counts['expected']} complete={counts['complete']} partial={counts['partial']} "
+                    f"no_data={counts['no_data']} missing={counts['missing']} failed={counts['failed']} "
+                    f"pending={len(session_pending)}",
+                    flush=True,
+                )
+                priority_tasks.extend(session_tasks)
+                priority_pending.extend(session_pending)
+                for key in priority_plan:
+                    priority_plan[key] += int(session_plan.get(key, 0))
+            if priority_pending:
+                tasks = priority_tasks
+                pending = priority_pending
+                plan = priority_plan
+            else:
+                print(
+                    f"{now_iso()} HISTORY_BACKLOG_START start={start.isoformat()} end={end.isoformat()} "
+                    f"recent_sessions_ok={len(priority_dates)} max_tasks={int(args.max_tasks or 0)}",
+                    flush=True,
+                )
+                tasks = build_tasks(symbols, start, end, args.session_type, include_weekends=bool(args.include_weekends))
+                pending, plan = build_pending_tasks(
+                    tasks,
+                    status=status,
+                    failures=failures,
+                    output_dir=output_dir,
+                    max_attempts=int(args.max_attempts),
+                    retry_failed=bool(args.retry_failed),
+                    existing_parquet_keys=existing_parquet_keys,
+                    sync_existing_status=bool(args.sync_status_from_parquet),
+                    update_blocked_status=not bool(args.plan_only),
+                )
+                if args.max_tasks and args.max_tasks > 0:
+                    pending = pending[: int(args.max_tasks)]
+        else:
+            tasks = build_tasks(symbols, start, end, args.session_type, include_weekends=bool(args.include_weekends))
+            pending, plan = build_pending_tasks(
+                tasks,
+                status=status,
+                failures=failures,
+                output_dir=output_dir,
+                max_attempts=int(args.max_attempts),
+                retry_failed=bool(args.retry_failed),
+                existing_parquet_keys=existing_parquet_keys,
+                sync_existing_status=bool(args.sync_status_from_parquet),
+                update_blocked_status=not bool(args.plan_only),
+            )
 
-        if args.max_tasks and args.max_tasks > 0:
-            pending = pending[: int(args.max_tasks)]
+            if args.max_tasks and args.max_tasks > 0:
+                pending = pending[: int(args.max_tasks)]
 
         print(
             f"{now_iso()} HISTORY_COLLECTOR_START symbols={len(symbols)} total_symbols={len(symbols)} tasks={len(tasks)} "
@@ -607,7 +805,7 @@ def main() -> int:
             f"include_weekends={bool(args.include_weekends)} output_dir={output_dir}",
             flush=True,
         )
-        is_single_latest_day = start == end
+        is_single_latest_day = start == end and not bool(args.priority_recent_catchup)
         if is_single_latest_day:
             print(
                 f"{now_iso()} HISTORY_COLLECTOR_LATEST_DAY_START date={start.isoformat()} "
@@ -636,6 +834,21 @@ def main() -> int:
                     f"{now_iso()} HISTORY_COLLECTOR_LATEST_DAY_DONE date={start.isoformat()} "
                     f"files_written=0 symbols_complete=0 symbols_partial=0 symbols_no_data=0 symbols_failed=0 "
                     f"parquet_files={parquet_files} completion_pct={completion_pct(parquet_files, len(tasks))}",
+                    flush=True,
+                )
+            for session_date in priority_dates:
+                counts = session_readiness_counts(
+                    symbols,
+                    session_date=session_date,
+                    session_type=args.session_type,
+                    status=status,
+                    output_dir=output_dir,
+                    existing_parquet_keys=collect_existing_parquet_keys(output_dir, args.session_type),
+                )
+                print(
+                    f"{now_iso()} HISTORY_PRIORITY_SESSION_DONE date={session_date.isoformat()} "
+                    f"expected={counts['expected']} complete={counts['complete']} partial={counts['partial']} "
+                    f"no_data={counts['no_data']} missing={counts['missing']} failed={counts['failed']}",
                     flush=True,
                 )
             safe_sqlite_call(
@@ -682,6 +895,21 @@ def main() -> int:
                     f"{now_iso()} HISTORY_COLLECTOR_LATEST_DAY_DONE date={start.isoformat()} "
                     f"files_written=0 symbols_complete=0 symbols_partial=0 symbols_no_data=0 symbols_failed=0 "
                     f"parquet_files={parquet_files} completion_pct={completion_pct(parquet_files, len(tasks))}",
+                    flush=True,
+                )
+            for session_date in priority_dates:
+                counts = session_readiness_counts(
+                    symbols,
+                    session_date=session_date,
+                    session_type=args.session_type,
+                    status=status,
+                    output_dir=output_dir,
+                    existing_parquet_keys=collect_existing_parquet_keys(output_dir, args.session_type),
+                )
+                print(
+                    f"{now_iso()} HISTORY_PRIORITY_SESSION_DONE date={session_date.isoformat()} "
+                    f"expected={counts['expected']} complete={counts['complete']} partial={counts['partial']} "
+                    f"no_data={counts['no_data']} missing={counts['missing']} failed={counts['failed']}",
                     flush=True,
                 )
             safe_sqlite_call(
@@ -828,6 +1056,21 @@ def main() -> int:
                 f"files_written={parquet_files_written} symbols_complete={completed} symbols_partial={partial} "
                 f"symbols_no_data={no_data} symbols_failed={failed} parquet_files={parquet_files} "
                 f"completion_pct={completion_pct(parquet_files, len(tasks))}",
+                flush=True,
+            )
+        for session_date in priority_dates:
+            counts = session_readiness_counts(
+                symbols,
+                session_date=session_date,
+                session_type=args.session_type,
+                status=status,
+                output_dir=output_dir,
+                existing_parquet_keys=collect_existing_parquet_keys(output_dir, args.session_type),
+            )
+            print(
+                f"{now_iso()} HISTORY_PRIORITY_SESSION_DONE date={session_date.isoformat()} "
+                f"expected={counts['expected']} complete={counts['complete']} partial={counts['partial']} "
+                f"no_data={counts['no_data']} missing={counts['missing']} failed={counts['failed']}",
                 flush=True,
             )
         safe_sqlite_call(

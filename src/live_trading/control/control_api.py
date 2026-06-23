@@ -413,6 +413,8 @@ def _queue_history_collector(ctx: ControlApiContext, body: JsonDict, *, force: b
         "plan_only": _bool_value(body.get("plan_only"), False),
         "include_weekends": _bool_value(body.get("include_weekends"), False),
         "retry_failed": _bool_value(body.get("retry_failed"), False),
+        "priority_recent_catchup": _bool_value(body.get("priority_recent_catchup"), False),
+        "recent_sessions": int(body.get("recent_sessions") or ctx.runtime_state.get("history_collector_recent_sessions") or 5),
     }
     queue = _ensure_history_queue(ctx)
     queue.append(cmd)
@@ -442,6 +444,9 @@ def _build_history_collector_args(cmd: JsonDict) -> list[str]:
         args.append("--include-weekends")
     if _bool_value(cmd.get("retry_failed"), False):
         args.append("--retry-failed")
+    if _bool_value(cmd.get("priority_recent_catchup"), False):
+        args.append("--priority-recent-catchup")
+        args.extend(["--recent-sessions", str(int(cmd.get("recent_sessions") or 5))])
     return args
 
 

@@ -526,11 +526,30 @@ def write_diagnostics_csv(path: str | Path, ranking_date: date, stats: dict[str,
     return len(rows)
 
 
-def update_latest_output(dated_output: str | Path, latest_output: str | Path, rows: list[dict[str, Any]]) -> bool:
+def update_latest_output(
+    dated_output: str | Path,
+    latest_output: str | Path,
+    rows: list[dict[str, Any]],
+    *,
+    missing_history_count: int = 0,
+    max_missing_history_for_latest: int = 0,
+) -> bool:
     if len(rows) < MIN_LATEST_ROWS:
         print(
             f"DAILY_TOP100_LATEST_SKIPPED reason=too_few_rows rows={len(rows)} "
             f"required={MIN_LATEST_ROWS} latest_output={latest_output}",
+            flush=True,
+        )
+        return False
+    if int(missing_history_count) > int(max_missing_history_for_latest):
+        print(
+            f"DAILY_TOP100_BLOCKED_HISTORY_NOT_READY missing_history={int(missing_history_count)} "
+            f"max_missing_history={int(max_missing_history_for_latest)} latest_output={latest_output}",
+            flush=True,
+        )
+        print(
+            f"DAILY_TOP100_LATEST_SKIPPED reason=missing_history missing_history={int(missing_history_count)} "
+            f"max_missing_history={int(max_missing_history_for_latest)} latest_output={latest_output}",
             flush=True,
         )
         return False
@@ -566,6 +585,7 @@ def main() -> int:
     parser.add_argument("--diagnostics-output", default=None)
     parser.add_argument("--max-missing-log", type=int, default=DEFAULT_MAX_MISSING_LOG)
     parser.add_argument("--max-reject-log", type=int, default=DEFAULT_MAX_REJECT_LOG)
+    parser.add_argument("--max-missing-history-for-latest", type=int, default=0)
     parser.add_argument("--symbol-denylist", default=DEFAULT_SYMBOL_DENYLIST)
     parser.add_argument("--runtime-ineligible-path", default=DEFAULT_RUNTIME_INELIGIBLE)
     parser.add_argument("--no-sqlite", action="store_true")
@@ -609,7 +629,13 @@ def main() -> int:
         )
     latest_ok = None
     if args.latest_output:
-        latest_ok = update_latest_output(args.output, args.latest_output, rows)
+        latest_ok = update_latest_output(
+            args.output,
+            args.latest_output,
+            rows,
+            missing_history_count=int(stats.get("missing", 0)),
+            max_missing_history_for_latest=int(args.max_missing_history_for_latest),
+        )
     stored = 0
     if not args.no_sqlite:
         stored = RankingStore(args.sqlite_path).replace_daily_rankings(ranking_date.isoformat(), rows)

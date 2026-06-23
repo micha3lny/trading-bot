@@ -34,6 +34,7 @@ DATED_OUTPUT="${DATED_OUTPUT:-$OUTPUT_DIR/daily_top100_${RANKING_DATE}.csv}"
 LATEST_OUTPUT="${LATEST_OUTPUT:-$OUTPUT_DIR/daily_top100_latest.csv}"
 DIAGNOSTICS_OUTPUT="${DIAGNOSTICS_OUTPUT:-$OUTPUT_DIR/daily_top100_${RANKING_DATE}_diagnostics.csv}"
 SQLITE_PATH="${SQLITE_PATH:-data/runtime/rankings.sqlite}"
+MAX_MISSING_HISTORY_FOR_LATEST="${MAX_MISSING_HISTORY_FOR_LATEST:-0}"
 
 log "DAILY_TOP100_PREMARKET_START repo=$REPO_ROOT ranking_date=$RANKING_DATE top_n=$TOP_N"
 log "universe=$UNIVERSE"
@@ -41,6 +42,7 @@ log "history_dir=$HISTORY_DIR"
 log "dated_output=$DATED_OUTPUT"
 log "latest_output=$LATEST_OUTPUT"
 log "diagnostics_output=$DIAGNOSTICS_OUTPUT"
+log "max_missing_history_for_latest=$MAX_MISSING_HISTORY_FOR_LATEST"
 
 set +e
 python -m src.live_trading.ranking.daily_top100_builder \
@@ -51,6 +53,7 @@ python -m src.live_trading.ranking.daily_top100_builder \
   --latest-output "$LATEST_OUTPUT" \
   --diagnostics-output "$DIAGNOSTICS_OUTPUT" \
   --sqlite-path "$SQLITE_PATH" \
+  --max-missing-history-for-latest "$MAX_MISSING_HISTORY_FOR_LATEST" \
   --top-n "$TOP_N"
 RC=$?
 set -e

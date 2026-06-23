@@ -220,6 +220,34 @@ class DailyTop100BuilderTests(unittest.TestCase):
             self.assertEqual(len(loaded), 100)
             self.assertEqual(loaded["symbol"].iloc[0], "S001")
 
+    def test_latest_output_blocks_when_missing_history_exceeds_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dated = root / "daily_top100_2026-06-22.csv"
+            latest = root / "daily_top100_latest.csv"
+            latest.write_text("rank,symbol,score,alpha_score\n1,OLD,1,1\n", encoding="utf-8")
+            rows = [
+                {
+                    "rank": idx,
+                    "symbol": f"S{idx:03d}",
+                    "score": 100.0 - idx / 1000,
+                    "alpha_score": 100.0 - idx / 1000,
+                }
+                for idx in range(1, 101)
+            ]
+            write_output_csv(dated, rows)
+
+            self.assertFalse(
+                update_latest_output(
+                    dated,
+                    latest,
+                    rows,
+                    missing_history_count=1,
+                    max_missing_history_for_latest=0,
+                )
+            )
+            self.assertIn("OLD", latest.read_text(encoding="utf-8"))
+
     def test_ranking_store_replaces_one_day_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = RankingStore(Path(tmp) / "rankings.sqlite")

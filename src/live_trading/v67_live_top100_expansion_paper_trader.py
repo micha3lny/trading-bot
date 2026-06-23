@@ -3608,6 +3608,8 @@ def enqueue_overnight_collector_if_due(runtime_state: dict[str, Any], args: argp
                 "plan_only": False,
                 "include_weekends": False,
                 "retry_failed": True if mode == "daily" else bool(getattr(args, "overnight_collector_retry_failed", False)),
+                "priority_recent_catchup": True,
+                "recent_sessions": int(getattr(args, "history_collector_recent_sessions", 5) or 5),
             }
             queue.append(command)
             queued_commands.append(command)
@@ -5187,6 +5189,7 @@ def main() -> int:
     parser.add_argument("--overnight-collector-max-tasks", type=int, default=3000)
     parser.add_argument("--overnight-collector-max-attempts", type=int, default=5)
     parser.add_argument("--overnight-collector-retry-failed", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--history-collector-recent-sessions", type=int, default=5)
     parser.add_argument("--history-collector-client-id", type=int, default=168)
     parser.add_argument("--history-collector-max-runtime-minutes", type=float, default=120.0)
     parser.add_argument("--startup-history-repair", action=argparse.BooleanOptionalAction, default=True)
@@ -5305,6 +5308,7 @@ def main() -> int:
         "history_collector_end_utc": str(args.market_open_utc),
         "history_collector_max_tasks": int(args.overnight_collector_max_tasks),
         "history_collector_max_attempts": int(args.overnight_collector_max_attempts),
+        "history_collector_recent_sessions": int(args.history_collector_recent_sessions),
         "history_collector_client_id": int(args.history_collector_client_id),
         "history_collector_max_runtime_minutes": float(args.history_collector_max_runtime_minutes),
         "market_open_utc": str(args.market_open_utc),

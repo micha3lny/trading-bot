@@ -121,6 +121,19 @@ class ControlApiHelperTests(unittest.TestCase):
         self.assertIn("--include-weekends", args)
         self.assertIn("--retry-failed", args)
 
+    def test_build_history_collector_args_includes_priority_recent_catchup(self) -> None:
+        args = _build_history_collector_args(
+            {
+                "start_date": "2026-01-01",
+                "end_date": "2026-06-22",
+                "priority_recent_catchup": True,
+                "recent_sessions": 5,
+            }
+        )
+        self.assertIn("--priority-recent-catchup", args)
+        self.assertIn("--recent-sessions", args)
+        self.assertIn("5", args)
+
     def test_queue_history_collector_date_sets_single_day_range(self) -> None:
         ctx = ControlApiContext(
             ib=None,
@@ -375,6 +388,8 @@ class ControlApiHelperTests(unittest.TestCase):
             self.assertEqual(queue[0]["collector_mode"], "backlog")
             self.assertEqual(queue[0]["start_date"], "2026-04-20")
             self.assertEqual(queue[0]["end_date"], "2026-05-20")
+            self.assertTrue(queue[0]["priority_recent_catchup"])
+            self.assertEqual(queue[0]["recent_sessions"], 5)
 
     def test_overnight_scheduler_skips_holiday_monday_to_previous_friday(self) -> None:
         runtime_state = {}
