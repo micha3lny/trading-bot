@@ -1093,12 +1093,13 @@ def persist_managed_positions(
     portfolio_rows: list[dict[str, Any]] | None = None,
 ) -> None:
     recorded_at = now_utc()
+    position_items = list(positions.items())
     active_payloads = {
         symbol: managed_position_payload(
             pos,
             managed_position_market_price_info(pos, latest_snapshots, portfolio_rows, recorded_at=recorded_at),
         )
-        for symbol, pos in positions.items()
+        for symbol, pos in position_items
         if pos.active
     }
     payload = {
@@ -1108,7 +1109,7 @@ def persist_managed_positions(
     }
     recorder.path("managed_positions.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     store = getattr(recorder, "sqlite_store", None)
-    for symbol, pos in positions.items():
+    for symbol, pos in position_items:
         raw_payload = managed_position_payload(
             pos,
             managed_position_market_price_info(pos, latest_snapshots, portfolio_rows, recorded_at=recorded_at),
@@ -4311,7 +4312,7 @@ def sync_managed_entry_fill_verification(
     managed_positions: dict[str, ManagedPosition],
 ) -> int:
     updated = 0
-    for symbol, pos in managed_positions.items():
+    for symbol, pos in list(managed_positions.items()):
         if not pos.active or pos.entry_fill_verified:
             continue
         if not entry_fill_verified(recorder, symbol, pos.quantity):
@@ -6041,7 +6042,12 @@ def main() -> int:
                         latest_broker_qty_by_symbol,
                     )
                     record_account_snapshot(ib, recorder)
-                    new_fills = record_recent_fills(ib, recorder, seen_fills)
+                    new_fills = record_recent_fills(
+                        ib,
+                        recorder,
+                        seen_fills,
+                        allow_stale_commission_reingest=not is_us_equity_session_active_now(args, now=observed_at),
+                    )
                     position_reconcile_started_at = now_utc()
                     safe_sqlite_call(
                         getattr(recorder, "sqlite_store", None),
@@ -6227,6 +6233,9 @@ def main() -> int:
                 f"open_price_ok={open_price_ok} open_price_missing={open_price_missing} "
                 f"subscriptions_active={len(tickers)} subscriptions_cap={subscriptions_cap} subscription_cap_block={int(subscription_cap_block)} "
                 f"sqlite_queue_depth={int(sqlite_writer_status.get('queue_depth') or 0)} "
+                f"sqlite_oldest_queued_age_seconds={sqlite_writer_status.get('oldest_queued_age_seconds') or 0} "
+                f"sqlite_current_write_method={str(sqlite_writer_status.get('current_write_method') or '').replace(' ', '_')} "
+                f"sqlite_current_write_duration_seconds={sqlite_writer_status.get('current_write_duration_seconds') or 0} "
                 f"sqlite_dropped_writes={int(sqlite_writer_status.get('dropped_writes') or 0)} "
                 f"sqlite_last_write_latency_ms={sqlite_writer_status.get('last_write_latency_ms') or ''} "
                 f"sqlite_last_write_error={sqlite_last_error} "

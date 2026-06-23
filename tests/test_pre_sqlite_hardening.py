@@ -265,6 +265,28 @@ class PreSqliteHardeningTests(unittest.TestCase):
             self.assertAlmostEqual(raw["max_adverse_unrealized_pnl"], 0.0)
             self.assertEqual(file_payload["positions"]["CRBP"]["market_price"], 10.5)
 
+    def test_persist_managed_positions_uses_stable_snapshot_when_dict_mutates(self) -> None:
+        class MutatingStore:
+            def __init__(self, positions: dict[str, ManagedPosition]) -> None:
+                self.positions = positions
+                self.rows: list[dict] = []
+
+            def upsert_position(self, row: dict) -> None:
+                self.rows.append(dict(row))
+                self.positions.pop("MUTB", None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(tmp, session_date="2026-06-23")
+            positions = {
+                "MUTA": ManagedPosition("MUTA", object(), 1, 10.0, "2026-06-23T13:31:00+00:00", 10.0, active=True),
+                "MUTB": ManagedPosition("MUTB", object(), 1, 11.0, "2026-06-23T13:32:00+00:00", 11.0, active=True),
+            }
+            recorder.sqlite_store = MutatingStore(positions)
+
+            persist_managed_positions(recorder, positions)
+
+            self.assertEqual([row["symbol"] for row in recorder.sqlite_store.rows], ["MUTA", "MUTB"])
+
     def test_live_market_metrics_update_canonical_reducer_position(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             recorder = LiveDataRecorder(tmp, session_date="2026-05-28")

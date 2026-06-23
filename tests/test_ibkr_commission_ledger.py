@@ -93,6 +93,7 @@ class CountingStore:
         self.pending_counts = {}
         self.status_calls = []
         self.pending_buy_ids = []
+        self.pending_buy_ids_calls = 0
 
     def mark_operation_status(self, *args, **kwargs):
         self.status_calls.append((args, kwargs))
@@ -111,6 +112,7 @@ class CountingStore:
         return {"pending_before": 1, "pending_after": 0, "resolved": 1}
 
     def pending_buy_commission_execution_ids(self):
+        self.pending_buy_ids_calls += 1
         return list(self.pending_buy_ids)
 
 
@@ -317,6 +319,29 @@ class IbkrCommissionLedgerTests(unittest.TestCase):
             self.assertEqual(rows[0]["commission_source"], "ibkr")
             self.assertEqual(store.rows[-1]["execution_id"], "BUY_PENDING_COMM")
             self.assertEqual(store.rows[-1]["commission_source"], "ibkr")
+
+    def test_record_recent_fills_defers_stale_commission_reingest_when_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(Path(tmp), session_date="2026-06-23")
+            store = CountingStore()
+            store.pending_counts = {"pending_trade_finalization_count": 2}
+            store.pending_buy_ids = ["OLD_BUY_1", "OLD_BUY_2"]
+            setattr(recorder, "sqlite_store", store)
+
+            count = record_recent_fills(
+                FakeIB([]),
+                recorder,
+                seen=set(),
+                allow_stale_commission_reingest=False,
+            )
+
+            self.assertEqual(count, 0)
+            self.assertEqual(store.pending_buy_ids_calls, 0)
+            self.assertEqual(store.finalize_count, 1)
+            idle_calls = [call for call in store.status_calls if len(call[0]) >= 2 and call[0][1] == "idle"]
+            self.assertTrue(idle_calls)
+            finalized = idle_calls[-1][1]["finalized_pending_trades"]
+            self.assertEqual(finalized["commission_reingest"]["reason"], "market_session_active")
 
     def test_daily_report_fill_ledger_uses_actual_commission(self) -> None:
         rows = [

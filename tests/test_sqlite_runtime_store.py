@@ -135,6 +135,34 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 queue_store.close(drain=False)
 
+    def test_sqlite_writer_queue_prioritizes_critical_over_best_effort_backlog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "runtime.sqlite"
+            queue_store = SQLiteWriteQueue(db_path)
+            try:
+                for idx in range(200):
+                    safe_sqlite_call(
+                        queue_store,
+                        "record_runtime_event",
+                        event_time="2026-06-23T13:30:00+00:00",
+                        event_type="BEST_EFFORT_BACKLOG",
+                        source=f"unit_test_{idx}",
+                        wait_for_ack=False,
+                    )
+                safe_sqlite_call(
+                    queue_store,
+                    "upsert_execution",
+                    {"execution_id": "CRITICAL_1", "symbol": "RKLB", "side": "BOT", "quantity": 1, "price": 10},
+                    timeout_seconds=5.0,
+                )
+                rows = queue_store.query("SELECT execution_id FROM executions WHERE execution_id = 'CRITICAL_1'")
+                self.assertEqual(len(rows), 1)
+                status = queue_store.status()
+                self.assertIn("oldest_queued_age_seconds", status)
+                self.assertIn("current_write_method", status)
+            finally:
+                queue_store.close()
+
     def test_upsert_execution_idempotent_and_commission_update(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")

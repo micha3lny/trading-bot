@@ -25,6 +25,19 @@ SQLITE_WRITER_QUEUE_MAXSIZE = int(os.environ.get("TRADING_BOT_SQLITE_WRITER_QUEU
 SQLITE_WRITER_CRITICAL_TIMEOUT_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRITER_CRITICAL_TIMEOUT_SECONDS", "2.0"))
 SQLITE_WRITER_BEST_EFFORT_TIMEOUT_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRITER_BEST_EFFORT_TIMEOUT_SECONDS", "0.01"))
 SQLITE_WRITER_JOIN_TIMEOUT_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRITER_JOIN_TIMEOUT_SECONDS", "5.0"))
+SQLITE_WRITER_TIMEOUT_LOG_INTERVAL_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRITER_TIMEOUT_LOG_INTERVAL_SECONDS", "30.0"))
+SQLITE_WRITER_METHOD_ACK_TIMEOUT_SECONDS = {
+    "set_broker_net_positions": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_BROKER_POSITIONS", "8.0")),
+    "reconcile_active_positions_to_broker_snapshot": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_RECONCILE", "12.0")),
+    "rebuild_positions_from_executions": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_REBUILD", "20.0")),
+    "upsert_execution": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_EXECUTION", "8.0")),
+    "upsert_position": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_POSITION", "8.0")),
+    "upsert_order": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_ORDER", "8.0")),
+    "upsert_trade": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_TRADE", "8.0")),
+    "finalize_pending_trades": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_FINALIZE", "15.0")),
+    "runtime_pending_counts": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_PENDING_COUNTS", "5.0")),
+    "mark_operation_status": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_OPERATION_STATUS", "5.0")),
+}
 CRITICAL_SQLITE_WRITE_METHODS = {
     "upsert_execution",
     "upsert_order",
@@ -2564,6 +2577,13 @@ class SQLiteWriteRequest:
     exception: BaseException | None = None
 
 
+@dataclass(order=True)
+class SQLiteWriteQueueItem:
+    priority_rank: int
+    sequence: int
+    request: SQLiteWriteRequest | None = field(compare=False)
+
+
 class SQLiteWriteQueue:
     """Single-writer proxy for runtime SQLite writes.
 
@@ -2586,7 +2606,9 @@ class SQLiteWriteQueue:
         self.maxsize = int(maxsize)
         self.critical_timeout_seconds = float(critical_timeout_seconds)
         self.best_effort_timeout_seconds = float(best_effort_timeout_seconds)
-        self._queue: queue.Queue[SQLiteWriteRequest | None] = queue.Queue(maxsize=max(1, self.maxsize))
+        self._queue: queue.PriorityQueue[SQLiteWriteQueueItem] = queue.PriorityQueue(maxsize=max(1, self.maxsize))
+        self._sequence = 0
+        self._timeout_log_last: dict[str, float] = {}
         self._closed = threading.Event()
         self._ready = threading.Event()
         self._status_lock = threading.Lock()
@@ -2600,6 +2622,10 @@ class SQLiteWriteQueue:
             "last_write_method": "",
             "last_write_error": "",
             "last_write_at": "",
+            "current_write_method": "",
+            "current_write_started_at": "",
+            "current_write_duration_seconds": 0.0,
+            "oldest_queued_age_seconds": 0.0,
             "writer_alive": 0,
         }
         self._thread = threading.Thread(target=self._run, name="sqlite-runtime-writer", daemon=True)
@@ -2618,7 +2644,33 @@ class SQLiteWriteQueue:
             out = dict(self._status)
         out["queue_depth"] = self._queue.qsize()
         out["writer_alive"] = int(self._thread.is_alive())
+        current_started = out.get("current_write_monotonic")
+        if isinstance(current_started, (int, float)) and current_started > 0:
+            out["current_write_duration_seconds"] = round(time.monotonic() - float(current_started), 3)
+        out.pop("current_write_monotonic", None)
+        out["oldest_queued_age_seconds"] = self._oldest_queued_age_seconds()
         return out
+
+    def _oldest_queued_age_seconds(self) -> float:
+        try:
+            with self._queue.mutex:
+                enqueued = [
+                    item.request.enqueued_at
+                    for item in list(self._queue.queue)
+                    if item.request is not None
+                ]
+            if not enqueued:
+                return 0.0
+            return round(max(0.0, time.monotonic() - min(enqueued)), 3)
+        except Exception:
+            return 0.0
+
+    def _priority_rank(self, priority: str) -> int:
+        if priority == "critical":
+            return 0
+        if priority == "normal":
+            return 5
+        return 10
 
     def _run(self) -> None:
         store: SQLiteRuntimeStore | None = None
@@ -2626,11 +2678,19 @@ class SQLiteWriteQueue:
             store = SQLiteRuntimeStore(self.path)
             self._ready.set()
             while True:
-                request = self._queue.get()
+                item = self._queue.get()
+                request = item.request
                 if request is None:
                     self._queue.task_done()
                     break
                 started = time.monotonic()
+                self._set_status(
+                    current_write_method=request.method,
+                    current_write_started_at=utc_now_iso(),
+                    current_write_monotonic=started,
+                    current_write_duration_seconds=0.0,
+                    oldest_queued_age_seconds=self._oldest_queued_age_seconds(),
+                )
                 try:
                     request.result = safe_sqlite_call(store, request.method, *request.args, **request.kwargs)
                 except BaseException as exc:
@@ -2646,6 +2706,11 @@ class SQLiteWriteQueue:
                         self._status["last_write_latency_ms"] = latency_ms
                         self._status["last_write_method"] = request.method
                         self._status["last_write_at"] = utc_now_iso()
+                        self._status["current_write_method"] = ""
+                        self._status["current_write_started_at"] = ""
+                        self._status["current_write_monotonic"] = 0.0
+                        self._status["current_write_duration_seconds"] = 0.0
+                        self._status["oldest_queued_age_seconds"] = self._oldest_queued_age_seconds()
                         self._status["queue_depth"] = self._queue.qsize()
                         self._status["writer_alive"] = int(self._thread.is_alive())
                     request.done.set()
@@ -2687,7 +2752,11 @@ class SQLiteWriteQueue:
         if wait_for_ack is None:
             wait_for_ack = effective_priority == "critical"
         if timeout_seconds is None:
-            timeout_seconds = self.critical_timeout_seconds if wait_for_ack else self.best_effort_timeout_seconds
+            timeout_seconds = (
+                SQLITE_WRITER_METHOD_ACK_TIMEOUT_SECONDS.get(method, self.critical_timeout_seconds)
+                if wait_for_ack
+                else self.best_effort_timeout_seconds
+            )
         request = SQLiteWriteRequest(
             method=method,
             args=tuple(args),
@@ -2697,7 +2766,9 @@ class SQLiteWriteQueue:
             timeout_seconds=float(timeout_seconds),
         )
         try:
-            self._queue.put(request, timeout=max(0.0, float(timeout_seconds)))
+            self._sequence += 1
+            item = SQLiteWriteQueueItem(self._priority_rank(effective_priority), self._sequence, request)
+            self._queue.put(item, timeout=max(0.0, float(timeout_seconds)))
         except queue.Full:
             with self._status_lock:
                 self._status["dropped_writes"] = int(self._status.get("dropped_writes", 0) or 0) + 1
@@ -2709,10 +2780,20 @@ class SQLiteWriteQueue:
         if not wait_for_ack:
             return "queued"
         if not request.done.wait(timeout=max(0.0, float(timeout_seconds))):
-            log_sqlite_line(
-                f"{utc_now_iso()} SQLITE_WRITE_ACK_TIMEOUT method={method} "
-                f"priority={effective_priority} timeout_seconds={timeout_seconds}"
-            )
+            now = time.monotonic()
+            last = float(self._timeout_log_last.get(method) or 0.0)
+            if now - last >= SQLITE_WRITER_TIMEOUT_LOG_INTERVAL_SECONDS:
+                self._timeout_log_last[method] = now
+                status = self.status()
+                log_sqlite_line(
+                    f"{utc_now_iso()} SQLITE_WRITE_ACK_TIMEOUT method={method} "
+                    f"priority={effective_priority} timeout_seconds={timeout_seconds} "
+                    f"queue_depth={status.get('queue_depth')} oldest_queued_age_seconds={status.get('oldest_queued_age_seconds')} "
+                    f"current_write_method={status.get('current_write_method') or ''} "
+                    f"current_write_duration_seconds={status.get('current_write_duration_seconds') or 0} "
+                    f"last_write_method={status.get('last_write_method') or ''} "
+                    f"last_write_latency_ms={status.get('last_write_latency_ms') or ''}"
+                )
             return None
         if request.exception is not None:
             raise request.exception
@@ -2741,7 +2822,8 @@ class SQLiteWriteQueue:
             while self._queue.unfinished_tasks > 0 and time.monotonic() < deadline:
                 time.sleep(0.01)
         try:
-            self._queue.put_nowait(None)
+            self._sequence += 1
+            self._queue.put_nowait(SQLiteWriteQueueItem(99, self._sequence, None))
         except queue.Full:
             pass
         self._thread.join(timeout=max(0.0, timeout_seconds))
