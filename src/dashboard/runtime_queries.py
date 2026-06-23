@@ -3138,7 +3138,12 @@ def load_dashboard_snapshot(
             diagnostics["carried_closed_today_count"] = 0
         trades_updated_last_60s = int(diagnostics.get("trades_updated_last_60s", 0) or 0)
         diagnostics["runtime_trust_status"] = "SQLITE_UNTRUSTED_REDUCER_ACTIVE" if trades_updated_last_60s > 0 else "SQLITE_PERSISTED_TRADES"
-        diagnostics["broker_closed_trades_count"] = "N/A"
+        diagnostics["broker_closed_trades_count"] = int(execution_pnl.get("closed_symbols") or 0)
+        diagnostics["broker_net_pnl"] = float(execution_pnl.get("net_actual_pnl") or 0.0)
+        diagnostics["broker_commissions"] = float(execution_pnl.get("commissions") or 0.0)
+        diagnostics["reducer_closed_rows_count"] = int(len(closed))
+        diagnostics["reducer_net_pnl"] = float(pd.to_numeric(closed.get("net_actual", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not closed.empty else 0.0
+        diagnostics["reducer_commissions"] = float(pd.to_numeric(closed.get("ibkr_commission", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not closed.empty else 0.0
         diagnostics["closed_pnl_source"] = str(execution_pnl.get("main_pnl_source") or "executions_realized_pnl_minus_sell_commission")
         diagnostics["main_pnl_source"] = str(execution_pnl.get("main_pnl_source") or "executions_realized_pnl_minus_sell_commission")
         diagnostics["realized_pnl_semantics"] = "gross_before_commission"

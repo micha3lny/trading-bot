@@ -1269,6 +1269,28 @@ def render_diagnostics(diag: dict) -> None:
     reducer_cols[1].metric("Broker Closed Trades", str(diag.get("broker_closed_trades_count", "N/A")))
     reducer_cols[2].metric("Reducer Updated <60s", int(diag.get("trades_updated_last_60s", 0) or 0))
     reducer_cols[3].metric("Reducer Running", int(diag.get("reducer_running", 0) or 0))
+    pnl_diag = pd.DataFrame(
+        [
+            {
+                "Source": "Broker / executions truth",
+                "Closed Trades Count": int(diag.get("broker_closed_trades_count", 0) or 0),
+                "Net PnL": float(diag.get("broker_net_pnl", 0.0) or 0.0),
+                "Commissions": float(diag.get("broker_commissions", 0.0) or 0.0),
+            },
+            {
+                "Source": "Reducer / reconstructed rows",
+                "Closed Trades Count": int(diag.get("reducer_closed_rows_count", 0) or 0),
+                "Net PnL": float(diag.get("reducer_net_pnl", 0.0) or 0.0),
+                "Commissions": float(diag.get("reducer_commissions", 0.0) or 0.0),
+            },
+        ]
+    )
+    st.markdown("**Closed PnL Source Diagnostics**")
+    st.dataframe(
+        style_pnl(pnl_diag, ["Net PnL"]).format({"Net PnL": "${:,.2f}", "Commissions": "${:,.2f}"}),
+        width="stretch",
+        hide_index=True,
+    )
     st.caption(
         "runtime_trust_status="
         f"{diag.get('runtime_trust_status', 'UNKNOWN')} "
