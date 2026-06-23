@@ -591,6 +591,9 @@ def render_summary(summary: dict) -> None:
     row2[2].metric("Commissions", money(summary.get("commissions", 0.0)))
     row2[3].metric("Closed Trades", int(summary.get("closed_trades", 0)))
     row2[4].metric("Open Trades", int(summary.get("open_trades", 0)))
+    source = summary.get("main_pnl_source") or summary.get("closed_pnl_source") or ""
+    if source:
+        st.caption(f"main_pnl_source={source}")
 
 
 def render_data_quality_summary(summary: dict) -> None:

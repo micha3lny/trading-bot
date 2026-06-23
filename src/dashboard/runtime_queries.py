@@ -356,7 +356,11 @@ def load_execution_pnl_summary(conn: sqlite3.Connection, window: DateWindow, str
             COUNT(*) AS execution_rows,
             COUNT(DISTINCT COALESCE(symbol, '')) AS symbols,
             SUM(COALESCE(realized_pnl, 0)) AS gross_realized,
-            SUM(COALESCE(commission, 0)) AS commissions
+            SUM(CASE
+                WHEN UPPER(COALESCE(side, '')) IN ('SLD', 'SELL') THEN COALESCE(commission, 0)
+                ELSE 0
+            END) AS sell_commissions,
+            SUM(COALESCE(commission, 0)) AS all_commissions
         FROM executions e
         WHERE COALESCE(e.session_date, '') BETWEEN ? AND ?
         {clause}
@@ -393,14 +397,18 @@ def load_execution_pnl_summary(conn: sqlite3.Connection, window: DateWindow, str
     )
     closed_symbols = float((closed_symbol_rows.iloc[0].to_dict() if not closed_symbol_rows.empty else {}).get("closed_symbols") or 0)
     gross = float(row.get("gross_realized") or 0.0)
-    commissions = float(row.get("commissions") or 0.0)
+    sell_commissions = float(row.get("sell_commissions") or 0.0)
+    all_commissions = float(row.get("all_commissions") or 0.0)
     return {
         "execution_rows": float(row.get("execution_rows") or 0),
         "symbols": float(row.get("symbols") or 0),
         "closed_symbols": closed_symbols,
         "gross_pnl": gross,
-        "commissions": commissions,
-        "net_actual_pnl": gross - commissions,
+        "commissions": sell_commissions,
+        "sell_commissions": sell_commissions,
+        "all_commissions": all_commissions,
+        "net_actual_pnl": gross - sell_commissions,
+        "main_pnl_source": "executions_realized_pnl_minus_sell_commission",
     }
 
 
@@ -2923,7 +2931,7 @@ def build_summary(
         gross = float(execution_pnl.get("gross_pnl") or 0.0)
         commissions = float(execution_pnl.get("commissions") or 0.0)
         net = float(execution_pnl.get("net_actual_pnl") or 0.0)
-        pnl_source = "executions_realized_pnl"
+        pnl_source = str(execution_pnl.get("main_pnl_source") or "executions_realized_pnl_minus_sell_commission")
     open_upnl = float(pd.to_numeric(open_positions["upnl"], errors="coerce").fillna(0).sum()) if not open_positions.empty else 0.0
     wins = trusted_closed[trusted_closed["gross"].fillna(0) > 0] if not trusted_closed.empty else trusted_closed
     win_rate = (len(wins) / len(trusted_closed) * 100.0) if len(trusted_closed) else 0.0
@@ -2942,6 +2950,7 @@ def build_summary(
         "closed_trades": float((execution_pnl or {}).get("closed_symbols") or len(closed_positions)),
         "open_trades": float(len(open_positions)),
         "closed_pnl_source": pnl_source,
+        "main_pnl_source": pnl_source,
         "realized_pnl_semantics": "gross_before_commission" if execution_pnl is not None else "trades_table",
         "net_formula": "sum_realized_pnl_minus_commission" if execution_pnl is not None else "trades_net_actual",
         "execution_rows": float((execution_pnl or {}).get("execution_rows") or 0),
@@ -3130,14 +3139,17 @@ def load_dashboard_snapshot(
         trades_updated_last_60s = int(diagnostics.get("trades_updated_last_60s", 0) or 0)
         diagnostics["runtime_trust_status"] = "SQLITE_UNTRUSTED_REDUCER_ACTIVE" if trades_updated_last_60s > 0 else "SQLITE_PERSISTED_TRADES"
         diagnostics["broker_closed_trades_count"] = "N/A"
-        diagnostics["closed_pnl_source"] = "executions_realized_pnl"
+        diagnostics["closed_pnl_source"] = str(execution_pnl.get("main_pnl_source") or "executions_realized_pnl_minus_sell_commission")
+        diagnostics["main_pnl_source"] = str(execution_pnl.get("main_pnl_source") or "executions_realized_pnl_minus_sell_commission")
         diagnostics["realized_pnl_semantics"] = "gross_before_commission"
-        diagnostics["net_formula"] = "sum_realized_pnl_minus_commission"
+        diagnostics["net_formula"] = "sum_sell_realized_pnl_minus_sell_commission"
         diagnostics["execution_pnl_rows"] = int(execution_pnl.get("execution_rows") or 0)
         diagnostics["execution_pnl_symbols"] = int(execution_pnl.get("symbols") or 0)
         diagnostics["execution_closed_symbols"] = int(execution_pnl.get("closed_symbols") or 0)
         diagnostics["execution_gross_realized"] = float(execution_pnl.get("gross_pnl") or 0.0)
         diagnostics["execution_commissions"] = float(execution_pnl.get("commissions") or 0.0)
+        diagnostics["execution_sell_commissions"] = float(execution_pnl.get("sell_commissions") or 0.0)
+        diagnostics["execution_all_commissions"] = float(execution_pnl.get("all_commissions") or 0.0)
         diagnostics["execution_net_pnl"] = float(execution_pnl.get("net_actual_pnl") or 0.0)
         snapshot_version = (
             f"closed={len(closed)};"
