@@ -1353,6 +1353,8 @@ def closed_from_trades(
             signal_source,
             signal_time,
             ready_since,
+            entry_order_id,
+            entry_perm_id,
             raw_json,
             updated_at,
             trade_reduction_version
@@ -1622,11 +1624,14 @@ def closed_from_trades(
     out["matched_order_id"] = matched_order_ids
     out["strategy"] = strategy_values
     out["closed_source"] = "trades"
-    for col in ("top100_rank", "top100_score", "live_entry_score", "live_entry_rank"):
+    for col in ("top100_rank", "top100_score", "live_entry_score", "live_entry_rank", "entry_order_id", "entry_perm_id"):
         values: list[float | None] = []
         for row in out.to_dict("records"):
             raw = parse_raw_json(row.get("raw_json"))
-            values.append(to_float(row.get(col), None) if row.get(col) is not None else to_float(raw.get(col), None))
+            if col in {"entry_order_id", "entry_perm_id"}:
+                values.append(row.get(col) if row.get(col) not in (None, "") else raw.get(col))
+            else:
+                values.append(to_float(row.get(col), None) if row.get(col) is not None else to_float(raw.get(col), None))
         out[col] = values
     out["gross"] = pd.to_numeric(out["gross"], errors="coerce").fillna(0.0)
     out["buy"] = pd.to_numeric(out["buy"], errors="coerce").fillna(0.0)
@@ -1682,7 +1687,8 @@ def closed_from_trades(
             "trade_id", "symbol", "qty", "ibkr_commission", "buy", "sell", "gross", "net_actual", "net_pct", "pnl_pct", "peak_pct",
             "mae_pct", "peak_price", "low_price", "peak_unrealized_pnl", "max_adverse_unrealized_pnl",
             "giveback_from_peak", "drop_from_peak_pct", "top100_rank", "top100_score",
-            "live_entry_score", "live_entry_rank", "hold_minutes", "exit_reason", "strategy",
+            "live_entry_score", "live_entry_rank", "entry_order_id", "entry_perm_id",
+            "hold_minutes", "exit_reason", "strategy",
             "entry_time", "exit_time", "commission_status", "data_quality", "session_date",
             "entry_date", "exit_date", "carried_closed_today",
             "runtime_pnl_trusted", "runtime_pnl_untrusted_reason",
@@ -2171,6 +2177,8 @@ def load_open_positions(
             p.signal_source,
             p.signal_time,
             p.ready_since,
+            p.entry_order_id,
+            p.entry_perm_id,
             p.updated_at,
             p.source,
             p.raw_json
@@ -2286,6 +2294,8 @@ def load_open_positions(
             "top100_score": to_float(row.get("top100_score"), None) if row.get("top100_score") is not None else to_float(raw.get("top100_score"), None),
             "live_entry_score": to_float(row.get("live_entry_score"), None) if row.get("live_entry_score") is not None else to_float(raw.get("live_entry_score"), None),
             "live_entry_rank": to_float(row.get("live_entry_rank"), None) if row.get("live_entry_rank") is not None else to_float(raw.get("live_entry_rank"), None),
+            "entry_order_id": row.get("entry_order_id") if row.get("entry_order_id") not in (None, "") else raw.get("entry_order_id"),
+            "entry_perm_id": row.get("entry_perm_id") if row.get("entry_perm_id") not in (None, "") else raw.get("entry_perm_id"),
         })
     return pd.DataFrame(out)
 

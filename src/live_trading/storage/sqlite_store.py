@@ -485,6 +485,8 @@ class SQLiteRuntimeStore:
                 signal_source TEXT,
                 signal_time TEXT,
                 ready_since TEXT,
+                entry_order_id TEXT,
+                entry_perm_id TEXT,
                 ibkr_entry_confirmed INTEGER DEFAULT 0,
                 ibkr_exit_confirmed INTEGER DEFAULT 0,
                 ibkr_position_flat_confirmed INTEGER DEFAULT 0,
@@ -581,6 +583,8 @@ class SQLiteRuntimeStore:
                 signal_source TEXT,
                 signal_time TEXT,
                 ready_since TEXT,
+                entry_order_id TEXT,
+                entry_perm_id TEXT,
                 updated_at TEXT,
                 raw_json TEXT
             );
@@ -733,6 +737,8 @@ class SQLiteRuntimeStore:
             self._ensure_column(table, "signal_source", "TEXT")
             self._ensure_column(table, "signal_time", "TEXT")
             self._ensure_column(table, "ready_since", "TEXT")
+            self._ensure_column(table, "entry_order_id", "TEXT")
+            self._ensure_column(table, "entry_perm_id", "TEXT")
         self._ensure_column("orders", "position_key", "TEXT")
         self._ensure_column("orders", "exit_reason", "TEXT")
         self._ensure_column("orders", "exit_reason_source", "TEXT")
@@ -2207,7 +2213,9 @@ class SQLiteRuntimeStore:
                 live_entry_features_json,
                 signal_source,
                 signal_time,
-                ready_since
+                ready_since,
+                entry_order_id,
+                entry_perm_id
             FROM trades
             WHERE trade_id = ?
             """,
@@ -2230,7 +2238,9 @@ class SQLiteRuntimeStore:
                         live_entry_features_json,
                         signal_source,
                         signal_time,
-                        ready_since
+                        ready_since,
+                        entry_order_id,
+                        entry_perm_id
                     FROM trades
                     WHERE UPPER(symbol) = ?
                       AND session_date = ?
@@ -2294,6 +2304,8 @@ class SQLiteRuntimeStore:
             "signal_source": entry_meta_value("signal_source"),
             "signal_time": entry_meta_value("signal_time"),
             "ready_since": entry_meta_value("ready_since"),
+            "entry_order_id": entry_meta_value("entry_order_id"),
+            "entry_perm_id": entry_meta_value("entry_perm_id"),
             "ibkr_entry_confirmed": bool_int(row.get("ibkr_entry_confirmed")),
             "ibkr_exit_confirmed": bool_int(row.get("ibkr_exit_confirmed")),
             "ibkr_position_flat_confirmed": bool_int(row.get("ibkr_position_flat_confirmed")),
@@ -2368,7 +2380,9 @@ class SQLiteRuntimeStore:
                 live_entry_features_json,
                 signal_source,
                 signal_time,
-                ready_since
+                ready_since,
+                entry_order_id,
+                entry_perm_id
             FROM positions
             WHERE position_key = ?
             """,
@@ -2407,6 +2421,8 @@ class SQLiteRuntimeStore:
             "signal_source": entry_meta_value("signal_source"),
             "signal_time": entry_meta_value("signal_time"),
             "ready_since": entry_meta_value("ready_since"),
+            "entry_order_id": entry_meta_value("entry_order_id"),
+            "entry_perm_id": entry_meta_value("entry_perm_id"),
             "updated_at": row.get("updated_at") or utc_now_iso(),
             "raw_json": row.get("raw_json") or row,
         }

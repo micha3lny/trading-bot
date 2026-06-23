@@ -615,6 +615,7 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
     cols = [
         "symbol", "qty", "entry_time", "buy", "now", "now_dollars", "now_pct", "peak_pct",
         "giveback_pct", "top100_rank", "top100_score", "live_entry_score", "live_entry_rank",
+        "entry_order_id", "entry_perm_id",
         "status", "strategy", "data_quality", "ibkr_confirmed",
         "price_status", "now_price_source", "market_price_at", "last_update", "source", "exit_sent", "execution_ids",
     ]
@@ -645,6 +646,8 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
             "top100_score": "Top100 Score",
             "live_entry_score": "Live Entry Score",
             "live_entry_rank": "Live Entry Rank",
+            "entry_order_id": "Entry Order ID",
+            "entry_perm_id": "Entry Perm ID",
             "status": "Status",
             "strategy": "Strategy",
             "data_quality": "Data Quality",
@@ -661,7 +664,8 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
     display_cols = [
         "Symbol", "Qty", "Entry Time", "Buy", "Now", "Now $", "Now %",
         "Peak %", "Drop from Peak %", "Top100 Rank", "Top100 Score",
-        "Live Entry Score", "Live Entry Rank", "Status", "Strategy", "Data Quality",
+        "Live Entry Score", "Live Entry Rank", "Entry Order ID", "Entry Perm ID",
+        "Status", "Strategy", "Data Quality",
         "IBKR Confirmed", "Price Status", "Now Source", "Price Time",
         "Last Update", "Source", "Exit Sent", "Execution IDs",
     ]
@@ -917,7 +921,8 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
         "symbol", "entry_date", "exit_date", "qty", "ibkr_commission", "commission_status", "buy", "sell", "gross", "net_actual", "net_pct", "peak_pct",
         "mae_pct", "peak_price", "low_price", "peak_unrealized_pnl", "max_adverse_unrealized_pnl",
         "giveback_from_peak", "drop_from_peak_pct", "top100_rank", "top100_score",
-        "live_entry_score", "live_entry_rank", "hold_minutes", "exit_reason", "strategy",
+        "live_entry_score", "live_entry_rank", "entry_order_id", "entry_perm_id",
+        "hold_minutes", "exit_reason", "strategy",
         "entry_time", "exit_time", "exit_reason_source", "matched_event_type",
         "matched_event_time", "matched_order_id", "data_quality", "partial_rows",
     ]
@@ -969,6 +974,8 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
             "top100_score": "Top100 Score",
             "live_entry_score": "Live Entry Score",
             "live_entry_rank": "Live Entry Rank",
+            "entry_order_id": "Entry Order ID",
+            "entry_perm_id": "Entry Perm ID",
             "hold_minutes": "Min",
             "exit_reason": "Exit Reason",
             "entry_time": "Entry Time",
@@ -985,7 +992,8 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     display_cols = [
         "Symbol", "Quantity", "IBKR Comm", "Commission Status", "Buy", "Sell", "Gross", "Net", "Net %",
         "Peak %", "Drop from Peak %", "Top100 Rank", "Top100 Score",
-        "Live Entry Score", "Live Entry Rank", "Min", "Exit Reason", "Exit Reason Source",
+        "Live Entry Score", "Live Entry Rank", "Entry Order ID", "Entry Perm ID",
+        "Min", "Exit Reason", "Exit Reason Source",
         "Matched Event Type", "Matched Event Time", "Matched Order ID",
         "Entry Date", "Exit Date", "Entry Time", "Exit Time", "Strategy",
         "Data Quality", "Partial Rows",

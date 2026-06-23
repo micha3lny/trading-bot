@@ -114,6 +114,8 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                     "top100_score": 88.5,
                     "live_entry_score": 72.25,
                     "live_entry_rank": 2,
+                    "entry_order_id": "7010",
+                    "entry_perm_id": "9010",
                     "raw_json": {"entry_time": "2026-06-23T13:31:00+00:00", "market_price": 11},
                 })
             finally:
@@ -125,6 +127,8 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertAlmostEqual(row["top100_score"], 88.5)
             self.assertAlmostEqual(row["live_entry_score"], 72.25)
             self.assertEqual(row["live_entry_rank"], 2)
+            self.assertEqual(row["entry_order_id"], "7010")
+            self.assertEqual(row["entry_perm_id"], "9010")
 
     def test_closed_trade_excursion_columns_and_missing_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -212,6 +216,8 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
                     "top100_score": 91.25,
                     "live_entry_score": 83.5,
                     "live_entry_rank": 1,
+                    "entry_order_id": "7011",
+                    "entry_perm_id": "9011",
                 })
             finally:
                 store.close()
@@ -222,6 +228,8 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertAlmostEqual(row["top100_score"], 91.25)
             self.assertAlmostEqual(row["live_entry_score"], 83.5)
             self.assertEqual(row["live_entry_rank"], 1)
+            self.assertEqual(row["entry_order_id"], "7011")
+            self.assertEqual(row["entry_perm_id"], "9011")
 
     def test_runtime_executions_use_sqlite_and_sort_descending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

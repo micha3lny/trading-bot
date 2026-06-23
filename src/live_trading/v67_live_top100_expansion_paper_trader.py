@@ -128,6 +128,8 @@ class ManagedPosition:
     signal_source: str | None = None
     signal_time: str | None = None
     ready_since: str | None = None
+    entry_order_id: str | None = None
+    entry_perm_id: str | None = None
 
 
 def now_utc() -> str:
@@ -1135,6 +1137,8 @@ def managed_position_payload(pos: ManagedPosition, market_price_info: dict[str, 
         "signal_source": pos.signal_source,
         "signal_time": pos.signal_time,
         "ready_since": pos.ready_since,
+        "entry_order_id": pos.entry_order_id,
+        "entry_perm_id": pos.entry_perm_id,
         "last_update": pos.last_update_time or (market_price_info or {}).get("market_price_at") or now_utc(),
         "last_update_time": pos.last_update_time,
     }
@@ -1251,6 +1255,8 @@ def persist_managed_positions(
                 "signal_source": pos.signal_source,
                 "signal_time": pos.signal_time,
                 "ready_since": pos.ready_since,
+                "entry_order_id": pos.entry_order_id,
+                "entry_perm_id": pos.entry_perm_id,
                 "updated_at": payload["recorded_at"],
                 "raw_json": raw_payload,
             },
@@ -1327,6 +1333,8 @@ def restore_managed_positions(
                 signal_source=str(row.get("signal_source") or "") or None,
                 signal_time=str(row.get("signal_time") or "") or None,
                 ready_since=str(row.get("ready_since") or "") or None,
+                entry_order_id=str(row.get("entry_order_id") or "") or None,
+                entry_perm_id=str(row.get("entry_perm_id") or "") or None,
             )
     except Exception as exc:
         print(f"{now_utc()} managed_positions_restore_error={exc!r}", flush=True)
@@ -6091,6 +6099,7 @@ def main() -> int:
                     order.outsideRth = False
                     trade = ib.placeOrder(q, order)
                     order_id_for_entry = getattr(getattr(trade, "order", None), "orderId", "")
+                    entry_perm_id = str(getattr(getattr(trade, "order", None), "permId", "") or "")
                     top100_meta = dict(_runtime_dict(runtime_state, "top100_entry_metadata_by_symbol").get(symbol, {}))
                     live_features_json = json.dumps(features, ensure_ascii=False, default=str, sort_keys=True)
                     entry_trade_id = f"entry:{getattr(recorder, 'session_date', '')}:{symbol}:{order_id_for_entry}"
@@ -6102,6 +6111,8 @@ def main() -> int:
                         "signal_source": diagnostics.get("signal_source"),
                         "signal_time": diagnostics.get("signal_time"),
                         "ready_since": diagnostics.get("ready_since"),
+                        "entry_order_id": str(order_id_for_entry or ""),
+                        "entry_perm_id": entry_perm_id,
                     }
                     _runtime_dict(runtime_state, "entry_order_by_order_id")[_runtime_order_id(order_id_for_entry)] = {
                         "symbol": symbol,
@@ -6185,6 +6196,8 @@ def main() -> int:
                             signal_source=str(diagnostics.get("signal_source") or "") or None,
                             signal_time=str(diagnostics.get("signal_time") or "") or None,
                             ready_since=str(diagnostics.get("ready_since") or "") or None,
+                            entry_order_id=str(order_id_for_entry or "") or None,
+                            entry_perm_id=entry_perm_id or None,
                         )
                         persist_managed_positions(recorder, managed_positions)
                     order_payload = {

@@ -432,6 +432,8 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                     "signal_source": "live",
                     "signal_time": "2026-06-23T13:45:00+00:00",
                     "ready_since": "2026-06-23T13:44:55+00:00",
+                    "entry_order_id": "7001",
+                    "entry_perm_id": "9001",
                 })
                 store.upsert_trade({
                     "trade_id": trade_id,
@@ -442,13 +444,15 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                     "gross_pnl": 12.0,
                     "net_pnl": 10.0,
                 })
-                row = store.query("SELECT top100_rank, top100_score, top100_source_date, live_entry_score, live_entry_rank, signal_source FROM trades WHERE trade_id = ?", [trade_id])[0]
+                row = store.query("SELECT top100_rank, top100_score, top100_source_date, live_entry_score, live_entry_rank, signal_source, entry_order_id, entry_perm_id FROM trades WHERE trade_id = ?", [trade_id])[0]
                 self.assertEqual(row["top100_rank"], 7)
                 self.assertAlmostEqual(row["top100_score"], 91.5)
                 self.assertEqual(row["top100_source_date"], "2026-06-22")
                 self.assertAlmostEqual(row["live_entry_score"], 82.74)
                 self.assertEqual(row["live_entry_rank"], 1)
                 self.assertEqual(row["signal_source"], "live")
+                self.assertEqual(row["entry_order_id"], "7001")
+                self.assertEqual(row["entry_perm_id"], "9001")
 
                 store.upsert_position({
                     "strategy_name": "v67",
@@ -461,12 +465,16 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                     "top100_score": 91.5,
                     "live_entry_score": 82.74,
                     "live_entry_rank": 1,
+                    "entry_order_id": "7001",
+                    "entry_perm_id": "9001",
                 })
-                pos = store.query("SELECT top100_rank, top100_score, live_entry_score, live_entry_rank FROM positions WHERE symbol = 'ARQQ'")[0]
+                pos = store.query("SELECT top100_rank, top100_score, live_entry_score, live_entry_rank, entry_order_id, entry_perm_id FROM positions WHERE symbol = 'ARQQ'")[0]
                 self.assertEqual(pos["top100_rank"], 7)
                 self.assertAlmostEqual(pos["top100_score"], 91.5)
                 self.assertAlmostEqual(pos["live_entry_score"], 82.74)
                 self.assertEqual(pos["live_entry_rank"], 1)
+                self.assertEqual(pos["entry_order_id"], "7001")
+                self.assertEqual(pos["entry_perm_id"], "9001")
             finally:
                 store.close()
 
