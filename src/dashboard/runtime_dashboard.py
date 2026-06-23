@@ -4,6 +4,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+import hashlib
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib import error as urlerror
@@ -352,6 +353,11 @@ def infer_top100_source_date(latest_path: str | Path) -> str:
     latest = Path(latest_path)
     if not latest.exists():
         return "MISSING"
+    try:
+        latest_digest = hashlib.sha256(latest.read_bytes()).hexdigest()
+    except Exception:
+        latest_digest = ""
+    exact_matches: list[str] = []
     candidates: list[tuple[float, str]] = []
     for path in latest.parent.glob("daily_top100_*.csv"):
         if path.name == latest.name or path.name.endswith("_diagnostics.csv"):
@@ -362,8 +368,16 @@ def infer_top100_source_date(latest_path: str | Path) -> str:
                 pd.to_datetime(stem)
             except Exception:
                 continue
+            if latest_digest:
+                try:
+                    if hashlib.sha256(path.read_bytes()).hexdigest() == latest_digest:
+                        exact_matches.append(stem)
+                except Exception:
+                    pass
             delta = abs(path.stat().st_mtime - latest.stat().st_mtime)
             candidates.append((delta, stem))
+    if exact_matches:
+        return sorted(exact_matches)[-1]
     if not candidates:
         return "UNKNOWN"
     return sorted(candidates, key=lambda item: item[0])[0][1]
@@ -419,7 +433,13 @@ def load_top100_readiness(
     }
 
 
-def load_eod_readiness(sqlite_path: str, session_date: str) -> dict[str, object]:
+def load_eod_readiness(
+    sqlite_path: str,
+    session_date: str,
+    *,
+    broker_open_count: int | None = None,
+    sqlite_active_count: int | None = None,
+) -> dict[str, object]:
     final = sqlite_row(
         sqlite_path,
         """
@@ -459,7 +479,12 @@ def load_eod_readiness(sqlite_path: str, session_date: str) -> dict[str, object]
     clean = final_raw.get("clean")
     if clean is None:
         clean = 1 if str(final.get("reason") or "").lower() in {"clean", "eod_success"} else None
-    status = "OK" if clean in {1, True, "1", "true", "True"} else ("FAILED" if final else "UNKNOWN")
+    final_clean = clean in {1, True, "1", "true", "True"}
+    flat_confirmed = broker_open_count == 0 and sqlite_active_count == 0
+    if final_clean or flat_confirmed:
+        status = "OK"
+    else:
+        status = "FAILED" if final else "UNKNOWN"
     return {
         "last_flatten_event": flatten.get("event_type") or "UNKNOWN",
         "last_flatten_at": flatten.get("event_time") or "UNKNOWN",
@@ -467,6 +492,10 @@ def load_eod_readiness(sqlite_path: str, session_date: str) -> dict[str, object]
         "last_final_at": final.get("event_time") or "UNKNOWN",
         "positions_verified_closed": int(verified or 0),
         "status": status,
+        "final_clean": final_clean,
+        "broker_open_count": broker_open_count,
+        "sqlite_active_count": sqlite_active_count,
+        "flat_confirmed": flat_confirmed,
         "raw": final_raw,
     }
 
@@ -1810,7 +1839,12 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
         expected_source_session_date=previous_session,
     )
     top100_diag = load_top100_diagnostics_summary(Path(top100_latest).parent, previous_session)
-    eod = load_eod_readiness(sqlite_path, readiness_date)
+    eod = load_eod_readiness(
+        sqlite_path,
+        readiness_date,
+        broker_open_count=broker_open_count,
+        sqlite_active_count=sqlite_active,
+    )
     try:
         ops_snapshot = load_dashboard_snapshot(sqlite_path, DateWindow(readiness_date, readiness_date), "All")
     except Exception as exc:
@@ -1870,7 +1904,8 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
             universe_status,
             [
                 f"selected_date={readiness_date}",
-                f"previous_completed_session={previous_session}",
+                f"history_session_date={previous_session}",
+                f"latest_completed_session={previous_session}",
                 f"history_dir={history_dir}",
                 f"collector_status_dir={collector_status_dir}",
                 f"complete={history_readiness.get('complete_symbols')} no_data={history_readiness.get('no_data_symbols')} "
@@ -1903,6 +1938,8 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
                 f"last_flatten_event={eod.get('last_flatten_event')} at={eod.get('last_flatten_at')}",
                 f"last_final_at={eod.get('last_final_at')}",
                 f"positions_verified_closed={eod.get('positions_verified_closed')}",
+                f"broker_open_count={eod.get('broker_open_count')} sqlite_active_count={eod.get('sqlite_active_count')}",
+                f"flat_confirmed={eod.get('flat_confirmed')} final_clean={eod.get('final_clean')}",
             ],
         )
     with row3[1]:
