@@ -478,6 +478,39 @@ def record_commission_report(recorder: LiveDataRecorder, commission_report: Any)
     return "placeholder"
 
 
+def retry_missing_commission_reports_for_pending_trades(ib: IB, recorder: LiveDataRecorder) -> dict[str, Any]:
+    sqlite_store = getattr(recorder, "sqlite_store", None)
+    pending_exec_ids = safe_sqlite_call(sqlite_store, "pending_buy_commission_execution_ids") or []
+    wanted = {str(exec_id or "").strip() for exec_id in pending_exec_ids if str(exec_id or "").strip()}
+    if not wanted:
+        return {"requested": 0, "recovered": 0, "missing": 0}
+    fills_by_exec = {fill_key(fill): fill for fill in merged_recent_fills(ib)}
+    recovered = 0
+    still_missing: list[str] = []
+    for execution_id in sorted(wanted):
+        fill = fills_by_exec.get(execution_id)
+        if fill is None or not fill_has_ibkr_commission(fill):
+            still_missing.append(execution_id)
+            continue
+        row = fill_row_from_ibkr_fill(fill)
+        status = upsert_fill_row(recorder, row)
+        canonical_row = fill_row_by_execution_id(recorder, execution_id) or row
+        sync_complete_fill_to_sqlite_once(recorder, canonical_row)
+        recovered += 1
+        rate_limited_recorder_log(
+            recorder,
+            "COMMISSION_REPORT_REINGESTED",
+            f"{now_utc()} COMMISSION_REPORT_REINGESTED execution_id={execution_id} status={status}",
+            key=execution_id,
+        )
+    if still_missing:
+        print(
+            f"{now_utc()} COMMISSION_REPORT_REINGEST_MISSING count={len(still_missing)} execution_ids={','.join(still_missing[:20])}",
+            flush=True,
+        )
+    return {"requested": len(wanted), "recovered": recovered, "missing": len(still_missing)}
+
+
 def install_commission_report_handler(ib: IB, recorder: LiveDataRecorder) -> None:
     if getattr(ib, "_v67_commission_report_handler_installed", False):
         return
@@ -543,7 +576,14 @@ def record_recent_fills(ib: IB, recorder: LiveDataRecorder, seen: set[str]) -> i
         pending = safe_sqlite_call(sqlite_store, "runtime_pending_counts") or {}
         finalized_pending = {}
         if int((pending or {}).get("pending_trade_finalization_count") or 0) > 0:
+            commission_retry = retry_missing_commission_reports_for_pending_trades(ib, recorder)
+            if int(commission_retry.get("recovered") or 0) > 0:
+                refreshed_pending = safe_sqlite_call(sqlite_store, "runtime_pending_counts")
+                if refreshed_pending is not None:
+                    pending = refreshed_pending
             finalized_pending = safe_sqlite_call(sqlite_store, "finalize_pending_trades") or {}
+            if commission_retry:
+                finalized_pending = {**finalized_pending, "commission_reingest": commission_retry}
             refreshed_pending = safe_sqlite_call(sqlite_store, "runtime_pending_counts")
             if refreshed_pending is not None:
                 pending = refreshed_pending

@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from scripts.cleanup_runtime_events import cleanup_runtime_events
-from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore, SQLiteWriteQueue, safe_sqlite_call
+from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore, SQLiteWriteQueue, parse_jsonish, safe_sqlite_call
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.v66_ibkr_account_recorder import record_recent_fills
 
@@ -892,11 +892,15 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 active = store.query("SELECT * FROM positions WHERE symbol = 'FLATC' AND COALESCE(active, 0) = 1")
                 trades = store.query("SELECT status, raw_json FROM trades WHERE symbol = 'FLATC'")
                 diag = store.pending_trade_finalization_diagnostics(today)
+                buy_exec = store.query("SELECT commission, commission_source FROM executions WHERE execution_id = 'B_FLAT_MISSING_BUY_COMM'")
 
                 self.assertEqual(active, [])
                 self.assertEqual(len(trades), 1)
-                self.assertEqual(trades[0]["status"], "COMMISSION_PENDING")
-                self.assertIn("BUY_COMMISSION_NOT_IBKR", diag[0]["blockers"])
+                self.assertEqual(trades[0]["status"], "CLOSED")
+                self.assertEqual(diag, [])
+                self.assertEqual(buy_exec[0]["commission"], 0)
+                self.assertEqual(buy_exec[0]["commission_source"], "buy_commission_unavailable_after_eod")
+                self.assertTrue(parse_jsonish(trades[0]["raw_json"]).get("buy_commission_unavailable_after_eod"))
             finally:
                 store.close()
 

@@ -56,6 +56,12 @@ HIGH_FREQUENCY_RUNTIME_EVENT_THROTTLE_SECONDS = {
 SUMMARY_RUNTIME_EVENT_TYPES = {
     "BUY_BLOCKED": "BUY_BLOCKED_SUMMARY",
 }
+TERMINAL_COMMISSION_SOURCES = {
+    "ibkr",
+    "buy_commission_unavailable_after_eod",
+    "inferred_missing_buy_commission",
+}
+FALLBACK_BUY_COMMISSION_SOURCE = "buy_commission_unavailable_after_eod"
 
 
 def utc_now_iso() -> str:
@@ -990,6 +996,14 @@ class SQLiteRuntimeStore:
                 for field in ("trade_id", "order_key", "strategy_name", "session_date", "order_id", "perm_id", "exit_reason", "exit_reason_source"):
                     if data.get(field) in (None, "") and current.get(field) not in (None, ""):
                         data[field] = current.get(field)
+                current_commission_source = str(current.get("commission_source") or "").lower()
+                incoming_commission_source = str(data.get("commission_source") or "").lower()
+                if current_commission_source in TERMINAL_COMMISSION_SOURCES and incoming_commission_source != "ibkr":
+                    data["commission_source"] = current.get("commission_source")
+                    data["commission"] = current.get("commission")
+                    data["commission_currency"] = current.get("commission_currency")
+                    if data.get("realized_pnl") is None and current.get("realized_pnl") is not None:
+                        data["realized_pnl"] = current.get("realized_pnl")
             if self._execution_rows_equivalent(existing[0] if existing else None, data):
                 if self._equivalent_execution_needs_position_reconcile(data):
                     self.rebuild_symbol_trade_state(
@@ -1153,7 +1167,7 @@ class SQLiteRuntimeStore:
                     THEN 1 ELSE 0 END
                 ) AS pending_execution_count,
                 SUM(CASE
-                    WHEN COALESCE(commission_source, '') != 'ibkr'
+                    WHEN COALESCE(commission_source, '') NOT IN ('ibkr', 'buy_commission_unavailable_after_eod', 'inferred_missing_buy_commission')
                          OR commission IS NULL
                     THEN 1 ELSE 0 END
                 ) AS pending_commission_count,
@@ -1264,7 +1278,7 @@ class SQLiteRuntimeStore:
                 blockers.append("SELL_EXECUTION_MISSING")
             if buy_exec is not None:
                 buy_source = str(buy_exec.get("commission_source") or "")
-                if buy_source != "ibkr" or safe_float(buy_exec.get("commission")) is None:
+                if buy_source not in TERMINAL_COMMISSION_SOURCES or safe_float(buy_exec.get("commission")) is None:
                     blockers.append("BUY_COMMISSION_NOT_IBKR")
             else:
                 buy_source = ""
@@ -1319,6 +1333,18 @@ class SQLiteRuntimeStore:
             "before": before,
             "after": after,
         }
+
+    def pending_buy_commission_execution_ids(self, session_date: str | None = None) -> list[str]:
+        diagnostics = self.pending_trade_finalization_diagnostics(session_date)
+        out: list[str] = []
+        seen: set[str] = set()
+        for row in diagnostics:
+            blockers = {part.strip() for part in str(row.get("blockers") or "").split(",") if part.strip()}
+            execution_id = str(row.get("buy_execution_id") or "").strip()
+            if execution_id and "BUY_COMMISSION_NOT_IBKR" in blockers and execution_id not in seen:
+                out.append(execution_id)
+                seen.add(execution_id)
+        return out
 
     def _reconcile_trade_state_after_execution(self, execution: dict[str, Any]) -> None:
         try:
@@ -1540,6 +1566,38 @@ class SQLiteRuntimeStore:
             "giveback_from_peak": giveback_from_peak,
         }
 
+    def _broker_flat_for_symbol(self, symbol: str, broker_net_positions: dict[str, float] | None) -> bool:
+        if broker_net_positions is None:
+            return False
+        target = safe_float(broker_net_positions.get(str(symbol or "").upper().strip()))
+        return abs(target or 0.0) <= 1e-9
+
+    def _mark_buy_commission_unavailable_after_eod(self, execution_id: Any) -> None:
+        execution_id = str(execution_id or "").strip()
+        if not execution_id:
+            return
+        rows = self.query("SELECT commission, commission_source, raw_json FROM executions WHERE execution_id = ?", [execution_id])
+        if not rows:
+            return
+        current = rows[0]
+        source = str(current.get("commission_source") or "").lower()
+        if source in TERMINAL_COMMISSION_SOURCES and safe_float(current.get("commission")) is not None:
+            return
+        raw = parse_jsonish(current.get("raw_json"))
+        raw["commission_fallback_source"] = FALLBACK_BUY_COMMISSION_SOURCE
+        raw["commission_fallback_time"] = utc_now_iso()
+        raw["commission_fallback_reason"] = "broker_flat_sell_realized_buy_commission_unavailable"
+        self.execute(
+            """
+            UPDATE executions
+            SET commission = COALESCE(commission, 0),
+                commission_source = ?,
+                raw_json = ?
+            WHERE execution_id = ?
+            """,
+            [FALLBACK_BUY_COMMISSION_SOURCE, safe_json(raw), execution_id],
+        )
+
     def rebuild_symbol_trade_state(
         self,
         symbol: str,
@@ -1622,10 +1680,13 @@ class SQLiteRuntimeStore:
                 exit_date = str(row.get("session_date") or "") or iso_date_part(sell_time) or latest_session
                 buy_fraction = matched_qty / (safe_float(lot.get("original_qty")) or matched_qty or 1.0)
                 sell_fraction = matched_qty / qty if qty else 1.0
-                buy_commission_confirmed = str(lot.get("commission_source") or "").lower() == "ibkr"
-                sell_commission_confirmed = str(row.get("commission_source") or "").lower() == "ibkr"
-                buy_commission_missing = str(lot.get("commission_source") or "").lower() == "missing"
-                sell_commission_missing = str(row.get("commission_source") or "").lower() == "missing"
+                buy_commission_source = str(lot.get("commission_source") or "").lower()
+                sell_commission_source = str(row.get("commission_source") or "").lower()
+                buy_commission_confirmed = buy_commission_source == "ibkr"
+                sell_commission_confirmed = sell_commission_source == "ibkr"
+                buy_commission_fallback = buy_commission_source in (TERMINAL_COMMISSION_SOURCES - {"ibkr"})
+                buy_commission_missing = buy_commission_source == "missing"
+                sell_commission_missing = sell_commission_source == "missing"
                 commission = execution_commission(lot, buy_fraction) + execution_commission(row, sell_fraction)
                 gross = (sell_price - buy_price) * matched_qty
                 net_pnl = gross - commission
@@ -1641,9 +1702,24 @@ class SQLiteRuntimeStore:
                     net_pnl=net_pnl,
                     raw_sources=(position_raw, buy_raw, sell_raw),
                 )
-                pending_commission_count = int(buy_commission_missing) + int(sell_commission_missing)
                 sell_realized_expected = sell_commission_confirmed or sell_commission_missing
                 sell_realized_ready = safe_float(row.get("realized_pnl")) is not None
+                broker_flat_for_symbol = self._broker_flat_for_symbol(symbol, broker_net_positions)
+                buy_commission_unavailable_after_eod = (
+                    buy_commission_missing
+                    and sell_commission_confirmed
+                    and sell_realized_ready
+                    and broker_flat_for_symbol
+                )
+                if buy_commission_unavailable_after_eod:
+                    self._mark_buy_commission_unavailable_after_eod(lot.get("execution_id"))
+                    lot["commission"] = 0.0
+                    lot["commission_source"] = FALLBACK_BUY_COMMISSION_SOURCE
+                    buy_commission_missing = False
+                    buy_commission_fallback = True
+                    commission = execution_commission(lot, buy_fraction) + execution_commission(row, sell_fraction)
+                    net_pnl = gross - commission
+                pending_commission_count = int(buy_commission_missing) + int(sell_commission_missing)
                 pending_realized_pnl_count = 1 if sell_realized_expected and not sell_realized_ready else 0
                 if pending_commission_count:
                     trade_status = "COMMISSION_PENDING"
@@ -1654,6 +1730,8 @@ class SQLiteRuntimeStore:
                 pnl_status = "REALIZED_PNL_READY" if sell_realized_ready else "PNL_PENDING"
                 if pending_commission_count == 0 and buy_commission_confirmed and sell_commission_confirmed:
                     commission_status = "OK"
+                elif pending_commission_count == 0 and buy_commission_fallback and sell_commission_confirmed:
+                    commission_status = "BUY_FALLBACK"
                 elif pending_commission_count == 0:
                     commission_status = "UNKNOWN"
                 else:
@@ -1695,6 +1773,9 @@ class SQLiteRuntimeStore:
                     "pending_realized_pnl_count": pending_realized_pnl_count,
                     "pnl_status": pnl_status,
                     "commission_status": commission_status,
+                    "buy_commission_fallback_source": FALLBACK_BUY_COMMISSION_SOURCE if buy_commission_fallback else "",
+                    "buy_commission_unavailable_after_eod": bool(buy_commission_fallback),
+                    "broker_flat_at_fallback": bool(broker_flat_for_symbol),
                     "mfe_pct": excursion.get("mfe_pct"),
                     "mae_pct": excursion.get("mae_pct"),
                     "peak_price": excursion.get("peak_price"),

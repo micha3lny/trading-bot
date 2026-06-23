@@ -12,6 +12,7 @@ from src.live_trading.v66_ibkr_account_recorder import (
     install_commission_report_handler,
     record_commission_report,
     record_recent_fills,
+    retry_missing_commission_reports_for_pending_trades,
 )
 
 
@@ -91,6 +92,7 @@ class CountingStore:
         self.finalize_count = 0
         self.pending_counts = {}
         self.status_calls = []
+        self.pending_buy_ids = []
 
     def mark_operation_status(self, *args, **kwargs):
         self.status_calls.append((args, kwargs))
@@ -107,6 +109,9 @@ class CountingStore:
         self.finalize_count += 1
         self.pending_counts = {}
         return {"pending_before": 1, "pending_after": 0, "resolved": 1}
+
+    def pending_buy_commission_execution_ids(self):
+        return list(self.pending_buy_ids)
 
 
 class InterruptingPendingCountStore(CountingStore):
@@ -289,6 +294,28 @@ class IbkrCommissionLedgerTests(unittest.TestCase):
             self.assertAlmostEqual(float(store.rows[-1]["quantity"]), 98.0)
             self.assertEqual(store.rows[-1]["fill_price"], "2.34")
             self.assertEqual(store.rows[-1]["commission"], "0.42")
+            self.assertEqual(store.rows[-1]["commission_source"], "ibkr")
+
+    def test_retry_missing_commission_reports_targets_pending_buy_exec_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(Path(tmp), session_date="2026-05-22")
+            store = CountingStore()
+            store.pending_buy_ids = ["BUY_PENDING_COMM"]
+            setattr(recorder, "sqlite_store", store)
+
+            result = retry_missing_commission_reports_for_pending_trades(
+                FakeIB([fake_fill("BUY_PENDING_COMM", symbol="OUST", side="BOT", shares=2, price=10, commission=0.37)]),
+                recorder,
+            )
+
+            rows = read_fills(recorder)
+            self.assertEqual(result["requested"], 1)
+            self.assertEqual(result["recovered"], 1)
+            self.assertEqual(result["missing"], 0)
+            self.assertEqual(rows[0]["execution_id"], "BUY_PENDING_COMM")
+            self.assertEqual(rows[0]["commission"], "0.37")
+            self.assertEqual(rows[0]["commission_source"], "ibkr")
+            self.assertEqual(store.rows[-1]["execution_id"], "BUY_PENDING_COMM")
             self.assertEqual(store.rows[-1]["commission_source"], "ibkr")
 
     def test_daily_report_fill_ledger_uses_actual_commission(self) -> None:
