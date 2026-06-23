@@ -6,6 +6,7 @@ from src.live_trading.v67_live_top100_expansion_paper_trader import (
     SymbolState,
     entry_minute_capacity,
     is_stale_ready_candidate,
+    low_live_entry_score_blocked,
     mark_entry_block_state,
     ready_candidate_diagnostics,
     ready_candidate_age_seconds,
@@ -137,6 +138,12 @@ class EntryBacklogGuardTests(unittest.TestCase):
 
         self.assertEqual(entry_minute_capacity(runtime_state, 5, 130.0), 0)
         self.assertEqual(entry_minute_capacity(runtime_state, 5, 165.0), 5)
+
+    def test_min_live_entry_score_blocks_only_when_enabled(self) -> None:
+        self.assertFalse(low_live_entry_score_blocked(19.35, 0))
+        self.assertFalse(low_live_entry_score_blocked(82.74, 80))
+        self.assertTrue(low_live_entry_score_blocked(19.35, 20))
+        self.assertTrue(low_live_entry_score_blocked(None, 1))
 
 
 if __name__ == "__main__":

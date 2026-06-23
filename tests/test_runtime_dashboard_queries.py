@@ -96,6 +96,36 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(row["exit_sent"], 1)
             self.assertEqual(row["execution_ids"], "B1, B2")
 
+    def test_runtime_open_positions_include_entry_score_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_date = "2026-06-23"
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_position({
+                    "session_date": session_date,
+                    "strategy_name": "v67",
+                    "symbol": "SCORE",
+                    "quantity": 5,
+                    "avg_price": 10,
+                    "active": 1,
+                    "status": "OPEN",
+                    "top100_rank": 4,
+                    "top100_score": 88.5,
+                    "live_entry_score": 72.25,
+                    "live_entry_rank": 2,
+                    "raw_json": {"entry_time": "2026-06-23T13:31:00+00:00", "market_price": 11},
+                })
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow(session_date, session_date), "v67")
+            row = snapshot["open_positions"].iloc[0]
+            self.assertEqual(row["top100_rank"], 4)
+            self.assertAlmostEqual(row["top100_score"], 88.5)
+            self.assertAlmostEqual(row["live_entry_score"], 72.25)
+            self.assertEqual(row["live_entry_rank"], 2)
+
     def test_closed_trade_excursion_columns_and_missing_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
@@ -157,6 +187,41 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["data_quality_summary"]["mfe_missing"], 1)
             self.assertEqual(snapshot["data_quality_summary"]["mae_missing"], 1)
             self.assertEqual(snapshot["data_quality_summary"]["peak_price_missing"], 1)
+
+    def test_runtime_closed_trades_include_entry_score_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_trade({
+                    "trade_id": "T_SCORE",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-23",
+                    "symbol": "SCORE",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-06-23T13:31:00+00:00",
+                    "exit_fill_time": "2026-06-23T13:40:00+00:00",
+                    "closed_at": "2026-06-23T13:40:00+00:00",
+                    "entry_price": 10,
+                    "exit_price": 11,
+                    "quantity": 2,
+                    "gross_pnl": 2,
+                    "commission": 0,
+                    "net_pnl": 2,
+                    "top100_rank": 3,
+                    "top100_score": 91.25,
+                    "live_entry_score": 83.5,
+                    "live_entry_rank": 1,
+                })
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-23", "2026-06-23"), "v67")
+            row = snapshot["closed_positions"].iloc[0]
+            self.assertEqual(row["top100_rank"], 3)
+            self.assertAlmostEqual(row["top100_score"], 91.25)
+            self.assertAlmostEqual(row["live_entry_score"], 83.5)
+            self.assertEqual(row["live_entry_rank"], 1)
 
     def test_runtime_executions_use_sqlite_and_sort_descending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

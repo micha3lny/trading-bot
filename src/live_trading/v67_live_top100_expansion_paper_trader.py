@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import atexit
 import csv
+import hashlib
 import json
 import math
+import os
 import signal
 import shutil
 import subprocess
@@ -116,6 +118,16 @@ class ManagedPosition:
     last_exit_order_ts: float | None = None
     eod_retry_count: int = 0
     entry_fill_verified: bool = False
+    top100_rank: int | None = None
+    top100_score: float | None = None
+    top100_source_date: str | None = None
+    top100_features_json: str | None = None
+    live_entry_score: float | None = None
+    live_entry_rank: int | None = None
+    live_entry_features_json: str | None = None
+    signal_source: str | None = None
+    signal_time: str | None = None
+    ready_since: str | None = None
 
 
 def now_utc() -> str:
@@ -300,6 +312,15 @@ def safe_float(value: Any) -> float | None:
         return None
 
 
+def safe_int(value: Any) -> int | None:
+    try:
+        if value is None or value == "":
+            return None
+        return int(float(value))
+    except Exception:
+        return None
+
+
 def safe_bool(value: Any, default: bool = False) -> bool:
     if value is None or value == "":
         return default
@@ -313,6 +334,16 @@ def safe_bool(value: Any, default: bool = False) -> bool:
     if text in {"0", "false", "no", "n", "off"}:
         return False
     return default
+
+
+def low_live_entry_score_blocked(live_entry_score: Any, min_live_entry_score: Any) -> bool:
+    threshold = safe_float(min_live_entry_score) or 0.0
+    if threshold <= 0:
+        return False
+    score = safe_float(live_entry_score)
+    if score is None:
+        score = 0.0
+    return score < threshold
 
 
 def append_dict_csv(path: Path, row: dict[str, Any], fieldnames: list[str]) -> None:
@@ -383,6 +414,79 @@ def load_tradeable_top_symbols(
             continue
         selected.append(symbol)
     return selected, skipped
+
+
+def infer_top100_source_date_from_latest(latest_path: str | Path) -> str:
+    latest = Path(latest_path)
+    if not latest.exists():
+        return ""
+    try:
+        latest_digest = hashlib.sha256(latest.read_bytes()).hexdigest()
+    except Exception:
+        latest_digest = ""
+    candidates: list[tuple[float, str]] = []
+    exact_matches: list[str] = []
+    for path in latest.parent.glob("daily_top100_*.csv"):
+        if path.name == latest.name or path.name.endswith("_diagnostics.csv"):
+            continue
+        stem = path.stem.replace("daily_top100_", "")
+        if len(stem) != 10:
+            continue
+        try:
+            datetime.fromisoformat(stem)
+        except Exception:
+            continue
+        if latest_digest:
+            try:
+                if hashlib.sha256(path.read_bytes()).hexdigest() == latest_digest:
+                    exact_matches.append(stem)
+            except Exception:
+                pass
+        try:
+            candidates.append((abs(path.stat().st_mtime - latest.stat().st_mtime), stem))
+        except Exception:
+            pass
+    if exact_matches:
+        return sorted(exact_matches)[-1]
+    if candidates:
+        return sorted(candidates, key=lambda item: item[0])[0][1]
+    return ""
+
+
+def load_top100_entry_metadata(alpha_rank_csv: str, top_n: int, min_price: float | None = None) -> dict[str, dict[str, Any]]:
+    p = Path(alpha_rank_csv)
+    if not p.exists():
+        return {}
+    try:
+        df = pd.read_csv(p)
+    except Exception:
+        return {}
+    if "symbol" not in df.columns:
+        return {}
+    df["symbol"] = df["symbol"].astype(str).str.upper()
+    if "alpha_score" in df.columns:
+        df["alpha_score"] = pd.to_numeric(df["alpha_score"], errors="coerce").fillna(0.0)
+        df = df.sort_values("alpha_score", ascending=False)
+    if min_price is not None and "last_close" in df.columns:
+        df["last_close"] = pd.to_numeric(df["last_close"], errors="coerce")
+        df = df[df["last_close"] >= min_price]
+    df = df.dropna(subset=["symbol"]).drop_duplicates("symbol").head(top_n)
+    source_date = infer_top100_source_date_from_latest(p)
+    out: dict[str, dict[str, Any]] = {}
+    for idx, row in enumerate(df.to_dict("records"), 1):
+        symbol = str(row.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        rank = safe_int(row.get("rank")) or idx
+        score = safe_float(row.get("score") or row.get("final_score") or row.get("alpha_score"))
+        features = dict(row)
+        out[symbol] = {
+            "top100_rank": rank,
+            "top100_score": score,
+            "top100_source_date": source_date,
+            "top100_features_json": json.dumps(features, ensure_ascii=False, default=str, sort_keys=True),
+        }
+    return out
 
 
 def runtime_ineligible_info(runtime_state: dict[str, Any], symbol: str) -> dict[str, Any]:
@@ -1021,6 +1125,16 @@ def managed_position_payload(pos: ManagedPosition, market_price_info: dict[str, 
         "last_exit_order_ts": pos.last_exit_order_ts,
         "eod_retry_count": pos.eod_retry_count,
         "entry_fill_verified": pos.entry_fill_verified,
+        "top100_rank": pos.top100_rank,
+        "top100_score": pos.top100_score,
+        "top100_source_date": pos.top100_source_date,
+        "top100_features_json": pos.top100_features_json,
+        "live_entry_score": pos.live_entry_score,
+        "live_entry_rank": pos.live_entry_rank,
+        "live_entry_features_json": pos.live_entry_features_json,
+        "signal_source": pos.signal_source,
+        "signal_time": pos.signal_time,
+        "ready_since": pos.ready_since,
         "last_update": pos.last_update_time or (market_price_info or {}).get("market_price_at") or now_utc(),
         "last_update_time": pos.last_update_time,
     }
@@ -1127,6 +1241,16 @@ def persist_managed_positions(
                 "source": pos.source,
                 "active": pos.active,
                 "exit_sent": pos.exit_sent,
+                "top100_rank": pos.top100_rank,
+                "top100_score": pos.top100_score,
+                "top100_source_date": pos.top100_source_date,
+                "top100_features_json": pos.top100_features_json,
+                "live_entry_score": pos.live_entry_score,
+                "live_entry_rank": pos.live_entry_rank,
+                "live_entry_features_json": pos.live_entry_features_json,
+                "signal_source": pos.signal_source,
+                "signal_time": pos.signal_time,
+                "ready_since": pos.ready_since,
                 "updated_at": payload["recorded_at"],
                 "raw_json": raw_payload,
             },
@@ -1193,6 +1317,16 @@ def restore_managed_positions(
                 last_exit_order_ts=safe_float(row.get("last_exit_order_ts")),
                 eod_retry_count=int(float(row.get("eod_retry_count") or 0)),
                 entry_fill_verified=entry_verified,
+                top100_rank=safe_int(row.get("top100_rank")),
+                top100_score=safe_float(row.get("top100_score")),
+                top100_source_date=str(row.get("top100_source_date") or "") or None,
+                top100_features_json=str(row.get("top100_features_json") or "") or None,
+                live_entry_score=safe_float(row.get("live_entry_score")),
+                live_entry_rank=safe_int(row.get("live_entry_rank")),
+                live_entry_features_json=str(row.get("live_entry_features_json") or "") or None,
+                signal_source=str(row.get("signal_source") or "") or None,
+                signal_time=str(row.get("signal_time") or "") or None,
+                ready_since=str(row.get("ready_since") or "") or None,
             )
     except Exception as exc:
         print(f"{now_utc()} managed_positions_restore_error={exc!r}", flush=True)
@@ -3792,6 +3926,11 @@ def reload_top100_universe_if_requested(
             print(f"{now_utc()} ENTRY_SYMBOL_INELIGIBLE_SKIPPED symbol={symbol} reason={reason} source=top100_reload", flush=True)
         if not entry_symbols:
             raise RuntimeError("top100_reload_no_tradeable_symbols")
+        runtime_state["top100_entry_metadata_by_symbol"] = load_top100_entry_metadata(
+            reload_path,
+            int(args.top_n),
+            min_price=args.min_price,
+        )
         if len(entry_symbols) < int(args.top_n):
             print(
                 f"{now_utc()} TOP100_RELOAD_WARNING reason=fewer_tradeable_symbols_after_ineligible_filter "
@@ -5157,6 +5296,7 @@ def main() -> int:
     parser.add_argument("--max-entry-candidate-age-seconds", type=float, default=60.0)
     parser.add_argument("--max-entries-per-cycle", type=int, default=5)
     parser.add_argument("--max-entries-per-minute", type=int, default=5)
+    parser.add_argument("--min-live-entry-score", type=float, default=float(os.environ.get("MIN_LIVE_ENTRY_SCORE", "0") or 0.0))
     parser.add_argument("--entry-backlog-window-seconds", type=float, default=60.0)
     parser.add_argument("--entry-backlog-threshold", type=int, default=5)
     parser.add_argument("--exit-stop-loss-pct", type=float, default=8.0)
@@ -5217,6 +5357,7 @@ def main() -> int:
         symbol_denylist_path=args.symbol_denylist,
         runtime_ineligible_path=args.runtime_ineligible_path,
     )
+    top100_entry_metadata_by_symbol = load_top100_entry_metadata(args.alpha_rank_csv, args.top_n, min_price=args.min_price)
     recorder = LiveDataRecorder(args.recorder_dir)
     log_dir = install_unified_logger(args.log_dir)
     shutdown = ShutdownDiagnostics(log_dir=log_dir, args=args)
@@ -5350,6 +5491,7 @@ def main() -> int:
         "top100_reload_diagnostics": {},
         "top100_entries_blocked": False,
         "top100_freshness": {},
+        "top100_entry_metadata_by_symbol": dict(top100_entry_metadata_by_symbol),
         "sqlite_writer_status": {},
         "market_closed_logged_dates": set(),
         "risk_guard_last_status": {
@@ -5869,6 +6011,30 @@ def main() -> int:
                         reason=features["reason"],
                         raw_json=signal_payload,
                     )
+                    min_live_entry_score = float(getattr(args, "min_live_entry_score", 0.0) or 0.0)
+                    live_entry_score = safe_float(features.get("score")) or 0.0
+                    if low_live_entry_score_blocked(live_entry_score, min_live_entry_score):
+                        rejection_counter["live_entry_score_too_low"] += 1
+                        print(
+                            f"{now_utc()} ENTRY_BLOCKED_LOW_SCORE symbol={symbol} "
+                            f"live_entry_score={live_entry_score:.4f} min_live_entry_score={min_live_entry_score:.4f}",
+                            flush=True,
+                        )
+                        record_lifecycle_with_formal(
+                            recorder,
+                            "ENTRY_BLOCKED_LOW_SCORE",
+                            symbol,
+                            action="BUY",
+                            quantity=qty,
+                            price=price,
+                            reason="live_entry_score_too_low",
+                            raw_json={
+                                **signal_payload,
+                                "live_entry_score": live_entry_score,
+                                "min_live_entry_score": min_live_entry_score,
+                            },
+                        )
+                        continue
                     candidate_notional = float(qty) * float(price) if qty and price else 0.0
                     risk_status = evaluate_risk_guard(
                         recorder,
@@ -5925,6 +6091,18 @@ def main() -> int:
                     order.outsideRth = False
                     trade = ib.placeOrder(q, order)
                     order_id_for_entry = getattr(getattr(trade, "order", None), "orderId", "")
+                    top100_meta = dict(_runtime_dict(runtime_state, "top100_entry_metadata_by_symbol").get(symbol, {}))
+                    live_features_json = json.dumps(features, ensure_ascii=False, default=str, sort_keys=True)
+                    entry_trade_id = f"entry:{getattr(recorder, 'session_date', '')}:{symbol}:{order_id_for_entry}"
+                    entry_metadata = {
+                        **top100_meta,
+                        "live_entry_score": live_entry_score,
+                        "live_entry_rank": ranking_position,
+                        "live_entry_features_json": live_features_json,
+                        "signal_source": diagnostics.get("signal_source"),
+                        "signal_time": diagnostics.get("signal_time"),
+                        "ready_since": diagnostics.get("ready_since"),
+                    }
                     _runtime_dict(runtime_state, "entry_order_by_order_id")[_runtime_order_id(order_id_for_entry)] = {
                         "symbol": symbol,
                         "quantity": qty,
@@ -5932,8 +6110,29 @@ def main() -> int:
                         "submitted_at": now_utc(),
                         "ranking_position": ranking_position,
                         "score": features.get("score"),
+                        "trade_id": entry_trade_id,
+                        **entry_metadata,
                         "conId": getattr(q, "conId", None),
                     }
+                    safe_sqlite_call(
+                        getattr(recorder, "sqlite_store", None),
+                        "upsert_trade",
+                        {
+                            "trade_id": entry_trade_id,
+                            "strategy_name": STRATEGY_NAME,
+                            "session_date": getattr(recorder, "session_date", None),
+                            "symbol": symbol,
+                            "status": "ENTRY_PENDING",
+                            "entry_signal_time": diagnostics.get("signal_time"),
+                            "entry_order_time": now_utc(),
+                            "entry_price": price,
+                            "quantity": qty,
+                            "remaining_quantity": qty,
+                            "ibkr_entry_confirmed": 0,
+                            "raw_json": {**signal_payload, **entry_metadata, "order_id": order_id_for_entry},
+                            **entry_metadata,
+                        },
+                    )
                     submission_count = record_entry_submission(runtime_state, loop_now)
                     entries_submitted_this_cycle += 1
                     backlog_window = float(args.entry_backlog_window_seconds or 60.0)
@@ -5976,10 +6175,21 @@ def main() -> int:
                             entry_time=now_utc(),
                             peak_price=float(price),
                             entry_fill_verified=False,
+                            top100_rank=safe_int(top100_meta.get("top100_rank")),
+                            top100_score=safe_float(top100_meta.get("top100_score")),
+                            top100_source_date=str(top100_meta.get("top100_source_date") or "") or None,
+                            top100_features_json=str(top100_meta.get("top100_features_json") or "") or None,
+                            live_entry_score=live_entry_score,
+                            live_entry_rank=ranking_position,
+                            live_entry_features_json=live_features_json,
+                            signal_source=str(diagnostics.get("signal_source") or "") or None,
+                            signal_time=str(diagnostics.get("signal_time") or "") or None,
+                            ready_since=str(diagnostics.get("ready_since") or "") or None,
                         )
                         persist_managed_positions(recorder, managed_positions)
                     order_payload = {
                         **diagnostics,
+                        **entry_metadata,
                         "entries_submitted_last_minute": submission_count,
                         "max_entries_per_cycle": int(args.max_entries_per_cycle or 0),
                         "max_entries_per_minute": int(args.max_entries_per_minute or 0),

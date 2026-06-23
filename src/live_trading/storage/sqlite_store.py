@@ -475,6 +475,16 @@ class SQLiteRuntimeStore:
                 max_adverse_unrealized_pnl REAL,
                 giveback_from_peak REAL,
                 exit_reason TEXT,
+                top100_rank INTEGER,
+                top100_score REAL,
+                top100_source_date TEXT,
+                top100_features_json TEXT,
+                live_entry_score REAL,
+                live_entry_rank INTEGER,
+                live_entry_features_json TEXT,
+                signal_source TEXT,
+                signal_time TEXT,
+                ready_since TEXT,
                 ibkr_entry_confirmed INTEGER DEFAULT 0,
                 ibkr_exit_confirmed INTEGER DEFAULT 0,
                 ibkr_position_flat_confirmed INTEGER DEFAULT 0,
@@ -561,6 +571,16 @@ class SQLiteRuntimeStore:
                 ibkr_avg_cost REAL,
                 active INTEGER,
                 exit_sent INTEGER,
+                top100_rank INTEGER,
+                top100_score REAL,
+                top100_source_date TEXT,
+                top100_features_json TEXT,
+                live_entry_score REAL,
+                live_entry_rank INTEGER,
+                live_entry_features_json TEXT,
+                signal_source TEXT,
+                signal_time TEXT,
+                ready_since TEXT,
                 updated_at TEXT,
                 raw_json TEXT
             );
@@ -702,6 +722,17 @@ class SQLiteRuntimeStore:
         self._ensure_column("trades", "peak_unrealized_pnl", "REAL")
         self._ensure_column("trades", "max_adverse_unrealized_pnl", "REAL")
         self._ensure_column("trades", "giveback_from_peak", "REAL")
+        for table in ("trades", "positions"):
+            self._ensure_column(table, "top100_rank", "INTEGER")
+            self._ensure_column(table, "top100_score", "REAL")
+            self._ensure_column(table, "top100_source_date", "TEXT")
+            self._ensure_column(table, "top100_features_json", "TEXT")
+            self._ensure_column(table, "live_entry_score", "REAL")
+            self._ensure_column(table, "live_entry_rank", "INTEGER")
+            self._ensure_column(table, "live_entry_features_json", "TEXT")
+            self._ensure_column(table, "signal_source", "TEXT")
+            self._ensure_column(table, "signal_time", "TEXT")
+            self._ensure_column(table, "ready_since", "TEXT")
         self._ensure_column("orders", "position_key", "TEXT")
         self._ensure_column("orders", "exit_reason", "TEXT")
         self._ensure_column("orders", "exit_reason_source", "TEXT")
@@ -2163,8 +2194,66 @@ class SQLiteRuntimeStore:
             with self.transaction():
                 return self.upsert_trade(row)
         trade_id = str(row.get("trade_id") or uuid.uuid4().hex)
-        previous = self.query("SELECT trade_reduction_version FROM trades WHERE trade_id = ?", [trade_id])
+        previous = self.query(
+            """
+            SELECT
+                trade_reduction_version,
+                top100_rank,
+                top100_score,
+                top100_source_date,
+                top100_features_json,
+                live_entry_score,
+                live_entry_rank,
+                live_entry_features_json,
+                signal_source,
+                signal_time,
+                ready_since
+            FROM trades
+            WHERE trade_id = ?
+            """,
+            [trade_id],
+        )
+        previous_row = previous[0] if previous else {}
+        if not previous_row:
+            symbol_for_meta = str(row.get("symbol") or "").upper()
+            session_for_meta = row.get("session_date") or session_date_utc()
+            if symbol_for_meta and session_for_meta:
+                entry_rows = self.query(
+                    """
+                    SELECT
+                        top100_rank,
+                        top100_score,
+                        top100_source_date,
+                        top100_features_json,
+                        live_entry_score,
+                        live_entry_rank,
+                        live_entry_features_json,
+                        signal_source,
+                        signal_time,
+                        ready_since
+                    FROM trades
+                    WHERE UPPER(symbol) = ?
+                      AND session_date = ?
+                      AND (
+                        trade_id LIKE 'entry:%'
+                        OR UPPER(COALESCE(status, '')) IN ('ENTRY_PENDING', 'ENTRY_PARTIAL', 'OPEN')
+                      )
+                    ORDER BY COALESCE(entry_order_time, entry_signal_time, entry_fill_time, updated_at, '') DESC
+                    LIMIT 1
+                    """,
+                    [symbol_for_meta, session_for_meta],
+                )
+                previous_row = entry_rows[0] if entry_rows else {}
         previous_version = safe_int(previous[0].get("trade_reduction_version")) if previous else None
+        raw = parse_jsonish(row.get("raw_json"))
+        def entry_meta_value(name: str) -> Any:
+            value = row.get(name)
+            if value not in (None, ""):
+                return value
+            value = raw.get(name)
+            if value not in (None, ""):
+                return value
+            return previous_row.get(name) if previous_row else None
         data = {
             "trade_id": trade_id,
             "strategy_name": row.get("strategy_name") or "unknown",
@@ -2195,6 +2284,16 @@ class SQLiteRuntimeStore:
             "max_adverse_unrealized_pnl": safe_float(row.get("max_adverse_unrealized_pnl")),
             "giveback_from_peak": safe_float(row.get("giveback_from_peak")),
             "exit_reason": row.get("exit_reason") or parse_jsonish(row.get("raw_json")).get("exit_reason"),
+            "top100_rank": safe_int(entry_meta_value("top100_rank")),
+            "top100_score": safe_float(entry_meta_value("top100_score")),
+            "top100_source_date": entry_meta_value("top100_source_date"),
+            "top100_features_json": entry_meta_value("top100_features_json"),
+            "live_entry_score": safe_float(entry_meta_value("live_entry_score")),
+            "live_entry_rank": safe_int(entry_meta_value("live_entry_rank")),
+            "live_entry_features_json": entry_meta_value("live_entry_features_json"),
+            "signal_source": entry_meta_value("signal_source"),
+            "signal_time": entry_meta_value("signal_time"),
+            "ready_since": entry_meta_value("ready_since"),
             "ibkr_entry_confirmed": bool_int(row.get("ibkr_entry_confirmed")),
             "ibkr_exit_confirmed": bool_int(row.get("ibkr_exit_confirmed")),
             "ibkr_position_flat_confirmed": bool_int(row.get("ibkr_position_flat_confirmed")),
@@ -2257,6 +2356,34 @@ class SQLiteRuntimeStore:
         session = row.get("session_date") or session_date_utc()
         symbol = str(row.get("symbol") or "").upper()
         position_key = str(row.get("position_key") or f"{strategy}:{session}:{symbol}")
+        previous = self.query(
+            """
+            SELECT
+                top100_rank,
+                top100_score,
+                top100_source_date,
+                top100_features_json,
+                live_entry_score,
+                live_entry_rank,
+                live_entry_features_json,
+                signal_source,
+                signal_time,
+                ready_since
+            FROM positions
+            WHERE position_key = ?
+            """,
+            [position_key],
+        )
+        previous_row = previous[0] if previous else {}
+        raw = parse_jsonish(row.get("raw_json"))
+        def entry_meta_value(name: str) -> Any:
+            value = row.get(name)
+            if value not in (None, ""):
+                return value
+            value = raw.get(name)
+            if value not in (None, ""):
+                return value
+            return previous_row.get(name) if previous_row else None
         data = {
             "position_key": position_key,
             "strategy_name": strategy,
@@ -2270,6 +2397,16 @@ class SQLiteRuntimeStore:
             "ibkr_avg_cost": safe_float(row.get("ibkr_avg_cost")),
             "active": bool_int(row.get("active")),
             "exit_sent": bool_int(row.get("exit_sent")),
+            "top100_rank": safe_int(entry_meta_value("top100_rank")),
+            "top100_score": safe_float(entry_meta_value("top100_score")),
+            "top100_source_date": entry_meta_value("top100_source_date"),
+            "top100_features_json": entry_meta_value("top100_features_json"),
+            "live_entry_score": safe_float(entry_meta_value("live_entry_score")),
+            "live_entry_rank": safe_int(entry_meta_value("live_entry_rank")),
+            "live_entry_features_json": entry_meta_value("live_entry_features_json"),
+            "signal_source": entry_meta_value("signal_source"),
+            "signal_time": entry_meta_value("signal_time"),
+            "ready_since": entry_meta_value("ready_since"),
             "updated_at": row.get("updated_at") or utc_now_iso(),
             "raw_json": row.get("raw_json") or row,
         }

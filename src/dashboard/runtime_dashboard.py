@@ -614,7 +614,8 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
         return
     cols = [
         "symbol", "qty", "entry_time", "buy", "now", "now_dollars", "now_pct", "peak_pct",
-        "giveback_pct", "status", "strategy", "data_quality", "ibkr_confirmed",
+        "giveback_pct", "top100_rank", "top100_score", "live_entry_score", "live_entry_rank",
+        "status", "strategy", "data_quality", "ibkr_confirmed",
         "price_status", "now_price_source", "market_price_at", "last_update", "source", "exit_sent", "execution_ids",
     ]
     available = [col for col in cols if col in df.columns]
@@ -626,7 +627,7 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
         out["last_update"] = out["last_update"].map(display_time)
     if "market_price_at" in out.columns:
         out["market_price_at"] = out["market_price_at"].map(display_time)
-    for col in ("buy", "now", "now_dollars", "now_pct", "peak_pct", "giveback_pct"):
+    for col in ("buy", "now", "now_dollars", "now_pct", "peak_pct", "giveback_pct", "top100_score", "live_entry_score"):
         if col in out.columns:
             out[col] = out[col].map(display_optional_number)
     out = out.rename(
@@ -640,6 +641,10 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
             "now_pct": "Now %",
             "peak_pct": "Peak %",
             "giveback_pct": "Drop from Peak %",
+            "top100_rank": "Top100 Rank",
+            "top100_score": "Top100 Score",
+            "live_entry_score": "Live Entry Score",
+            "live_entry_rank": "Live Entry Rank",
             "status": "Status",
             "strategy": "Strategy",
             "data_quality": "Data Quality",
@@ -655,7 +660,8 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
     )
     display_cols = [
         "Symbol", "Qty", "Entry Time", "Buy", "Now", "Now $", "Now %",
-        "Peak %", "Drop from Peak %", "Status", "Strategy", "Data Quality",
+        "Peak %", "Drop from Peak %", "Top100 Rank", "Top100 Score",
+        "Live Entry Score", "Live Entry Rank", "Status", "Strategy", "Data Quality",
         "IBKR Confirmed", "Price Status", "Now Source", "Price Time",
         "Last Update", "Source", "Exit Sent", "Execution IDs",
     ]
@@ -910,7 +916,8 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     cols = [
         "symbol", "entry_date", "exit_date", "qty", "ibkr_commission", "commission_status", "buy", "sell", "gross", "net_actual", "net_pct", "peak_pct",
         "mae_pct", "peak_price", "low_price", "peak_unrealized_pnl", "max_adverse_unrealized_pnl",
-        "giveback_from_peak", "drop_from_peak_pct", "hold_minutes", "exit_reason", "strategy",
+        "giveback_from_peak", "drop_from_peak_pct", "top100_rank", "top100_score",
+        "live_entry_score", "live_entry_rank", "hold_minutes", "exit_reason", "strategy",
         "entry_time", "exit_time", "exit_reason_source", "matched_event_type",
         "matched_event_time", "matched_order_id", "data_quality", "partial_rows",
     ]
@@ -932,6 +939,8 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
         "giveback_from_peak",
         "drop_from_peak_pct",
         "hold_minutes",
+        "top100_score",
+        "live_entry_score",
     ):
         if col in out.columns:
             out[col] = out[col].map(display_number_or_missing)
@@ -956,6 +965,10 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
             "max_adverse_unrealized_pnl": "Max Adverse UPNL",
             "giveback_from_peak": "Giveback $",
             "drop_from_peak_pct": "Drop from Peak %",
+            "top100_rank": "Top100 Rank",
+            "top100_score": "Top100 Score",
+            "live_entry_score": "Live Entry Score",
+            "live_entry_rank": "Live Entry Rank",
             "hold_minutes": "Min",
             "exit_reason": "Exit Reason",
             "entry_time": "Entry Time",
@@ -971,12 +984,63 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     )
     display_cols = [
         "Symbol", "Quantity", "IBKR Comm", "Commission Status", "Buy", "Sell", "Gross", "Net", "Net %",
-        "Peak %", "Drop from Peak %", "Min", "Exit Reason", "Exit Reason Source",
+        "Peak %", "Drop from Peak %", "Top100 Rank", "Top100 Score",
+        "Live Entry Score", "Live Entry Rank", "Min", "Exit Reason", "Exit Reason Source",
         "Matched Event Type", "Matched Event Time", "Matched Order ID",
         "Entry Date", "Exit Date", "Entry Time", "Exit Time", "Strategy",
         "Data Quality", "Partial Rows",
     ]
     return out[[col for col in display_cols if col in out.columns]]
+
+
+def live_entry_score_bucket(value: object) -> str:
+    try:
+        score = float(value)
+    except Exception:
+        return "score missing"
+    if pd.isna(score):
+        return "score missing"
+    if score >= 80:
+        return "live_entry_score >= 80"
+    if score >= 60:
+        return "live_entry_score 60-80"
+    if score >= 40:
+        return "live_entry_score 40-60"
+    if score >= 20:
+        return "live_entry_score 20-40"
+    return "live_entry_score <20"
+
+
+def render_live_entry_score_summary(df: pd.DataFrame) -> None:
+    if df.empty or "live_entry_score" not in df.columns:
+        return
+    rows: list[dict[str, object]] = []
+    working = df.copy()
+    working["_score_bucket"] = working["live_entry_score"].map(live_entry_score_bucket)
+    for bucket in [
+        "live_entry_score >= 80",
+        "live_entry_score 60-80",
+        "live_entry_score 40-60",
+        "live_entry_score 20-40",
+        "live_entry_score <20",
+        "score missing",
+    ]:
+        group = working[working["_score_bucket"] == bucket]
+        net = pd.to_numeric(group.get("net_actual"), errors="coerce").dropna()
+        count = int(len(group))
+        wins = int((net > 0).sum()) if not net.empty else 0
+        avg_net = float(net.mean()) if not net.empty else 0.0
+        rows.append(
+            {
+                "Bucket": bucket,
+                "Trade Count": count,
+                "Win Rate": pct((wins / len(net) * 100.0) if len(net) else 0.0),
+                "Avg Net PnL": display_optional_number(avg_net),
+                "Expectancy": display_optional_number(avg_net),
+            }
+        )
+    st.subheader("Live Entry Score Buckets")
+    st.dataframe(style_pnl(pd.DataFrame(rows), ["Avg Net PnL", "Expectancy"]), width="stretch", hide_index=True)
 
 
 def render_closed_positions(df: pd.DataFrame) -> None:
@@ -992,6 +1056,8 @@ def render_closed_positions(df: pd.DataFrame) -> None:
         st.warning(f"{len(diagnostics)} carried/unattributed closed rows are excluded from the main strategy table and shown below.")
     if normal.empty:
         st.info("No normal attributed strategy closed trades. See carry/unattributed diagnostics below.")
+    else:
+        render_live_entry_score_summary(normal)
     aggregate = aggregate_closed_positions(normal)
     out = format_closed_positions(aggregate, "closed") if not aggregate.empty else pd.DataFrame()
     if not out.empty:

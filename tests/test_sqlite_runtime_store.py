@@ -411,6 +411,65 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_entry_score_metadata_columns_persist_and_survive_trade_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                trade_id = "entry:2026-06-23:ARQQ:1001"
+                store.upsert_trade({
+                    "trade_id": trade_id,
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-23",
+                    "symbol": "ARQQ",
+                    "status": "ENTRY_PENDING",
+                    "top100_rank": 7,
+                    "top100_score": 91.5,
+                    "top100_source_date": "2026-06-22",
+                    "top100_features_json": {"rank": 7, "score": 91.5},
+                    "live_entry_score": 82.74,
+                    "live_entry_rank": 1,
+                    "live_entry_features_json": {"score": 82.74},
+                    "signal_source": "live",
+                    "signal_time": "2026-06-23T13:45:00+00:00",
+                    "ready_since": "2026-06-23T13:44:55+00:00",
+                })
+                store.upsert_trade({
+                    "trade_id": trade_id,
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-23",
+                    "symbol": "ARQQ",
+                    "status": "CLOSED",
+                    "gross_pnl": 12.0,
+                    "net_pnl": 10.0,
+                })
+                row = store.query("SELECT top100_rank, top100_score, top100_source_date, live_entry_score, live_entry_rank, signal_source FROM trades WHERE trade_id = ?", [trade_id])[0]
+                self.assertEqual(row["top100_rank"], 7)
+                self.assertAlmostEqual(row["top100_score"], 91.5)
+                self.assertEqual(row["top100_source_date"], "2026-06-22")
+                self.assertAlmostEqual(row["live_entry_score"], 82.74)
+                self.assertEqual(row["live_entry_rank"], 1)
+                self.assertEqual(row["signal_source"], "live")
+
+                store.upsert_position({
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-23",
+                    "symbol": "ARQQ",
+                    "quantity": 10,
+                    "avg_price": 10,
+                    "active": 1,
+                    "top100_rank": 7,
+                    "top100_score": 91.5,
+                    "live_entry_score": 82.74,
+                    "live_entry_rank": 1,
+                })
+                pos = store.query("SELECT top100_rank, top100_score, live_entry_score, live_entry_rank FROM positions WHERE symbol = 'ARQQ'")[0]
+                self.assertEqual(pos["top100_rank"], 7)
+                self.assertAlmostEqual(pos["top100_score"], 91.5)
+                self.assertAlmostEqual(pos["live_entry_score"], 82.74)
+                self.assertEqual(pos["live_entry_rank"], 1)
+            finally:
+                store.close()
+
     def test_eod_sell_creates_closed_trade_from_existing_buy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
