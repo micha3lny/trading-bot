@@ -20,6 +20,7 @@ from src.dashboard.broker_reality import (
     match_executions,
     normalize_execution_record,
     parse_ibkr_activity_csv,
+    reconcile_broker_vs_sqlite,
     reconstruct_closed_trades_fifo,
 )
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
@@ -333,7 +334,7 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
 
         self.assertEqual(rows["execution_id"].tolist(), ["TODAY"])
 
-    def test_sqlite_closed_trades_exposes_execution_pair_diagnostics(self) -> None:
+    def test_sqlite_closed_trades_use_execution_realized_pnl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
             store = SQLiteRuntimeStore(db)
@@ -358,6 +359,30 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
                         "sell_execution_id": "S1",
                     },
                 })
+                store.upsert_execution({
+                    "execution_id": "B1",
+                    "session_date": "2026-06-16",
+                    "symbol": "RXT",
+                    "side": "BOT",
+                    "quantity": 58,
+                    "price": 1.25,
+                    "commission": 0.4,
+                    "commission_source": "ibkr",
+                    "realized_pnl": 0.0,
+                    "executed_at": "2026-06-16T13:35:00+00:00",
+                })
+                store.upsert_execution({
+                    "execution_id": "S1",
+                    "session_date": "2026-06-16",
+                    "symbol": "RXT",
+                    "side": "SLD",
+                    "quantity": 58,
+                    "price": 1.30,
+                    "commission": 0.7,
+                    "commission_source": "ibkr",
+                    "realized_pnl": 2.9,
+                    "executed_at": "2026-06-16T14:10:00+00:00",
+                })
             finally:
                 store.close()
 
@@ -366,7 +391,10 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows.iloc[0]["entry_execution_id"], "B1")
         self.assertEqual(rows.iloc[0]["exit_execution_id"], "S1")
-        self.assertEqual(rows.iloc[0]["source"], "sqlite_execution_reducer")
+        self.assertEqual(rows.iloc[0]["source"], "SQLITE_EXECUTIONS_REALIZED_PNL")
+        self.assertAlmostEqual(rows.iloc[0]["realized_pnl"], 2.9)
+        self.assertAlmostEqual(rows.iloc[0]["commission"], 0.7)
+        self.assertAlmostEqual(rows.iloc[0]["net_pnl"], 2.2)
 
     def test_sqlite_trade_pnl_uses_runtime_trusted_closed_view(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -400,11 +428,9 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
             pnl = load_sqlite_trade_pnl(db, "2026-06-16")
             closed = load_sqlite_closed_trades(db, "2026-06-16")
 
-        self.assertEqual(len(closed), 1)
-        self.assertAlmostEqual(closed.iloc[0]["realized_pnl"], 0.0)
-        self.assertAlmostEqual(closed.iloc[0]["net_pnl"], 0.0)
+        self.assertEqual(len(closed), 0)
         row = pnl.iloc[0]
-        self.assertEqual(row["reconciliation_sqlite_trade_source"], "executions_realized_pnl")
+        self.assertEqual(row["reconciliation_sqlite_trade_source"], "executions_realized_pnl_minus_sell_commission")
         self.assertEqual(row["runtime_trade_source"], "sqlite_executions")
         self.assertEqual(row["trades"], 0)
         self.assertEqual(row["closed_symbols"], 0)
@@ -461,13 +487,71 @@ Trades,Data,Stocks,USD,MRAM,2026-06-15 13:35:39,3,31.65,-1.23,BUY,EX123
 
             pnl = load_sqlite_trade_pnl(db, "2026-06-18").iloc[0]
 
-        self.assertEqual(pnl["reconciliation_sqlite_trade_source"], "executions_realized_pnl")
+        self.assertEqual(pnl["reconciliation_sqlite_trade_source"], "executions_realized_pnl_minus_sell_commission")
         self.assertEqual(pnl["realized_pnl_semantics"], "gross_before_commission")
-        self.assertEqual(pnl["net_formula"], "sum_realized_pnl_minus_commission")
+        self.assertEqual(pnl["net_formula"], "sum_sell_realized_pnl_minus_sell_commission")
         self.assertEqual(pnl["closed_symbols"], 1)
         self.assertAlmostEqual(pnl["sqlite_gross"], 5.06)
-        self.assertAlmostEqual(pnl["sqlite_commission"], 2.5)
-        self.assertAlmostEqual(pnl["sqlite_net"], 2.56)
+        self.assertAlmostEqual(pnl["sqlite_commission"], 1.5)
+        self.assertAlmostEqual(pnl["sqlite_net"], 3.56)
+
+    def test_reconciliation_status_uses_execution_closed_truth_not_trade_rows(self) -> None:
+        executions = pd.DataFrame([
+            {
+                "execution_time": "2026-06-23T13:30:00+00:00",
+                "symbol": "ARQQ",
+                "side": "BUY",
+                "quantity": 10,
+                "price": 10.0,
+                "commission": 0.4,
+                "realized_pnl": 0.0,
+                "execution_id": "B_ARQQ",
+            },
+            {
+                "execution_time": "2026-06-23T14:00:00+00:00",
+                "symbol": "ARQQ",
+                "side": "SELL",
+                "quantity": 10,
+                "price": 11.0,
+                "commission": 0.6,
+                "realized_pnl": 10.0,
+                "execution_id": "S_ARQQ",
+            },
+        ])
+        broker_closed = closed_trades_from_commission_reports(executions, "2026-06-23")
+        sqlite_closed = broker_closed.copy()
+        sqlite_closed["source"] = "SQLITE_EXECUTIONS_REALIZED_PNL"
+        sqlite_closed["trade_id"] = sqlite_closed["trade_id"].astype(str).str.replace("ibkr_realized:", "sqlite_realized:", regex=False)
+        sqlite_pnl = pd.DataFrame([
+            {
+                "trades": 1,
+                "closed_symbols": 1,
+                "sqlite_gross": 10.0,
+                "sqlite_commission": 0.6,
+                "sqlite_net": 9.4,
+                "reconciliation_sqlite_trade_source": "executions_realized_pnl_minus_sell_commission",
+                "runtime_trade_source": "sqlite_executions",
+                "trusted_closed_count": 29,
+                "untrusted_carry_count": 0,
+            }
+        ])
+
+        result = reconcile_broker_vs_sqlite(
+            executions,
+            executions.copy(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            broker_closed,
+            sqlite_closed,
+            sqlite_pnl,
+            selected_date="2026-06-23",
+            broker_status="OK",
+        )
+
+        self.assertEqual(result.summary["status"], "IBKR_RECONCILED")
+        self.assertEqual(result.summary["broker_closed_trades"], 1)
+        self.assertEqual(result.summary["sqlite_closed_trades"], 1)
+        self.assertEqual(result.summary["reconciliation_sqlite_trade_source"], "executions_realized_pnl_minus_sell_commission")
 
 
 if __name__ == "__main__":

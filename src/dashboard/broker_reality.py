@@ -12,7 +12,7 @@ from typing import Any
 
 import pandas as pd
 
-from src.dashboard.runtime_queries import DateWindow, load_dashboard_snapshot, load_execution_pnl_summary, parse_raw_json, to_float
+from src.dashboard.runtime_queries import parse_raw_json, to_float
 from src.live_trading.storage.sqlite_store import connect_sqlite, resolve_sqlite_path
 
 
@@ -283,47 +283,21 @@ def load_sqlite_executions(sqlite_path: str | Path, selected_date: str) -> pd.Da
 
 
 def load_sqlite_closed_trades(sqlite_path: str | Path, selected_date: str) -> pd.DataFrame:
-    path = Path(resolve_sqlite_path(sqlite_path))
-    if not path.exists():
-        return empty_closed_trades()
-    snapshot = load_dashboard_snapshot(path, DateWindow(selected_date, selected_date), "All", include_reconstructed=False)
-    rows = snapshot.get("closed_positions", pd.DataFrame())
-    if rows is None or rows.empty:
-        return empty_closed_trades()
-    out: list[dict[str, Any]] = []
-    for row in rows.to_dict("records"):
-        raw = parse_raw_json(row.get("raw_json"))
-        entry_execution_id = str(
-            raw.get("buy_execution_id")
-            or raw.get("entry_execution_id")
-            or raw.get("bot_execution_id")
-            or ""
-        )
-        exit_execution_id = str(
-            raw.get("sell_execution_id")
-            or raw.get("exit_execution_id")
-            or raw.get("sld_execution_id")
-            or ""
-        )
-        source = str(row.get("source") or raw.get("reconstruction_source") or raw.get("source") or "sqlite_trades")
-        out.append(
-            {
-                "symbol": str(row.get("symbol") or "").upper(),
-                "trade_id": str(row.get("trade_id") or ""),
-                "entry_time": iso_time(row.get("entry_time")),
-                "exit_time": iso_time(row.get("exit_time")),
-                "quantity": abs(to_float(row.get("qty"), 0.0) or 0.0),
-                "entry_price": to_float(row.get("buy"), None),
-                "exit_price": to_float(row.get("sell"), None),
-                "realized_pnl": to_float(row.get("gross"), 0.0) or 0.0,
-                "commission": abs(to_float(row.get("ibkr_commission"), 0.0) or 0.0),
-                "net_pnl": to_float(row.get("net_actual"), 0.0) or 0.0,
-                "source": source,
-                "entry_execution_id": str(row.get("entry_execution_id") or entry_execution_id),
-                "exit_execution_id": str(row.get("exit_execution_id") or exit_execution_id),
-            }
-        )
-    return pd.DataFrame(out, columns=BROKER_CLOSED_TRADE_COLUMNS)
+    """Closed SQLite truth for Broker Reality from the immutable executions ledger.
+
+    This intentionally does not read Runtime Dashboard closed rows or the
+    reconstructed ``trades`` table.  It mirrors ``check_today_broker_sql.py``:
+    closed symbols are derived from executions and net PnL is SELL-side
+    realized_pnl minus SELL-side IBKR commission.
+    """
+    executions = load_sqlite_executions(sqlite_path, selected_date)
+    rows = closed_trades_from_commission_reports(executions, selected_date)
+    if rows.empty:
+        return rows
+    rows = rows.copy()
+    rows["source"] = "SQLITE_EXECUTIONS_REALIZED_PNL"
+    rows["trade_id"] = rows["trade_id"].astype(str).str.replace("ibkr_realized:", "sqlite_realized:", regex=False)
+    return rows[BROKER_CLOSED_TRADE_COLUMNS]
 
 
 def fetch_ibkr_live_portfolio(host: str, port: int, client_id: int, timeout: float = 4.0) -> tuple[pd.DataFrame, str]:
@@ -979,9 +953,24 @@ def load_sqlite_trade_pnl(sqlite_path: str | Path, selected_date: str) -> pd.Dat
     path = Path(resolve_sqlite_path(sqlite_path))
     if not path.exists():
         return pd.DataFrame()
+    executions = load_sqlite_executions(path, selected_date)
+    closed = closed_trades_from_commission_reports(executions, selected_date)
+    gross = float(pd.to_numeric(closed.get("realized_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not closed.empty else 0.0
+    sell_commission = float(pd.to_numeric(closed.get("commission", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not closed.empty else 0.0
+    net = float(pd.to_numeric(closed.get("net_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not closed.empty else 0.0
     conn = connect_sqlite(path, read_only=True)
     try:
-        execution_pnl = load_execution_pnl_summary(conn, DateWindow(selected_date, selected_date), "All")
+        execution_count_rows = pd.read_sql_query(
+            """
+            SELECT
+                COUNT(*) AS execution_rows,
+                COUNT(DISTINCT UPPER(COALESCE(symbol, ''))) AS execution_symbols
+            FROM executions
+            WHERE COALESCE(substr(executed_at, 1, 10), substr(recorded_at, 1, 10), session_date) = ?
+            """,
+            conn,
+            params=[selected_date],
+        )
         trusted_rows = pd.read_sql_query(
             """
             SELECT
@@ -1007,25 +996,26 @@ def load_sqlite_trade_pnl(sqlite_path: str | Path, selected_date: str) -> pd.Dat
         )
     finally:
         conn.close()
+    execution_count_row = execution_count_rows.iloc[0].to_dict() if not execution_count_rows.empty else {}
     trade_row = trusted_rows.iloc[0].to_dict() if not trusted_rows.empty else {}
     trades = int(trade_row.get("trades") or 0)
     untrusted = int(trade_row.get("untrusted_carry_count") or 0)
     return pd.DataFrame(
         [
             {
-                "trades": int(execution_pnl.get("closed_symbols") or 0),
-                "closed_symbols": int(execution_pnl.get("closed_symbols") or 0),
-                "sqlite_gross": float(execution_pnl.get("gross_pnl") or 0.0),
-                "sqlite_commission": float(execution_pnl.get("commissions") or 0.0),
-                "sqlite_net": float(execution_pnl.get("net_actual_pnl") or 0.0),
-                "reconciliation_sqlite_trade_source": "executions_realized_pnl",
+                "trades": int(len(closed)),
+                "closed_symbols": int(len(closed)),
+                "sqlite_gross": gross,
+                "sqlite_commission": sell_commission,
+                "sqlite_net": net,
+                "reconciliation_sqlite_trade_source": "executions_realized_pnl_minus_sell_commission",
                 "runtime_trade_source": "sqlite_executions",
                 "realized_pnl_semantics": "gross_before_commission",
-                "net_formula": "sum_realized_pnl_minus_commission",
+                "net_formula": "sum_sell_realized_pnl_minus_sell_commission",
                 "trusted_closed_count": trades - untrusted,
                 "untrusted_carry_count": untrusted,
-                "execution_rows": int(execution_pnl.get("execution_rows") or 0),
-                "execution_symbols": int(execution_pnl.get("symbols") or 0),
+                "execution_rows": int(execution_count_row.get("execution_rows") or 0),
+                "execution_symbols": int(execution_count_row.get("execution_symbols") or 0),
             }
         ]
     )
