@@ -40,6 +40,17 @@ class DateWindow:
     end_date: str
 
 
+def execution_day_sql(alias: str = "e") -> str:
+    prefix = f"{alias}." if alias else ""
+    return (
+        "COALESCE("
+        f"NULLIF(substr({prefix}executed_at, 1, 10), ''), "
+        f"NULLIF({prefix}session_date, ''), "
+        f"COALESCE(substr({prefix}recorded_at, 1, 10), '')"
+        ")"
+    )
+
+
 def utc_today() -> str:
     return datetime.now(timezone.utc).strftime("%F")
 
@@ -234,7 +245,7 @@ def list_sessions(sqlite_path: str | Path | None = None) -> list[str]:
             conn,
             """
             SELECT DISTINCT session_date FROM (
-                SELECT session_date FROM executions WHERE session_date IS NOT NULL
+                SELECT COALESCE(NULLIF(substr(executed_at, 1, 10), ''), NULLIF(session_date, ''), substr(recorded_at, 1, 10)) AS session_date FROM executions
                 UNION ALL SELECT session_date FROM trades WHERE session_date IS NOT NULL
                 UNION ALL SELECT substr(exit_fill_time, 1, 10) AS session_date FROM trades WHERE exit_fill_time IS NOT NULL
                 UNION ALL SELECT substr(closed_at, 1, 10) AS session_date FROM trades WHERE closed_at IS NOT NULL
@@ -259,7 +270,7 @@ def list_strategies(sqlite_path: str | Path | None, window: DateWindow) -> list[
             conn,
             """
             SELECT DISTINCT strategy_name FROM (
-                SELECT strategy_name, session_date FROM executions
+                SELECT strategy_name, COALESCE(NULLIF(substr(executed_at, 1, 10), ''), NULLIF(session_date, ''), substr(recorded_at, 1, 10)) AS session_date FROM executions
                 UNION ALL SELECT strategy_name, session_date FROM trades
                 UNION ALL SELECT strategy_name, substr(exit_fill_time, 1, 10) AS session_date FROM trades WHERE exit_fill_time IS NOT NULL
                 UNION ALL SELECT strategy_name, substr(closed_at, 1, 10) AS session_date FROM trades WHERE closed_at IS NOT NULL
@@ -288,6 +299,7 @@ def load_executions(conn: sqlite3.Connection, window: DateWindow, strategy: str 
         clause, params = "", []
     else:
         clause, params = " AND (COALESCE(e.strategy_name, 'unknown') = ? OR COALESCE(e.strategy_name, 'unknown') = 'unknown')", [strategy]
+    execution_day_expr = execution_day_sql("e")
     rows = read_sql(
         conn,
         f"""
@@ -320,7 +332,7 @@ def load_executions(conn: sqlite3.Connection, window: DateWindow, strategy: str 
             exit_reason_source,
             raw_json
         FROM executions e
-        WHERE e.session_date BETWEEN ? AND ? {clause}
+        WHERE {execution_day_expr} BETWEEN ? AND ? {clause}
         ORDER BY COALESCE(e.executed_at, e.recorded_at) DESC, e.execution_id DESC
         """,
         [window.start_date, window.end_date, *params],
@@ -349,13 +361,7 @@ def load_execution_pnl_summary(conn: sqlite3.Connection, window: DateWindow, str
         clause, params = "", []
     else:
         clause, params = " AND (COALESCE(e.strategy_name, 'unknown') = ? OR COALESCE(e.strategy_name, 'unknown') = 'unknown')", [strategy]
-    execution_day_expr = """
-            COALESCE(
-                NULLIF(substr(e.executed_at, 1, 10), ''),
-                NULLIF(substr(e.recorded_at, 1, 10), ''),
-                COALESCE(e.session_date, '')
-            )
-    """
+    execution_day_expr = execution_day_sql("e")
     rows = read_sql(
         conn,
         f"""

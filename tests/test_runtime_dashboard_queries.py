@@ -434,12 +434,17 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertAlmostEqual(current_day["summary"]["gross_pnl"], 0.0)
             self.assertAlmostEqual(current_day["summary"]["commissions"], 0.0)
             self.assertAlmostEqual(current_day["summary"]["net_actual_pnl"], 0.0)
+            self.assertTrue(current_day["executions"].empty)
+            self.assertEqual(current_day["diagnostics"]["execution_pnl_rows"], 0)
 
             previous_day = load_dashboard_snapshot(db, DateWindow("2026-06-23", "2026-06-23"), "v67")
             self.assertEqual(previous_day["summary"]["closed_trades"], 1)
             self.assertAlmostEqual(previous_day["summary"]["gross_pnl"], 10.0)
             self.assertAlmostEqual(previous_day["summary"]["commissions"], 1.0)
             self.assertAlmostEqual(previous_day["summary"]["net_actual_pnl"], 9.0)
+            self.assertEqual(len(previous_day["executions"]), 2)
+            self.assertIn("v67", list_strategies(db, DateWindow("2026-06-23", "2026-06-23")))
+            self.assertIn("2026-06-23", list_sessions(db))
 
     def test_execution_pair_without_trade_row_reconstructs_closed_trade_with_times(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
