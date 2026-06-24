@@ -304,7 +304,34 @@ class DailyTop100BuilderTests(unittest.TestCase):
             self.assertEqual(len(loaded), 100)
             self.assertEqual(loaded["symbol"].iloc[0], "S001")
 
-    def test_latest_output_blocks_when_missing_history_exceeds_threshold(self) -> None:
+    def test_latest_output_accepts_missing_history_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dated = root / "daily_top100_2026-06-22.csv"
+            latest = root / "daily_top100_latest.csv"
+            latest.write_text("rank,symbol,score,alpha_score\n1,OLD,1,1\n", encoding="utf-8")
+            rows = [
+                {
+                    "rank": idx,
+                    "symbol": f"S{idx:03d}",
+                    "score": 100.0 - idx / 1000,
+                    "alpha_score": 100.0 - idx / 1000,
+                }
+                for idx in range(1, 101)
+            ]
+            write_output_csv(dated, rows)
+
+            self.assertTrue(
+                update_latest_output(
+                    dated,
+                    latest,
+                    rows,
+                    missing_history_count=1,
+                )
+            )
+            self.assertIn("S001", latest.read_text(encoding="utf-8"))
+
+    def test_latest_output_strict_limit_can_block_missing_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             dated = root / "daily_top100_2026-06-22.csv"

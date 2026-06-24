@@ -34,12 +34,13 @@ DATED_OUTPUT="${DATED_OUTPUT:-$OUTPUT_DIR/daily_top100_${RANKING_DATE}.csv}"
 LATEST_OUTPUT="${LATEST_OUTPUT:-$OUTPUT_DIR/daily_top100_latest.csv}"
 DIAGNOSTICS_OUTPUT="${DIAGNOSTICS_OUTPUT:-$OUTPUT_DIR/daily_top100_${RANKING_DATE}_diagnostics.csv}"
 SQLITE_PATH="${SQLITE_PATH:-data/runtime/rankings.sqlite}"
-MAX_MISSING_HISTORY_FOR_LATEST="${MAX_MISSING_HISTORY_FOR_LATEST:-0}"
+MAX_MISSING_HISTORY_FOR_LATEST="${MAX_MISSING_HISTORY_FOR_LATEST:-}"
 MAX_PARTIAL_HISTORY_FOR_TOP100="${MAX_PARTIAL_HISTORY_FOR_TOP100:-0}"
 MAX_FAILED_HISTORY_FOR_TOP100="${MAX_FAILED_HISTORY_FOR_TOP100:-0}"
 PRIOR_SESSIONS="${TRADING_BOT_TOP100_PRIOR_SESSIONS:-${PRIOR_SESSIONS:-5}}"
 PRIOR_READ_SLOW_SECONDS="${TRADING_BOT_TOP100_PRIOR_READ_SLOW_SECONDS:-${PRIOR_READ_SLOW_SECONDS:-2.0}}"
 SKIP_HISTORY_READINESS_GATE="${SKIP_HISTORY_READINESS_GATE:-0}"
+STRICT_HISTORY_READINESS_GATE="${STRICT_HISTORY_READINESS_GATE:-0}"
 
 log "DAILY_TOP100_PREMARKET_START repo=$REPO_ROOT ranking_date=$RANKING_DATE top_n=$TOP_N"
 log "universe=$UNIVERSE"
@@ -50,6 +51,7 @@ log "diagnostics_output=$DIAGNOSTICS_OUTPUT"
 log "max_missing_history_for_latest=$MAX_MISSING_HISTORY_FOR_LATEST"
 log "max_partial_history_for_top100=$MAX_PARTIAL_HISTORY_FOR_TOP100"
 log "max_failed_history_for_top100=$MAX_FAILED_HISTORY_FOR_TOP100"
+log "strict_history_readiness_gate=$STRICT_HISTORY_READINESS_GATE"
 log "prior_sessions=$PRIOR_SESSIONS"
 log "prior_read_slow_seconds=$PRIOR_READ_SLOW_SECONDS"
 
@@ -65,9 +67,17 @@ if [[ "$SKIP_HISTORY_READINESS_GATE" != "1" ]]; then
   READINESS_RC=$?
   set -e
   if [[ "$READINESS_RC" -ne 0 ]]; then
-    log "DAILY_TOP100_PREMARKET_FAILED readiness_rc=$READINESS_RC"
-    exit "$READINESS_RC"
+    if [[ "$STRICT_HISTORY_READINESS_GATE" == "1" ]]; then
+      log "DAILY_TOP100_PREMARKET_FAILED readiness_rc=$READINESS_RC strict_history_readiness_gate=1"
+      exit "$READINESS_RC"
+    fi
+    log "DAILY_TOP100_PREMARKET_READINESS_WARNING readiness_rc=$READINESS_RC strict_history_readiness_gate=0 continuing=1"
   fi
+fi
+
+BUILDER_MISSING_ARGS=()
+if [[ -n "$MAX_MISSING_HISTORY_FOR_LATEST" ]]; then
+  BUILDER_MISSING_ARGS=(--max-missing-history-for-latest "$MAX_MISSING_HISTORY_FOR_LATEST")
 fi
 
 set +e
@@ -79,7 +89,7 @@ python -m src.live_trading.ranking.daily_top100_builder \
   --latest-output "$LATEST_OUTPUT" \
   --diagnostics-output "$DIAGNOSTICS_OUTPUT" \
   --sqlite-path "$SQLITE_PATH" \
-  --max-missing-history-for-latest "$MAX_MISSING_HISTORY_FOR_LATEST" \
+  "${BUILDER_MISSING_ARGS[@]}" \
   --prior-sessions "$PRIOR_SESSIONS" \
   --prior-read-slow-seconds "$PRIOR_READ_SLOW_SECONDS" \
   --top-n "$TOP_N"

@@ -648,7 +648,7 @@ def update_latest_output(
     rows: list[dict[str, Any]],
     *,
     missing_history_count: int = 0,
-    max_missing_history_for_latest: int = 0,
+    max_missing_history_for_latest: int | None = None,
 ) -> bool:
     if len(rows) < MIN_LATEST_ROWS:
         print(
@@ -657,7 +657,7 @@ def update_latest_output(
             flush=True,
         )
         return False
-    if int(missing_history_count) > int(max_missing_history_for_latest):
+    if max_missing_history_for_latest is not None and int(missing_history_count) > int(max_missing_history_for_latest):
         print(
             f"DAILY_TOP100_BLOCKED_HISTORY_NOT_READY missing_history={int(missing_history_count)} "
             f"max_missing_history={int(max_missing_history_for_latest)} latest_output={latest_output}",
@@ -669,6 +669,12 @@ def update_latest_output(
             flush=True,
         )
         return False
+    if int(missing_history_count) > 0:
+        print(
+            f"DAILY_TOP100_LATEST_ACCEPTING_PARTIAL_HISTORY missing_history={int(missing_history_count)} "
+            f"latest_output={latest_output}",
+            flush=True,
+        )
 
     dated = Path(dated_output)
     latest = Path(latest_output)
@@ -703,7 +709,7 @@ def main() -> int:
     parser.add_argument("--max-missing-log", type=int, default=DEFAULT_MAX_MISSING_LOG)
     parser.add_argument("--max-reject-log", type=int, default=DEFAULT_MAX_REJECT_LOG)
     parser.add_argument("--max-partial-history-log", type=int, default=DEFAULT_MAX_PARTIAL_HISTORY_LOG)
-    parser.add_argument("--max-missing-history-for-latest", type=int, default=0)
+    parser.add_argument("--max-missing-history-for-latest", type=int, default=None)
     parser.add_argument("--symbol-denylist", default=DEFAULT_SYMBOL_DENYLIST)
     parser.add_argument("--runtime-ineligible-path", default=DEFAULT_RUNTIME_INELIGIBLE)
     parser.add_argument("--no-sqlite", action="store_true")
@@ -754,7 +760,11 @@ def main() -> int:
             args.latest_output,
             rows,
             missing_history_count=int(stats.get("missing", 0)),
-            max_missing_history_for_latest=int(args.max_missing_history_for_latest),
+            max_missing_history_for_latest=(
+                int(args.max_missing_history_for_latest)
+                if args.max_missing_history_for_latest is not None
+                else None
+            ),
         )
     stored = 0
     if not args.no_sqlite:
