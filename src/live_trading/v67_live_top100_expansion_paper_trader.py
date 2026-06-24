@@ -3441,6 +3441,17 @@ def latest_completed_trading_day(now: datetime, market_close_utc: str) -> date:
     return previous_us_equity_trading_day(cur)
 
 
+def recent_completed_trading_sessions(end_date: date, lookback_sessions: int) -> list[date]:
+    session_count = max(1, int(lookback_sessions or 1))
+    sessions: list[date] = []
+    cur = end_date
+    while len(sessions) < session_count:
+        if is_us_equity_trading_day(cur):
+            sessions.append(cur)
+        cur = previous_us_equity_trading_day(cur)
+    return sorted(sessions)
+
+
 def _runtime_set(runtime_state: dict[str, Any], key: str) -> set[str]:
     value = runtime_state.setdefault(key, set())
     if isinstance(value, set):
@@ -3752,29 +3763,72 @@ def enqueue_startup_history_repair_if_needed(
 ) -> dict[str, Any]:
     if not bool(getattr(args, "startup_history_repair", True)):
         return {"queued": False, "reason": "disabled"}
+    if runtime_state.get("pending_eod_flatten"):
+        print(
+            f"{now_utc()} STARTUP_HISTORY_REPAIR_SKIPPED reason=pending_eod_flatten",
+            flush=True,
+        )
+        return {"queued": False, "reason": "pending_eod_flatten"}
     now = now or datetime.now(timezone.utc)
-    target_date = previous_us_equity_trading_day(now.date())
+    target_date = latest_completed_trading_day(now, getattr(args, "market_close_utc", "20:00"))
+    lookback_sessions = max(1, int(getattr(args, "startup_history_repair_lookback_sessions", 5) or 5))
+    sessions = recent_completed_trading_sessions(target_date, lookback_sessions)
+    start_date = sessions[0]
+    end_date = sessions[-1]
     session_type = "RTH"
-    assessment = assess_history_completion(
-        history_dir=getattr(args, "daily_top100_history_dir", DEFAULT_HISTORY_DIR),
-        universe_csv=getattr(args, "daily_top100_universe", DEFAULT_UNIVERSE),
-        session_date=target_date,
-        session_type=session_type,
+    print(
+        f"{now_utc()} STARTUP_HISTORY_REPAIR_RANGE "
+        f"start_date={start_date.isoformat()} end_date={end_date.isoformat()} "
+        f"sessions={','.join(session.isoformat() for session in sessions)}",
+        flush=True,
     )
+    assessments = [
+        assess_history_completion(
+            history_dir=getattr(args, "daily_top100_history_dir", DEFAULT_HISTORY_DIR),
+            universe_csv=getattr(args, "daily_top100_universe", DEFAULT_UNIVERSE),
+            session_date=session,
+            session_type=session_type,
+        )
+        for session in sessions
+    ]
+    assessment = assessments[-1]
     min_pct = float(getattr(args, "startup_history_repair_min_completion_pct", 100.0))
     retry_failed = bool(getattr(args, "startup_history_repair_retry_failed", True))
-    incomplete = assessment["expected_symbols"] > 0 and assessment["completion_pct"] < min_pct
-    has_failed = int(assessment.get("failed") or 0) > 0
-    should_queue = incomplete or (retry_failed and has_failed)
+    incomplete_assessments = [
+        row
+        for row in assessments
+        if int(row.get("expected_symbols") or 0) > 0
+        and float(row.get("completion_pct") or 0.0) < min_pct
+    ]
+    failed_assessments = [
+        row
+        for row in assessments
+        if int(row.get("failed") or 0) > 0
+    ]
+    should_queue = bool(incomplete_assessments) or (retry_failed and bool(failed_assessments))
+    missing_total = sum(int(row.get("missing") or 0) for row in assessments)
+    failed_total = sum(int(row.get("failed") or 0) for row in assessments)
+    lowest_completion_pct = min((float(row.get("completion_pct") or 0.0) for row in assessments), default=100.0)
     print(
         f"{now_utc()} STARTUP_HISTORY_REPAIR_CHECK date={assessment['date']} "
         f"completion_pct={assessment['completion_pct']} expected_symbols={assessment['expected_symbols']} "
         f"parquet_files={assessment['parquet_files']} status_done={assessment['status_done']} "
-        f"missing={assessment['missing']} failed={assessment['failed']} min_completion_pct={min_pct}",
+        f"missing={assessment['missing']} failed={assessment['failed']} min_completion_pct={min_pct} "
+        f"range_start={start_date.isoformat()} range_end={end_date.isoformat()} "
+        f"range_missing={missing_total} range_failed={failed_total} "
+        f"range_lowest_completion_pct={round(lowest_completion_pct, 2)}",
         flush=True,
     )
     if not should_queue:
-        return {**assessment, "queued": False, "reason": "complete"}
+        return {
+            **assessment,
+            "queued": False,
+            "reason": "complete",
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "repair_range_sessions": [session.isoformat() for session in sessions],
+            "assessments": assessments,
+        }
     queue = runtime_state.setdefault("history_collector_commands", [])
     if not isinstance(queue, list):
         queue = []
@@ -3787,7 +3841,7 @@ def enqueue_startup_history_repair_if_needed(
         )
         return {**assessment, "queued": False, "reason": "collector_already_running"}
     existing_latest = any(
-        str(cmd.get("end_date")) == str(assessment["date"]) and str(cmd.get("collector_mode")) in {"daily", "startup_repair"}
+        str(cmd.get("end_date")) == end_date.isoformat() and str(cmd.get("collector_mode")) in {"daily", "startup_repair"}
         for cmd in queue
         if isinstance(cmd, dict)
     )
@@ -3798,15 +3852,15 @@ def enqueue_startup_history_repair_if_needed(
             flush=True,
         )
         return {**assessment, "queued": False, "reason": "latest_day_already_queued"}
-    command_id = f"startup_history_repair_{assessment['date'].replace('-', '')}"
+    command_id = f"startup_history_repair_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
     command = {
         "id": command_id,
         "type": "history_collector",
         "source": "startup_history_repair",
         "collector_mode": "startup_repair",
         "schedule_slot_utc": "startup",
-        "start_date": assessment["date"],
-        "end_date": assessment["date"],
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
         "session_type": session_type,
         "max_tasks": int(getattr(args, "startup_history_repair_max_tasks", getattr(args, "overnight_daily_collector_max_tasks", 3000))),
         "max_attempts": int(getattr(args, "overnight_collector_max_attempts", 5)),
@@ -3822,11 +3876,23 @@ def enqueue_startup_history_repair_if_needed(
     queue.sort(key=_history_command_priority)
     print(
         f"{now_utc()} STARTUP_HISTORY_REPAIR_QUEUED command_id={command_id} "
-        f"start={command['start_date']} end={command['end_date']} missing={assessment['missing']} "
-        f"failed={assessment['failed']} completion_pct={assessment['completion_pct']}",
+        f"start={command['start_date']} end={command['end_date']} sessions={len(sessions)} "
+        f"missing={missing_total} failed={failed_total} "
+        f"latest_completion_pct={assessment['completion_pct']} "
+        f"range_lowest_completion_pct={round(lowest_completion_pct, 2)}",
         flush=True,
     )
-    return {**assessment, "queued": True, "command_id": command_id}
+    return {
+        **assessment,
+        "queued": True,
+        "command_id": command_id,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "repair_range_sessions": [session.isoformat() for session in sessions],
+        "assessments": assessments,
+        "range_missing": missing_total,
+        "range_failed": failed_total,
+    }
 
 
 def enqueue_overnight_collector_if_due(runtime_state: dict[str, Any], args: argparse.Namespace, now: datetime | None = None) -> None:
@@ -5521,6 +5587,7 @@ def main() -> int:
     parser.add_argument("--startup-history-repair", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--startup-history-repair-min-completion-pct", type=float, default=100.0)
     parser.add_argument("--startup-history-repair-max-tasks", type=int, default=3000)
+    parser.add_argument("--startup-history-repair-lookback-sessions", type=int, default=int(os.environ.get("HISTORY_REPAIR_LOOKBACK_SESSIONS", "5")))
     parser.add_argument("--startup-history-repair-retry-failed", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--daily-top100-build-utc", default="11:30")
     parser.add_argument("--daily-top100-universe", default=DEFAULT_UNIVERSE)
@@ -5699,8 +5766,10 @@ def main() -> int:
         "ibkr_disconnect_at": "",
     }
     startup_ranking_date = latest_completed_trading_day(datetime.now(timezone.utc), getattr(args, "market_close_utc", "20:00"))
+    runtime_state["history_collector_default_date"] = startup_ranking_date.isoformat()
+    runtime_state["history_collector_start_date"] = startup_ranking_date.isoformat()
+    runtime_state["history_collector_end_date"] = startup_ranking_date.isoformat()
     apply_top100_freshness_gate(runtime_state, args, startup_ranking_date)
-    enqueue_startup_history_repair_if_needed(runtime_state, args)
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
     adopted_once = False
@@ -5813,14 +5882,39 @@ def main() -> int:
             "set_broker_net_positions",
             post_startup_broker_qty_by_symbol,
         )
-        sqlite_rebuild_result = safe_sqlite_call(
-            getattr(recorder, "sqlite_store", None),
-            "rebuild_positions_from_executions",
-            broker_net_positions=post_startup_broker_qty_by_symbol,
+        startup_sqlite_active_symbols = sqlite_active_position_symbols(recorder)
+        startup_managed_active_symbols = {
+            str(symbol).upper()
+            for symbol, pos in managed_positions.items()
+            if getattr(pos, "active", False)
+        }
+        startup_rebuild_symbols = sorted(
+            set(post_startup_broker_qty_by_symbol)
+            | startup_sqlite_active_symbols
+            | startup_managed_active_symbols
         )
+        if startup_rebuild_symbols:
+            sqlite_rebuild_result = safe_sqlite_call(
+                getattr(recorder, "sqlite_store", None),
+                "rebuild_positions_from_executions",
+                startup_rebuild_symbols,
+                broker_net_positions=post_startup_broker_qty_by_symbol,
+            )
+        else:
+            sqlite_rebuild_result = {
+                "skipped": True,
+                "reason": "no_broker_or_sqlite_active_symbols",
+                "symbols_processed": 0,
+                "open_symbols": [],
+                "open_symbols_count": 0,
+                "broker_constrained": True,
+            }
         print(
             f"{now_utc()} STARTUP_SQLITE_POSITION_REBUILD "
             f"broker_snapshot_count={len(post_startup_broker_qty_by_symbol)} "
+            f"sqlite_active_symbols_count={len(startup_sqlite_active_symbols)} "
+            f"managed_active_symbols_count={len(startup_managed_active_symbols)} "
+            f"requested_symbols_count={len(startup_rebuild_symbols)} "
             f"result={json.dumps(sqlite_rebuild_result or {}, sort_keys=True, default=str)}",
             flush=True,
         )
@@ -5834,6 +5928,7 @@ def main() -> int:
                 reason="startup_pending_eod_flatten",
                 force=True,
             )
+        enqueue_startup_history_repair_if_needed(runtime_state, args)
 
         recorder.record_run_metadata({
             "module": "v67_live_top100_expansion_paper_trader",

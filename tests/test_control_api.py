@@ -162,6 +162,30 @@ class ControlApiHelperTests(unittest.TestCase):
         self.assertEqual(command["max_tasks"], 3000)
         self.assertEqual(command["max_attempts"], 1)
 
+    def test_queue_history_collector_defaults_to_runtime_latest_session_not_year_start(self) -> None:
+        ctx = ControlApiContext(
+            ib=None,
+            recorder=None,
+            managed_positions={},
+            runtime_state={"history_collector_default_date": "2026-06-22"},
+            record_lifecycle_fn=lambda *args, **kwargs: None,
+        )
+        payload = _queue_history_collector(
+            ctx,
+            {
+                "session_type": "RTH",
+                "force": True,
+                "allow_live_session": True,
+            },
+            force=True,
+        )
+
+        self.assertTrue(payload["ok"])
+        command = payload["command"]
+        self.assertEqual(command["start_date"], "2026-06-22")
+        self.assertEqual(command["end_date"], "2026-06-22")
+        self.assertNotEqual(command["start_date"], "2026-01-01")
+
     def test_queue_history_collector_rejects_force_during_live_session_by_default(self) -> None:
         ctx = ControlApiContext(
             ib=None,
@@ -462,6 +486,7 @@ class ControlApiHelperTests(unittest.TestCase):
                 startup_history_repair_min_completion_pct=100.0,
                 startup_history_repair_retry_failed=True,
                 startup_history_repair_max_tasks=3000,
+                startup_history_repair_lookback_sessions=1,
                 daily_top100_history_dir=str(history_dir),
                 daily_top100_universe=str(universe),
                 overnight_collector_max_attempts=5,
@@ -482,6 +507,40 @@ class ControlApiHelperTests(unittest.TestCase):
             self.assertEqual(queue[0]["end_date"], "2026-05-27")
             self.assertTrue(queue[0]["force"])
 
+    def test_startup_history_repair_uses_recent_session_range_not_year_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            universe = root / "universe.csv"
+            universe.write_text("symbol\nAAA\nBBB\n", encoding="utf-8")
+            history_dir = root / "history" / "universe_1m"
+            runtime_state = {}
+            args = SimpleNamespace(
+                startup_history_repair=True,
+                startup_history_repair_min_completion_pct=100.0,
+                startup_history_repair_retry_failed=True,
+                startup_history_repair_max_tasks=3000,
+                startup_history_repair_lookback_sessions=5,
+                market_close_utc="20:00",
+                daily_top100_history_dir=str(history_dir),
+                daily_top100_universe=str(universe),
+                overnight_collector_max_attempts=5,
+                history_collector_client_id=168,
+            )
+
+            result = enqueue_startup_history_repair_if_needed(
+                runtime_state,
+                args,
+                now=datetime(2026, 6, 24, 8, 0, tzinfo=timezone.utc),
+            )
+
+            self.assertTrue(result["queued"])
+            queue = runtime_state["history_collector_commands"]
+            self.assertEqual(queue[0]["collector_mode"], "startup_repair")
+            self.assertEqual(queue[0]["end_date"], "2026-06-23")
+            self.assertNotEqual(queue[0]["start_date"], "2026-01-01")
+            self.assertEqual(len(result["repair_range_sessions"]), 5)
+            self.assertEqual(queue[0]["start_date"], result["repair_range_sessions"][0])
+
     def test_startup_history_repair_skips_when_status_complete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -500,6 +559,7 @@ class ControlApiHelperTests(unittest.TestCase):
                 startup_history_repair_min_completion_pct=100.0,
                 startup_history_repair_retry_failed=True,
                 startup_history_repair_max_tasks=3000,
+                startup_history_repair_lookback_sessions=1,
                 daily_top100_history_dir=str(history_dir),
                 daily_top100_universe=str(universe),
                 overnight_collector_max_attempts=5,

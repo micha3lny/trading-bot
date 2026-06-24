@@ -396,8 +396,14 @@ def _queue_history_collector(ctx: ControlApiContext, body: JsonDict, *, force: b
     command_id = uuid.uuid4().hex
     today = datetime.now(timezone.utc).date().isoformat()
     requested_date = body.get("date")
-    start_date = str(body.get("start_date") or requested_date or ctx.runtime_state.get("history_collector_start_date") or "2026-01-01")
-    end_date = str(body.get("end_date") or requested_date or today)
+    default_date = str(
+        ctx.runtime_state.get("history_collector_default_date")
+        or ctx.runtime_state.get("history_collector_start_date")
+        or ctx.runtime_state.get("history_collector_end_date")
+        or today
+    )
+    start_date = str(body.get("start_date") or requested_date or default_date)
+    end_date = str(body.get("end_date") or requested_date or default_date)
     cmd = {
         "id": command_id,
         "type": "history_collector",
@@ -423,12 +429,15 @@ def _queue_history_collector(ctx: ControlApiContext, body: JsonDict, *, force: b
 
 
 def _build_history_collector_args(cmd: JsonDict) -> list[str]:
+    default_date = datetime.now(timezone.utc).date().isoformat()
+    end_date = str(cmd.get("end_date") or cmd.get("date") or cmd.get("start_date") or default_date)
+    start_date = str(cmd.get("start_date") or cmd.get("date") or end_date)
     args = [
         sys.executable,
         "-m",
         "src.live_trading.data.v68_universe_1m_parquet_collector",
-        "--start-date", str(cmd.get("start_date") or "2026-01-01"),
-        "--end-date", str(cmd.get("end_date") or datetime.now(timezone.utc).date().isoformat()),
+        "--start-date", start_date,
+        "--end-date", end_date,
         "--session-type", str(cmd.get("session_type") or "RTH"),
         "--client-id", str(int(cmd.get("client_id") or 168)),
         "--max-tasks", str(int(cmd.get("max_tasks") or 300)),
