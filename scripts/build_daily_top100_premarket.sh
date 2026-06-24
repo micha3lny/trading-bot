@@ -37,6 +37,8 @@ SQLITE_PATH="${SQLITE_PATH:-data/runtime/rankings.sqlite}"
 MAX_MISSING_HISTORY_FOR_LATEST="${MAX_MISSING_HISTORY_FOR_LATEST:-0}"
 MAX_PARTIAL_HISTORY_FOR_TOP100="${MAX_PARTIAL_HISTORY_FOR_TOP100:-0}"
 MAX_FAILED_HISTORY_FOR_TOP100="${MAX_FAILED_HISTORY_FOR_TOP100:-0}"
+PRIOR_SESSIONS="${TRADING_BOT_TOP100_PRIOR_SESSIONS:-${PRIOR_SESSIONS:-5}}"
+PRIOR_READ_SLOW_SECONDS="${TRADING_BOT_TOP100_PRIOR_READ_SLOW_SECONDS:-${PRIOR_READ_SLOW_SECONDS:-2.0}}"
 SKIP_HISTORY_READINESS_GATE="${SKIP_HISTORY_READINESS_GATE:-0}"
 
 log "DAILY_TOP100_PREMARKET_START repo=$REPO_ROOT ranking_date=$RANKING_DATE top_n=$TOP_N"
@@ -48,6 +50,8 @@ log "diagnostics_output=$DIAGNOSTICS_OUTPUT"
 log "max_missing_history_for_latest=$MAX_MISSING_HISTORY_FOR_LATEST"
 log "max_partial_history_for_top100=$MAX_PARTIAL_HISTORY_FOR_TOP100"
 log "max_failed_history_for_top100=$MAX_FAILED_HISTORY_FOR_TOP100"
+log "prior_sessions=$PRIOR_SESSIONS"
+log "prior_read_slow_seconds=$PRIOR_READ_SLOW_SECONDS"
 
 if [[ "$SKIP_HISTORY_READINESS_GATE" != "1" ]]; then
   set +e
@@ -76,6 +80,8 @@ python -m src.live_trading.ranking.daily_top100_builder \
   --diagnostics-output "$DIAGNOSTICS_OUTPUT" \
   --sqlite-path "$SQLITE_PATH" \
   --max-missing-history-for-latest "$MAX_MISSING_HISTORY_FOR_LATEST" \
+  --prior-sessions "$PRIOR_SESSIONS" \
+  --prior-read-slow-seconds "$PRIOR_READ_SLOW_SECONDS" \
   --top-n "$TOP_N"
 RC=$?
 set -e

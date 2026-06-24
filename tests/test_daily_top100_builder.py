@@ -10,6 +10,7 @@ import pandas as pd
 from src.live_trading.ranking.daily_top100_builder import (
     build_daily_top,
     parquet_path,
+    recent_prior_closes_with_diagnostics,
     update_latest_output,
     write_diagnostics_csv,
     write_output_csv,
@@ -134,6 +135,57 @@ class DailyTop100BuilderTests(unittest.TestCase):
             self.assertEqual([row["symbol"] for row in rows], ["AAA", "BBB"])
             self.assertEqual(stats["excluded_ineligible"], 1)
             self.assertEqual(stats["_excluded_ineligible_rows"][0]["symbol"], "CONL")
+
+    def test_recent_prior_closes_reads_limited_prior_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history = root / "history"
+            ranking_date = date(2026, 5, 15)
+            write_session(history, "AAA", date(2026, 5, 14), session_frame("AAA", 10.0, 11.0, 5_000))
+            write_session(history, "AAA", date(2026, 5, 13), session_frame("AAA", 10.0, 12.0, 5_000))
+            write_session(history, "AAA", date(2026, 5, 12), session_frame("AAA", 10.0, 13.0, 5_000))
+
+            result = recent_prior_closes_with_diagnostics(
+                history,
+                "AAA",
+                ranking_date,
+                limit=2,
+                session_type="RTH",
+                slow_seconds=10.0,
+            )
+
+            self.assertEqual(result.closes, [11.0, 12.0])
+            self.assertEqual(result.paths_checked, 2)
+            self.assertEqual(result.paths_found, 2)
+            self.assertFalse(result.degraded)
+
+    def test_prior_read_slow_guard_degrades_symbol_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history = root / "history"
+            ranking_date = date(2026, 5, 15)
+            write_universe(root / "universe.csv", ["AAA"])
+            write_session(history, "AAA", ranking_date, session_frame("AAA", 10.0, 13.0, 5_000))
+            write_session(history, "AAA", date(2026, 5, 14), session_frame("AAA", 10.0, 11.0, 5_000))
+            write_session(history, "AAA", date(2026, 5, 13), session_frame("AAA", 10.0, 12.0, 5_000))
+
+            rows, stats = build_daily_top(
+                ranking_date=ranking_date,
+                universe_path=root / "universe.csv",
+                history_dir=history,
+                top_n=1,
+                session_type="RTH",
+                min_price=5.0,
+                min_bars=180,
+                min_volume=100_000,
+                min_dollar_volume=500_000,
+                prior_sessions=5,
+                prior_read_slow_seconds=0.000001,
+            )
+
+            self.assertEqual(len(rows), 1)
+            self.assertGreaterEqual(stats["prior_slow_symbols"], 1)
+            self.assertGreaterEqual(stats["prior_degraded_symbols"], 1)
 
     def test_diagnostics_report_contains_missing_and_rejected_symbols(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

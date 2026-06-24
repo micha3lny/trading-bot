@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -28,6 +29,8 @@ DEFAULT_SQLITE_PATH = "data/runtime/rankings.sqlite"
 MIN_LATEST_ROWS = 100
 DEFAULT_MAX_MISSING_LOG = 50
 DEFAULT_MAX_REJECT_LOG = 50
+DEFAULT_PRIOR_SESSIONS = int(os.getenv("TRADING_BOT_TOP100_PRIOR_SESSIONS", "5") or "5")
+DEFAULT_PRIOR_READ_SLOW_SECONDS = float(os.getenv("TRADING_BOT_TOP100_PRIOR_READ_SLOW_SECONDS", "2.0") or "2.0")
 
 
 @dataclass(frozen=True)
@@ -170,16 +173,80 @@ def prior_session_paths(
     return paths
 
 
-def recent_prior_closes(history_dir: str | Path, symbol: str, session_date: date, limit: int, session_type: str = "RTH") -> list[float]:
-    closes: list[float] = []
-    for path in prior_session_paths(history_dir, symbol, session_date, session_type, limit=max(0, limit)):
+@dataclass(frozen=True)
+class PriorCloseResult:
+    closes: list[float]
+    paths_checked: int
+    paths_found: int
+    seconds: float
+    slow: bool = False
+    degraded: bool = False
+
+
+def read_prior_close(path: Path) -> float | None:
+    """Read only the final close needed for prior-session context.
+
+    Full parquet normalization is intentionally avoided here. Top100 runs this
+    for thousands of symbols, and reading all columns for multiple prior days
+    dominates premarket build time on the Raspberry Pi.
+    """
+    try:
+        df = pd.read_parquet(path, columns=["close"])
+    except Exception:
         try:
-            df = normalize_history_df(pd.read_parquet(path))
+            df = pd.read_parquet(path)
         except Exception:
-            continue
-        if not df.empty:
-            closes.append(float(df["close"].iloc[-1]))
-    return closes
+            return None
+    if df.empty:
+        return None
+    columns = {str(col).strip().lower(): col for col in df.columns}
+    close_col = columns.get("close")
+    if close_col is None:
+        return None
+    close = pd.to_numeric(df[close_col], errors="coerce").dropna()
+    if close.empty:
+        return None
+    value = float(close.iloc[-1])
+    return value if value > 0 else None
+
+
+def recent_prior_closes_with_diagnostics(
+    history_dir: str | Path,
+    symbol: str,
+    session_date: date,
+    limit: int,
+    session_type: str = "RTH",
+    *,
+    slow_seconds: float | None = DEFAULT_PRIOR_READ_SLOW_SECONDS,
+) -> PriorCloseResult:
+    closes: list[float] = []
+    started = time.perf_counter()
+    paths = prior_session_paths(history_dir, symbol, session_date, session_type, limit=max(0, limit))
+    slow_limit = float(slow_seconds) if slow_seconds is not None and slow_seconds > 0 else None
+    degraded = False
+    for idx, path in enumerate(paths, 1):
+        if slow_limit is not None and time.perf_counter() - started > slow_limit:
+            degraded = True
+            break
+        close = read_prior_close(path)
+        if close is not None:
+            closes.append(close)
+        if slow_limit is not None and time.perf_counter() - started > slow_limit and idx < len(paths):
+            degraded = True
+            break
+    seconds = time.perf_counter() - started
+    return PriorCloseResult(
+        closes=closes,
+        paths_checked=len(paths),
+        paths_found=len(closes),
+        seconds=seconds,
+        slow=slow_limit is not None and seconds > slow_limit,
+        degraded=degraded,
+    )
+
+
+def recent_prior_closes(history_dir: str | Path, symbol: str, session_date: date, limit: int, session_type: str = "RTH") -> list[float]:
+    return recent_prior_closes_with_diagnostics(history_dir, symbol, session_date, limit, session_type).closes
 
 
 def analyze_symbol(
@@ -345,6 +412,7 @@ def build_daily_top(
     max_reject_log: int = DEFAULT_MAX_REJECT_LOG,
     symbol_denylist_path: str | Path | None = DEFAULT_SYMBOL_DENYLIST,
     runtime_ineligible_path: str | Path | None = DEFAULT_RUNTIME_INELIGIBLE,
+    prior_read_slow_seconds: float | None = DEFAULT_PRIOR_READ_SLOW_SECONDS,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     symbols = load_universe(universe_path)
     ineligible = combined_ineligible_symbols(symbol_denylist_path, runtime_ineligible_path)
@@ -361,7 +429,9 @@ def build_daily_top(
     print(
         f"DAILY_TOP100_START date={ranking_date.isoformat()} symbols={len(symbols)} "
         f"tradeable_symbols={len(tradeable_symbols)} excluded_ineligible={len(excluded_rows)} "
-        f"history_dir={history_dir} session_type={session_type}",
+        f"history_dir={history_dir} session_type={session_type} "
+        f"prior_sessions={max(0, int(prior_sessions))} "
+        f"prior_read_slow_seconds={float(prior_read_slow_seconds or 0.0):.2f}",
         flush=True,
     )
     ranked: list[SymbolRanking] = []
@@ -372,6 +442,10 @@ def build_daily_top(
         "rejected": 0,
         "errors": 0,
         "excluded_ineligible": len(excluded_rows),
+        "prior_slow_symbols": 0,
+        "prior_degraded_symbols": 0,
+        "prior_paths_checked": 0,
+        "prior_paths_found": 0,
     }
     missing_symbols: list[str] = []
     rejected_rows: list[dict[str, str]] = []
@@ -416,8 +490,28 @@ def build_daily_top(
                 emit_progress(idx)
                 continue
             prior_started = time.perf_counter()
-            prior_closes = recent_prior_closes(history_dir, symbol, ranking_date, prior_sessions, session_type)
+            prior_result = recent_prior_closes_with_diagnostics(
+                history_dir,
+                symbol,
+                ranking_date,
+                prior_sessions,
+                session_type,
+                slow_seconds=prior_read_slow_seconds,
+            )
+            prior_closes = prior_result.closes
             prior_read_seconds += time.perf_counter() - prior_started
+            stats["prior_paths_checked"] += prior_result.paths_checked
+            stats["prior_paths_found"] += prior_result.paths_found
+            if prior_result.slow:
+                stats["prior_slow_symbols"] += 1
+                print(
+                    f"TOP100_PRIOR_READ_SLOW symbol={symbol} seconds={prior_result.seconds:.2f} "
+                    f"prior_sessions={max(0, int(prior_sessions))} paths_checked={prior_result.paths_checked} "
+                    f"paths_found={prior_result.paths_found} degraded={1 if prior_result.degraded else 0}",
+                    flush=True,
+                )
+            if prior_result.degraded:
+                stats["prior_degraded_symbols"] += 1
             analyze_started = time.perf_counter()
             item, reject_reason = analyze_symbol(
                 symbol,
@@ -578,7 +672,8 @@ def main() -> int:
     parser.add_argument("--min-bars", type=int, default=180)
     parser.add_argument("--min-volume", type=float, default=100_000.0)
     parser.add_argument("--min-dollar-volume", type=float, default=500_000.0)
-    parser.add_argument("--prior-sessions", type=int, default=5)
+    parser.add_argument("--prior-sessions", type=int, default=DEFAULT_PRIOR_SESSIONS)
+    parser.add_argument("--prior-read-slow-seconds", type=float, default=DEFAULT_PRIOR_READ_SLOW_SECONDS)
     parser.add_argument("--sqlite-path", default=DEFAULT_SQLITE_PATH)
     parser.add_argument("--runtime-sqlite-path", default=None)
     parser.add_argument("--disable-runtime-sqlite", action="store_true")
@@ -618,6 +713,7 @@ def main() -> int:
         max_reject_log=int(args.max_reject_log),
         symbol_denylist_path=args.symbol_denylist,
         runtime_ineligible_path=args.runtime_ineligible_path,
+        prior_read_slow_seconds=float(args.prior_read_slow_seconds),
     )
     write_output_csv(args.output, rows)
     diagnostics_rows = 0
@@ -681,7 +777,12 @@ def main() -> int:
         f"symbols_per_second={float(stats.get('symbols_per_second', 0.0)):.2f} "
         f"current_read_seconds={float(stats.get('current_read_seconds', 0.0)):.1f} "
         f"prior_read_seconds={float(stats.get('prior_read_seconds', 0.0)):.1f} "
-        f"analyze_seconds={float(stats.get('analyze_seconds', 0.0)):.1f}",
+        f"analyze_seconds={float(stats.get('analyze_seconds', 0.0)):.1f} "
+        f"prior_sessions={int(args.prior_sessions)} "
+        f"prior_slow_symbols={stats.get('prior_slow_symbols', 0)} "
+        f"prior_degraded_symbols={stats.get('prior_degraded_symbols', 0)} "
+        f"prior_paths_checked={stats.get('prior_paths_checked', 0)} "
+        f"prior_paths_found={stats.get('prior_paths_found', 0)}",
         flush=True,
     )
     if len(rows) < int(args.top_n):
