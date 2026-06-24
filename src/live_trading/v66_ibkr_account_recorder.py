@@ -602,6 +602,7 @@ def record_recent_fills(
     allow_historical_commission_reingest: bool | None = None,
 ) -> int:
     sqlite_store = getattr(recorder, "sqlite_store", None)
+    session_date = str(getattr(recorder, "session_date", "") or "").strip()
     started_at = now_utc()
     safe_sqlite_call(sqlite_store, "mark_operation_status", "fill_ingest", "running", started_at=started_at)
     count = 0
@@ -642,14 +643,14 @@ def record_recent_fills(
                 continue
             seen.add(key)
             count += 1
-        pending = safe_sqlite_call(sqlite_store, "runtime_pending_counts") or {}
+        pending = safe_sqlite_call(sqlite_store, "runtime_pending_counts", session_date) or {}
         finalized_pending = {}
         if int((pending or {}).get("pending_trade_finalization_count") or 0) > 0:
             if allow_stale_commission_reingest:
                 commission_retry = retry_missing_commission_reports_for_pending_trades(
                     ib,
                     recorder,
-                    session_date=str(getattr(recorder, "session_date", "") or ""),
+                    session_date=session_date,
                     include_historical=allow_historical_commission_reingest,
                 )
             else:
@@ -669,13 +670,13 @@ def record_recent_fills(
                     window_seconds=300.0,
                 )
             if int(commission_retry.get("recovered") or 0) > 0:
-                refreshed_pending = safe_sqlite_call(sqlite_store, "runtime_pending_counts")
+                refreshed_pending = safe_sqlite_call(sqlite_store, "runtime_pending_counts", session_date)
                 if refreshed_pending is not None:
                     pending = refreshed_pending
-            finalized_pending = safe_sqlite_call(sqlite_store, "finalize_pending_trades") or {}
+            finalized_pending = safe_sqlite_call(sqlite_store, "finalize_pending_trades", session_date) or {}
             if commission_retry:
                 finalized_pending = {**finalized_pending, "commission_reingest": commission_retry}
-            refreshed_pending = safe_sqlite_call(sqlite_store, "runtime_pending_counts")
+            refreshed_pending = safe_sqlite_call(sqlite_store, "runtime_pending_counts", session_date)
             if refreshed_pending is not None:
                 pending = refreshed_pending
         safe_sqlite_call(

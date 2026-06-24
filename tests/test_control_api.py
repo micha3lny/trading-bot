@@ -507,6 +507,42 @@ class ControlApiHelperTests(unittest.TestCase):
             self.assertEqual(queue[0]["end_date"], "2026-05-27")
             self.assertTrue(queue[0]["force"])
 
+    def test_startup_history_repair_defers_near_market_open(self) -> None:
+        runtime_state = {}
+        args = SimpleNamespace(
+            startup_history_repair=True,
+            market_open_utc="13:30",
+            market_close_utc="20:00",
+        )
+
+        result = enqueue_startup_history_repair_if_needed(
+            runtime_state,
+            args,
+            now=datetime(2026, 6, 24, 13, 14, tzinfo=timezone.utc),
+        )
+
+        self.assertFalse(result["queued"])
+        self.assertEqual(result["reason"], "market_session_active_or_near_open")
+        self.assertNotIn("history_collector_commands", runtime_state)
+
+    def test_startup_history_repair_defers_when_eod_active(self) -> None:
+        runtime_state = {"eod_active": True}
+        args = SimpleNamespace(
+            startup_history_repair=True,
+            market_open_utc="13:30",
+            market_close_utc="20:00",
+        )
+
+        result = enqueue_startup_history_repair_if_needed(
+            runtime_state,
+            args,
+            now=datetime(2026, 6, 24, 8, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertFalse(result["queued"])
+        self.assertEqual(result["reason"], "eod_reconciliation_active")
+        self.assertNotIn("history_collector_commands", runtime_state)
+
     def test_startup_history_repair_uses_recent_session_range_not_year_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -951,6 +952,58 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 self.assertEqual(json.loads(after_trade["raw_json"])["pending_commission_count"], 0)
             finally:
                 store.close()
+
+    def test_finalize_pending_trades_without_date_does_not_rebuild_all_history_by_default(self) -> None:
+        today = date.today().isoformat()
+        old_day = "2026-05-01" if today != "2026-05-01" else "2026-05-02"
+        old_env = os.environ.pop("TRADING_BOT_ALLOW_FULL_PENDING_TRADE_REBUILD", None)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({
+                    "execution_id": "B_OLD_PENDING",
+                    "strategy_name": "v67",
+                    "session_date": old_day,
+                    "symbol": "OLDP",
+                    "side": "BOT",
+                    "quantity": 1,
+                    "price": 10,
+                    "commission": 0.4,
+                    "commission_source": "ibkr",
+                    "executed_at": f"{old_day}T13:30:00+00:00",
+                })
+                store.upsert_execution({
+                    "execution_id": "S_OLD_PENDING",
+                    "strategy_name": "v67",
+                    "session_date": old_day,
+                    "symbol": "OLDP",
+                    "side": "SLD",
+                    "quantity": 1,
+                    "price": 11,
+                    "commission": 0.5,
+                    "commission_source": "ibkr",
+                    "realized_pnl": 1.0,
+                    "executed_at": f"{old_day}T13:40:00+00:00",
+                })
+                trade = store.query("SELECT trade_id, raw_json FROM trades WHERE symbol = 'OLDP'")[0]
+                raw = json.loads(trade["raw_json"])
+                raw["pending_commission_count"] = 1
+                store.execute(
+                    "UPDATE trades SET status = 'COMMISSION_PENDING', raw_json = ? WHERE trade_id = ?",
+                    [json.dumps(raw), trade["trade_id"]],
+                )
+
+                result = store.finalize_pending_trades()
+                old_trade = store.query("SELECT status FROM trades WHERE symbol = 'OLDP'")[0]
+
+                self.assertEqual(result["session_date"], today)
+                self.assertFalse(result["full_rebuild"])
+                self.assertEqual(result["pending_before"], 0)
+                self.assertEqual(old_trade["status"], "COMMISSION_PENDING")
+            finally:
+                store.close()
+                if old_env is not None:
+                    os.environ["TRADING_BOT_ALLOW_FULL_PENDING_TRADE_REBUILD"] = old_env
 
     def test_pending_trade_diagnostics_identifies_missing_entry_commission(self) -> None:
         today = date.today().isoformat()

@@ -149,6 +149,32 @@ def is_us_equity_session_active_now(args: argparse.Namespace | None = None, *, n
     return market_open <= now_min < market_close
 
 
+def is_market_session_active_or_near_open(
+    args: argparse.Namespace | None = None,
+    *,
+    now: datetime | None = None,
+    near_open_minutes: int = 30,
+) -> tuple[bool, str, int | None]:
+    now = now or datetime.now(timezone.utc)
+    session = get_us_equity_session(now.date())
+    if not session.is_trading_day:
+        return False, "market_closed", None
+    if session.open_utc and session.close_utc:
+        open_dt = session.open_utc
+        close_dt = session.close_utc
+    else:
+        market_open = parse_utc_hhmm(getattr(args, "market_open_utc", "13:30") if args is not None else "13:30")
+        market_close = parse_utc_hhmm(getattr(args, "market_close_utc", "20:00") if args is not None else "20:00")
+        open_dt = now.replace(hour=market_open // 60, minute=market_open % 60, second=0, microsecond=0)
+        close_dt = now.replace(hour=market_close // 60, minute=market_close % 60, second=0, microsecond=0)
+    if open_dt <= now < close_dt:
+        return True, "market_session_active", None
+    seconds_to_open = int((open_dt - now).total_seconds())
+    if 0 <= seconds_to_open <= max(0, int(near_open_minutes)) * 60:
+        return True, "near_market_open", seconds_to_open
+    return False, "outside_market_session", seconds_to_open
+
+
 class ShutdownDiagnostics:
     def __init__(self, *, log_dir: str | Path | None, args: argparse.Namespace | None = None) -> None:
         self.log_dir = log_dir
@@ -3770,6 +3796,23 @@ def enqueue_startup_history_repair_if_needed(
         )
         return {"queued": False, "reason": "pending_eod_flatten"}
     now = now or datetime.now(timezone.utc)
+    eod_active = bool(runtime_state.get("eod_active") or runtime_state.get("eod_recovery_active"))
+    defer_for_market, defer_reason, seconds_to_open = is_market_session_active_or_near_open(args, now=now, near_open_minutes=30)
+    if eod_active or defer_for_market:
+        reason = "eod_reconciliation_active" if eod_active else "market_session_active_or_near_open"
+        print(
+            f"{now_utc()} STARTUP_HISTORY_REPAIR_DEFERRED reason={reason} "
+            f"market_reason={defer_reason} seconds_to_open={seconds_to_open if seconds_to_open is not None else ''} "
+            f"eod_active={int(eod_active)}",
+            flush=True,
+        )
+        return {
+            "queued": False,
+            "reason": reason,
+            "market_reason": defer_reason,
+            "seconds_to_open": seconds_to_open,
+            "eod_active": eod_active,
+        }
     target_date = latest_completed_trading_day(now, getattr(args, "market_close_utc", "20:00"))
     lookback_sessions = max(1, int(getattr(args, "startup_history_repair_lookback_sessions", 5) or 5))
     sessions = recent_completed_trading_sessions(target_date, lookback_sessions)

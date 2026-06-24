@@ -1375,6 +1375,17 @@ class SQLiteRuntimeStore:
         affected symbols, then returns before/after diagnostics so callers can
         see which condition remains if a trade is still pending.
         """
+        requested_session_date = str(session_date or "").strip()
+        full_rebuild = not bool(requested_session_date)
+        if full_rebuild and os.environ.get("TRADING_BOT_ALLOW_FULL_PENDING_TRADE_REBUILD") != "1":
+            requested_session_date = datetime.now(timezone.utc).date().isoformat()
+            full_rebuild = False
+        print(
+            f"{utc_now_iso()} FINALIZE_PENDING_TRADES_SCOPE "
+            f"session_date={requested_session_date or 'all'} full_rebuild={int(full_rebuild)}",
+            flush=True,
+        )
+        session_date = requested_session_date or None
         before = self.pending_trade_finalization_diagnostics(session_date)
         symbols = sorted({str(row.get("symbol") or "").upper() for row in before if str(row.get("symbol") or "").strip()})
         if symbols:
@@ -1382,6 +1393,7 @@ class SQLiteRuntimeStore:
         after = self.pending_trade_finalization_diagnostics(session_date)
         return {
             "session_date": session_date or "",
+            "full_rebuild": full_rebuild,
             "symbols_processed": symbols,
             "pending_before": len(before),
             "pending_after": len(after),
