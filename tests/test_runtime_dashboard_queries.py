@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.dashboard.runtime_queries import DateWindow, list_sessions, list_strategies, load_dashboard_snapshot, load_diagnostics, utc_today
+from src.dashboard.runtime_queries import DateWindow, aggregate_closed_positions, list_sessions, list_strategies, load_dashboard_snapshot, load_diagnostics, utc_today
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
 
@@ -2778,6 +2778,76 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-18", "2026-06-18"), "All")
 
             self.assertEqual(snapshot["closed_positions"].iloc[0]["strategy"], "v67")
+
+    def test_closed_diagnostics_aggregate_partial_fills_by_entry_order(self) -> None:
+        rows = pd.DataFrame(
+            [
+                {
+                    "trade_id": "reconstructed:CAST:part1",
+                    "symbol": "CAST",
+                    "session_date": "2026-06-24",
+                    "strategy": "unknown",
+                    "entry_date": "2026-06-24",
+                    "exit_date": "2026-06-24",
+                    "entry_time": "2026-06-24T13:35:00+00:00",
+                    "exit_time": "2026-06-24T14:00:00+00:00",
+                    "entry_order_id": "65046",
+                    "entry_perm_id": "99046",
+                    "qty": 100,
+                    "buy": 8.81,
+                    "sell": 8.79,
+                    "gross": -2.0,
+                    "net_actual": -2.5,
+                    "ibkr_commission": 0.5,
+                    "exit_reason": "unknown_exit_reason",
+                    "data_quality": "CARRY_BASIS_UNVERIFIED",
+                    "commission_status": "OK",
+                    "top100_rank": 1,
+                    "top100_score": 90.0,
+                    "live_entry_score": 75.0,
+                    "live_entry_rank": 1,
+                },
+                {
+                    "trade_id": "reconstructed:CAST:part2",
+                    "symbol": "CAST",
+                    "session_date": "2026-06-24",
+                    "strategy": "unknown",
+                    "entry_date": "2026-06-24",
+                    "exit_date": "2026-06-24",
+                    "entry_time": "2026-06-24T13:35:00+00:00",
+                    "exit_time": "2026-06-24T14:00:01+00:00",
+                    "entry_order_id": "65046",
+                    "entry_perm_id": "99046",
+                    "qty": 13,
+                    "buy": 8.81,
+                    "sell": 8.79,
+                    "gross": -0.26,
+                    "net_actual": -0.36,
+                    "ibkr_commission": 0.1,
+                    "exit_reason": "unknown_exit_reason",
+                    "data_quality": "CARRY_BASIS_UNVERIFIED",
+                    "commission_status": "OK",
+                    "top100_rank": 1,
+                    "top100_score": 90.0,
+                    "live_entry_score": 75.0,
+                    "live_entry_rank": 1,
+                },
+            ]
+        )
+
+        aggregated = aggregate_closed_positions(rows)
+
+        self.assertEqual(len(aggregated), 1)
+        row = aggregated.iloc[0]
+        self.assertEqual(row["symbol"], "CAST")
+        self.assertEqual(row["entry_order_id"], "65046")
+        self.assertAlmostEqual(row["qty"], 113.0)
+        self.assertAlmostEqual(row["gross"], -2.26)
+        self.assertAlmostEqual(row["net_actual"], -2.86)
+        self.assertAlmostEqual(row["ibkr_commission"], 0.6)
+        self.assertAlmostEqual(row["buy"], 8.81)
+        self.assertAlmostEqual(row["sell"], 8.79)
+        self.assertEqual(row["partial_rows"], 2)
 
 
 if __name__ == "__main__":

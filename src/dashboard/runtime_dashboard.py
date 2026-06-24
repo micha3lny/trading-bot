@@ -21,9 +21,9 @@ from src.live_trading.storage.sqlite_store import SQLITE_BUSY_TIMEOUT_MS, config
 
 from src.dashboard.runtime_queries import (  # noqa: E402
     DateWindow,
+    aggregate_closed_positions,
     list_sessions,
     list_strategies,
-    hold_minutes,
     load_dashboard_snapshot,
     utc_today,
 )
@@ -857,69 +857,6 @@ def closed_normal_mask(df: pd.DataFrame) -> pd.Series:
     return trusted & (strategy != "unknown") & ~carried
 
 
-def aggregate_closed_positions(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    rows: list[dict[str, object]] = []
-    group_cols = ["symbol", "strategy", "entry_date", "exit_date", "exit_reason"]
-    for _, group in df.groupby(group_cols, dropna=False, sort=False):
-        records = group.to_dict("records")
-        qty = pd.to_numeric(group.get("qty"), errors="coerce").fillna(0.0).abs()
-        qty_sum = float(qty.sum())
-        gross = pd.to_numeric(group.get("gross"), errors="coerce").sum(min_count=1)
-        net = pd.to_numeric(group.get("net_actual"), errors="coerce").sum(min_count=1)
-        commission = pd.to_numeric(group.get("ibkr_commission"), errors="coerce").fillna(0.0).sum()
-        buy_values = pd.to_numeric(group.get("buy"), errors="coerce")
-        sell_values = pd.to_numeric(group.get("sell"), errors="coerce")
-        buy = float((buy_values * qty).sum() / qty_sum) if qty_sum else None
-        sell = float((sell_values * qty).sum() / qty_sum) if qty_sum else None
-        denominator = (buy or 0.0) * qty_sum
-        net_pct = float((net / denominator) * 100.0) if denominator and pd.notna(net) else None
-        entry_times = [x for x in group.get("entry_time", pd.Series(dtype=object)).tolist() if x]
-        exit_times = [x for x in group.get("exit_time", pd.Series(dtype=object)).tolist() if x]
-        peak = pd.to_numeric(group.get("peak_pct"), errors="coerce").max()
-        mae = pd.to_numeric(group.get("mae_pct"), errors="coerce").min()
-        peak_price = pd.to_numeric(group.get("peak_price"), errors="coerce").max()
-        low_price = pd.to_numeric(group.get("low_price"), errors="coerce").min()
-        peak_upnl = pd.to_numeric(group.get("peak_unrealized_pnl"), errors="coerce").sum(min_count=1)
-        max_adverse_upnl = pd.to_numeric(group.get("max_adverse_unrealized_pnl"), errors="coerce").sum(min_count=1)
-        giveback = pd.to_numeric(group.get("giveback_from_peak"), errors="coerce").sum(min_count=1)
-        drop = pd.to_numeric(group.get("drop_from_peak_pct"), errors="coerce").min()
-        hold = hold_minutes(min(entry_times) if entry_times else None, max(exit_times) if exit_times else None)
-        first = records[0]
-        qualities = sorted({str(x) for x in group.get("data_quality", pd.Series(dtype=str)).dropna().tolist() if str(x)})
-        statuses = sorted({str(x) for x in group.get("commission_status", pd.Series(dtype=str)).dropna().tolist() if str(x)})
-        rows.append(
-            {
-                **first,
-                "qty": qty_sum,
-                "buy": buy,
-                "sell": sell,
-                "gross": gross,
-                "net_actual": net,
-                "net_pct": net_pct,
-                "pnl_pct": net_pct,
-                "ibkr_commission": commission,
-                "peak_pct": peak if pd.notna(peak) else None,
-                "mae_pct": mae if pd.notna(mae) else None,
-                "peak_price": peak_price if pd.notna(peak_price) else None,
-                "low_price": low_price if pd.notna(low_price) else None,
-                "peak_unrealized_pnl": peak_upnl if pd.notna(peak_upnl) else None,
-                "max_adverse_unrealized_pnl": max_adverse_upnl if pd.notna(max_adverse_upnl) else None,
-                "giveback_from_peak": giveback if pd.notna(giveback) else None,
-                "drop_from_peak_pct": drop if pd.notna(drop) else None,
-                "hold_minutes": hold,
-                "entry_time": min(entry_times) if entry_times else first.get("entry_time"),
-                "exit_time": max(exit_times) if exit_times else first.get("exit_time"),
-                "commission_status": "OK" if statuses == ["OK"] else (";".join(statuses) if statuses else ""),
-                "data_quality": "; ".join(qualities) if qualities else "OK",
-                "partial_rows": len(group),
-                "trade_ids": ", ".join(str(x) for x in group.get("trade_id", pd.Series(dtype=str)).dropna().tolist() if str(x)),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
 def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     cols = [
         "symbol", "entry_date", "exit_date", "qty", "ibkr_commission", "commission_status", "buy", "sell", "gross", "net_actual", "net_pct", "peak_pct",
@@ -1084,7 +1021,8 @@ def render_closed_positions(df: pd.DataFrame) -> None:
             st.dataframe(style_pnl(details, ["Gross", "Net", "Net %"]), width="stretch", hide_index=True)
     if not diagnostics.empty:
         st.subheader("Carry / Unattributed Closed Diagnostics")
-        diag_out = format_closed_positions(diagnostics, "closed_carry_diag")
+        aggregate_diag = aggregate_closed_positions(diagnostics)
+        diag_out = format_closed_positions(aggregate_diag, "closed_carry_diag")
         st.dataframe(
             style_pnl(diag_out, ["Gross", "Net", "Net %"]),
             width="stretch",
