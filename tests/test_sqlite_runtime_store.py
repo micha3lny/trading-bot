@@ -168,6 +168,41 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 queue_store.close()
 
+    def test_sqlite_writer_queue_coalesces_duplicate_status_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "runtime.sqlite"
+            queue_store = SQLiteWriteQueue(db_path)
+            try:
+                queue_store._coalesced_keys.add("runtime_pending_counts:all")
+                result = safe_sqlite_call(
+                    queue_store,
+                    "runtime_pending_counts",
+                    timeout_seconds=0.1,
+                )
+                self.assertIsNone(result)
+                status = queue_store.status()
+                self.assertEqual(int(status.get("coalesced_writes") or 0), 1)
+                self.assertEqual(status.get("coalesced_writes_by_method", {}).get("runtime_pending_counts"), 1)
+            finally:
+                queue_store._coalesced_keys.discard("runtime_pending_counts:all")
+                queue_store.close()
+
+    def test_mark_operation_status_is_best_effort_in_writer_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "runtime.sqlite"
+            queue_store = SQLiteWriteQueue(db_path)
+            try:
+                result = safe_sqlite_call(
+                    queue_store,
+                    "mark_operation_status",
+                    "fill_ingest",
+                    "running",
+                    wait_for_ack=None,
+                )
+                self.assertEqual(result, "queued")
+            finally:
+                queue_store.close()
+
     def test_upsert_execution_idempotent_and_commission_update(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")

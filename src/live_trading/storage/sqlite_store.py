@@ -26,6 +26,7 @@ SQLITE_WRITER_CRITICAL_TIMEOUT_SECONDS = float(os.environ.get("TRADING_BOT_SQLIT
 SQLITE_WRITER_BEST_EFFORT_TIMEOUT_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRITER_BEST_EFFORT_TIMEOUT_SECONDS", "0.01"))
 SQLITE_WRITER_JOIN_TIMEOUT_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRITER_JOIN_TIMEOUT_SECONDS", "5.0"))
 SQLITE_WRITER_TIMEOUT_LOG_INTERVAL_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRITER_TIMEOUT_LOG_INTERVAL_SECONDS", "30.0"))
+SQLITE_WRITER_SLOW_WRITE_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRITER_SLOW_WRITE_SECONDS", "5.0"))
 SQLITE_WRITER_METHOD_ACK_TIMEOUT_SECONDS = {
     "set_broker_net_positions": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_BROKER_POSITIONS", "8.0")),
     "reconcile_active_positions_to_broker_snapshot": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_RECONCILE", "12.0")),
@@ -44,14 +45,19 @@ CRITICAL_SQLITE_WRITE_METHODS = {
     "upsert_trade",
     "upsert_position",
     "record_reconciliation_run",
-    "mark_operation_status",
     "finalize_pending_trades",
     "rebuild_positions_from_executions",
     "reconcile_active_positions_to_broker_snapshot",
     "mark_position_flat",
     "mark_all_positions_flat",
 }
+COALESCED_SQLITE_WRITE_METHODS = {
+    "finalize_pending_trades",
+    "mark_operation_status",
+    "runtime_pending_counts",
+}
 BEST_EFFORT_SQLITE_WRITE_METHODS = {
+    "mark_operation_status",
     "record_runtime_event",
     "record_risk_event",
     "upsert_market_data_session",
@@ -2732,6 +2738,9 @@ class SQLiteWriteRequest:
     priority: str
     wait_for_ack: bool
     timeout_seconds: float
+    coalesce_key: str = ""
+    detail: str = ""
+    table: str = ""
     enqueued_at: float = field(default_factory=time.monotonic)
     done: threading.Event = field(default_factory=threading.Event)
     result: Any = None
@@ -2770,6 +2779,8 @@ class SQLiteWriteQueue:
         self._queue: queue.PriorityQueue[SQLiteWriteQueueItem] = queue.PriorityQueue(maxsize=max(1, self.maxsize))
         self._sequence = 0
         self._timeout_log_last: dict[str, float] = {}
+        self._coalesced_keys: set[str] = set()
+        self._coalesced_lock = threading.Lock()
         self._closed = threading.Event()
         self._ready = threading.Event()
         self._status_lock = threading.Lock()
@@ -2780,6 +2791,8 @@ class SQLiteWriteQueue:
             "dropped_writes": 0,
             "ack_timeouts_total": 0,
             "ack_timeouts_by_method": {},
+            "coalesced_writes": 0,
+            "coalesced_writes_by_method": {},
             "last_ack_timeout_method": "",
             "last_ack_timeout_at": "",
             "write_count": 0,
@@ -2789,6 +2802,8 @@ class SQLiteWriteQueue:
             "last_write_error": "",
             "last_write_at": "",
             "current_write_method": "",
+            "current_write_detail": "",
+            "current_write_table": "",
             "current_write_started_at": "",
             "current_write_duration_seconds": 0.0,
             "oldest_queued_age_seconds": 0.0,
@@ -2856,6 +2871,8 @@ class SQLiteWriteQueue:
                 started = time.monotonic()
                 self._set_status(
                     current_write_method=request.method,
+                    current_write_detail=request.detail,
+                    current_write_table=request.table,
                     current_write_started_at=utc_now_iso(),
                     current_write_monotonic=started,
                     current_write_duration_seconds=0.0,
@@ -2867,6 +2884,15 @@ class SQLiteWriteQueue:
                     request.exception = exc
                 finally:
                     latency_ms = round((time.monotonic() - started) * 1000.0, 3)
+                    if (latency_ms / 1000.0) >= SQLITE_WRITER_SLOW_WRITE_SECONDS:
+                        log_sqlite_line(
+                            f"{utc_now_iso()} SQLITE_SLOW_WRITE method={request.method} "
+                            f"duration_seconds={round(latency_ms / 1000.0, 3)} "
+                            f"table={str(request.table or '').replace(' ', '_')} "
+                            f"detail={str(request.detail or '').replace(' ', '_')} "
+                            f"queue_depth={self._queue.qsize()} "
+                            f"oldest_queued_age_seconds={self._oldest_queued_age_seconds()}"
+                        )
                     with self._status_lock:
                         if request.exception is None:
                             self._status["write_count"] = int(self._status.get("write_count", 0) or 0) + 1
@@ -2877,6 +2903,8 @@ class SQLiteWriteQueue:
                         self._status["last_write_method"] = request.method
                         self._status["last_write_at"] = utc_now_iso()
                         self._status["current_write_method"] = ""
+                        self._status["current_write_detail"] = ""
+                        self._status["current_write_table"] = ""
                         self._status["current_write_started_at"] = ""
                         self._status["current_write_monotonic"] = 0.0
                         self._status["current_write_duration_seconds"] = 0.0
@@ -2885,6 +2913,7 @@ class SQLiteWriteQueue:
                         self._status["queue_depth"] = queue_depth
                         self._status["max_queue_depth"] = max(int(self._status.get("max_queue_depth", 0) or 0), queue_depth)
                         self._status["writer_alive"] = int(self._thread.is_alive())
+                    self._release_coalesced_key(request.coalesce_key)
                     request.done.set()
                     self._queue.task_done()
         except BaseException as exc:
@@ -2908,6 +2937,49 @@ class SQLiteWriteQueue:
             return "best_effort"
         return "critical"
 
+    def _request_metadata(self, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[str, str, str]:
+        if method == "mark_operation_status":
+            name = str(args[0] if args else kwargs.get("name") or "").strip()
+            status = str(args[1] if len(args) > 1 else kwargs.get("status") or "").strip()
+            key = f"{method}:{name}:{status}"
+            return key, f"operation={name} status={status}", "runtime_state"
+        if method == "runtime_pending_counts":
+            session_date = str(args[0] if args else kwargs.get("session_date") or "").strip()
+            key = f"{method}:{session_date or 'all'}"
+            return key, f"session_date={session_date or 'all'} sql=pending_counts_aggregate", "executions,trades"
+        if method == "finalize_pending_trades":
+            session_date = str(args[0] if args else kwargs.get("session_date") or "").strip()
+            key = f"{method}:{session_date or 'all'}"
+            return key, f"session_date={session_date or 'all'} sql=pending_trade_rebuild", "trades,executions,positions"
+        if method == "rebuild_positions_from_executions":
+            symbols = args[0] if args else kwargs.get("symbols")
+            symbol_count = len(symbols) if isinstance(symbols, (list, tuple, set)) else "all"
+            return "", f"symbols={symbol_count} sql=reducer_rebuild", "executions,positions,trades"
+        return "", f"method={method}", ""
+
+    def _release_coalesced_key(self, key: str) -> None:
+        if not key:
+            return
+        with self._coalesced_lock:
+            self._coalesced_keys.discard(key)
+
+    def _coalesce_duplicate(self, method: str, key: str) -> bool:
+        if method not in COALESCED_SQLITE_WRITE_METHODS or not key:
+            return False
+        with self._coalesced_lock:
+            if key in self._coalesced_keys:
+                with self._status_lock:
+                    self._status["coalesced_writes"] = int(self._status.get("coalesced_writes", 0) or 0) + 1
+                    by_method = dict(self._status.get("coalesced_writes_by_method") or {})
+                    by_method[method] = int(by_method.get(method, 0) or 0) + 1
+                    self._status["coalesced_writes_by_method"] = by_method
+                    queue_depth = self._queue.qsize()
+                    self._status["queue_depth"] = queue_depth
+                    self._status["max_queue_depth"] = max(int(self._status.get("max_queue_depth", 0) or 0), queue_depth)
+                return True
+            self._coalesced_keys.add(key)
+            return False
+
     def call(
         self,
         method: str,
@@ -2929,6 +3001,9 @@ class SQLiteWriteQueue:
                 if wait_for_ack
                 else self.best_effort_timeout_seconds
             )
+        coalesce_key, detail, table = self._request_metadata(method, tuple(args), dict(kwargs))
+        if self._coalesce_duplicate(method, coalesce_key):
+            return None
         request = SQLiteWriteRequest(
             method=method,
             args=tuple(args),
@@ -2936,12 +3011,16 @@ class SQLiteWriteQueue:
             priority=effective_priority,
             wait_for_ack=bool(wait_for_ack),
             timeout_seconds=float(timeout_seconds),
+            coalesce_key=coalesce_key,
+            detail=detail,
+            table=table,
         )
         try:
             self._sequence += 1
             item = SQLiteWriteQueueItem(self._priority_rank(effective_priority), self._sequence, request)
             self._queue.put(item, timeout=max(0.0, float(timeout_seconds)))
         except queue.Full:
+            self._release_coalesced_key(coalesce_key)
             with self._status_lock:
                 self._status["dropped_writes"] = int(self._status.get("dropped_writes", 0) or 0) + 1
                 queue_depth = self._queue.qsize()
@@ -2979,7 +3058,10 @@ class SQLiteWriteQueue:
                         f"oldest_queued_age_seconds={status.get('oldest_queued_age_seconds')} "
                         f"current_write_method={status.get('current_write_method') or ''} "
                         f"current_write_duration_seconds={current_duration} "
+                        f"current_write_table={str(status.get('current_write_table') or '').replace(' ', '_')} "
+                        f"current_write_detail={str(status.get('current_write_detail') or '').replace(' ', '_')} "
                         f"dropped_writes={dropped_writes} "
+                        f"coalesced_writes={status.get('coalesced_writes') or 0} "
                         f"ack_timeouts_total={status.get('ack_timeouts_total') or 0} "
                         f"ack_timeouts_by_method={json.dumps(status.get('ack_timeouts_by_method') or {}, sort_keys=True, separators=(',', ':'))} "
                         f"last_write_method={status.get('last_write_method') or ''} "
