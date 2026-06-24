@@ -349,6 +349,13 @@ def load_execution_pnl_summary(conn: sqlite3.Connection, window: DateWindow, str
         clause, params = "", []
     else:
         clause, params = " AND (COALESCE(e.strategy_name, 'unknown') = ? OR COALESCE(e.strategy_name, 'unknown') = 'unknown')", [strategy]
+    execution_day_expr = """
+            COALESCE(
+                NULLIF(substr(e.executed_at, 1, 10), ''),
+                NULLIF(substr(e.recorded_at, 1, 10), ''),
+                COALESCE(e.session_date, '')
+            )
+    """
     rows = read_sql(
         conn,
         f"""
@@ -362,7 +369,7 @@ def load_execution_pnl_summary(conn: sqlite3.Connection, window: DateWindow, str
             END) AS sell_commissions,
             SUM(COALESCE(commission, 0)) AS all_commissions
         FROM executions e
-        WHERE COALESCE(e.session_date, '') BETWEEN ? AND ?
+        WHERE {execution_day_expr} BETWEEN ? AND ?
         {clause}
         """,
         [window.start_date, window.end_date, *params],
@@ -385,7 +392,7 @@ def load_execution_pnl_summary(conn: sqlite3.Connection, window: DateWindow, str
                     ELSE 0
                 END) AS sell_quantity
             FROM executions e
-            WHERE COALESCE(e.session_date, '') BETWEEN ? AND ?
+            WHERE {execution_day_expr} BETWEEN ? AND ?
             {clause}
             GROUP BY UPPER(COALESCE(symbol, ''))
             HAVING symbol != ''

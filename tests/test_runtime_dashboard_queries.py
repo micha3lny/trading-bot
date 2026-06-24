@@ -394,6 +394,53 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["diagnostics"]["delayed_fills"], 1)
             self.assertEqual(snapshot["diagnostics"]["risk_guard_blocks"], 1)
 
+    def test_summary_pnl_uses_execution_date_not_sync_session_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_execution({
+                    "execution_id": "BUY_PREV_DAY",
+                    "session_date": "2026-06-24",
+                    "strategy_name": "v67",
+                    "symbol": "SYNCED",
+                    "side": "BOT",
+                    "quantity": 10,
+                    "price": 10,
+                    "executed_at": "2026-06-23T14:00:00+00:00",
+                    "recorded_at": "2026-06-24T06:00:00+00:00",
+                    "commission": 0.5,
+                    "commission_source": "ibkr",
+                })
+                store.upsert_execution({
+                    "execution_id": "SELL_PREV_DAY",
+                    "session_date": "2026-06-24",
+                    "strategy_name": "v67",
+                    "symbol": "SYNCED",
+                    "side": "SLD",
+                    "quantity": 10,
+                    "price": 11,
+                    "executed_at": "2026-06-23T15:00:00+00:00",
+                    "recorded_at": "2026-06-24T06:00:01+00:00",
+                    "commission": 1.0,
+                    "commission_source": "ibkr",
+                    "realized_pnl": 10.0,
+                })
+            finally:
+                store.close()
+
+            current_day = load_dashboard_snapshot(db, DateWindow("2026-06-24", "2026-06-24"), "v67")
+            self.assertEqual(current_day["summary"]["closed_trades"], 0)
+            self.assertAlmostEqual(current_day["summary"]["gross_pnl"], 0.0)
+            self.assertAlmostEqual(current_day["summary"]["commissions"], 0.0)
+            self.assertAlmostEqual(current_day["summary"]["net_actual_pnl"], 0.0)
+
+            previous_day = load_dashboard_snapshot(db, DateWindow("2026-06-23", "2026-06-23"), "v67")
+            self.assertEqual(previous_day["summary"]["closed_trades"], 1)
+            self.assertAlmostEqual(previous_day["summary"]["gross_pnl"], 10.0)
+            self.assertAlmostEqual(previous_day["summary"]["commissions"], 1.0)
+            self.assertAlmostEqual(previous_day["summary"]["net_actual_pnl"], 9.0)
+
     def test_execution_pair_without_trade_row_reconstructs_closed_trade_with_times(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
