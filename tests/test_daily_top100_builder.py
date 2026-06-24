@@ -96,6 +96,10 @@ class DailyTop100BuilderTests(unittest.TestCase):
             self.assertGreaterEqual(float(stats["current_read_seconds"]), 0.0)
             self.assertGreaterEqual(float(stats["prior_read_seconds"]), 0.0)
             self.assertGreaterEqual(float(stats["analyze_seconds"]), 0.0)
+            self.assertEqual(stats["current_day_read_seconds"], stats["current_read_seconds"])
+            self.assertEqual(stats["prior_sessions_read_seconds"], stats["prior_read_seconds"])
+            self.assertEqual(stats["analysis_seconds"], stats["analyze_seconds"])
+            self.assertEqual(stats["total_seconds"], stats["elapsed_seconds"])
             loaded = pd.read_csv(output)
             self.assertIn("components_json", loaded.columns)
             self.assertEqual(loaded["symbol"].tolist(), ["AAA", "BBB"])
@@ -186,6 +190,34 @@ class DailyTop100BuilderTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertGreaterEqual(stats["prior_slow_symbols"], 1)
             self.assertGreaterEqual(stats["prior_degraded_symbols"], 1)
+            self.assertGreaterEqual(stats["prior_partial_symbols"], 1)
+
+    def test_missing_prior_session_data_degrades_without_rejecting_symbol(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history = root / "history"
+            ranking_date = date(2026, 5, 15)
+            write_universe(root / "universe.csv", ["AAA"])
+            write_session(history, "AAA", ranking_date, session_frame("AAA", 10.0, 13.0, 5_000))
+
+            rows, stats = build_daily_top(
+                ranking_date=ranking_date,
+                universe_path=root / "universe.csv",
+                history_dir=history,
+                top_n=1,
+                session_type="RTH",
+                min_price=5.0,
+                min_bars=180,
+                min_volume=100_000,
+                min_dollar_volume=500_000,
+                prior_sessions=5,
+                max_partial_history_log=0,
+            )
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(stats["valid"], 1)
+            self.assertEqual(stats["prior_partial_symbols"], 1)
+            self.assertEqual(stats["prior_paths_found"], 0)
 
     def test_diagnostics_report_contains_missing_and_rejected_symbols(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

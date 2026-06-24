@@ -29,6 +29,7 @@ DEFAULT_SQLITE_PATH = "data/runtime/rankings.sqlite"
 MIN_LATEST_ROWS = 100
 DEFAULT_MAX_MISSING_LOG = 50
 DEFAULT_MAX_REJECT_LOG = 50
+DEFAULT_MAX_PARTIAL_HISTORY_LOG = 50
 DEFAULT_PRIOR_SESSIONS = int(os.getenv("TRADING_BOT_TOP100_PRIOR_SESSIONS", "5") or "5")
 DEFAULT_PRIOR_READ_SLOW_SECONDS = float(os.getenv("TRADING_BOT_TOP100_PRIOR_READ_SLOW_SECONDS", "2.0") or "2.0")
 
@@ -413,6 +414,7 @@ def build_daily_top(
     symbol_denylist_path: str | Path | None = DEFAULT_SYMBOL_DENYLIST,
     runtime_ineligible_path: str | Path | None = DEFAULT_RUNTIME_INELIGIBLE,
     prior_read_slow_seconds: float | None = DEFAULT_PRIOR_READ_SLOW_SECONDS,
+    max_partial_history_log: int = DEFAULT_MAX_PARTIAL_HISTORY_LOG,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     symbols = load_universe(universe_path)
     ineligible = combined_ineligible_symbols(symbol_denylist_path, runtime_ineligible_path)
@@ -444,6 +446,7 @@ def build_daily_top(
         "excluded_ineligible": len(excluded_rows),
         "prior_slow_symbols": 0,
         "prior_degraded_symbols": 0,
+        "prior_partial_symbols": 0,
         "prior_paths_checked": 0,
         "prior_paths_found": 0,
     }
@@ -502,6 +505,16 @@ def build_daily_top(
             prior_read_seconds += time.perf_counter() - prior_started
             stats["prior_paths_checked"] += prior_result.paths_checked
             stats["prior_paths_found"] += prior_result.paths_found
+            expected_prior_sessions = max(0, int(prior_sessions))
+            if expected_prior_sessions > 0 and prior_result.paths_found < expected_prior_sessions:
+                stats["prior_partial_symbols"] += 1
+                if stats["prior_partial_symbols"] <= max(0, max_partial_history_log):
+                    print(
+                        f"TOP100_PARTIAL_HISTORY symbol={symbol} requested_prior_sessions={expected_prior_sessions} "
+                        f"available_prior_sessions={prior_result.paths_found} paths_checked={prior_result.paths_checked} "
+                        f"degraded={1 if prior_result.degraded else 0}",
+                        flush=True,
+                    )
             if prior_result.slow:
                 stats["prior_slow_symbols"] += 1
                 print(
@@ -543,10 +556,14 @@ def build_daily_top(
     ranked.sort(key=lambda item: (item.score, item.dollar_volume, item.intraday_high_pct), reverse=True)
     rows = [ranking_to_row(rank, item) for rank, item in enumerate(ranked[: max(0, top_n)], 1)]
     stats["elapsed_seconds"] = total_elapsed  # type: ignore[assignment]
+    stats["total_seconds"] = total_elapsed  # type: ignore[assignment]
     stats["symbols_per_second"] = total / total_elapsed if total else 0.0  # type: ignore[assignment]
     stats["current_read_seconds"] = current_read_seconds  # type: ignore[assignment]
+    stats["current_day_read_seconds"] = current_read_seconds  # type: ignore[assignment]
     stats["prior_read_seconds"] = prior_read_seconds  # type: ignore[assignment]
+    stats["prior_sessions_read_seconds"] = prior_read_seconds  # type: ignore[assignment]
     stats["analyze_seconds"] = analyze_seconds  # type: ignore[assignment]
+    stats["analysis_seconds"] = analyze_seconds  # type: ignore[assignment]
     stats["_missing_symbols"] = missing_symbols  # type: ignore[assignment]
     stats["_rejected_rows"] = rejected_rows  # type: ignore[assignment]
     stats["_error_rows"] = error_rows  # type: ignore[assignment]
@@ -559,6 +576,11 @@ def build_daily_top(
     if stats["rejected"] > max(0, max_reject_log):
         print(
             f"DAILY_TOP100_REJECTED_SUPPRESSED count={stats['rejected'] - max(0, max_reject_log)}",
+            flush=True,
+        )
+    if stats["prior_partial_symbols"] > max(0, max_partial_history_log):
+        print(
+            f"TOP100_PARTIAL_HISTORY_SUPPRESSED count={stats['prior_partial_symbols'] - max(0, max_partial_history_log)}",
             flush=True,
         )
     return rows, stats
@@ -680,6 +702,7 @@ def main() -> int:
     parser.add_argument("--diagnostics-output", default=None)
     parser.add_argument("--max-missing-log", type=int, default=DEFAULT_MAX_MISSING_LOG)
     parser.add_argument("--max-reject-log", type=int, default=DEFAULT_MAX_REJECT_LOG)
+    parser.add_argument("--max-partial-history-log", type=int, default=DEFAULT_MAX_PARTIAL_HISTORY_LOG)
     parser.add_argument("--max-missing-history-for-latest", type=int, default=0)
     parser.add_argument("--symbol-denylist", default=DEFAULT_SYMBOL_DENYLIST)
     parser.add_argument("--runtime-ineligible-path", default=DEFAULT_RUNTIME_INELIGIBLE)
@@ -714,6 +737,7 @@ def main() -> int:
         symbol_denylist_path=args.symbol_denylist,
         runtime_ineligible_path=args.runtime_ineligible_path,
         prior_read_slow_seconds=float(args.prior_read_slow_seconds),
+        max_partial_history_log=int(args.max_partial_history_log),
     )
     write_output_csv(args.output, rows)
     diagnostics_rows = 0
@@ -778,9 +802,14 @@ def main() -> int:
         f"current_read_seconds={float(stats.get('current_read_seconds', 0.0)):.1f} "
         f"prior_read_seconds={float(stats.get('prior_read_seconds', 0.0)):.1f} "
         f"analyze_seconds={float(stats.get('analyze_seconds', 0.0)):.1f} "
+        f"current_day_read_seconds={float(stats.get('current_day_read_seconds', 0.0)):.1f} "
+        f"prior_sessions_read_seconds={float(stats.get('prior_sessions_read_seconds', 0.0)):.1f} "
+        f"analysis_seconds={float(stats.get('analysis_seconds', 0.0)):.1f} "
+        f"total_seconds={float(stats.get('total_seconds', 0.0)):.1f} "
         f"prior_sessions={int(args.prior_sessions)} "
         f"prior_slow_symbols={stats.get('prior_slow_symbols', 0)} "
         f"prior_degraded_symbols={stats.get('prior_degraded_symbols', 0)} "
+        f"prior_partial_symbols={stats.get('prior_partial_symbols', 0)} "
         f"prior_paths_checked={stats.get('prior_paths_checked', 0)} "
         f"prior_paths_found={stats.get('prior_paths_found', 0)}",
         flush=True,

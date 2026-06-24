@@ -1380,6 +1380,12 @@ class SQLiteRuntimeStore:
         if full_rebuild and os.environ.get("TRADING_BOT_ALLOW_FULL_PENDING_TRADE_REBUILD") != "1":
             requested_session_date = datetime.now(timezone.utc).date().isoformat()
             full_rebuild = False
+            print(
+                f"{utc_now_iso()} SQLITE_HEAVY_REBUILD_DEFERRED method=finalize_pending_trades "
+                f"requested_scope=all effective_session_date={requested_session_date} "
+                f"reason=full_pending_trade_rebuild_requires_TRADING_BOT_ALLOW_FULL_PENDING_TRADE_REBUILD",
+                flush=True,
+            )
         print(
             f"{utc_now_iso()} FINALIZE_PENDING_TRADES_SCOPE "
             f"session_date={requested_session_date or 'all'} full_rebuild={int(full_rebuild)}",
@@ -2961,8 +2967,16 @@ class SQLiteWriteQueue:
             return key, f"session_date={session_date or 'all'} sql=pending_counts_aggregate", "executions,trades"
         if method == "finalize_pending_trades":
             session_date = str(args[0] if args else kwargs.get("session_date") or "").strip()
+            if not session_date and os.environ.get("TRADING_BOT_ALLOW_FULL_PENDING_TRADE_REBUILD") != "1":
+                effective = datetime.now(timezone.utc).date().isoformat()
+                key = f"{method}:{effective}"
+                return (
+                    key,
+                    f"session_date={effective} sql=pending_trade_rebuild full_rebuild=0 default_scoped=1",
+                    "trades,executions,positions",
+                )
             key = f"{method}:{session_date or 'all'}"
-            return key, f"session_date={session_date or 'all'} sql=pending_trade_rebuild", "trades,executions,positions"
+            return key, f"session_date={session_date or 'all'} sql=pending_trade_rebuild full_rebuild={0 if session_date else 1}", "trades,executions,positions"
         if method == "rebuild_positions_from_executions":
             symbols = args[0] if args else kwargs.get("symbols")
             symbol_count = len(symbols) if isinstance(symbols, (list, tuple, set)) else "all"
