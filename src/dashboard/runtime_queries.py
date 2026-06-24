@@ -2280,6 +2280,15 @@ def load_open_positions(
         else:
             execution_ids_value = str(execution_ids)
         hold_base = entry_time
+        top100_rank = to_float(row.get("top100_rank"), None) if row.get("top100_rank") is not None else to_float(raw.get("top100_rank"), None)
+        top100_score = to_float(row.get("top100_score"), None) if row.get("top100_score") is not None else to_float(raw.get("top100_score"), None)
+        live_entry_score = to_float(row.get("live_entry_score"), None) if row.get("live_entry_score") is not None else to_float(raw.get("live_entry_score"), None)
+        live_entry_rank = to_float(row.get("live_entry_rank"), None) if row.get("live_entry_rank") is not None else to_float(raw.get("live_entry_rank"), None)
+        entry_order_id = row.get("entry_order_id") if row.get("entry_order_id") not in (None, "") else raw.get("entry_order_id")
+        entry_perm_id = row.get("entry_perm_id") if row.get("entry_perm_id") not in (None, "") else raw.get("entry_perm_id")
+        signal_source = str(row.get("signal_source") or raw.get("signal_source") or "")
+        metadata_present = any(value not in (None, "") for value in (top100_rank, top100_score, live_entry_score, live_entry_rank, entry_order_id, entry_perm_id, signal_source))
+        entry_metadata_status = "OK" if metadata_present else "MISSING"
         out.append({
             "symbol": row.get("symbol"),
             "qty": qty or 0.0,
@@ -2311,12 +2320,13 @@ def load_open_positions(
             "last_update": row.get("updated_at"),
             "exit_sent": row.get("exit_sent"),
             "execution_ids": execution_ids_value,
-            "top100_rank": to_float(row.get("top100_rank"), None) if row.get("top100_rank") is not None else to_float(raw.get("top100_rank"), None),
-            "top100_score": to_float(row.get("top100_score"), None) if row.get("top100_score") is not None else to_float(raw.get("top100_score"), None),
-            "live_entry_score": to_float(row.get("live_entry_score"), None) if row.get("live_entry_score") is not None else to_float(raw.get("live_entry_score"), None),
-            "live_entry_rank": to_float(row.get("live_entry_rank"), None) if row.get("live_entry_rank") is not None else to_float(raw.get("live_entry_rank"), None),
-            "entry_order_id": row.get("entry_order_id") if row.get("entry_order_id") not in (None, "") else raw.get("entry_order_id"),
-            "entry_perm_id": row.get("entry_perm_id") if row.get("entry_perm_id") not in (None, "") else raw.get("entry_perm_id"),
+            "top100_rank": top100_rank,
+            "top100_score": top100_score,
+            "live_entry_score": live_entry_score,
+            "live_entry_rank": live_entry_rank,
+            "entry_order_id": entry_order_id,
+            "entry_perm_id": entry_perm_id,
+            "entry_metadata_status": entry_metadata_status,
         })
     return pd.DataFrame(out)
 

@@ -6459,6 +6459,27 @@ def main() -> int:
                             **entry_metadata,
                         },
                     )
+                    safe_sqlite_call(
+                        getattr(recorder, "sqlite_store", None),
+                        "upsert_order",
+                        {
+                            "order_key": f"entry:{order_id_for_entry or entry_trade_id}",
+                            "trade_id": entry_trade_id,
+                            "strategy_name": STRATEGY_NAME,
+                            "session_date": getattr(recorder, "session_date", None),
+                            "symbol": symbol,
+                            "side": "BUY",
+                            "order_type": "MKT",
+                            "quantity": qty,
+                            "limit_price": None,
+                            "status": "SUBMITTED",
+                            "ibkr_status": getattr(trade, "orderStatus", None).status if getattr(trade, "orderStatus", None) else None,
+                            "order_id": str(order_id_for_entry or ""),
+                            "perm_id": entry_perm_id,
+                            "submitted_at": now_utc(),
+                            "raw_json": {**signal_payload, **entry_metadata, "entry_decision_time": diagnostics.get("entry_decision_time")},
+                        },
+                    )
                     submission_count = record_entry_submission(runtime_state, loop_now)
                     entries_submitted_this_cycle += 1
                     backlog_window = float(args.entry_backlog_window_seconds or 60.0)

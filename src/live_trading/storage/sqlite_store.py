@@ -81,6 +81,20 @@ TERMINAL_COMMISSION_SOURCES = {
     "inferred_missing_buy_commission",
 }
 FALLBACK_BUY_COMMISSION_SOURCE = "buy_commission_unavailable_after_eod"
+ENTRY_METADATA_FIELDS = (
+    "top100_rank",
+    "top100_score",
+    "top100_source_date",
+    "top100_features_json",
+    "live_entry_score",
+    "live_entry_rank",
+    "live_entry_features_json",
+    "signal_source",
+    "signal_time",
+    "ready_since",
+    "entry_order_id",
+    "entry_perm_id",
+)
 
 
 def utc_now_iso() -> str:
@@ -810,6 +824,125 @@ class SQLiteRuntimeStore:
                     return False
         return True
 
+    def _entry_metadata_from_trade_row(self, row: dict[str, Any] | sqlite3.Row | None) -> dict[str, Any]:
+        if not row:
+            return {}
+        record = dict(row)
+        raw = parse_jsonish(record.get("raw_json"))
+        meta: dict[str, Any] = {
+            "trade_id": record.get("trade_id"),
+            "strategy_name": record.get("strategy_name"),
+            "session_date": record.get("session_date"),
+        }
+        for field in ENTRY_METADATA_FIELDS:
+            value = record.get(field)
+            if value in (None, ""):
+                value = raw.get(field)
+            if value not in (None, ""):
+                meta[field] = value
+        if raw.get("entry_decision_time"):
+            meta["entry_decision_time"] = raw.get("entry_decision_time")
+        return meta
+
+    def _entry_metadata_for_execution(self, row: dict[str, Any], raw: dict[str, Any] | None = None) -> dict[str, Any]:
+        raw = raw or parse_jsonish(row.get("raw_json"))
+        symbol = str(row.get("symbol") or raw.get("symbol") or "").upper()
+        session = row.get("session_date") or raw.get("session_date") or session_date_utc()
+        trade_id = str(row.get("trade_id") or raw.get("trade_id") or "").strip()
+        order_id = normalized_identifier(row.get("order_id") or raw.get("order_id") or raw.get("entry_order_id"))
+        perm_id = normalized_identifier(row.get("perm_id") or raw.get("perm_id") or raw.get("entry_perm_id"))
+
+        predicates: list[str] = []
+        params: list[Any] = []
+        if trade_id:
+            predicates.append("trade_id = ?")
+            params.append(trade_id)
+        if order_id:
+            predicates.append("COALESCE(entry_order_id, '') = ?")
+            params.append(order_id)
+        if perm_id:
+            predicates.append("COALESCE(entry_perm_id, '') = ?")
+            params.append(perm_id)
+        if predicates:
+            rows = self.query(
+                f"""
+                SELECT
+                    trade_id,
+                    strategy_name,
+                    session_date,
+                    top100_rank,
+                    top100_score,
+                    top100_source_date,
+                    top100_features_json,
+                    live_entry_score,
+                    live_entry_rank,
+                    live_entry_features_json,
+                    signal_source,
+                    signal_time,
+                    ready_since,
+                    entry_order_id,
+                    entry_perm_id,
+                    raw_json
+                FROM trades
+                WHERE {' OR '.join(predicates)}
+                ORDER BY COALESCE(entry_order_time, entry_signal_time, entry_fill_time, updated_at, '') DESC
+                LIMIT 1
+                """,
+                params,
+            )
+            if rows:
+                return self._entry_metadata_from_trade_row(rows[0])
+
+        if symbol and session:
+            rows = self.query(
+                """
+                SELECT
+                    trade_id,
+                    strategy_name,
+                    session_date,
+                    top100_rank,
+                    top100_score,
+                    top100_source_date,
+                    top100_features_json,
+                    live_entry_score,
+                    live_entry_rank,
+                    live_entry_features_json,
+                    signal_source,
+                    signal_time,
+                    ready_since,
+                    entry_order_id,
+                    entry_perm_id,
+                    raw_json
+                FROM trades
+                WHERE UPPER(symbol) = ?
+                  AND session_date = ?
+                  AND (
+                    trade_id LIKE 'entry:%'
+                    OR UPPER(COALESCE(status, '')) IN ('ENTRY_PENDING', 'ENTRY_PARTIAL', 'OPEN')
+                  )
+                ORDER BY COALESCE(entry_order_time, entry_signal_time, entry_fill_time, updated_at, '') DESC
+                LIMIT 1
+                """,
+                [symbol, session],
+            )
+            if rows:
+                return self._entry_metadata_from_trade_row(rows[0])
+        return {}
+
+    def _merge_entry_metadata_into_raw(self, raw: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
+        if not meta:
+            return raw
+        for field in ENTRY_METADATA_FIELDS:
+            value = meta.get(field)
+            if value not in (None, "") and raw.get(field) in (None, ""):
+                raw[field] = value
+        if meta.get("entry_decision_time") and raw.get("entry_decision_time") in (None, ""):
+            raw["entry_decision_time"] = meta.get("entry_decision_time")
+        if meta.get("trade_id") and raw.get("entry_trade_id") in (None, ""):
+            raw["entry_trade_id"] = meta.get("trade_id")
+        raw.setdefault("entry_metadata_source", "trade_entry_order")
+        return raw
+
     def record_runtime_event(self, **kwargs: Any) -> int:
         now = kwargs.get("event_time") or utc_now_iso()
         event_type = str(kwargs.get("event_type") or kwargs.get("event") or "UNKNOWN")
@@ -1005,6 +1138,23 @@ class SQLiteRuntimeStore:
                     row = {**row, "trade_id": matched_order.get("trade_id")}
                 if not row.get("order_key") and matched_order.get("order_key"):
                     row = {**row, "order_key": matched_order.get("order_key")}
+        entry_metadata: dict[str, Any] = {}
+        if normalized_execution_side(side) == "BUY":
+            entry_metadata = self._entry_metadata_for_execution(row, raw)
+            if entry_metadata:
+                updates: dict[str, Any] = {}
+                if not row.get("trade_id") and entry_metadata.get("trade_id"):
+                    updates["trade_id"] = entry_metadata.get("trade_id")
+                if not row.get("strategy_name") and entry_metadata.get("strategy_name"):
+                    updates["strategy_name"] = entry_metadata.get("strategy_name")
+                if not row.get("session_date") and entry_metadata.get("session_date"):
+                    updates["session_date"] = entry_metadata.get("session_date")
+                if not row.get("order_id") and entry_metadata.get("entry_order_id"):
+                    updates["order_id"] = entry_metadata.get("entry_order_id")
+                if not row.get("perm_id") and entry_metadata.get("entry_perm_id"):
+                    updates["perm_id"] = entry_metadata.get("entry_perm_id")
+                if updates:
+                    row = {**row, **updates}
         data = {
             "execution_id": execution_id,
             "trade_id": row.get("trade_id"),
@@ -1037,6 +1187,9 @@ class SQLiteRuntimeStore:
         if matched_order:
             raw.setdefault("exit_reason_order_key", matched_order.get("order_key"))
             raw.setdefault("exit_reason_order_id", matched_order.get("order_id"))
+        if entry_metadata:
+            raw = self._merge_entry_metadata_into_raw(raw, entry_metadata)
+            raw.setdefault("entry_metadata_source", "trade_entry_order")
         if not raw.get("execution_insert_time") and data.get("recorded_at"):
             raw["execution_insert_time"] = data.get("recorded_at")
         if data.get("commission_source") == "ibkr" and not raw.get("commission_report_time"):
@@ -2063,7 +2216,9 @@ class SQLiteRuntimeStore:
             first_lot = open_lots[0]
             entry_time = execution_sort_time(first_lot)
             entry_date = str(first_lot.get("session_date") or "") or iso_date_part(entry_time) or latest_session
-            strategy = str(first_lot.get("strategy_name") or latest_strategy or "unknown")
+            first_lot_raw = parse_jsonish(first_lot.get("raw_json"))
+            entry_metadata = self._entry_metadata_for_execution(first_lot, first_lot_raw)
+            strategy = str(entry_metadata.get("strategy_name") or first_lot.get("strategy_name") or latest_strategy or "unknown")
             open_excursion = self._trade_excursion_stats(
                 entry_price=avg_price,
                 exit_price=latest_price,
@@ -2085,8 +2240,20 @@ class SQLiteRuntimeStore:
                     "ibkr_quantity": open_qty,
                     "active": 1,
                     "exit_sent": 0,
+                    "top100_rank": safe_int(entry_metadata.get("top100_rank")),
+                    "top100_score": safe_float(entry_metadata.get("top100_score")),
+                    "top100_source_date": entry_metadata.get("top100_source_date"),
+                    "top100_features_json": entry_metadata.get("top100_features_json"),
+                    "live_entry_score": safe_float(entry_metadata.get("live_entry_score")),
+                    "live_entry_rank": safe_int(entry_metadata.get("live_entry_rank")),
+                    "live_entry_features_json": entry_metadata.get("live_entry_features_json"),
+                    "signal_source": entry_metadata.get("signal_source"),
+                    "signal_time": entry_metadata.get("signal_time"),
+                    "ready_since": entry_metadata.get("ready_since"),
+                    "entry_order_id": entry_metadata.get("entry_order_id"),
+                    "entry_perm_id": entry_metadata.get("entry_perm_id"),
                     "updated_at": last_event_time,
-                    "raw_json": {
+                    "raw_json": self._merge_entry_metadata_into_raw({
                         "active": True,
                         "entry_fill_verified": True,
                         "entry_time": entry_time,
@@ -2105,7 +2272,7 @@ class SQLiteRuntimeStore:
                         "last_update_time": last_event_time,
                         "broker_target_quantity": broker_target_qty,
                         "open_lot_execution_ids": [lot.get("execution_id") for lot in open_lots],
-                    },
+                    }, entry_metadata),
                 }
             )
         else:

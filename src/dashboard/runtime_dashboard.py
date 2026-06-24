@@ -619,7 +619,7 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
         "symbol", "qty", "entry_time", "buy", "now", "now_dollars", "now_pct", "peak_pct",
         "giveback_pct", "top100_rank", "top100_score", "live_entry_score", "live_entry_rank",
         "entry_order_id", "entry_perm_id",
-        "status", "strategy", "data_quality", "ibkr_confirmed",
+        "status", "strategy", "data_quality", "entry_metadata_status", "ibkr_confirmed",
         "price_status", "now_price_source", "market_price_at", "last_update", "source", "exit_sent", "execution_ids",
     ]
     available = [col for col in cols if col in df.columns]
@@ -654,6 +654,7 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
             "status": "Status",
             "strategy": "Strategy",
             "data_quality": "Data Quality",
+            "entry_metadata_status": "Entry Metadata",
             "ibkr_confirmed": "IBKR Confirmed",
             "price_status": "Price Status",
             "now_price_source": "Now Source",
@@ -668,7 +669,7 @@ def render_open_positions(df: pd.DataFrame, *, title: str = "Open Positions", pr
         "Symbol", "Qty", "Entry Time", "Buy", "Now", "Now $", "Now %",
         "Peak %", "Drop from Peak %", "Top100 Rank", "Top100 Score",
         "Live Entry Score", "Live Entry Rank", "Entry Order ID", "Entry Perm ID",
-        "Status", "Strategy", "Data Quality",
+        "Status", "Strategy", "Data Quality", "Entry Metadata",
         "IBKR Confirmed", "Price Status", "Now Source", "Price Time",
         "Last Update", "Source", "Exit Sent", "Execution IDs",
     ]

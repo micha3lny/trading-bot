@@ -519,6 +519,70 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_buy_execution_inherits_entry_metadata_for_reducer_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                trade_id = "entry:2026-06-24:ABSI:65020"
+                store.upsert_trade({
+                    "trade_id": trade_id,
+                    "strategy_name": "v67_top100_live_safe_expansion_v46_wide_trail",
+                    "session_date": "2026-06-24",
+                    "symbol": "ABSI",
+                    "status": "ENTRY_PENDING",
+                    "entry_signal_time": "2026-06-24T13:34:59+00:00",
+                    "entry_order_time": "2026-06-24T13:35:00+00:00",
+                    "entry_price": 8.83,
+                    "quantity": 113,
+                    "remaining_quantity": 113,
+                    "top100_rank": 12,
+                    "top100_score": 88.5,
+                    "top100_source_date": "2026-06-23",
+                    "live_entry_score": 75.23,
+                    "live_entry_rank": 1,
+                    "signal_source": "live",
+                    "signal_time": "2026-06-24T13:34:59+00:00",
+                    "ready_since": "2026-06-24T13:34:55+00:00",
+                    "entry_order_id": "65020",
+                    "entry_perm_id": "99020",
+                    "raw_json": {"entry_decision_time": "2026-06-24T13:35:00+00:00"},
+                })
+
+                store.upsert_execution({
+                    "execution_id": "ABSI-BUY-1",
+                    "symbol": "ABSI",
+                    "side": "BOT",
+                    "quantity": 113,
+                    "price": 8.83,
+                    "order_id": "65020",
+                    "perm_id": "99020",
+                    "executed_at": "2026-06-24T13:35:01+00:00",
+                    "recorded_at": "2026-06-24T13:35:02+00:00",
+                })
+
+                execution = store.query("SELECT trade_id, strategy_name, session_date, raw_json FROM executions WHERE execution_id = ?", ["ABSI-BUY-1"])[0]
+                execution_raw = parse_jsonish(execution["raw_json"])
+                self.assertEqual(execution["trade_id"], trade_id)
+                self.assertEqual(execution["strategy_name"], "v67_top100_live_safe_expansion_v46_wide_trail")
+                self.assertEqual(execution["session_date"], "2026-06-24")
+                self.assertAlmostEqual(execution_raw["live_entry_score"], 75.23)
+                self.assertEqual(execution_raw["live_entry_rank"], 1)
+                self.assertEqual(execution_raw["signal_source"], "live")
+                self.assertEqual(execution_raw["entry_order_id"], "65020")
+
+                position = store.query("SELECT * FROM positions WHERE symbol = 'ABSI' AND active = 1")[0]
+                self.assertEqual(position["strategy_name"], "v67_top100_live_safe_expansion_v46_wide_trail")
+                self.assertEqual(position["entry_order_id"], "65020")
+                self.assertAlmostEqual(position["live_entry_score"], 75.23)
+                self.assertEqual(position["live_entry_rank"], 1)
+                self.assertEqual(position["top100_rank"], 12)
+                self.assertAlmostEqual(position["top100_score"], 88.5)
+                position_raw = parse_jsonish(position["raw_json"])
+                self.assertEqual(position_raw["entry_order_id"], "65020")
+                self.assertEqual(position_raw["entry_metadata_source"], "trade_entry_order")
+            finally:
+                store.close()
+
     def test_eod_sell_creates_closed_trade_from_existing_buy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
