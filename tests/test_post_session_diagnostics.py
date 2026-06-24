@@ -306,6 +306,76 @@ class PostSessionDiagnosticsTests(unittest.TestCase):
             )
             self.assertFalse(runtime_state["pending_eod_flatten"])
 
+    def test_broker_flat_sqlite_active_triggers_cleanup_before_eod_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            recorder.sqlite_store = store
+            try:
+                store.upsert_position({
+                    "position_key": "unit:2026-05-22:RKLB",
+                    "strategy_name": "unit",
+                    "session_date": "2026-05-22",
+                    "symbol": "RKLB",
+                    "status": "OPEN",
+                    "quantity": 3,
+                    "avg_price": 10,
+                    "active": 1,
+                    "source": "unit_test",
+                    "raw_json": {"entry_time": "2026-05-22T13:30:00+00:00"},
+                })
+                runtime_state = {"pending_eod_flatten": True, "pending_eod_flatten_last_retry_ts": 0.0}
+
+                process_pending_eod_flatten_retry(
+                    FakeIB(portfolio=[]),
+                    recorder,
+                    {},
+                    SimpleNamespace(eod_retry_seconds=0.0, eod_max_retries=1),
+                    runtime_state,
+                    reason="unit_test_pending",
+                    force=True,
+                )
+
+                pending = json.loads(recorder.path("eod_pending.json").read_text())
+                active_rows = store.query("SELECT symbol FROM positions WHERE COALESCE(active, 0) = 1")
+                self.assertEqual(active_rows, [])
+                self.assertFalse(runtime_state["pending_eod_flatten"])
+                self.assertFalse(pending["pending_eod_flatten"])
+                self.assertEqual(pending["status"], "completed")
+                self.assertEqual(pending["broker_open_count"], 0)
+                self.assertEqual(pending["pending_orders"], 0)
+                self.assertEqual(pending["sqlite_active_count"], 0)
+                self.assertEqual(pending["sqlite_cleanup_result"]["sqlite_active_before"], 1)
+            finally:
+                store.close()
+
+    def test_broker_flat_pending_order_keeps_eod_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = recorder_in_tmp(tmp)
+            runtime_state = {"pending_eod_flatten": True, "pending_eod_flatten_last_retry_ts": 0.0}
+            open_trade = SimpleNamespace(
+                contract=FakeContract("RKLB"),
+                order=SimpleNamespace(orderId=77, action="SELL", totalQuantity=3),
+                orderStatus=SimpleNamespace(status="Submitted"),
+            )
+
+            process_pending_eod_flatten_retry(
+                FakeIB(portfolio=[], open_trades=[open_trade]),
+                recorder,
+                {},
+                SimpleNamespace(eod_retry_seconds=0.0, eod_max_retries=1),
+                runtime_state,
+                reason="unit_test_pending_order",
+                force=True,
+            )
+
+            pending = json.loads(recorder.path("eod_pending.json").read_text())
+            self.assertTrue(runtime_state["pending_eod_flatten"])
+            self.assertTrue(pending["pending_eod_flatten"])
+            self.assertEqual(pending["status"], "broker_flat_pending_orders")
+            self.assertEqual(pending["broker_open_count"], 0)
+            self.assertEqual(pending["pending_orders"], 1)
+
     def test_portfolio_sync_triggers_immediate_pending_eod_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             recorder = recorder_in_tmp(tmp)

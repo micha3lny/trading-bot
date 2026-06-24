@@ -2186,6 +2186,7 @@ def write_eod_final_status(
     pending_orders: int,
     managed_positions: dict[str, ManagedPosition],
     reason: str,
+    sqlite_active_count: int | None = None,
 ) -> dict[str, Any]:
     managed_open_symbols = sorted(symbol for symbol, pos in managed_positions.items() if pos.active)
     managed_open_set = set(managed_open_symbols)
@@ -2200,12 +2201,13 @@ def write_eod_final_status(
     summary = {
         "recorded_at": now_utc(),
         "reason": reason,
-        "clean": not rows and pending_orders == 0 and not managed_open_symbols,
+        "clean": not rows and pending_orders == 0 and not managed_open_symbols and (sqlite_active_count in (None, 0)),
         "open_positions": len(rows),
         "open_symbols": sorted(row["symbol"] for row in rows),
         "fractional_orphans": fractional_orphans,
         "whole_share_orphans": whole_share_orphans,
         "pending_orders": pending_orders,
+        "sqlite_active_count": sqlite_active_count,
         "managed_open": len(managed_open_symbols),
         "managed_open_symbols": managed_open_symbols,
         "pending_eod_flatten": bool(rows),
@@ -2266,21 +2268,99 @@ def persist_pending_eod_flatten(
     pending: bool,
     reason: str,
     rows: list[dict[str, Any]] | None = None,
+    status: str | None = None,
+    broker_open_count: int | None = None,
+    pending_orders: int | None = None,
+    sqlite_active_count: int | None = None,
+    remaining_symbols: list[str] | None = None,
+    sqlite_cleanup_result: Any = None,
 ) -> None:
     runtime_state["pending_eod_flatten"] = bool(pending)
     runtime_state["pending_eod_flatten_reason"] = reason if pending else ""
     runtime_state["pending_eod_flatten_updated_at"] = now_utc()
-    runtime_state["pending_eod_flatten_symbols"] = sorted(row["symbol"] for row in (rows or [])) if pending else []
+    symbols = sorted(set(remaining_symbols or [row["symbol"] for row in (rows or [])]))
+    runtime_state["pending_eod_flatten_symbols"] = symbols if pending else []
+    runtime_state["pending_eod_flatten_status"] = status or ("pending" if pending else "completed")
+    runtime_state["pending_eod_flatten_broker_open_count"] = broker_open_count
+    runtime_state["pending_eod_flatten_pending_orders"] = pending_orders
+    runtime_state["pending_eod_flatten_sqlite_active_count"] = sqlite_active_count
     payload = {
         "recorded_at": runtime_state["pending_eod_flatten_updated_at"],
         "pending_eod_flatten": bool(pending),
+        "status": runtime_state["pending_eod_flatten_status"],
         "reason": reason,
         "symbols": runtime_state["pending_eod_flatten_symbols"],
+        "remaining_broker_open_symbols": sorted(row["symbol"] for row in (rows or [])),
+        "remaining_symbols": runtime_state["pending_eod_flatten_symbols"],
+        "broker_open_count": broker_open_count,
+        "pending_orders": pending_orders,
+        "sqlite_active_count": sqlite_active_count,
+        "sqlite_cleanup_result": sqlite_cleanup_result,
     }
     try:
         recorder.path("eod_pending.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     except Exception as exc:
         print(f"{now_utc()} EOD_PENDING_PERSIST_FAILED reason={reason} error={exc!r}", flush=True)
+
+
+def eod_pending_status(
+    *,
+    broker_open_count: int,
+    pending_orders: int,
+    sqlite_active_count: int | None,
+) -> str:
+    sqlite_count = 0 if sqlite_active_count is None else int(sqlite_active_count)
+    if broker_open_count == 0 and pending_orders == 0 and sqlite_count == 0:
+        return "completed"
+    if broker_open_count == 0 and sqlite_count > 0:
+        return "broker_flat_sqlite_reconcile_pending"
+    if broker_open_count == 0 and pending_orders > 0:
+        return "broker_flat_pending_orders"
+    return "broker_positions_open"
+
+
+def reconcile_sqlite_after_broker_flat(
+    recorder: LiveDataRecorder,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    before_count = sqlite_active_position_count(recorder)
+    before_symbols = sorted(sqlite_active_position_symbols(recorder))
+    result: dict[str, Any] = {
+        "reason": reason,
+        "sqlite_active_before": before_count,
+        "sqlite_active_symbols_before": before_symbols,
+        "reconcile_result": None,
+        "mark_flat_count": 0,
+        "sqlite_active_after": before_count,
+        "sqlite_active_symbols_after": before_symbols,
+    }
+    store = getattr(recorder, "sqlite_store", None)
+    if store is None:
+        return result
+    reconcile_result = safe_sqlite_call(store, "reconcile_active_positions_to_broker_snapshot", {})
+    result["reconcile_result"] = reconcile_result
+    after_reconcile_count = sqlite_active_position_count(recorder)
+    if after_reconcile_count not in (None, 0):
+        marked = safe_sqlite_call(
+            store,
+            "mark_all_positions_flat",
+            reason=reason,
+            status="FLAT_CONFIRMED",
+        )
+        result["mark_flat_count"] = int(marked or 0)
+    result["sqlite_active_after"] = sqlite_active_position_count(recorder)
+    result["sqlite_active_symbols_after"] = sorted(sqlite_active_position_symbols(recorder))
+    print(
+        f"{now_utc()} EOD_SQLITE_RECONCILE_AFTER_BROKER_FLAT reason={reason} "
+        f"sqlite_active_before={result['sqlite_active_before']} "
+        f"sqlite_active_after={result['sqlite_active_after']} "
+        f"mark_flat_count={result['mark_flat_count']} "
+        f"symbols_before={','.join(before_symbols)} "
+        f"symbols_after={','.join(result['sqlite_active_symbols_after'])}",
+        flush=True,
+    )
+    return result
 
 
 def load_pending_eod_flatten(
@@ -2312,7 +2392,16 @@ def load_pending_eod_flatten(
         runtime_state["eod_pending_ignored_count"] = len(symbols)
         runtime_state["eod_pending_pending_restored"] = 0
         runtime_state["eod_pending_ignored_reason"] = "broker_sqlite_flat_on_startup"
-        persist_pending_eod_flatten(recorder, runtime_state, pending=False, reason="broker_sqlite_flat_on_startup")
+        persist_pending_eod_flatten(
+            recorder,
+            runtime_state,
+            pending=False,
+            reason="broker_sqlite_flat_on_startup",
+            status="completed",
+            broker_open_count=broker_open_count,
+            sqlite_active_count=sqlite_active_count,
+            remaining_symbols=[],
+        )
         print(
             f"{now_utc()} EOD_FLATTEN_PENDING_IGNORED_BROKER_FLAT "
             f"eod_pending_file={path} "
@@ -2327,6 +2416,7 @@ def load_pending_eod_flatten(
     runtime_state["eod_pending_ignored_reason"] = ""
     runtime_state["pending_eod_flatten"] = pending
     runtime_state["pending_eod_flatten_reason"] = str(payload.get("reason") or "")
+    runtime_state["pending_eod_flatten_status"] = str(payload.get("status") or ("pending" if pending else "completed"))
     runtime_state["pending_eod_flatten_updated_at"] = str(payload.get("recorded_at") or "")
     runtime_state["pending_eod_flatten_symbols"] = symbols
     if pending:
@@ -2536,6 +2626,7 @@ def hard_eod_flatten_portfolio(
     rows = ibkr_portfolio_position_rows(ib)
     open_keys = open_flatten_order_keys(ib)
     pending_order_count = len(open_ibkr_order_trades(ib))
+    sqlite_active_count = sqlite_active_position_count(recorder)
     attempt_by_symbol = runtime_state.setdefault("eod_flatten_attempts_by_symbol", {})
     last_submit_by_symbol = runtime_state.setdefault("eod_flatten_last_submit_ts_by_symbol", {})
     if not isinstance(attempt_by_symbol, dict):
@@ -2546,7 +2637,9 @@ def hard_eod_flatten_portfolio(
         runtime_state["eod_flatten_last_submit_ts_by_symbol"] = last_submit_by_symbol
 
     print(
-        f"{now_utc()} EOD_FLATTEN_VERIFY open_positions={len(rows)} open_flatten_orders={len(open_keys)} reason={reason}",
+        f"{now_utc()} EOD_FLATTEN_VERIFY open_positions={len(rows)} open_flatten_orders={len(open_keys)} "
+        f"pending_orders={pending_order_count} sqlite_active_count={sqlite_active_count if sqlite_active_count is not None else 'unknown'} "
+        f"reason={reason}",
         flush=True,
     )
     runtime_state["eod_last_verification"] = {
@@ -2555,28 +2648,81 @@ def hard_eod_flatten_portfolio(
         "ibkr_open_symbols": sorted(row["symbol"] for row in rows),
         "managed_open_symbols": sorted(symbol for symbol, pos in managed_positions.items() if pos.active),
         "open_flatten_orders": sorted(f"{symbol}:{action}" for symbol, action in open_keys),
+        "pending_orders": pending_order_count,
+        "sqlite_active_count": sqlite_active_count,
     }
 
     if not rows:
+        sqlite_cleanup_result = None
+        if sqlite_active_count not in (None, 0):
+            sqlite_cleanup_result = reconcile_sqlite_after_broker_flat(
+                recorder,
+                reason="broker_flat_sqlite_reconcile_pending",
+            )
+            sqlite_active_count = sqlite_active_position_count(recorder)
+        status = eod_pending_status(
+            broker_open_count=0,
+            pending_orders=pending_order_count,
+            sqlite_active_count=sqlite_active_count,
+        )
+        pending = status != "completed"
         for pos in managed_positions.values():
             if pos.active:
                 pos.active = False
-        runtime_state["manual_eod_flatten_requested"] = False
-        runtime_state["manual_eod_flatten_force"] = False
-        runtime_state["eod_flatten_attempts_by_symbol"] = {}
-        runtime_state["eod_flatten_last_submit_ts_by_symbol"] = {}
-        runtime_state["pending_eod_flatten"] = False
-        persist_pending_eod_flatten(recorder, runtime_state, pending=False, reason="ibkr_flat")
-        print(f"{now_utc()} EOD_FLATTEN_SUCCESS open_positions=0", flush=True)
-        record_lifecycle_with_formal(
-            recorder,
-            "EOD_FLATTEN_SUCCESS",
-            "__ALL__",
-            action="VERIFY",
-            quantity=0,
-            reason=reason,
-            raw_json={"open_positions": 0},
-        )
+        if not pending:
+            runtime_state["manual_eod_flatten_requested"] = False
+            runtime_state["manual_eod_flatten_force"] = False
+            runtime_state["eod_flatten_attempts_by_symbol"] = {}
+            runtime_state["eod_flatten_last_submit_ts_by_symbol"] = {}
+            runtime_state["pending_eod_flatten"] = False
+            persist_pending_eod_flatten(
+                recorder,
+                runtime_state,
+                pending=False,
+                reason="ibkr_flat",
+                status="completed",
+                broker_open_count=0,
+                pending_orders=pending_order_count,
+                sqlite_active_count=sqlite_active_count,
+                remaining_symbols=[],
+                sqlite_cleanup_result=sqlite_cleanup_result,
+            )
+            print(f"{now_utc()} EOD_FLATTEN_SUCCESS open_positions=0 pending_orders=0 sqlite_active_count=0", flush=True)
+            record_lifecycle_with_formal(
+                recorder,
+                "EOD_FLATTEN_SUCCESS",
+                "__ALL__",
+                action="VERIFY",
+                quantity=0,
+                reason=reason,
+                raw_json={
+                    "open_positions": 0,
+                    "pending_orders": pending_order_count,
+                    "sqlite_active_count": sqlite_active_count,
+                    "status": status,
+                },
+            )
+        else:
+            remaining_symbols = sorted(sqlite_active_position_symbols(recorder))
+            persist_pending_eod_flatten(
+                recorder,
+                runtime_state,
+                pending=True,
+                reason=status,
+                status=status,
+                broker_open_count=0,
+                pending_orders=pending_order_count,
+                sqlite_active_count=sqlite_active_count,
+                remaining_symbols=remaining_symbols,
+                sqlite_cleanup_result=sqlite_cleanup_result,
+            )
+            print(
+                f"{now_utc()} EOD_FLATTEN_RECOVERY_PENDING status={status} "
+                f"broker_open_count=0 pending_orders={pending_order_count} "
+                f"sqlite_active_count={sqlite_active_count if sqlite_active_count is not None else 'unknown'} "
+                f"remaining_symbols={','.join(remaining_symbols)}",
+                flush=True,
+            )
         write_eod_final_status(
             recorder,
             runtime_state,
@@ -2584,6 +2730,7 @@ def hard_eod_flatten_portfolio(
             pending_orders=pending_order_count,
             managed_positions=managed_positions,
             reason=reason,
+            sqlite_active_count=sqlite_active_count,
         )
         return 0
 
@@ -2662,8 +2809,23 @@ def hard_eod_flatten_portfolio(
         pending_orders=pending_order_count,
         managed_positions=managed_positions,
         reason=reason,
+        sqlite_active_count=sqlite_active_count,
     )
-    persist_pending_eod_flatten(recorder, runtime_state, pending=True, reason=reason, rows=rows)
+    persist_pending_eod_flatten(
+        recorder,
+        runtime_state,
+        pending=True,
+        reason=reason,
+        rows=rows,
+        status=eod_pending_status(
+            broker_open_count=len(rows),
+            pending_orders=pending_order_count,
+            sqlite_active_count=sqlite_active_count,
+        ),
+        broker_open_count=len(rows),
+        pending_orders=pending_order_count,
+        sqlite_active_count=sqlite_active_count,
+    )
     return submitted
 
 
@@ -2776,12 +2938,26 @@ def enforce_eod_flatten_if_due(
         return 0
 
     sqlite_active_count = sqlite_active_position_count(recorder)
-    if not active_managed and not ibkr_rows and sqlite_active_count == 0 and runtime_state.get("pending_eod_flatten"):
+    try:
+        pending_order_count = len(open_ibkr_order_trades(ib))
+    except Exception:
+        pending_order_count = 0
+    if not active_managed and not ibkr_rows and sqlite_active_count == 0 and pending_order_count == 0 and runtime_state.get("pending_eod_flatten"):
         ignored_count = len(runtime_state.get("pending_eod_flatten_symbols") or [])
         runtime_state["eod_pending_ignored_count"] = ignored_count
         runtime_state["eod_pending_pending_restored"] = 0
         runtime_state["eod_pending_ignored_reason"] = "broker_sqlite_flat_eod_failsafe"
-        persist_pending_eod_flatten(recorder, runtime_state, pending=False, reason="broker_sqlite_flat_eod_failsafe")
+        persist_pending_eod_flatten(
+            recorder,
+            runtime_state,
+            pending=False,
+            reason="broker_sqlite_flat_eod_failsafe",
+            status="completed",
+            broker_open_count=0,
+            pending_orders=0,
+            sqlite_active_count=0,
+            remaining_symbols=[],
+        )
         print(
             f"{now_utc()} EOD_FLATTEN_PENDING_IGNORED_BROKER_FLAT reason={reason} "
             f"eod_pending_file={recorder.path('eod_pending.json')} "
@@ -2792,7 +2968,7 @@ def enforce_eod_flatten_if_due(
         )
         return 0
 
-    if not active_managed and not ibkr_rows and not runtime_state.get("pending_eod_flatten"):
+    if not active_managed and not ibkr_rows and pending_order_count == 0 and not runtime_state.get("pending_eod_flatten"):
         return 0
 
     now_ts = time.time()
@@ -2805,6 +2981,7 @@ def enforce_eod_flatten_if_due(
         f"{now_utc()} EOD_FLATTEN_FAILSAFE_TRIGGER reason={reason} "
         f"managed_open={len(active_managed)} ibkr_open={len(ibkr_rows)} "
         f"sqlite_active_count={sqlite_active_count if sqlite_active_count is not None else 'unknown'} "
+        f"pending_orders={pending_order_count} "
         f"pending_eod_flatten={int(bool(runtime_state.get('pending_eod_flatten')))}",
         flush=True,
     )
