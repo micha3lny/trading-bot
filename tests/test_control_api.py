@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 import json
+import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -543,7 +544,7 @@ class ControlApiHelperTests(unittest.TestCase):
         self.assertEqual(result["reason"], "eod_reconciliation_active")
         self.assertNotIn("history_collector_commands", runtime_state)
 
-    def test_startup_history_repair_uses_recent_session_range_not_year_start(self) -> None:
+    def test_startup_history_repair_defaults_to_latest_completed_session_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             universe = root / "universe.csv"
@@ -556,6 +557,7 @@ class ControlApiHelperTests(unittest.TestCase):
                 startup_history_repair_retry_failed=True,
                 startup_history_repair_max_tasks=3000,
                 startup_history_repair_lookback_sessions=5,
+                startup_history_repair_lookback_days=1,
                 market_close_utc="20:00",
                 daily_top100_history_dir=str(history_dir),
                 daily_top100_universe=str(universe),
@@ -572,10 +574,51 @@ class ControlApiHelperTests(unittest.TestCase):
             self.assertTrue(result["queued"])
             queue = runtime_state["history_collector_commands"]
             self.assertEqual(queue[0]["collector_mode"], "startup_repair")
+            self.assertEqual(queue[0]["start_date"], "2026-06-23")
             self.assertEqual(queue[0]["end_date"], "2026-06-23")
-            self.assertNotEqual(queue[0]["start_date"], "2026-01-01")
+            self.assertEqual(queue[0]["id"], "startup_history_repair_20260623")
+            self.assertEqual(result["repair_range_sessions"], ["2026-06-23"])
+
+    def test_startup_history_repair_wide_range_requires_env_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            universe = root / "universe.csv"
+            universe.write_text("symbol\nAAA\nBBB\n", encoding="utf-8")
+            history_dir = root / "history" / "universe_1m"
+            runtime_state = {}
+            args = SimpleNamespace(
+                startup_history_repair=True,
+                startup_history_repair_min_completion_pct=100.0,
+                startup_history_repair_retry_failed=True,
+                startup_history_repair_max_tasks=3000,
+                startup_history_repair_lookback_sessions=5,
+                startup_history_repair_lookback_days=1,
+                market_close_utc="20:00",
+                daily_top100_history_dir=str(history_dir),
+                daily_top100_universe=str(universe),
+                overnight_collector_max_attempts=5,
+                history_collector_client_id=168,
+            )
+            previous = os.environ.get("TRADING_BOT_ALLOW_WIDE_HISTORY_REPAIR")
+            os.environ["TRADING_BOT_ALLOW_WIDE_HISTORY_REPAIR"] = "1"
+            try:
+                result = enqueue_startup_history_repair_if_needed(
+                    runtime_state,
+                    args,
+                    now=datetime(2026, 6, 24, 8, 0, tzinfo=timezone.utc),
+                )
+            finally:
+                if previous is None:
+                    os.environ.pop("TRADING_BOT_ALLOW_WIDE_HISTORY_REPAIR", None)
+                else:
+                    os.environ["TRADING_BOT_ALLOW_WIDE_HISTORY_REPAIR"] = previous
+
+            self.assertTrue(result["queued"])
+            queue = runtime_state["history_collector_commands"]
+            self.assertEqual(queue[0]["end_date"], "2026-06-23")
             self.assertEqual(len(result["repair_range_sessions"]), 5)
             self.assertEqual(queue[0]["start_date"], result["repair_range_sessions"][0])
+            self.assertRegex(queue[0]["id"], r"startup_history_repair_\d{8}_\d{8}")
 
     def test_startup_history_repair_skips_when_status_complete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1073,6 +1073,22 @@ def main() -> int:
                 f"no_data={counts['no_data']} missing={counts['missing']} failed={counts['failed']}",
                 flush=True,
             )
+            sessions_status = status.setdefault("sessions", {})
+            if isinstance(sessions_status, dict):
+                day_status = sessions_status.setdefault(session_date.isoformat(), {})
+                if isinstance(day_status, dict):
+                    day_status["summary"] = {
+                        "history_session_date": session_date.isoformat(),
+                        "latest_completed_session": session_date.isoformat(),
+                        "expected_symbols": counts["expected"],
+                        "complete_symbols": counts["complete"],
+                        "partial_symbols": counts["partial"],
+                        "no_data_symbols": counts["no_data"],
+                        "missing_symbols": counts["missing"],
+                        "failed_symbols": counts["failed"],
+                        "completion_pct": completion_pct(counts["complete"] + counts["no_data"], counts["expected"]),
+                    }
+        write_json_atomic(status_path, status)
         safe_sqlite_call(
             sqlite_store,
             "record_collector_run",

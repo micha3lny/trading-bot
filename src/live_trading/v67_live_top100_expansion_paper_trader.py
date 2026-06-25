@@ -3565,6 +3565,42 @@ def load_history_status(history_dir: str | Path) -> dict[str, Any]:
     return {}
 
 
+def normalize_history_status_rows(payload: dict[str, Any], *, session_date: date | None = None, session_type: str = "RTH") -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    normalized: dict[str, Any] = {}
+    for container_key in ("tasks", "status", "symbols", "rows"):
+        value = payload.get(container_key)
+        if isinstance(value, dict):
+            normalized.update({str(k): v for k, v in value.items()})
+    for key, value in payload.items():
+        if isinstance(value, dict) and "_" in str(key):
+            normalized[str(key)] = value
+    sessions = payload.get("sessions") or payload.get("by_date") or payload.get("dates")
+    if isinstance(sessions, dict):
+        for day, rows in sessions.items():
+            if session_date and str(day) != session_date.isoformat():
+                continue
+            if isinstance(rows, dict):
+                task_rows = rows.get("tasks") or rows.get("symbols") or rows.get("status") or rows
+                if isinstance(task_rows, dict):
+                    for symbol_or_key, row in task_rows.items():
+                        key = str(symbol_or_key)
+                        if "_" not in key:
+                            try:
+                                key = history_task_key(key, date.fromisoformat(str(day)), session_type)
+                            except Exception:
+                                continue
+                        normalized[key] = row
+                summary = rows.get("summary") if isinstance(rows.get("summary"), dict) else rows
+                if isinstance(summary, dict):
+                    normalized[f"__summary__:{day}:{session_type.upper()}"] = summary
+    summary = payload.get("summary")
+    if isinstance(summary, dict) and session_date:
+        normalized[f"__summary__:{session_date.isoformat()}:{session_type.upper()}"] = summary
+    return normalized
+
+
 def load_history_universe_symbols(universe_csv: str | Path) -> list[str]:
     try:
         df = pd.read_csv(universe_csv)
@@ -3586,7 +3622,46 @@ def assess_history_completion(
     session_type: str = "RTH",
 ) -> dict[str, Any]:
     symbols = load_history_universe_symbols(universe_csv)
-    status = load_history_status(history_dir)
+    raw_status = load_history_status(history_dir)
+    status = normalize_history_status_rows(raw_status, session_date=session_date, session_type=session_type)
+    summary = status.get(f"__summary__:{session_date.isoformat()}:{session_type.upper()}")
+    if isinstance(summary, dict):
+        expected_summary = safe_int(summary.get("expected_symbols") or summary.get("expected"))
+        complete_summary = safe_int(summary.get("complete_symbols") or summary.get("complete"))
+        partial_summary = safe_int(summary.get("partial_symbols") or summary.get("partial"))
+        no_data_summary = safe_int(summary.get("no_data_symbols") or summary.get("no_data"))
+        missing_summary = safe_int(summary.get("missing_symbols") or summary.get("missing"))
+        failed_summary = safe_int(summary.get("failed_symbols") or summary.get("failed"))
+        if expected_summary is not None and complete_summary is not None:
+            expected = expected_summary
+            complete_symbols = complete_summary or 0
+            partial_symbols = partial_summary or 0
+            no_data_symbols = no_data_summary or 0
+            failed = failed_summary or 0
+            missing = missing_summary if missing_summary is not None else max(0, expected - complete_symbols - partial_symbols - no_data_symbols - failed)
+            terminal = complete_symbols + no_data_symbols
+            completion_pct_value = round((terminal / expected) * 100.0, 2) if expected else 100.0
+            ready = expected > 0 and missing == 0 and partial_symbols == 0 and failed == 0
+            return {
+                "date": session_date.isoformat(),
+                "session_type": session_type.upper(),
+                "expected_symbols": expected,
+                "parquet_files": complete_symbols,
+                "status_done": terminal,
+                "complete_symbols": complete_symbols,
+                "partial_symbols": partial_symbols,
+                "no_data_symbols": no_data_symbols,
+                "failed": failed,
+                "missing": missing,
+                "failed_symbols": failed,
+                "missing_symbols": missing,
+                "completed": terminal,
+                "completion_pct": completion_pct_value,
+                "readiness_status": "OK" if ready else ("PARTIAL" if terminal or partial_symbols else "NOT_READY"),
+                "ready": ready,
+                "history_session_date": session_date.isoformat(),
+                "latest_completed_session": session_date.isoformat(),
+            }
     parquet_files = 0
     complete_symbols = 0
     partial_symbols = 0
@@ -3814,8 +3889,24 @@ def enqueue_startup_history_repair_if_needed(
             "eod_active": eod_active,
         }
     target_date = latest_completed_trading_day(now, getattr(args, "market_close_utc", "20:00"))
-    lookback_sessions = max(1, int(getattr(args, "startup_history_repair_lookback_sessions", 5) or 5))
-    sessions = recent_completed_trading_sessions(target_date, lookback_sessions)
+    wide_repair_enabled = str(os.environ.get("TRADING_BOT_ALLOW_WIDE_HISTORY_REPAIR", "")).strip().lower() in {"1", "true", "yes", "on"}
+    lookback_days = max(1, int(getattr(args, "startup_history_repair_lookback_days", 1) or 1))
+    if wide_repair_enabled:
+        lookback_sessions = max(1, int(getattr(args, "startup_history_repair_lookback_sessions", lookback_days) or lookback_days))
+        sessions = recent_completed_trading_sessions(target_date, lookback_sessions)
+        print(
+            f"{now_utc()} STARTUP_HISTORY_REPAIR_RANGE_RESOLVED "
+            f"mode=wide start={sessions[0].isoformat()} end={sessions[-1].isoformat()} "
+            f"sessions={','.join(session.isoformat() for session in sessions)} reason=env_enabled",
+            flush=True,
+        )
+    else:
+        sessions = [target_date]
+        print(
+            f"{now_utc()} STARTUP_HISTORY_REPAIR_RANGE_RESOLVED "
+            f"mode=single_session date={target_date.isoformat()} lookback_days={lookback_days}",
+            flush=True,
+        )
     start_date = sessions[0]
     end_date = sessions[-1]
     session_type = "RTH"
@@ -3863,6 +3954,12 @@ def enqueue_startup_history_repair_if_needed(
         flush=True,
     )
     if not should_queue:
+        print(
+            f"{now_utc()} STARTUP_HISTORY_REPAIR_SKIPPED_ALREADY_COMPLETE "
+            f"date={assessment['date']} completion_pct={assessment['completion_pct']} "
+            f"missing={assessment['missing']} failed={assessment['failed']} partial={assessment['partial_symbols']}",
+            flush=True,
+        )
         return {
             **assessment,
             "queued": False,
@@ -3895,7 +3992,11 @@ def enqueue_startup_history_repair_if_needed(
             flush=True,
         )
         return {**assessment, "queued": False, "reason": "latest_day_already_queued"}
-    command_id = f"startup_history_repair_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
+    command_id = (
+        f"startup_history_repair_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
+        if wide_repair_enabled
+        else f"startup_history_repair_{end_date.strftime('%Y%m%d')}"
+    )
     command = {
         "id": command_id,
         "type": "history_collector",
@@ -5630,7 +5731,8 @@ def main() -> int:
     parser.add_argument("--startup-history-repair", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--startup-history-repair-min-completion-pct", type=float, default=100.0)
     parser.add_argument("--startup-history-repair-max-tasks", type=int, default=3000)
-    parser.add_argument("--startup-history-repair-lookback-sessions", type=int, default=int(os.environ.get("HISTORY_REPAIR_LOOKBACK_SESSIONS", "5")))
+    parser.add_argument("--startup-history-repair-lookback-days", type=int, default=int(os.environ.get("TRADING_BOT_STARTUP_HISTORY_REPAIR_LOOKBACK_DAYS", "1")))
+    parser.add_argument("--startup-history-repair-lookback-sessions", type=int, default=int(os.environ.get("HISTORY_REPAIR_LOOKBACK_SESSIONS", "5")), help="Used only when TRADING_BOT_ALLOW_WIDE_HISTORY_REPAIR=1.")
     parser.add_argument("--startup-history-repair-retry-failed", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--daily-top100-build-utc", default="11:30")
     parser.add_argument("--daily-top100-universe", default=DEFAULT_UNIVERSE)

@@ -286,6 +286,64 @@ def load_history_readiness_summary(
     status_rows = load_json_file(Path(status_dir) / "collector_status.json", {})
     if not isinstance(status_rows, dict):
         status_rows = {}
+    def int_value(value: object, default: int = 0) -> int:
+        try:
+            if value in (None, ""):
+                return default
+            return int(float(value))
+        except Exception:
+            return default
+
+    normalized_status: dict[str, object] = {}
+    for container_key in ("tasks", "status", "symbols", "rows"):
+        value = status_rows.get(container_key)
+        if isinstance(value, dict):
+            normalized_status.update({str(k): v for k, v in value.items()})
+    for key, value in status_rows.items():
+        if isinstance(value, dict) and "_" in str(key):
+            normalized_status[str(key)] = value
+    sessions = status_rows.get("sessions") or status_rows.get("by_date") or status_rows.get("dates")
+    if isinstance(sessions, dict):
+        day_rows = sessions.get(session_date)
+        if isinstance(day_rows, dict):
+            task_rows = day_rows.get("tasks") or day_rows.get("symbols") or day_rows.get("status") or day_rows
+            if isinstance(task_rows, dict):
+                for symbol_or_key, row in task_rows.items():
+                    key = str(symbol_or_key)
+                    if "_" not in key:
+                        key = history_task_key(key, session_date, session_type)
+                    normalized_status[key] = row
+            summary = day_rows.get("summary") if isinstance(day_rows.get("summary"), dict) else day_rows
+            if isinstance(summary, dict):
+                normalized_status[f"__summary__:{session_date}:{session_type.upper()}"] = summary
+    summary = status_rows.get("summary")
+    if isinstance(summary, dict):
+        normalized_status[f"__summary__:{session_date}:{session_type.upper()}"] = summary
+    status_rows = normalized_status or status_rows
+    summary_row = status_rows.get(f"__summary__:{session_date}:{session_type.upper()}")
+    if isinstance(summary_row, dict):
+        expected = int_value(summary_row.get("expected_symbols") or summary_row.get("expected"), len(symbols))
+        complete = int_value(summary_row.get("complete_symbols") or summary_row.get("complete"))
+        partial = int_value(summary_row.get("partial_symbols") or summary_row.get("partial"))
+        no_data = int_value(summary_row.get("no_data_symbols") or summary_row.get("no_data"))
+        failed = int_value(summary_row.get("failed_symbols") or summary_row.get("failed"))
+        missing = int_value(summary_row.get("missing_symbols") or summary_row.get("missing"), max(0, expected - complete - partial - no_data - failed))
+        terminal = complete + no_data
+        completion_pct = round((terminal / expected) * 100.0, 2) if expected else 0.0
+        ready = expected > 0 and missing == 0 and partial == 0 and failed == 0
+        return {
+            "history_session_date": session_date,
+            "latest_completed_session": session_date,
+            "expected_symbols": expected,
+            "complete_symbols": complete,
+            "partial_symbols": partial,
+            "no_data_symbols": no_data,
+            "failed_symbols": failed,
+            "missing_symbols": missing,
+            "terminal_symbols": terminal,
+            "completion_pct": completion_pct,
+            "status": "OK" if ready else ("PARTIAL" if terminal or partial or failed else "MISSING"),
+        }
     complete = partial = no_data = failed = missing = 0
     for symbol in symbols:
         path = history_parquet_path(history_dir, symbol, session_date, session_type)
@@ -309,6 +367,8 @@ def load_history_readiness_summary(
     ready = expected > 0 and missing == 0 and partial == 0 and failed == 0
     status = "OK" if ready else ("PARTIAL" if terminal or partial or failed else "MISSING")
     return {
+        "history_session_date": session_date,
+        "latest_completed_session": session_date,
         "expected_symbols": expected,
         "complete_symbols": complete,
         "partial_symbols": partial,
