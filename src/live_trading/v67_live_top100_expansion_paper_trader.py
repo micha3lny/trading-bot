@@ -3967,8 +3967,9 @@ def enqueue_startup_history_repair_if_needed(
             f"date={assessment['date']} reason={reason} readiness_status={assessment.get('readiness_status')} "
             f"effective_completion_pct={assessment.get('effective_completion_pct')} "
             f"parquet_completion_pct={assessment.get('parquet_completion_pct')} "
+            f"complete={assessment.get('complete_symbols')} "
             f"missing={assessment['missing']} failed={assessment['failed']} partial={assessment['partial_symbols']} "
-            f"no_data={assessment.get('no_data_symbols')}",
+            f"no_data={assessment.get('no_data_symbols')} threshold={min_pct}",
             flush=True,
         )
         return {
@@ -5742,7 +5743,13 @@ def main() -> int:
     parser.add_argument("--history-collector-client-id", type=int, default=168)
     parser.add_argument("--history-collector-max-runtime-minutes", type=float, default=120.0)
     parser.add_argument("--startup-history-repair", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--startup-history-repair-min-completion-pct", type=float, default=100.0)
+    full_history_required = str(os.environ.get("TRADING_BOT_REQUIRE_FULL_HISTORY_COMPLETION", "")).strip().lower() in {"1", "true", "yes", "on"}
+    startup_history_default_pct = "100.0" if full_history_required else "95.0"
+    parser.add_argument(
+        "--startup-history-repair-min-completion-pct",
+        type=float,
+        default=float(os.environ.get("TRADING_BOT_STARTUP_HISTORY_REPAIR_MIN_COMPLETION_PCT", startup_history_default_pct)),
+    )
     parser.add_argument("--startup-history-repair-max-tasks", type=int, default=3000)
     parser.add_argument("--startup-history-repair-lookback-days", type=int, default=int(os.environ.get("TRADING_BOT_STARTUP_HISTORY_REPAIR_LOOKBACK_DAYS", "1")))
     parser.add_argument("--startup-history-repair-lookback-sessions", type=int, default=int(os.environ.get("HISTORY_REPAIR_LOOKBACK_SESSIONS", "5")), help="Used only when TRADING_BOT_ALLOW_WIDE_HISTORY_REPAIR=1.")

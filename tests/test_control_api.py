@@ -733,6 +733,48 @@ class ControlApiHelperTests(unittest.TestCase):
             self.assertEqual(result["readiness_status"], "PARTIAL")
             self.assertNotIn("history_collector_commands", runtime_state)
 
+    def test_startup_history_repair_default_operational_threshold_skips_partial_above_95(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            symbols = [f"S{i:03d}" for i in range(100)]
+            universe = root / "universe.csv"
+            universe.write_text("symbol\n" + "\n".join(symbols) + "\n", encoding="utf-8")
+            history_dir = root / "history" / "universe_1m"
+            session = datetime(2026, 6, 25, tzinfo=timezone.utc).date()
+            status = {}
+            for symbol in symbols[:94]:
+                status[history_task_key(symbol, session)] = {"status": "complete"}
+            for symbol in symbols[94:98]:
+                status[history_task_key(symbol, session)] = {"status": "no_data"}
+            for symbol in symbols[98:]:
+                status[history_task_key(symbol, session)] = {"status": "partial"}
+            (root / "history").mkdir(parents=True, exist_ok=True)
+            (root / "history" / "collector_status.json").write_text(json.dumps(status), encoding="utf-8")
+            runtime_state = {}
+            args = SimpleNamespace(
+                startup_history_repair=True,
+                startup_history_repair_min_completion_pct=95.0,
+                startup_history_repair_retry_failed=True,
+                startup_history_repair_max_tasks=3000,
+                startup_history_repair_lookback_sessions=1,
+                daily_top100_history_dir=str(history_dir),
+                daily_top100_universe=str(universe),
+                overnight_collector_max_attempts=5,
+                history_collector_client_id=168,
+            )
+
+            result = enqueue_startup_history_repair_if_needed(
+                runtime_state,
+                args,
+                now=datetime(2026, 6, 26, 8, 0, tzinfo=timezone.utc),
+            )
+
+            self.assertFalse(result["queued"])
+            self.assertEqual(result["reason"], "acceptable_partial")
+            self.assertEqual(result["effective_completion_pct"], 98.0)
+            self.assertEqual(result["partial_symbols"], 2)
+            self.assertNotIn("history_collector_commands", runtime_state)
+
     def test_daily_top100_build_waits_for_latest_history_completion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
