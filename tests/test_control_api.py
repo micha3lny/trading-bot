@@ -7,6 +7,7 @@ import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from src.live_trading.v67_live_top100_expansion_paper_trader import (
     apply_top100_freshness_gate,
@@ -806,6 +807,122 @@ class ControlApiHelperTests(unittest.TestCase):
             self.assertIsNone(runtime_state.get("daily_top100_process"))
             self.assertEqual(runtime_state.get("daily_top100_build_run_keys"), set())
             self.assertIn("daily_top100_build_wait_logged_keys", runtime_state)
+
+    def test_daily_top100_auto_build_queues_when_acceptable_partial_and_dated_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            symbols = [f"S{i:03d}" for i in range(100)]
+            universe = root / "universe.csv"
+            universe.write_text("symbol\n" + "\n".join(symbols) + "\n", encoding="utf-8")
+            history_dir = root / "history" / "universe_1m"
+            session = datetime(2026, 6, 25, tzinfo=timezone.utc).date()
+            status = {}
+            for symbol in symbols[:94]:
+                status[history_task_key(symbol, session)] = {"status": "complete"}
+            for symbol in symbols[94:98]:
+                status[history_task_key(symbol, session)] = {"status": "no_data"}
+            for symbol in symbols[98:]:
+                status[history_task_key(symbol, session)] = {"status": "partial"}
+            (root / "history").mkdir(parents=True, exist_ok=True)
+            (root / "history" / "collector_status.json").write_text(json.dumps(status), encoding="utf-8")
+
+            class Proc:
+                def poll(self):
+                    return None
+
+            runtime_state = {}
+            args = SimpleNamespace(
+                enable_overnight_automation=True,
+                daily_top100_build_utc="12:45",
+                market_close_utc="20:00",
+                startup_history_repair_min_completion_pct=95.0,
+                daily_top100_history_dir=str(history_dir),
+                daily_top100_universe=str(universe),
+                daily_top100_output_dir=str(root / "universe_out"),
+                daily_top100_latest_output=str(root / "daily_top100_latest.csv"),
+                daily_top100_top_n=100,
+                daily_top100_sqlite_path=str(root / "rankings.sqlite"),
+            )
+
+            with patch("src.live_trading.v67_live_top100_expansion_paper_trader.subprocess.Popen", return_value=Proc()) as popen:
+                process_daily_top100_build(
+                    runtime_state,
+                    args,
+                    now=datetime(2026, 6, 26, 8, 0, tzinfo=timezone.utc),
+                )
+
+            self.assertTrue(popen.called)
+            self.assertIsNotNone(runtime_state.get("daily_top100_process"))
+            command = runtime_state["daily_top100_running_command"]
+            self.assertEqual(command["ranking_date"], "2026-06-25")
+            self.assertTrue(any("daily_top100_2026-06-25.csv" in str(part) for part in command["command"]))
+            self.assertIn("2026-06-25_auto_missing_dated", runtime_state["daily_top100_build_run_keys"])
+
+    def test_daily_top100_auto_build_skips_when_dated_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            universe = root / "universe.csv"
+            universe.write_text("symbol\nAAA\n", encoding="utf-8")
+            output_dir = root / "universe_out"
+            output_dir.mkdir(parents=True)
+            (output_dir / "daily_top100_2026-06-25.csv").write_text("rank,symbol,score\n1,AAA,1\n", encoding="utf-8")
+            runtime_state = {}
+            args = SimpleNamespace(
+                enable_overnight_automation=True,
+                daily_top100_build_utc="12:45",
+                market_close_utc="20:00",
+                startup_history_repair_min_completion_pct=95.0,
+                daily_top100_history_dir=str(root / "history" / "universe_1m"),
+                daily_top100_universe=str(universe),
+                daily_top100_output_dir=str(output_dir),
+                daily_top100_latest_output=str(root / "daily_top100_latest.csv"),
+                daily_top100_top_n=100,
+                daily_top100_sqlite_path=str(root / "rankings.sqlite"),
+            )
+
+            with patch("src.live_trading.v67_live_top100_expansion_paper_trader.subprocess.Popen") as popen:
+                process_daily_top100_build(
+                    runtime_state,
+                    args,
+                    now=datetime(2026, 6, 26, 8, 0, tzinfo=timezone.utc),
+                )
+
+            self.assertFalse(popen.called)
+            self.assertIsNone(runtime_state.get("daily_top100_process"))
+            self.assertIn("2026-06-25_dated_exists", runtime_state["daily_top100_auto_build_skip_logged_keys"])
+
+    def test_daily_top100_auto_build_does_not_queue_when_history_not_acceptable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            universe = root / "universe.csv"
+            universe.write_text("symbol\nAAA\nBBB\n", encoding="utf-8")
+            history_dir = root / "history" / "universe_1m"
+            history_parquet_path(history_dir, "AAA", datetime(2026, 6, 25, tzinfo=timezone.utc).date()).parent.mkdir(parents=True, exist_ok=True)
+            history_parquet_path(history_dir, "AAA", datetime(2026, 6, 25, tzinfo=timezone.utc).date()).write_bytes(b"x")
+            runtime_state = {}
+            args = SimpleNamespace(
+                enable_overnight_automation=True,
+                daily_top100_build_utc="12:45",
+                market_close_utc="20:00",
+                startup_history_repair_min_completion_pct=95.0,
+                daily_top100_history_dir=str(history_dir),
+                daily_top100_universe=str(universe),
+                daily_top100_output_dir=str(root / "universe_out"),
+                daily_top100_latest_output=str(root / "daily_top100_latest.csv"),
+                daily_top100_top_n=100,
+                daily_top100_sqlite_path=str(root / "rankings.sqlite"),
+            )
+
+            with patch("src.live_trading.v67_live_top100_expansion_paper_trader.subprocess.Popen") as popen:
+                process_daily_top100_build(
+                    runtime_state,
+                    args,
+                    now=datetime(2026, 6, 26, 8, 0, tzinfo=timezone.utc),
+                )
+
+            self.assertFalse(popen.called)
+            self.assertIsNone(runtime_state.get("daily_top100_process"))
+            self.assertEqual(runtime_state.get("daily_top100_build_run_keys"), set())
 
     def test_stale_top100_blocks_entries_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -3740,6 +3740,16 @@ def latest_history_is_complete(
     return result
 
 
+def history_is_acceptable_for_top100_build(assessment: dict[str, Any], min_completion_pct: float) -> bool:
+    expected = int(assessment.get("expected_symbols") or 0)
+    if expected <= 0:
+        return False
+    missing = int(assessment.get("missing") or assessment.get("missing_symbols") or 0)
+    failed = int(assessment.get("failed") or assessment.get("failed_symbols") or 0)
+    effective_completion_pct = float(assessment.get("effective_completion_pct") or assessment.get("completion_pct") or 0.0)
+    return missing == 0 and failed == 0 and effective_completion_pct >= float(min_completion_pct)
+
+
 def _history_command_priority(command: dict[str, Any]) -> int:
     mode = str(command.get("collector_mode") or "")
     if mode in {"daily", "startup_repair"}:
@@ -4214,11 +4224,28 @@ def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Nam
 
     now = now or datetime.now(timezone.utc)
     slot = str(getattr(args, "daily_top100_build_utc", "12:45"))
-    if not is_utc_slot_due(now, slot):
+    slot_due = is_utc_slot_due(now, slot)
+    ranking_date = latest_completed_trading_day(now, getattr(args, "market_close_utc", "20:00")).isoformat()
+    output_dir = Path(getattr(args, "daily_top100_output_dir", "data/universe"))
+    dated_output = output_dir / f"daily_top100_{ranking_date}.csv"
+    diagnostics_output = output_dir / f"daily_top100_{ranking_date}_diagnostics.csv"
+    latest_output = Path(getattr(args, "daily_top100_latest_output", "data/universe/daily_top100_latest.csv"))
+    dated_exists = dated_output.exists()
+    auto_build_needed = not dated_exists
+    if not slot_due and not auto_build_needed:
+        skip_key = f"{ranking_date}_dated_exists"
+        skip_keys = _runtime_set(runtime_state, "daily_top100_auto_build_skip_logged_keys")
+        if skip_key not in skip_keys:
+            skip_keys.add(skip_key)
+            print(
+                f"{now_utc()} DAILY_TOP100_AUTO_BUILD_SKIPPED date={ranking_date} "
+                f"reason=dated_exists output={dated_output}",
+                flush=True,
+            )
         return
 
-    ranking_date = latest_completed_trading_day(now, getattr(args, "market_close_utc", "20:00")).isoformat()
-    key = f"{ranking_date}_{slot}"
+    trigger = "scheduled" if slot_due else "auto_missing_dated"
+    key = f"{ranking_date}_{slot if slot_due else 'auto_missing_dated'}"
     run_keys = _runtime_set(runtime_state, "daily_top100_build_run_keys")
     if key in run_keys:
         return
@@ -4226,14 +4253,16 @@ def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Nam
         return
     min_pct = float(getattr(args, "startup_history_repair_min_completion_pct", 100.0))
     assessment = latest_history_is_complete(args=args, session_date=date.fromisoformat(ranking_date), min_completion_pct=min_pct, runtime_state=runtime_state)
-    if not bool(assessment.get("complete")):
+    acceptable_history = history_is_acceptable_for_top100_build(assessment, min_pct)
+    if not acceptable_history:
         last_key = f"{ranking_date}_{slot}_{assessment.get('completion_pct')}_{assessment.get('missing')}_{assessment.get('failed')}"
         wait_keys = _runtime_set(runtime_state, "daily_top100_build_wait_logged_keys")
         if last_key not in wait_keys:
             wait_keys.add(last_key)
             print(
                 f"{now_utc()} DAILY_TOP100_BUILD_SKIPPED reason=latest_history_incomplete "
-                f"ranking_date={ranking_date} completion_pct={assessment.get('completion_pct')} "
+                f"ranking_date={ranking_date} effective_completion_pct={assessment.get('effective_completion_pct')} "
+                f"parquet_completion_pct={assessment.get('parquet_completion_pct')} completion_pct={assessment.get('completion_pct')} "
                 f"expected_symbols={assessment.get('expected_symbols')} parquet_files={assessment.get('parquet_files')} "
                 f"missing={assessment.get('missing')} failed={assessment.get('failed')} min_completion_pct={min_pct}",
                 flush=True,
@@ -4248,10 +4277,15 @@ def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Nam
             )
         return
 
-    output_dir = Path(getattr(args, "daily_top100_output_dir", "data/universe"))
-    dated_output = output_dir / f"daily_top100_{ranking_date}.csv"
-    diagnostics_output = output_dir / f"daily_top100_{ranking_date}_diagnostics.csv"
-    latest_output = Path(getattr(args, "daily_top100_latest_output", "data/universe/daily_top100_latest.csv"))
+    if auto_build_needed and not slot_due:
+        print(
+            f"{now_utc()} DAILY_TOP100_AUTO_BUILD_QUEUED date={ranking_date} "
+            f"reason=dated_missing acceptable_history=1 effective_completion_pct={assessment.get('effective_completion_pct')} "
+            f"parquet_completion_pct={assessment.get('parquet_completion_pct')} "
+            f"partial={assessment.get('partial_symbols')} no_data={assessment.get('no_data_symbols')} "
+            f"missing={assessment.get('missing')} failed={assessment.get('failed')} output={dated_output}",
+            flush=True,
+        )
     command = [
         sys.executable,
         "-m",
@@ -4270,7 +4304,7 @@ def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Nam
         command.extend(["--sqlite-path", sqlite_path])
     print(
         f"{now_utc()} DAILY_TOP100_BUILD_START ranking_date={ranking_date} "
-        f"output={dated_output} latest_output={latest_output}",
+        f"trigger={trigger} output={dated_output} latest_output={latest_output}",
         flush=True,
     )
     try:
