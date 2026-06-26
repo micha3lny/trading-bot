@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.live_trading.history_readiness import canonical_history_readiness
 
 
 def now_iso() -> str:
@@ -76,10 +83,18 @@ def assess(*, history_dir: Path, universe: Path, session_date: str, session_type
             counts["failed_symbols"] += 1
         else:
             counts["missing_symbols"] += 1
-    expected = int(counts["expected_symbols"])
-    terminal = int(counts["complete_symbols"]) + int(counts["no_data_symbols"])
-    counts["completion_pct"] = round((terminal / expected) * 100.0, 2) if expected else 0.0
-    return counts
+    readiness = canonical_history_readiness(
+        session_date=session_date,
+        session_type=session_type,
+        expected_symbols=int(counts["expected_symbols"]),
+        complete_symbols=int(counts["complete_symbols"]),
+        partial_symbols=int(counts["partial_symbols"]),
+        no_data_symbols=int(counts["no_data_symbols"]),
+        missing_symbols=int(counts["missing_symbols"]),
+        failed_symbols=int(counts["failed_symbols"]),
+        parquet_files=int(counts["parquet_files"]),
+    )
+    return {**counts, **readiness, "ranking_date": session_date}
 
 
 def main() -> int:
@@ -105,13 +120,16 @@ def main() -> int:
         and int(counts["partial_symbols"]) <= int(args.max_partial)
         and int(counts["failed_symbols"]) <= int(args.max_failed)
     )
-    status = "OK" if ready else ("PARTIAL" if int(counts["complete_symbols"]) or int(counts["no_data_symbols"]) else "NOT_READY")
+    status = "OK" if ready else str(counts.get("readiness_status") or "NOT_READY")
     print(
         f"{now_iso()} HISTORY_READINESS_CHECK ranking_date={counts['ranking_date']} "
         f"expected_symbols={counts['expected_symbols']} complete_symbols={counts['complete_symbols']} "
         f"partial_symbols={counts['partial_symbols']} missing_symbols={counts['missing_symbols']} "
         f"no_data_symbols={counts['no_data_symbols']} failed_symbols={counts['failed_symbols']} "
-        f"parquet_files={counts['parquet_files']} completion_pct={counts['completion_pct']} readiness_status={status}",
+        f"parquet_files={counts['parquet_files']} "
+        f"effective_completion_pct={counts['effective_completion_pct']} "
+        f"parquet_completion_pct={counts['parquet_completion_pct']} "
+        f"completion_pct={counts['completion_pct']} readiness_status={status}",
         flush=True,
     )
     if not ready:

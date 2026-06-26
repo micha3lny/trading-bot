@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.live_trading.storage.sqlite_store import SQLITE_BUSY_TIMEOUT_MS, configure_sqlite_connection  # noqa: E402
+from src.live_trading.history_readiness import canonical_history_readiness  # noqa: E402
 
 from src.dashboard.runtime_queries import (  # noqa: E402
     DateWindow,
@@ -328,28 +329,25 @@ def load_history_readiness_summary(
         no_data = int_value(summary_row.get("no_data_symbols") or summary_row.get("no_data"))
         failed = int_value(summary_row.get("failed_symbols") or summary_row.get("failed"))
         missing = int_value(summary_row.get("missing_symbols") or summary_row.get("missing"), max(0, expected - complete - partial - no_data - failed))
-        terminal = complete + no_data
-        completion_pct = round((terminal / expected) * 100.0, 2) if expected else 0.0
-        ready = expected > 0 and missing == 0 and partial == 0 and failed == 0
-        return {
-            "history_session_date": session_date,
-            "latest_completed_session": session_date,
-            "expected_symbols": expected,
-            "complete_symbols": complete,
-            "partial_symbols": partial,
-            "no_data_symbols": no_data,
-            "failed_symbols": failed,
-            "missing_symbols": missing,
-            "terminal_symbols": terminal,
-            "completion_pct": completion_pct,
-            "status": "OK" if ready else ("PARTIAL" if terminal or partial or failed else "MISSING"),
-        }
-    complete = partial = no_data = failed = missing = 0
+        parquet_files = int_value(summary_row.get("parquet_files") or summary_row.get("files") or summary_row.get("complete_files"), complete)
+        return canonical_history_readiness(
+            session_date=session_date,
+            session_type=session_type,
+            expected_symbols=expected,
+            complete_symbols=complete,
+            partial_symbols=partial,
+            no_data_symbols=no_data,
+            missing_symbols=missing,
+            failed_symbols=failed,
+            parquet_files=parquet_files,
+        )
+    complete = partial = no_data = failed = missing = parquet_files = 0
     for symbol in symbols:
         path = history_parquet_path(history_dir, symbol, session_date, session_type)
         row = status_rows.get(history_task_key(symbol, session_date, session_type)) or {}
         row_status = str(row.get("status") or "").lower() if isinstance(row, dict) else ""
         if path.exists() and path.stat().st_size > 0:
+            parquet_files += 1
             complete += 1
         elif row_status == "complete":
             complete += 1
@@ -361,24 +359,17 @@ def load_history_readiness_summary(
             failed += 1
         else:
             missing += 1
-    expected = len(symbols)
-    terminal = complete + no_data
-    completion_pct = round((terminal / expected) * 100.0, 2) if expected else 0.0
-    ready = expected > 0 and missing == 0 and partial == 0 and failed == 0
-    status = "OK" if ready else ("PARTIAL" if terminal or partial or failed else "MISSING")
-    return {
-        "history_session_date": session_date,
-        "latest_completed_session": session_date,
-        "expected_symbols": expected,
-        "complete_symbols": complete,
-        "partial_symbols": partial,
-        "no_data_symbols": no_data,
-        "failed_symbols": failed,
-        "missing_symbols": missing,
-        "terminal_symbols": terminal,
-        "completion_pct": completion_pct,
-        "status": status,
-    }
+    return canonical_history_readiness(
+        session_date=session_date,
+        session_type=session_type,
+        expected_symbols=len(symbols),
+        complete_symbols=complete,
+        partial_symbols=partial,
+        no_data_symbols=no_data,
+        missing_symbols=missing,
+        failed_symbols=failed,
+        parquet_files=parquet_files,
+    )
 
 
 def load_top100_diagnostics_summary(output_dir: str | Path, session_date: str) -> dict[str, object]:
@@ -2008,7 +1999,9 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
                 f"collector_status_dir={collector_status_dir}",
                 f"complete={history_readiness.get('complete_symbols')} no_data={history_readiness.get('no_data_symbols')} "
                 f"partial={history_readiness.get('partial_symbols')} missing={history_readiness.get('missing_symbols')} "
-                f"failed={history_readiness.get('failed_symbols')} completion_pct={history_readiness.get('completion_pct')}",
+                f"failed={history_readiness.get('failed_symbols')} "
+                f"effective_completion_pct={history_readiness.get('effective_completion_pct')} "
+                f"parquet_completion_pct={history_readiness.get('parquet_completion_pct')}",
             ],
         )
     with row2[1]:

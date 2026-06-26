@@ -24,6 +24,7 @@ from ib_insync import IB, Stock, MarketOrder
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.control.control_api import process_control_api_commands, process_history_collector_commands, start_control_api
 from src.live_trading.market_calendar import get_us_equity_session, is_us_equity_trading_day, previous_us_equity_trading_day
+from src.live_trading.history_readiness import canonical_history_readiness
 from src.live_trading.ineligible_symbols import (
     DEFAULT_RUNTIME_INELIGIBLE,
     DEFAULT_SYMBOL_DENYLIST,
@@ -3632,6 +3633,7 @@ def assess_history_completion(
         no_data_summary = safe_int(summary.get("no_data_symbols") or summary.get("no_data"))
         missing_summary = safe_int(summary.get("missing_symbols") or summary.get("missing"))
         failed_summary = safe_int(summary.get("failed_symbols") or summary.get("failed"))
+        parquet_summary = safe_int(summary.get("parquet_files") or summary.get("files") or summary.get("complete_files"))
         if expected_summary is not None and complete_summary is not None:
             expected = expected_summary
             complete_symbols = complete_summary or 0
@@ -3639,29 +3641,17 @@ def assess_history_completion(
             no_data_symbols = no_data_summary or 0
             failed = failed_summary or 0
             missing = missing_summary if missing_summary is not None else max(0, expected - complete_symbols - partial_symbols - no_data_symbols - failed)
-            terminal = complete_symbols + no_data_symbols
-            completion_pct_value = round((terminal / expected) * 100.0, 2) if expected else 100.0
-            ready = expected > 0 and missing == 0 and partial_symbols == 0 and failed == 0
-            return {
-                "date": session_date.isoformat(),
-                "session_type": session_type.upper(),
-                "expected_symbols": expected,
-                "parquet_files": complete_symbols,
-                "status_done": terminal,
-                "complete_symbols": complete_symbols,
-                "partial_symbols": partial_symbols,
-                "no_data_symbols": no_data_symbols,
-                "failed": failed,
-                "missing": missing,
-                "failed_symbols": failed,
-                "missing_symbols": missing,
-                "completed": terminal,
-                "completion_pct": completion_pct_value,
-                "readiness_status": "OK" if ready else ("PARTIAL" if terminal or partial_symbols else "NOT_READY"),
-                "ready": ready,
-                "history_session_date": session_date.isoformat(),
-                "latest_completed_session": session_date.isoformat(),
-            }
+            return canonical_history_readiness(
+                session_date=session_date.isoformat(),
+                session_type=session_type,
+                expected_symbols=expected,
+                complete_symbols=complete_symbols,
+                partial_symbols=partial_symbols,
+                no_data_symbols=no_data_symbols,
+                missing_symbols=missing,
+                failed_symbols=failed,
+                parquet_files=parquet_summary if parquet_summary is not None else complete_symbols,
+            )
     parquet_files = 0
     complete_symbols = 0
     partial_symbols = 0
@@ -3686,28 +3676,17 @@ def assess_history_completion(
         if not has_parquet and row_status not in {"complete", "partial", "no_data", "no_data_permanent", "failed", "failed_permanent"}:
             missing += 1
     expected = len(symbols)
-    terminal = complete_symbols + no_data_symbols
-    completion_pct_value = round((terminal / expected) * 100.0, 2) if expected else 100.0
-    ready = expected > 0 and missing == 0 and partial_symbols == 0 and failed == 0
-    readiness_status = "OK" if ready else ("PARTIAL" if terminal or partial_symbols else "NOT_READY")
-    return {
-        "date": session_date.isoformat(),
-        "session_type": session_type.upper(),
-        "expected_symbols": expected,
-        "parquet_files": parquet_files,
-        "status_done": terminal,
-        "complete_symbols": complete_symbols,
-        "partial_symbols": partial_symbols,
-        "no_data_symbols": no_data_symbols,
-        "failed": failed,
-        "missing": missing,
-        "failed_symbols": failed,
-        "missing_symbols": missing,
-        "completed": terminal,
-        "completion_pct": completion_pct_value,
-        "readiness_status": readiness_status,
-        "ready": ready,
-    }
+    return canonical_history_readiness(
+        session_date=session_date.isoformat(),
+        session_type=session_type,
+        expected_symbols=expected,
+        complete_symbols=complete_symbols,
+        partial_symbols=partial_symbols,
+        no_data_symbols=no_data_symbols,
+        missing_symbols=missing,
+        failed_symbols=failed,
+        parquet_files=parquet_files,
+    )
 
 
 def latest_history_is_complete(
@@ -3725,7 +3704,7 @@ def latest_history_is_complete(
         session_type=session_type,
     )
     expected = int(assessment.get("expected_symbols") or 0)
-    completion_pct_value = float(assessment.get("completion_pct") or 0.0)
+    completion_pct_value = float(assessment.get("effective_completion_pct") or assessment.get("completion_pct") or 0.0)
     failed = int(assessment.get("failed") or 0)
     complete = (
         bool(assessment.get("ready"))
@@ -3751,6 +3730,8 @@ def latest_history_is_complete(
         f"expected_symbols={result.get('expected_symbols')} complete_symbols={result.get('complete_symbols')} "
         f"partial_symbols={result.get('partial_symbols')} missing_symbols={result.get('missing_symbols')} "
         f"no_data_symbols={result.get('no_data_symbols')} failed_symbols={result.get('failed_symbols')} "
+        f"effective_completion_pct={result.get('effective_completion_pct')} "
+        f"parquet_completion_pct={result.get('parquet_completion_pct')} "
         f"completion_pct={result.get('completion_pct')} readiness_status={result.get('readiness_status')} "
         f"last_collector_run={last_collector_run} last_successful_collector_run={last_successful_collector_run} "
         f"latest_top100_file_age={latest_age}",
@@ -3932,7 +3913,12 @@ def enqueue_startup_history_repair_if_needed(
         row
         for row in assessments
         if int(row.get("expected_symbols") or 0) > 0
-        and float(row.get("completion_pct") or 0.0) < min_pct
+        and str(row.get("readiness_status") or "") != "OK"
+        and not (
+            int(row.get("missing") or 0) == 0
+            and int(row.get("failed") or 0) == 0
+            and float(row.get("effective_completion_pct") or row.get("completion_pct") or 0.0) >= min_pct
+        )
     ]
     failed_assessments = [
         row
@@ -3942,28 +3928,53 @@ def enqueue_startup_history_repair_if_needed(
     should_queue = bool(incomplete_assessments) or (retry_failed and bool(failed_assessments))
     missing_total = sum(int(row.get("missing") or 0) for row in assessments)
     failed_total = sum(int(row.get("failed") or 0) for row in assessments)
-    lowest_completion_pct = min((float(row.get("completion_pct") or 0.0) for row in assessments), default=100.0)
+    lowest_completion_pct = min((float(row.get("effective_completion_pct") or row.get("completion_pct") or 0.0) for row in assessments), default=100.0)
+    lowest_parquet_completion_pct = min((float(row.get("parquet_completion_pct") or 0.0) for row in assessments), default=100.0)
+    readiness_ok = all(str(row.get("readiness_status") or "") == "OK" for row in assessments)
+    acceptable_partial = (
+        not readiness_ok
+        and all(int(row.get("missing") or 0) == 0 and int(row.get("failed") or 0) == 0 for row in assessments)
+        and lowest_completion_pct >= min_pct
+    )
     print(
         f"{now_utc()} STARTUP_HISTORY_REPAIR_CHECK date={assessment['date']} "
+        f"readiness_status={assessment.get('readiness_status')} "
+        f"effective_completion_pct={assessment.get('effective_completion_pct')} "
+        f"parquet_completion_pct={assessment.get('parquet_completion_pct')} "
         f"completion_pct={assessment['completion_pct']} expected_symbols={assessment['expected_symbols']} "
         f"parquet_files={assessment['parquet_files']} status_done={assessment['status_done']} "
-        f"missing={assessment['missing']} failed={assessment['failed']} min_completion_pct={min_pct} "
+        f"complete={assessment.get('complete_symbols')} partial={assessment.get('partial_symbols')} "
+        f"no_data={assessment.get('no_data_symbols')} missing={assessment['missing']} failed={assessment['failed']} "
+        f"min_completion_pct={min_pct} "
         f"range_start={start_date.isoformat()} range_end={end_date.isoformat()} "
         f"range_missing={missing_total} range_failed={failed_total} "
-        f"range_lowest_completion_pct={round(lowest_completion_pct, 2)}",
+        f"range_lowest_effective_completion_pct={round(lowest_completion_pct, 2)} "
+        f"range_lowest_parquet_completion_pct={round(lowest_parquet_completion_pct, 2)}",
         flush=True,
     )
     if not should_queue:
+        if readiness_ok:
+            reason = "readiness_ok"
+            event_name = "STARTUP_HISTORY_REPAIR_SKIPPED_ALREADY_READY"
+        elif acceptable_partial:
+            reason = "acceptable_partial"
+            event_name = "STARTUP_HISTORY_REPAIR_SKIPPED_ACCEPTABLE_PARTIAL"
+        else:
+            reason = "complete"
+            event_name = "STARTUP_HISTORY_REPAIR_SKIPPED_ALREADY_COMPLETE"
         print(
-            f"{now_utc()} STARTUP_HISTORY_REPAIR_SKIPPED_ALREADY_COMPLETE "
-            f"date={assessment['date']} completion_pct={assessment['completion_pct']} "
-            f"missing={assessment['missing']} failed={assessment['failed']} partial={assessment['partial_symbols']}",
+            f"{now_utc()} {event_name} "
+            f"date={assessment['date']} reason={reason} readiness_status={assessment.get('readiness_status')} "
+            f"effective_completion_pct={assessment.get('effective_completion_pct')} "
+            f"parquet_completion_pct={assessment.get('parquet_completion_pct')} "
+            f"missing={assessment['missing']} failed={assessment['failed']} partial={assessment['partial_symbols']} "
+            f"no_data={assessment.get('no_data_symbols')}",
             flush=True,
         )
         return {
             **assessment,
             "queued": False,
-            "reason": "complete",
+            "reason": reason,
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
             "repair_range_sessions": [session.isoformat() for session in sessions],
@@ -4022,8 +4033,10 @@ def enqueue_startup_history_repair_if_needed(
         f"{now_utc()} STARTUP_HISTORY_REPAIR_QUEUED command_id={command_id} "
         f"start={command['start_date']} end={command['end_date']} sessions={len(sessions)} "
         f"missing={missing_total} failed={failed_total} "
-        f"latest_completion_pct={assessment['completion_pct']} "
-        f"range_lowest_completion_pct={round(lowest_completion_pct, 2)}",
+        f"latest_effective_completion_pct={assessment.get('effective_completion_pct')} "
+        f"latest_parquet_completion_pct={assessment.get('parquet_completion_pct')} "
+        f"range_lowest_effective_completion_pct={round(lowest_completion_pct, 2)} "
+        f"range_lowest_parquet_completion_pct={round(lowest_parquet_completion_pct, 2)}",
         flush=True,
     )
     return {
