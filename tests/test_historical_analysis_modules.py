@@ -18,12 +18,13 @@ from src.live_trading.analysis.common import (
     calculate_path_stats,
     calculate_runner_stats,
     entry_time_bucket,
+    load_recorder_candles,
     min_after_pct,
     simulate_tp_sl,
 )
 from src.live_trading.analysis.missed_runners_analyzer import classify_missed_reason
-from src.live_trading.analysis.missed_runners_analyzer import previous_session_context
-from src.live_trading.analysis.overnight_hold_ranker import ensure_overnight_columns, overnight_score, score_bucket
+from src.live_trading.analysis.missed_runners_analyzer import add_multiday_ranks, previous_session_context
+from src.live_trading.analysis.overnight_hold_ranker import analyze_trade_overnight, ensure_overnight_columns, overnight_score, score_bucket
 from src.live_trading.ranking.daily_top100_builder import parquet_path
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
@@ -183,6 +184,26 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
             self.assertEqual(ctx["was_detectable_from_history"], 1)
             self.assertIn("prev_1d_return>=3", ctx["detectability_reason"])
 
+    def test_missed_runner_adds_hypothetical_multiday_rank(self) -> None:
+        df = pd.DataFrame([
+            {"symbol": "AAA", "prev_1d_return_pct": 5, "prev_3d_return_pct": 8, "prev_5d_return_pct": 10, "prev_3d_max_intraday_high_pct": 9, "prev_5d_max_intraday_high_pct": 12, "prev_3d_relative_volume_like": 2, "prev_5d_relative_volume_like": 2},
+            {"symbol": "BBB", "prev_1d_return_pct": 0, "prev_3d_return_pct": 0, "prev_5d_return_pct": 0, "prev_3d_max_intraday_high_pct": 0, "prev_5d_max_intraday_high_pct": 0},
+        ])
+        ranked = add_multiday_ranks(df)
+        self.assertEqual(ranked.loc[ranked["symbol"] == "AAA", "hypothetical_multiday_rank"].iloc[0], 1)
+        self.assertEqual(ranked.loc[ranked["symbol"] == "AAA", "would_enter_multiday_top100"].iloc[0], 1)
+
+    def test_recorder_candles_bar_time_timezone_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "recorder" / "2026-06-26"
+            root.mkdir(parents=True)
+            pd.DataFrame([
+                {"symbol": "AAA", "bar_time": "2026-06-26 09:30:00-04:00", "open": 10, "high": 10.2, "low": 9.9, "close": 10.1, "volume": 100},
+            ]).to_csv(root / "candles_1m.csv", index=False)
+            candles = load_recorder_candles(Path(tmp) / "recorder", "2026-06-26", "AAA")
+            self.assertFalse(candles.empty)
+            self.assertEqual(candles.iloc[0]["timestamp"], pd.Timestamp("2026-06-26T13:30:00Z"))
+
     def test_overnight_score_and_bucket(self) -> None:
         score, bucket, reason = overnight_score({
             "next_session_high_from_entry_pct": 6.0,
@@ -200,6 +221,27 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         self.assertEqual(bucket, "strong_hold_candidate")
         self.assertIn("next_high>=5", reason)
         self.assertEqual(score_bucket(20), "avoid_overnight")
+
+    def test_overnight_missing_next_session_data_has_no_score(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            row = analyze_trade_overnight(
+                {
+                    "trade_id": "T1",
+                    "symbol": "AAA",
+                    "session_date": "2026-06-26",
+                    "entry_fill_time": "2026-06-26T13:31:00+00:00",
+                    "exit_fill_time": "2026-06-26T14:00:00+00:00",
+                    "entry_price": 10.0,
+                    "exit_price": 10.2,
+                    "quantity": 1,
+                    "net_pnl": 0.2,
+                },
+                history_dir=Path(tmp) / "history",
+                recorder_dir=Path(tmp) / "recorder",
+                session_type="RTH",
+            )
+            self.assertIsNone(row["overnight_hold_score"])
+            self.assertEqual(row["overnight_hold_bucket"], "missing_next_session_data")
 
     def test_overnight_migration_adds_columns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

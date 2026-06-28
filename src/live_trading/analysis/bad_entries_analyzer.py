@@ -23,6 +23,7 @@ from src.live_trading.analysis.common import (
     safe_read_csv,
     simulate_tp_sl,
 )
+from src.live_trading.market_calendar import get_us_equity_session
 
 
 DEFAULT_SQLITE_PATH = Path("data/runtime/trading_runtime.sqlite")
@@ -34,6 +35,10 @@ OUTPUT_COLUMNS = [
     "trade_id",
     "symbol",
     "entry_time",
+    "entry_time_source",
+    "entry_time_normalization_warning",
+    "matched_first_candle_time",
+    "entry_session_phase",
     "entry_price",
     "exit_time",
     "exit_price",
@@ -102,6 +107,16 @@ def load_closed_trades(sqlite_path: str | Path, start_date: str, end_date: str) 
     return trades
 
 
+def load_executions(sqlite_path: str | Path, start_date: str, end_date: str) -> pd.DataFrame:
+    return read_sql_table(
+        sqlite_path,
+        "executions",
+        where="session_date BETWEEN ? AND ? OR substr(executed_at, 1, 10) BETWEEN ? AND ? OR substr(recorded_at, 1, 10) BETWEEN ? AND ?",
+        params=[start_date, end_date, start_date, end_date, start_date, end_date],
+        order_by="COALESCE(executed_at, recorded_at), execution_id",
+    )
+
+
 def load_spread_snapshots(recorder_dir: Path, session_date: str) -> pd.DataFrame:
     root = recorder_dir / session_date
     for name in ["spread_snapshots.csv", "market_snapshots.csv"]:
@@ -126,6 +141,91 @@ def signal_age(row: dict[str, Any], entry_time: pd.Timestamp | None) -> tuple[fl
     if age < 0:
         return None, "negative_age"
     return age, ""
+
+
+def execution_timestamp(row: dict[str, Any]) -> pd.Timestamp | None:
+    ts = parse_dt(first_existing_column(row, ["executed_at", "recorded_at"]))
+    if ts is not None:
+        return ts
+    raw = parse_raw_json(row.get("raw_json"))
+    execution = raw.get("execution") if isinstance(raw.get("execution"), dict) else {}
+    return parse_dt(
+        execution.get("time")
+        or execution.get("executionTime")
+        or raw.get("executed_at")
+        or raw.get("execution_time")
+        or raw.get("time")
+    )
+
+
+def match_buy_execution(trade: dict[str, Any], executions: pd.DataFrame) -> dict[str, Any]:
+    if executions.empty:
+        return {}
+    rows = executions.copy()
+    sides = rows.get("side", pd.Series(dtype=str)).fillna("").astype(str).str.upper()
+    rows = rows[sides.isin(["BOT", "BUY", "BOUGHT"])]
+    if rows.empty:
+        return {}
+    trade_id = str(trade.get("trade_id") or "")
+    symbol = str(trade.get("symbol") or "").upper()
+    if trade_id and "trade_id" in rows.columns:
+        exact = rows[rows["trade_id"].fillna("").astype(str) == trade_id]
+        if not exact.empty:
+            exact = exact.copy()
+            exact["_ts"] = [execution_timestamp(r) for r in exact.to_dict("records")]
+            return exact.sort_values("_ts", na_position="last").iloc[0].to_dict()
+    if "symbol" in rows.columns:
+        sym = rows[rows["symbol"].fillna("").astype(str).str.upper() == symbol].copy()
+        if not sym.empty:
+            sym["_ts"] = [execution_timestamp(r) for r in sym.to_dict("records")]
+            return sym.sort_values("_ts", na_position="last").iloc[0].to_dict()
+    return {}
+
+
+def resolve_entry_time(
+    trade: dict[str, Any],
+    raw: dict[str, Any],
+    buy_execution: dict[str, Any],
+    candles_full: pd.DataFrame,
+    session_date: str,
+) -> tuple[pd.Timestamp | None, str, str, pd.Timestamp | None]:
+    trade_time = parse_dt(first_existing_column(trade, ["entry_fill_time", "entry_time"]) or raw.get("entry_time"))
+    exec_time = execution_timestamp(buy_execution) if buy_execution else None
+    first_candle = candles_full.iloc[0]["timestamp"] if not candles_full.empty and "timestamp" in candles_full.columns else None
+    open_ts = pd.Timestamp(get_us_equity_session(pd.Timestamp(session_date).date()).open_utc)
+    warning = ""
+    chosen = trade_time
+    source = "trades.entry_fill_time"
+    if exec_time is not None:
+        chosen = exec_time
+        source = "executions.executed_at"
+    if chosen is not None and first_candle is not None:
+        # Reconstructed trades can carry bogus premarket timestamps. If the
+        # trade timestamp is before RTH but the matched execution/candles are
+        # available in RTH, use the execution timestamp or mark as mismatch.
+        if chosen < open_ts and first_candle >= open_ts:
+            if exec_time is not None and exec_time >= open_ts:
+                chosen = exec_time
+                source = "executions.executed_at"
+                warning = "trade_entry_before_rth_used_execution"
+            else:
+                warning = "time_mismatch"
+    return chosen, source, warning, first_candle
+
+
+def entry_phase(entry_time: pd.Timestamp | None, session_date: str, warning: str) -> str:
+    if warning == "time_mismatch":
+        return "time_mismatch"
+    if entry_time is None:
+        return ""
+    session = get_us_equity_session(pd.Timestamp(session_date).date())
+    open_ts = pd.Timestamp(session.open_utc)
+    close_ts = pd.Timestamp(session.close_utc)
+    if entry_time < open_ts:
+        return "premarket"
+    if entry_time <= close_ts:
+        return "rth"
+    return "afterhours"
 
 
 def window_after_entry(candles: pd.DataFrame, entry_time: pd.Timestamp | None, minutes: int) -> pd.DataFrame:
@@ -200,12 +300,24 @@ def analyze_bad_entries(
     session_type: str = "RTH",
 ) -> pd.DataFrame:
     trades = load_closed_trades(sqlite_path, start_date, end_date)
+    executions = load_executions(sqlite_path, start_date, end_date)
     rows: list[dict[str, Any]] = []
     spread_cache: dict[str, pd.DataFrame] = {}
+    diagnostics = {
+        "candles_loaded_symbols": set(),
+        "candles_min_time_utc": None,
+        "candles_max_time_utc": None,
+        "trades_min_entry_time_utc": None,
+        "trades_max_entry_time_utc": None,
+        "time_mismatch_count": 0,
+        "metrics_computed_count": 0,
+        "metrics_missing_count": 0,
+    }
+    signal_age_counts = {"ready_since": 0, "signal_time": 0, "missing": 0, "negative": 0}
     for trade in trades.to_dict("records"):
         raw = parse_raw_json(trade.get("raw_json"))
         symbol = str(trade.get("symbol") or "").upper()
-        entry_time = parse_dt(first_existing_column(trade, ["entry_fill_time", "entry_time"]) or raw.get("entry_time"))
+        raw_entry_time = parse_dt(first_existing_column(trade, ["entry_fill_time", "entry_time"]) or raw.get("entry_time"))
         exit_time = parse_dt(first_existing_column(trade, ["exit_fill_time", "closed_at", "exit_time"]) or raw.get("exit_time"))
         session_date = str(first_existing_column(trade, ["session_date"]) or (exit_time.strftime("%F") if exit_time is not None else start_date))
         entry_price = fnum(first_existing_column(trade, ["entry_price", "buy_price"]) or raw.get("entry_price"))
@@ -216,11 +328,27 @@ def analyze_bad_entries(
             gross = fnum(trade.get("gross_pnl"), 0.0) or 0.0
             commission = abs(fnum(trade.get("commission"), 0.0) or 0.0)
             net_pnl = gross - commission
-        candles = load_trade_candles(history_dir, recorder_dir, symbol, session_date, entry_time, exit_time, session_type)
-        stats = calculate_path_stats(candles, entry_price or 0.0, entry_time)
-        first_green = first_green_seconds(candles, entry_price or 0.0, entry_time)
-        local_peak_pct, pullback_pct = local_peak_before_entry(candles, entry_price or 0.0, entry_time)
-        first_window = window_after_entry(candles, entry_time, 1)
+        buy_exec = match_buy_execution(trade, executions)
+        candles_full = load_trade_candles(history_dir, recorder_dir, symbol, session_date, None, exit_time, session_type)
+        if not candles_full.empty:
+            diagnostics["candles_loaded_symbols"].add(symbol)
+            cmin = candles_full["timestamp"].min()
+            cmax = candles_full["timestamp"].max()
+            diagnostics["candles_min_time_utc"] = cmin if diagnostics["candles_min_time_utc"] is None else min(diagnostics["candles_min_time_utc"], cmin)
+            diagnostics["candles_max_time_utc"] = cmax if diagnostics["candles_max_time_utc"] is None else max(diagnostics["candles_max_time_utc"], cmax)
+        entry_time, entry_time_source, entry_warning, first_candle = resolve_entry_time(trade, raw, buy_exec, candles_full, session_date)
+        if raw_entry_time is not None:
+            diagnostics["trades_min_entry_time_utc"] = raw_entry_time if diagnostics["trades_min_entry_time_utc"] is None else min(diagnostics["trades_min_entry_time_utc"], raw_entry_time)
+            diagnostics["trades_max_entry_time_utc"] = raw_entry_time if diagnostics["trades_max_entry_time_utc"] is None else max(diagnostics["trades_max_entry_time_utc"], raw_entry_time)
+        if entry_warning == "time_mismatch":
+            diagnostics["time_mismatch_count"] += 1
+        candles = candles_full[candles_full["timestamp"] >= entry_time].reset_index(drop=True) if entry_time is not None and not candles_full.empty and entry_warning != "time_mismatch" else pd.DataFrame()
+        metrics_ok = not candles.empty and entry_time is not None and entry_price is not None and entry_warning != "time_mismatch"
+        diagnostics["metrics_computed_count" if metrics_ok else "metrics_missing_count"] += 1
+        stats = calculate_path_stats(candles, entry_price or 0.0, entry_time) if metrics_ok else calculate_path_stats(pd.DataFrame(), 0.0, None)
+        first_green = first_green_seconds(candles, entry_price or 0.0, entry_time) if metrics_ok else None
+        local_peak_pct, pullback_pct = local_peak_before_entry(candles_full, entry_price or 0.0, entry_time) if metrics_ok else (None, None)
+        first_window = window_after_entry(candles, entry_time, 1) if metrics_ok else pd.DataFrame()
         first_close = fnum(first_window.iloc[0].get("close")) if not first_window.empty else None
         fallback_exit_time = exit_time
         fallback_exit_price = exit_price
@@ -231,6 +359,13 @@ def analyze_bad_entries(
             spread_cache[session_date] = load_spread_snapshots(recorder_dir, session_date)
         spread = nearest_row(spread_cache[session_date], entry_time, symbol)
         sig_age, sig_age_warning = signal_age(trade, entry_time)
+        if sig_age_warning == "negative_age":
+            signal_age_counts["negative"] += 1
+        elif sig_age is not None:
+            source_used = "ready_since" if first_existing_column(trade, ["ready_since"]) or raw.get("ready_since") else "signal_time"
+            signal_age_counts[source_used] += 1
+        else:
+            signal_age_counts["missing"] += 1
         net_pnl_pct = None
         if entry_price and entry_price > 0 and quantity > 0 and net_pnl is not None:
             net_pnl_pct = net_pnl / (entry_price * quantity) * 100.0
@@ -239,6 +374,10 @@ def analyze_bad_entries(
             "trade_id": trade.get("trade_id"),
             "symbol": symbol,
             "entry_time": iso_ts(entry_time),
+            "entry_time_source": entry_time_source,
+            "entry_time_normalization_warning": entry_warning,
+            "matched_first_candle_time": iso_ts(first_candle),
+            "entry_session_phase": entry_phase(entry_time, session_date, entry_warning),
             "entry_price": entry_price,
             "exit_time": iso_ts(exit_time),
             "exit_price": exit_price,
@@ -246,25 +385,25 @@ def analyze_bad_entries(
             "net_pnl": net_pnl,
             "net_pnl_pct": net_pnl_pct,
             "exit_reason": first_existing_column(trade, ["exit_reason"]) or raw.get("exit_reason") or "unknown_exit_reason",
-            "price_after_1m_pct": price_after_pct(candles, entry_price or 0.0, entry_time, 1),
-            "price_after_2m_pct": price_after_pct(candles, entry_price or 0.0, entry_time, 2),
-            "price_after_5m_pct": price_after_pct(candles, entry_price or 0.0, entry_time, 5),
-            "price_after_10m_pct": price_after_pct(candles, entry_price or 0.0, entry_time, 10),
+            "price_after_1m_pct": price_after_pct(candles, entry_price or 0.0, entry_time, 1) if metrics_ok else None,
+            "price_after_2m_pct": price_after_pct(candles, entry_price or 0.0, entry_time, 2) if metrics_ok else None,
+            "price_after_5m_pct": price_after_pct(candles, entry_price or 0.0, entry_time, 5) if metrics_ok else None,
+            "price_after_10m_pct": price_after_pct(candles, entry_price or 0.0, entry_time, 10) if metrics_ok else None,
             "mfe_pct": stats.mfe_pct,
             "mae_pct": stats.mae_pct,
             "peak_pct": stats.mfe_pct,
             "low_after_entry_pct": stats.mae_pct,
-            "immediate_drop": int(((first_close is not None and entry_price is not None and first_close < entry_price) or ((min_after_pct(candles, entry_price or 0.0, entry_time, 1) or 0.0) < 0.0))),
-            "never_green": int(first_green is None),
-            "min_after_1m_pct": min_after_pct(candles, entry_price or 0.0, entry_time, 1),
-            "min_after_2m_pct": min_after_pct(candles, entry_price or 0.0, entry_time, 2),
-            "min_after_3m_pct": min_after_pct(candles, entry_price or 0.0, entry_time, 3),
-            "min_after_5m_pct": min_after_pct(candles, entry_price or 0.0, entry_time, 5),
-            "min_after_10m_pct": min_after_pct(candles, entry_price or 0.0, entry_time, 10),
-            "max_after_1m_pct": max_after_pct(candles, entry_price or 0.0, entry_time, 1),
-            "max_after_2m_pct": max_after_pct(candles, entry_price or 0.0, entry_time, 2),
-            "max_after_5m_pct": max_after_pct(candles, entry_price or 0.0, entry_time, 5),
-            "max_after_10m_pct": max_after_pct(candles, entry_price or 0.0, entry_time, 10),
+            "immediate_drop": int(metrics_ok and ((first_close is not None and entry_price is not None and first_close < entry_price) or ((min_after_pct(candles, entry_price or 0.0, entry_time, 1) or 0.0) < 0.0))),
+            "never_green": int(metrics_ok and first_green is None),
+            "min_after_1m_pct": min_after_pct(candles, entry_price or 0.0, entry_time, 1) if metrics_ok else None,
+            "min_after_2m_pct": min_after_pct(candles, entry_price or 0.0, entry_time, 2) if metrics_ok else None,
+            "min_after_3m_pct": min_after_pct(candles, entry_price or 0.0, entry_time, 3) if metrics_ok else None,
+            "min_after_5m_pct": min_after_pct(candles, entry_price or 0.0, entry_time, 5) if metrics_ok else None,
+            "min_after_10m_pct": min_after_pct(candles, entry_price or 0.0, entry_time, 10) if metrics_ok else None,
+            "max_after_1m_pct": max_after_pct(candles, entry_price or 0.0, entry_time, 1) if metrics_ok else None,
+            "max_after_2m_pct": max_after_pct(candles, entry_price or 0.0, entry_time, 2) if metrics_ok else None,
+            "max_after_5m_pct": max_after_pct(candles, entry_price or 0.0, entry_time, 5) if metrics_ok else None,
+            "max_after_10m_pct": max_after_pct(candles, entry_price or 0.0, entry_time, 10) if metrics_ok else None,
             "first_green_seconds": first_green,
             "entry_near_local_peak_pct": local_peak_pct,
             "pullback_before_entry_pct": pullback_pct,
@@ -272,8 +411,8 @@ def analyze_bad_entries(
             "time_to_peak_seconds": stats.time_to_peak_seconds,
             "time_to_low_seconds": stats.time_to_low_seconds,
             "max_drawdown_from_peak_pct": stats.max_drawdown_from_peak_pct,
-            "entry_minutes_after_open": entry_minutes_after_open(entry_time, session_date),
-            "entry_time_bucket": entry_time_bucket(entry_time, session_date),
+            "entry_minutes_after_open": entry_minutes_after_open(entry_time, session_date) if entry_phase(entry_time, session_date, entry_warning) == "rth" else None,
+            "entry_time_bucket": entry_time_bucket(entry_time, session_date) if entry_phase(entry_time, session_date, entry_warning) == "rth" else entry_phase(entry_time, session_date, entry_warning),
             "signal_age_seconds": sig_age,
             "signal_age_warning": sig_age_warning,
             "spread_bps_at_entry": first_existing_column(spread, ["spread_bps", "bid_ask_spread_bps"]),
@@ -291,7 +430,10 @@ def analyze_bad_entries(
         rows.append(row)
     if not rows:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
-    return pd.DataFrame(rows)[OUTPUT_COLUMNS]
+    out = pd.DataFrame(rows)[OUTPUT_COLUMNS]
+    out.attrs["diagnostics"] = diagnostics
+    out.attrs["signal_age_counts"] = signal_age_counts
+    return out
 
 
 def score_bucket(value: Any) -> str:
@@ -421,6 +563,28 @@ def print_summary(df: pd.DataFrame) -> None:
         f"avg_mfe={mfe.mean() if not mfe.empty else 0:.2f} median_mfe={mfe.median() if not mfe.empty else 0:.2f} "
         f"avg_mae={mae.mean() if not mae.empty else 0:.2f} median_mae={mae.median() if not mae.empty else 0:.2f}"
     )
+    diag = df.attrs.get("diagnostics", {}) if hasattr(df, "attrs") else {}
+    signal_counts = df.attrs.get("signal_age_counts", {}) if hasattr(df, "attrs") else {}
+    if diag:
+        print(
+            "BAD_ENTRIES_TIME_DIAGNOSTICS "
+            f"candles_loaded_symbols={len(diag.get('candles_loaded_symbols') or [])} "
+            f"candles_min_time_utc={diag.get('candles_min_time_utc') or ''} "
+            f"candles_max_time_utc={diag.get('candles_max_time_utc') or ''} "
+            f"trades_min_entry_time_utc={diag.get('trades_min_entry_time_utc') or ''} "
+            f"trades_max_entry_time_utc={diag.get('trades_max_entry_time_utc') or ''} "
+            f"time_mismatch_count={diag.get('time_mismatch_count', 0)} "
+            f"metrics_computed_count={diag.get('metrics_computed_count', 0)} "
+            f"metrics_missing_count={diag.get('metrics_missing_count', 0)}"
+        )
+    if signal_counts:
+        print(
+            "SIGNAL_AGE_SOURCE_COUNTS "
+            f"ready_since={signal_counts.get('ready_since', 0)} "
+            f"signal_time={signal_counts.get('signal_time', 0)} "
+            f"missing={signal_counts.get('missing', 0)} "
+            f"negative={signal_counts.get('negative', 0)}"
+        )
     if df.empty:
         return
     first_green = pd.to_numeric(df.get("first_green_seconds", pd.Series(dtype=float)), errors="coerce")

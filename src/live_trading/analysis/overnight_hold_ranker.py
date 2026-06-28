@@ -161,11 +161,16 @@ def analyze_trade_overnight(
         "next_session_close_from_entry_pct": pct(next_close, entry_price),
         "next_session_max_drawdown_from_entry_pct": pct(next_low, entry_price),
     }
+    features["missing_next_session_data"] = int(next_candles.empty)
+    if next_candles.empty:
+        features["overnight_hold_score"] = None
+        features["overnight_hold_bucket"] = "missing_next_session_data"
+        features["overnight_hold_reason"] = "missing_next_session_data"
+        return features
     score, bucket, reason = overnight_score(features)
     features["overnight_hold_score"] = score
     features["overnight_hold_bucket"] = bucket
     features["overnight_hold_reason"] = reason
-    features["missing_next_session_data"] = int(next_candles.empty)
     return features
 
 
@@ -248,6 +253,9 @@ def print_summary(df: pd.DataFrame) -> None:
     print(f"OVERNIGHT_HOLD_RANKING total_closed_trades={total} scored_trades={scored} missing_next_session_data={missing} avg_overnight_hold_score={avg_score:.2f}")
     if df.empty:
         return
+    if missing:
+        dates = ",".join(sorted(set(str(x) for x in df.loc[pd.to_numeric(df.get("missing_next_session_data", 0), errors="coerce").fillna(0) > 0, "next_session_date"].dropna().tolist())))
+        print(f"OVERNIGHT_NEXT_SESSION_DATA_MISSING date={dates} count={missing}")
     print("bucket_counts=" + ", ".join(f"{k}:{v}" for k, v in df["overnight_hold_bucket"].fillna("missing").value_counts().to_dict().items()))
     grouped = df.groupby("overnight_hold_bucket", dropna=False).agg(
         avg_next_high_from_entry_pct=("next_session_high_from_entry_pct", "mean"),

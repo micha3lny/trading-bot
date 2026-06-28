@@ -69,6 +69,9 @@ OUTPUT_COLUMNS = [
     "prev_5d_avg_volume",
     "prev_3d_relative_volume_like",
     "prev_5d_relative_volume_like",
+    "hypothetical_multiday_score",
+    "hypothetical_multiday_rank",
+    "would_enter_multiday_top100",
 ]
 
 
@@ -262,6 +265,36 @@ def previous_session_context(history_dir: Path, symbol: str, session_date: str) 
     }
 
 
+def multiday_score(row: dict[str, Any]) -> float:
+    """Compact 0-100 what-if score for prior momentum/liquidity."""
+    score = 0.0
+
+    def pos(value: Any, cap: float, weight: float) -> float:
+        val = fnum(value)
+        if val is None:
+            return 0.0
+        return max(0.0, min(float(val), cap)) / cap * weight
+
+    score += pos(row.get("prev_1d_return_pct"), 10.0, 20.0)
+    score += pos(row.get("prev_3d_return_pct"), 15.0, 20.0)
+    score += pos(row.get("prev_5d_return_pct"), 25.0, 20.0)
+    score += pos(row.get("prev_3d_max_intraday_high_pct"), 15.0, 15.0)
+    score += pos(row.get("prev_5d_max_intraday_high_pct"), 25.0, 15.0)
+    score += pos(row.get("prev_3d_relative_volume_like"), 3.0, 5.0)
+    score += pos(row.get("prev_5d_relative_volume_like"), 3.0, 5.0)
+    return round(max(0.0, min(100.0, score)), 4)
+
+
+def add_multiday_ranks(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out["hypothetical_multiday_score"] = [multiday_score(row) for row in out.to_dict("records")]
+    out["hypothetical_multiday_rank"] = out["hypothetical_multiday_score"].rank(method="first", ascending=False).astype(int)
+    out["would_enter_multiday_top100"] = (out["hypothetical_multiday_rank"] <= 100).astype(int)
+    return out
+
+
 def analyze_missed_runners(
     *,
     session_date: str,
@@ -337,6 +370,7 @@ def analyze_missed_runners(
     out = pd.DataFrame(rows)
     if out.empty:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
+    out = add_multiday_ranks(out)
     return out.sort_values("open_to_high_pct", ascending=False)[OUTPUT_COLUMNS]
 
 
@@ -353,16 +387,18 @@ def print_summary(df: pd.DataFrame) -> None:
     no_signal = int((df["missed_reason_group"] == "no_signal").sum())
     bought_late = int((df["missed_reason_group"] == "bought_late").sum())
     detectable_not_top100 = int(((df["was_detectable_from_history"] == 1) & (df["missed_reason_group"] == "not_in_top100")).sum())
+    detectable_multiday_top100 = int(((df["was_detectable_from_history"] == 1) & (df["missed_reason_group"] == "not_in_top100") & (df["would_enter_multiday_top100"] == 1)).sum())
     print(
         f"missed_breakdown not_in_top100={not_in_top100} no_signal={no_signal} bought_late={bought_late} "
-        f"detectable_from_history={detectable} not_detectable_from_history={total - detectable} detectable_but_not_in_top100={detectable_not_top100}"
+        f"detectable_from_history={detectable} not_detectable_from_history={total - detectable} "
+        f"detectable_but_not_in_top100={detectable_not_top100} detectable_multiday_top100={detectable_multiday_top100}"
     )
     print("reason_counts=" + ", ".join(f"{k}:{v}" for k, v in reasons.most_common()))
     cols = ["symbol", "source_bucket", "open_to_high_pct", "was_bought", "missed_reason_group", "top100_rank", "top100_score"]
     print("top20_by_open_to_high_pct:")
     print(df[cols].head(20).to_string(index=False))
     print("top_missed_detectable_runners:")
-    print(df[(df["was_bought"] == 0) & (df["was_detectable_from_history"] == 1)].head(20)[["symbol", "open_to_high_pct", "missed_reason_group", "detectability_reason", "top100_rank"]].to_string(index=False))
+    print(df[(df["was_bought"] == 0) & (df["was_detectable_from_history"] == 1)].head(20)[["symbol", "open_to_high_pct", "missed_reason_group", "detectability_reason", "top100_rank", "hypothetical_multiday_score", "hypothetical_multiday_rank", "would_enter_multiday_top100"]].to_string(index=False))
     print("top_missed_not_detectable_runners:")
     print(df[(df["was_bought"] == 0) & (df["was_detectable_from_history"] == 0)].head(20)[["symbol", "open_to_high_pct", "missed_reason_group", "top100_rank"]].to_string(index=False))
 

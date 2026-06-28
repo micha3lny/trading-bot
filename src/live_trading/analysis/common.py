@@ -163,6 +163,12 @@ def load_recorder_candles(recorder_dir: str | Path, session_date: str, symbol: s
         if symbol and "symbol" in df.columns:
             df = df[df["symbol"].map(normalize_symbol) == normalize_symbol(symbol)]
         try:
+            if "timestamp" not in {str(c).strip().lower() for c in df.columns}:
+                lower = {str(c).strip().lower(): c for c in df.columns}
+                for candidate in ("bar_time", "bar_time_utc", "time", "datetime"):
+                    if candidate in lower:
+                        df = df.rename(columns={lower[candidate]: "timestamp"})
+                        break
             return normalize_history_df(df)
         except Exception:
             continue
