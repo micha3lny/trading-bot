@@ -43,6 +43,12 @@ from src.live_trading.analysis.signal_case_trace import (
     decision_classification,
     pass_fail,
 )
+from src.live_trading.analysis.symbol_subscription_inspector import (
+    build_parser as build_subscription_inspector_parser,
+    infer_verdict,
+    parse_key_values,
+    symbol_journal_lines,
+)
 from src.live_trading.ranking.daily_top100_builder import parquet_path
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
@@ -531,6 +537,50 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
     def test_signal_case_trace_pass_fail(self) -> None:
         self.assertEqual(pass_fail(True), "PASS")
         self.assertEqual(pass_fail(False), "FAIL")
+
+    def test_subscription_inspector_symbol_journal_lines_exact_symbol(self) -> None:
+        lines = [
+            "2026-06-26T13:31:00+00:00 TOP100_RELOAD_REQUESTED symbol=AOUT conId=1",
+            "2026-06-26T13:31:00+00:00 TOP100_RELOAD_REQUESTED symbol=AOUTX conId=2",
+        ]
+        self.assertEqual(len(symbol_journal_lines(lines, "AOUT")), 1)
+
+    def test_subscription_inspector_parse_key_values(self) -> None:
+        parsed = parse_key_values("TOP100_RELOAD_DONE subscribed_top100=86 active_position_symbols_count=14 max_subscriptions=100")
+        self.assertEqual(parsed["subscribed_top100"], "86")
+        self.assertEqual(parsed["max_subscriptions"], "100")
+
+    def test_subscription_inspector_infers_subscription_cap_root_cause(self) -> None:
+        verdict = infer_verdict(
+            in_top100=True,
+            journal_symbol=[],
+            journal_terms=["TOP100_RELOAD_DONE top100_requested=100 subscribed_top100=86 max_subscriptions=100"],
+            contract_rows=0,
+            candles_rows=0,
+            sqlite_count_total=0,
+            center_lines=[],
+        )
+        self.assertEqual(verdict["likely_root_cause"], "not_in_reload_requested_symbols_or_subscription_cap")
+
+    def test_subscription_inspector_infers_subscribed_but_no_market_data(self) -> None:
+        verdict = infer_verdict(
+            in_top100=True,
+            journal_symbol=[
+                "TOP100_RELOAD_REQUESTED symbol=AOUT conId=1",
+                "TOP100_RELOAD_SUBSCRIBED symbol=AOUT conId=1",
+            ],
+            journal_terms=[],
+            contract_rows=1,
+            candles_rows=0,
+            sqlite_count_total=0,
+            center_lines=[],
+        )
+        self.assertEqual(verdict["likely_root_cause"], "subscribed_but_no_market_data_seen")
+
+    def test_subscription_inspector_cli_help(self) -> None:
+        help_text = build_subscription_inspector_parser().format_help()
+        self.assertIn("Inspect whether one or more Top100 symbols", help_text)
+        self.assertIn("--symbols", help_text)
 
     def test_overnight_score_and_bucket(self) -> None:
         score, bucket, reason = overnight_score({
