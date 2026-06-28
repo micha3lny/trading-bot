@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.live_trading.analysis.bad_entries_analyzer import (
+    analyze_bad_entries,
     first_green_seconds,
     load_closed_trades,
     rank_bucket,
@@ -203,6 +204,125 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
             candles = load_recorder_candles(Path(tmp) / "recorder", "2026-06-26", "AAA")
             self.assertFalse(candles.empty)
             self.assertEqual(candles.iloc[0]["timestamp"], pd.Timestamp("2026-06-26T13:30:00Z"))
+
+    def test_bad_entries_uses_parquet_when_recorder_candles_do_not_cover_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "runtime.sqlite"
+            history = root / "history"
+            recorder = root / "recorder"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_trade({
+                    "trade_id": "T_FCEL",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-26",
+                    "symbol": "FCEL",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-06-26T14:02:47+00:00",
+                    "exit_fill_time": "2026-06-26T14:12:47+00:00",
+                    "entry_price": 10.0,
+                    "exit_price": 10.4,
+                    "quantity": 10,
+                    "net_pnl": 4.0,
+                    "raw_json": {"live_entry_score": 70},
+                })
+                store.upsert_execution({
+                    "execution_id": "B_FCEL",
+                    "trade_id": "T_FCEL",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-26",
+                    "symbol": "FCEL",
+                    "side": "BOT",
+                    "quantity": 10,
+                    "price": 10.0,
+                    "executed_at": "2026-06-26T14:02:47+00:00",
+                })
+            finally:
+                store.close()
+            rec_root = recorder / "2026-06-26"
+            rec_root.mkdir(parents=True)
+            pd.DataFrame([
+                {"symbol": "FCEL", "bar_time": "2026-06-26 09:30:00-04:00", "open": 9.8, "high": 10.0, "low": 9.7, "close": 9.9, "volume": 100},
+                {"symbol": "FCEL", "bar_time": "2026-06-26 09:58:00-04:00", "open": 9.9, "high": 10.1, "low": 9.8, "close": 10.0, "volume": 100},
+            ]).to_csv(rec_root / "candles_1m.csv", index=False)
+            path = parquet_path(history, "FCEL", pd.Timestamp("2026-06-26").date(), "RTH")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([
+                {"timestamp": "2026-06-26T14:02:00+00:00", "open": 10.0, "high": 10.2, "low": 9.9, "close": 10.1, "volume": 1000},
+                {"timestamp": "2026-06-26T14:03:00+00:00", "open": 10.1, "high": 10.8, "low": 10.0, "close": 10.7, "volume": 1000},
+                {"timestamp": "2026-06-26T14:12:00+00:00", "open": 10.4, "high": 10.5, "low": 10.2, "close": 10.4, "volume": 1000},
+                {"timestamp": "2026-06-26T14:13:00+00:00", "open": 10.4, "high": 10.5, "low": 10.2, "close": 10.4, "volume": 1000},
+            ]).to_parquet(path, index=False)
+
+            out = analyze_bad_entries(
+                start_date="2026-06-26",
+                end_date="2026-06-26",
+                sqlite_path=db,
+                history_dir=history,
+                recorder_dir=recorder,
+            )
+            self.assertEqual(len(out), 1)
+            self.assertEqual(out.iloc[0]["candle_source"], "parquet")
+            self.assertEqual(out.iloc[0]["candle_coverage_warning"], "recorder_incomplete")
+            self.assertGreater(float(out.iloc[0]["mfe_pct"]), 0)
+
+    def test_bad_entries_keeps_execution_fifo_trade_when_trades_table_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "runtime.sqlite"
+            history = root / "history"
+            recorder = root / "recorder"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_execution({
+                    "execution_id": "B_UNCY",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-26",
+                    "symbol": "UNCY",
+                    "side": "BOT",
+                    "quantity": 10,
+                    "price": 10.0,
+                    "executed_at": "2026-06-26T14:08:53+00:00",
+                    "commission": 0.5,
+                    "commission_source": "ibkr",
+                })
+                store.upsert_execution({
+                    "execution_id": "S_UNCY",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-26",
+                    "symbol": "UNCY",
+                    "side": "SLD",
+                    "quantity": 10,
+                    "price": 10.5,
+                    "executed_at": "2026-06-26T14:18:53+00:00",
+                    "commission": 0.5,
+                    "commission_source": "ibkr",
+                    "realized_pnl": 5.0,
+                })
+                store.execute("DELETE FROM trades")
+            finally:
+                store.close()
+            path = parquet_path(history, "UNCY", pd.Timestamp("2026-06-26").date(), "RTH")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([
+                {"timestamp": "2026-06-26T14:08:00+00:00", "open": 10.0, "high": 10.1, "low": 9.9, "close": 10.0, "volume": 1000},
+                {"timestamp": "2026-06-26T14:09:00+00:00", "open": 10.0, "high": 10.7, "low": 10.0, "close": 10.6, "volume": 1000},
+                {"timestamp": "2026-06-26T14:18:00+00:00", "open": 10.4, "high": 10.5, "low": 10.3, "close": 10.5, "volume": 1000},
+                {"timestamp": "2026-06-26T14:19:00+00:00", "open": 10.5, "high": 10.5, "low": 10.3, "close": 10.5, "volume": 1000},
+            ]).to_parquet(path, index=False)
+
+            out = analyze_bad_entries(
+                start_date="2026-06-26",
+                end_date="2026-06-26",
+                sqlite_path=db,
+                history_dir=history,
+                recorder_dir=recorder,
+            )
+            self.assertEqual(len(out), 1)
+            self.assertEqual(out.iloc[0]["symbol"], "UNCY")
+            self.assertEqual(out.iloc[0]["candle_source"], "parquet")
+            self.assertGreater(float(out.iloc[0]["mfe_pct"]), 0)
 
     def test_overnight_score_and_bucket(self) -> None:
         score, bucket, reason = overnight_score({

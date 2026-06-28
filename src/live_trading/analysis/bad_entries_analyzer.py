@@ -13,7 +13,8 @@ from src.live_trading.analysis.common import (
     first_existing_column,
     fnum,
     iso_ts,
-    load_trade_candles,
+    load_recorder_candles,
+    load_session_candles,
     min_after_pct,
     nearest_row,
     parse_dt,
@@ -38,6 +39,10 @@ OUTPUT_COLUMNS = [
     "entry_time_source",
     "entry_time_normalization_warning",
     "matched_first_candle_time",
+    "candle_source",
+    "candle_coverage_warning",
+    "candles_min_time_utc",
+    "candles_max_time_utc",
     "entry_session_phase",
     "entry_price",
     "exit_time",
@@ -115,6 +120,121 @@ def load_executions(sqlite_path: str | Path, start_date: str, end_date: str) -> 
         params=[start_date, end_date, start_date, end_date, start_date, end_date],
         order_by="COALESCE(executed_at, recorded_at), execution_id",
     )
+
+
+def execution_closed_trades(executions: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
+    if executions.empty:
+        return pd.DataFrame()
+    rows = executions.copy()
+    rows["_side_norm"] = rows.get("side", pd.Series(dtype=str)).fillna("").astype(str).str.upper().map(
+        lambda value: "BUY" if value in {"BOT", "BUY", "BOUGHT"} else ("SELL" if value in {"SLD", "SELL", "SOLD"} else value)
+    )
+    rows["_ts"] = [execution_timestamp(row) for row in rows.to_dict("records")]
+    rows = rows.dropna(subset=["_ts"]).sort_values(["symbol", "_ts", "execution_id"], na_position="last")
+    out: list[dict[str, Any]] = []
+    for symbol, group in rows.groupby(rows["symbol"].fillna("").astype(str).str.upper()):
+        if not symbol:
+            continue
+        open_lots: list[dict[str, Any]] = []
+        for row in group.to_dict("records"):
+            side = row.get("_side_norm")
+            qty = abs(fnum(row.get("quantity"), 0.0) or 0.0)
+            price = fnum(row.get("price"), 0.0) or 0.0
+            if qty <= 0 or price <= 0:
+                continue
+            if side == "BUY":
+                lot = dict(row)
+                lot["remaining_qty"] = qty
+                lot["original_qty"] = qty
+                open_lots.append(lot)
+                continue
+            if side != "SELL":
+                continue
+            sell_ts = row.get("_ts")
+            sell_date = sell_ts.strftime("%F") if sell_ts is not None else str(row.get("session_date") or "")
+            if sell_date < start_date or sell_date > end_date:
+                continue
+            remaining = qty
+            while remaining > 1e-9 and open_lots:
+                lot = open_lots[0]
+                lot_remaining = fnum(lot.get("remaining_qty"), 0.0) or 0.0
+                if lot_remaining <= 1e-9:
+                    open_lots.pop(0)
+                    continue
+                matched_qty = min(remaining, lot_remaining)
+                buy_ts = lot.get("_ts")
+                buy_price = fnum(lot.get("price"), 0.0) or 0.0
+                gross = (price - buy_price) * matched_qty
+                buy_fraction = matched_qty / (fnum(lot.get("original_qty"), matched_qty) or matched_qty or 1.0)
+                sell_fraction = matched_qty / qty if qty else 1.0
+                buy_commission = abs(fnum(lot.get("commission"), 0.0) or 0.0) * buy_fraction if str(lot.get("commission_source") or "").lower() == "ibkr" else 0.0
+                sell_commission = abs(fnum(row.get("commission"), 0.0) or 0.0) * sell_fraction if str(row.get("commission_source") or "").lower() == "ibkr" else 0.0
+                sell_realized = fnum(row.get("realized_pnl"))
+                net_pnl = (sell_realized * sell_fraction - sell_commission) if sell_realized is not None else gross - buy_commission - sell_commission
+                buy_raw = parse_raw_json(lot.get("raw_json"))
+                sell_raw = parse_raw_json(row.get("raw_json"))
+                raw = {**buy_raw}
+                raw.update({
+                    "reconstruction_source": "bad_entries_execution_fifo",
+                    "buy_execution_id": lot.get("execution_id"),
+                    "sell_execution_id": row.get("execution_id"),
+                    "sell_raw_json": sell_raw,
+                })
+                trade_id = f"exec_fifo:{sell_date}:{symbol}:{lot.get('execution_id')}:{row.get('execution_id')}:{matched_qty:g}"
+                out.append({
+                    "trade_id": trade_id,
+                    "status": "CLOSED",
+                    "session_date": str(lot.get("session_date") or (buy_ts.strftime("%F") if buy_ts is not None else sell_date)),
+                    "symbol": symbol,
+                    "entry_fill_time": iso_ts(buy_ts),
+                    "exit_fill_time": iso_ts(sell_ts),
+                    "closed_at": iso_ts(sell_ts),
+                    "entry_price": buy_price,
+                    "exit_price": price,
+                    "quantity": matched_qty,
+                    "gross_pnl": gross,
+                    "commission": buy_commission + sell_commission,
+                    "net_pnl": net_pnl,
+                    "exit_reason": row.get("exit_reason") or sell_raw.get("exit_reason") or "",
+                    "top100_rank": lot.get("top100_rank") or buy_raw.get("top100_rank"),
+                    "top100_score": lot.get("top100_score") or buy_raw.get("top100_score"),
+                    "live_entry_score": lot.get("live_entry_score") or buy_raw.get("live_entry_score"),
+                    "live_entry_rank": lot.get("live_entry_rank") or buy_raw.get("live_entry_rank"),
+                    "signal_time": lot.get("signal_time") or buy_raw.get("signal_time"),
+                    "ready_since": lot.get("ready_since") or buy_raw.get("ready_since"),
+                    "raw_json": raw,
+                })
+                lot["remaining_qty"] = lot_remaining - matched_qty
+                remaining -= matched_qty
+                if (fnum(lot.get("remaining_qty"), 0.0) or 0.0) <= 1e-9:
+                    open_lots.pop(0)
+    return pd.DataFrame(out)
+
+
+def trade_execution_pair_key(row: dict[str, Any]) -> tuple[str, str]:
+    raw = parse_raw_json(row.get("raw_json"))
+    return str(raw.get("buy_execution_id") or ""), str(raw.get("sell_execution_id") or "")
+
+
+def augment_trades_from_executions(trades: pd.DataFrame, executions: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
+    exec_trades = execution_closed_trades(executions, start_date, end_date)
+    if exec_trades.empty:
+        return trades
+    if trades.empty:
+        return exec_trades
+    existing_pairs = {trade_execution_pair_key(row) for row in trades.to_dict("records")}
+    existing_trade_ids = {str(value) for value in trades.get("trade_id", pd.Series(dtype=str)).fillna("").astype(str)}
+    missing = []
+    for row in exec_trades.to_dict("records"):
+        pair = trade_execution_pair_key(row)
+        if pair in existing_pairs and pair != ("", ""):
+            continue
+        if str(row.get("trade_id") or "") in existing_trade_ids:
+            continue
+        missing.append(row)
+    if not missing:
+        return trades
+    return pd.concat([trades, pd.DataFrame(missing)], ignore_index=True, sort=False)
 
 
 def load_spread_snapshots(recorder_dir: Path, session_date: str) -> pd.DataFrame:
@@ -213,6 +333,48 @@ def resolve_entry_time(
     return chosen, source, warning, first_candle
 
 
+def candle_minmax(candles: pd.DataFrame) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    if candles.empty or "timestamp" not in candles.columns:
+        return None, None
+    return candles["timestamp"].min(), candles["timestamp"].max()
+
+
+def candles_cover_trade_window(candles: pd.DataFrame, entry_time: pd.Timestamp | None, exit_time: pd.Timestamp | None) -> bool:
+    cmin, cmax = candle_minmax(candles)
+    if cmin is None or cmax is None or entry_time is None:
+        return False
+    needed_end = entry_time + pd.Timedelta(minutes=10)
+    if exit_time is not None:
+        needed_end = min(needed_end, exit_time)
+    return cmin <= entry_time <= cmax and cmax >= needed_end
+
+
+def choose_trade_candles(
+    *,
+    history_dir: Path,
+    recorder_dir: Path,
+    symbol: str,
+    session_date: str,
+    entry_time: pd.Timestamp | None,
+    exit_time: pd.Timestamp | None,
+    session_type: str,
+) -> tuple[pd.DataFrame, str, str, pd.Timestamp | None, pd.Timestamp | None]:
+    recorder = load_recorder_candles(recorder_dir, session_date, symbol)
+    if candles_cover_trade_window(recorder, entry_time, exit_time):
+        cmin, cmax = candle_minmax(recorder)
+        return recorder.sort_values("timestamp").reset_index(drop=True), "recorder", "ok", cmin, cmax
+    parquet = load_session_candles(history_dir, symbol, session_date, session_type)
+    if candles_cover_trade_window(parquet, entry_time, exit_time):
+        cmin, cmax = candle_minmax(parquet)
+        warning = "recorder_incomplete" if not recorder.empty else "ok"
+        return parquet.sort_values("timestamp").reset_index(drop=True), "parquet", warning, cmin, cmax
+    if not recorder.empty:
+        cmin, cmax = candle_minmax(recorder)
+        return pd.DataFrame(), "missing", "recorder_incomplete", cmin, cmax
+    cmin, cmax = candle_minmax(parquet)
+    return pd.DataFrame(), "missing", "parquet_missing", cmin, cmax
+
+
 def entry_phase(entry_time: pd.Timestamp | None, session_date: str, warning: str) -> str:
     if warning == "time_mismatch":
         return "time_mismatch"
@@ -301,6 +463,7 @@ def analyze_bad_entries(
 ) -> pd.DataFrame:
     trades = load_closed_trades(sqlite_path, start_date, end_date)
     executions = load_executions(sqlite_path, start_date, end_date)
+    trades = augment_trades_from_executions(trades, executions, start_date, end_date)
     rows: list[dict[str, Any]] = []
     spread_cache: dict[str, pd.DataFrame] = {}
     diagnostics = {
@@ -329,20 +492,35 @@ def analyze_bad_entries(
             commission = abs(fnum(trade.get("commission"), 0.0) or 0.0)
             net_pnl = gross - commission
         buy_exec = match_buy_execution(trade, executions)
-        candles_full = load_trade_candles(history_dir, recorder_dir, symbol, session_date, None, exit_time, session_type)
+        preliminary_candles = load_recorder_candles(recorder_dir, session_date, symbol)
+        if preliminary_candles.empty:
+            preliminary_candles = load_session_candles(history_dir, symbol, session_date, session_type)
+        entry_time, entry_time_source, entry_warning, first_candle = resolve_entry_time(trade, raw, buy_exec, preliminary_candles, session_date)
+        candles_full, candle_source, candle_warning, candles_min_time, candles_max_time = choose_trade_candles(
+            history_dir=history_dir,
+            recorder_dir=recorder_dir,
+            symbol=symbol,
+            session_date=session_date,
+            entry_time=entry_time,
+            exit_time=exit_time,
+            session_type=session_type,
+        )
         if not candles_full.empty:
             diagnostics["candles_loaded_symbols"].add(symbol)
-            cmin = candles_full["timestamp"].min()
-            cmax = candles_full["timestamp"].max()
-            diagnostics["candles_min_time_utc"] = cmin if diagnostics["candles_min_time_utc"] is None else min(diagnostics["candles_min_time_utc"], cmin)
-            diagnostics["candles_max_time_utc"] = cmax if diagnostics["candles_max_time_utc"] is None else max(diagnostics["candles_max_time_utc"], cmax)
-        entry_time, entry_time_source, entry_warning, first_candle = resolve_entry_time(trade, raw, buy_exec, candles_full, session_date)
+            diagnostics["candles_min_time_utc"] = candles_min_time if diagnostics["candles_min_time_utc"] is None else min(diagnostics["candles_min_time_utc"], candles_min_time)
+            diagnostics["candles_max_time_utc"] = candles_max_time if diagnostics["candles_max_time_utc"] is None else max(diagnostics["candles_max_time_utc"], candles_max_time)
         if raw_entry_time is not None:
             diagnostics["trades_min_entry_time_utc"] = raw_entry_time if diagnostics["trades_min_entry_time_utc"] is None else min(diagnostics["trades_min_entry_time_utc"], raw_entry_time)
             diagnostics["trades_max_entry_time_utc"] = raw_entry_time if diagnostics["trades_max_entry_time_utc"] is None else max(diagnostics["trades_max_entry_time_utc"], raw_entry_time)
         if entry_warning == "time_mismatch":
             diagnostics["time_mismatch_count"] += 1
-        candles = candles_full[candles_full["timestamp"] >= entry_time].reset_index(drop=True) if entry_time is not None and not candles_full.empty and entry_warning != "time_mismatch" else pd.DataFrame()
+        if entry_time is not None and not candles_full.empty and entry_warning != "time_mismatch":
+            candles = candles_full[candles_full["timestamp"] >= entry_time]
+            if exit_time is not None:
+                candles = candles[candles["timestamp"] <= exit_time]
+            candles = candles.reset_index(drop=True)
+        else:
+            candles = pd.DataFrame()
         metrics_ok = not candles.empty and entry_time is not None and entry_price is not None and entry_warning != "time_mismatch"
         diagnostics["metrics_computed_count" if metrics_ok else "metrics_missing_count"] += 1
         stats = calculate_path_stats(candles, entry_price or 0.0, entry_time) if metrics_ok else calculate_path_stats(pd.DataFrame(), 0.0, None)
@@ -377,6 +555,10 @@ def analyze_bad_entries(
             "entry_time_source": entry_time_source,
             "entry_time_normalization_warning": entry_warning,
             "matched_first_candle_time": iso_ts(first_candle),
+            "candle_source": candle_source,
+            "candle_coverage_warning": candle_warning,
+            "candles_min_time_utc": iso_ts(candles_min_time),
+            "candles_max_time_utc": iso_ts(candles_max_time),
             "entry_session_phase": entry_phase(entry_time, session_date, entry_warning),
             "entry_price": entry_price,
             "exit_time": iso_ts(exit_time),
