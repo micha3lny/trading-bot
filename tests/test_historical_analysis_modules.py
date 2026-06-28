@@ -324,6 +324,78 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
             self.assertEqual(out.iloc[0]["candle_source"], "parquet")
             self.assertGreater(float(out.iloc[0]["mfe_pct"]), 0)
 
+    def test_bad_entries_groups_partial_exit_fills_by_logical_trade_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "runtime.sqlite"
+            history = root / "history"
+            recorder = root / "recorder"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_execution({
+                    "execution_id": "B_CAST",
+                    "order_id": 65046,
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-26",
+                    "symbol": "CAST",
+                    "side": "BOT",
+                    "quantity": 113,
+                    "price": 8.81,
+                    "executed_at": "2026-06-26T14:08:00+00:00",
+                    "commission": 1.0,
+                    "commission_source": "ibkr",
+                })
+                for exec_id, qty, ts in [
+                    ("S_CAST_1", 100, "2026-06-26T14:18:00+00:00"),
+                    ("S_CAST_2", 13, "2026-06-26T14:18:05+00:00"),
+                ]:
+                    store.upsert_execution({
+                        "execution_id": exec_id,
+                        "order_id": 65047,
+                        "strategy_name": "v67",
+                        "session_date": "2026-06-26",
+                        "symbol": "CAST",
+                        "side": "SLD",
+                        "quantity": qty,
+                        "price": 8.79,
+                        "executed_at": ts,
+                        "commission": 0.5,
+                        "commission_source": "ibkr",
+                        "realized_pnl": -0.02 * qty,
+                    })
+                store.execute("DELETE FROM trades")
+            finally:
+                store.close()
+            path = parquet_path(history, "CAST", pd.Timestamp("2026-06-26").date(), "RTH")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([
+                {"timestamp": "2026-06-26T14:08:00+00:00", "open": 8.81, "high": 8.85, "low": 8.78, "close": 8.82, "volume": 1000},
+                {"timestamp": "2026-06-26T14:09:00+00:00", "open": 8.82, "high": 8.90, "low": 8.80, "close": 8.87, "volume": 1000},
+                {"timestamp": "2026-06-26T14:18:00+00:00", "open": 8.80, "high": 8.81, "low": 8.78, "close": 8.79, "volume": 1000},
+                {"timestamp": "2026-06-26T14:19:00+00:00", "open": 8.79, "high": 8.81, "low": 8.78, "close": 8.79, "volume": 1000},
+            ]).to_parquet(path, index=False)
+
+            grouped = analyze_bad_entries(
+                start_date="2026-06-26",
+                end_date="2026-06-26",
+                sqlite_path=db,
+                history_dir=history,
+                recorder_dir=recorder,
+            )
+            per_fill = analyze_bad_entries(
+                start_date="2026-06-26",
+                end_date="2026-06-26",
+                sqlite_path=db,
+                history_dir=history,
+                recorder_dir=recorder,
+                per_fill=True,
+            )
+            self.assertEqual(len(grouped), 1)
+            self.assertEqual(grouped.iloc[0]["analysis_source"], "reconstructed_execution_fifo")
+            self.assertAlmostEqual(float(grouped.iloc[0]["quantity"]), 113.0)
+            self.assertEqual(len(per_fill), 2)
+            self.assertTrue((per_fill["analysis_source"] == "reconstructed_execution_fifo_fill").all())
+
     def test_overnight_score_and_bucket(self) -> None:
         score, bucket, reason = overnight_score({
             "next_session_high_from_entry_pct": 6.0,

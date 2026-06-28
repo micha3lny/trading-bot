@@ -34,6 +34,8 @@ DEFAULT_RECORDER_DIR = Path("data/live/recorder")
 OUTPUT_COLUMNS = [
     "date",
     "trade_id",
+    "analysis_source",
+    "logical_trade_group",
     "symbol",
     "entry_time",
     "entry_time_source",
@@ -174,18 +176,25 @@ def execution_closed_trades(executions: pd.DataFrame, start_date: str, end_date:
                 buy_raw = parse_raw_json(lot.get("raw_json"))
                 sell_raw = parse_raw_json(row.get("raw_json"))
                 raw = {**buy_raw}
+                entry_order_id = lot.get("order_id") or lot.get("perm_id") or buy_raw.get("entry_order_id") or buy_raw.get("order_id")
+                exit_order_id = row.get("order_id") or row.get("perm_id") or sell_raw.get("exit_order_id") or sell_raw.get("order_id")
                 raw.update({
                     "reconstruction_source": "bad_entries_execution_fifo",
                     "buy_execution_id": lot.get("execution_id"),
                     "sell_execution_id": row.get("execution_id"),
+                    "entry_order_id": entry_order_id,
+                    "exit_order_id": exit_order_id,
                     "sell_raw_json": sell_raw,
                 })
                 trade_id = f"exec_fifo:{sell_date}:{symbol}:{lot.get('execution_id')}:{row.get('execution_id')}:{matched_qty:g}"
                 out.append({
                     "trade_id": trade_id,
+                    "analysis_source": "reconstructed_execution_fifo_fill",
                     "status": "CLOSED",
                     "session_date": str(lot.get("session_date") or (buy_ts.strftime("%F") if buy_ts is not None else sell_date)),
                     "symbol": symbol,
+                    "entry_order_id": entry_order_id,
+                    "exit_order_id": exit_order_id,
                     "entry_fill_time": iso_ts(buy_ts),
                     "exit_fill_time": iso_ts(sell_ts),
                     "closed_at": iso_ts(sell_ts),
@@ -211,19 +220,124 @@ def execution_closed_trades(executions: pd.DataFrame, start_date: str, end_date:
     return pd.DataFrame(out)
 
 
+def first_non_empty(values: pd.Series) -> Any:
+    for value in values:
+        if value not in (None, "") and not (isinstance(value, float) and pd.isna(value)):
+            return value
+    return None
+
+
+def logical_group_from_row(row: dict[str, Any]) -> str:
+    raw = parse_raw_json(row.get("raw_json"))
+    symbol = str(row.get("symbol") or "").upper()
+    session_date = str(row.get("session_date") or "")[:10]
+    entry_order_id = (
+        row.get("entry_order_id")
+        or raw.get("entry_order_id")
+        or raw.get("order_id")
+        or raw.get("buy_order_id")
+        or row.get("order_id")
+    )
+    if entry_order_id not in (None, ""):
+        return f"{symbol}|{session_date}|entry_order:{entry_order_id}"
+    entry_time = parse_dt(first_existing_column(row, ["entry_fill_time", "entry_time"]) or raw.get("entry_time"))
+    entry_price = fnum(first_existing_column(row, ["entry_price", "buy_price"]) or raw.get("entry_price"))
+    entry_minute = entry_time.floor("min").isoformat() if entry_time is not None else ""
+    price_key = f"{entry_price:.4f}" if entry_price is not None else ""
+    return f"{symbol}|{session_date}|entry:{entry_minute}|price:{price_key}"
+
+
+def logical_match_key(row: dict[str, Any]) -> tuple[str, str, str]:
+    raw = parse_raw_json(row.get("raw_json"))
+    symbol = str(row.get("symbol") or "").upper()
+    entry_order_id = str(row.get("entry_order_id") or raw.get("entry_order_id") or raw.get("order_id") or "")
+    entry_time = parse_dt(first_existing_column(row, ["entry_fill_time", "entry_time"]) or raw.get("entry_time"))
+    entry_minute = entry_time.floor("min").isoformat() if entry_time is not None else ""
+    return symbol, entry_order_id, entry_minute
+
+
+def aggregate_reconstructed_trades(exec_trades: pd.DataFrame) -> pd.DataFrame:
+    if exec_trades.empty:
+        return exec_trades
+    rows = exec_trades.copy()
+    rows["_logical_group"] = [logical_group_from_row(row) for row in rows.to_dict("records")]
+    grouped_rows: list[dict[str, Any]] = []
+    for group_id, group in rows.groupby("_logical_group", sort=False):
+        records = group.to_dict("records")
+        first = dict(records[0])
+        qty = pd.to_numeric(group.get("quantity", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+        total_qty = float(qty.sum())
+        if total_qty <= 0:
+            continue
+        entry_prices = pd.to_numeric(group.get("entry_price", pd.Series(dtype=float)), errors="coerce")
+        exit_prices = pd.to_numeric(group.get("exit_price", pd.Series(dtype=float)), errors="coerce")
+        first["trade_id"] = f"exec_fifo_group:{group_id}"
+        first["analysis_source"] = "reconstructed_execution_fifo"
+        first["logical_trade_group"] = group_id
+        first["quantity"] = total_qty
+        first["entry_price"] = float((entry_prices.fillna(0.0) * qty).sum() / total_qty) if entry_prices.notna().any() else None
+        first["exit_price"] = float((exit_prices.fillna(0.0) * qty).sum() / total_qty) if exit_prices.notna().any() else None
+        for col in ["gross_pnl", "commission", "net_pnl"]:
+            first[col] = float(pd.to_numeric(group.get(col, pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum())
+        entry_times = [parse_dt(value) for value in group.get("entry_fill_time", pd.Series(dtype=str))]
+        exit_times = [parse_dt(value) for value in group.get("exit_fill_time", pd.Series(dtype=str))]
+        entry_times = [value for value in entry_times if value is not None]
+        exit_times = [value for value in exit_times if value is not None]
+        first["entry_fill_time"] = iso_ts(min(entry_times) if entry_times else None)
+        first["exit_fill_time"] = iso_ts(max(exit_times) if exit_times else None)
+        first["closed_at"] = first["exit_fill_time"]
+        raw = parse_raw_json(first.get("raw_json"))
+        raw.update({
+            "reconstruction_source": "bad_entries_execution_fifo_grouped",
+            "buy_execution_ids": [parse_raw_json(row.get("raw_json")).get("buy_execution_id") for row in records],
+            "sell_execution_ids": [parse_raw_json(row.get("raw_json")).get("sell_execution_id") for row in records],
+            "entry_order_id": first_non_empty(group.get("entry_order_id", pd.Series(dtype=object))),
+            "exit_order_ids": sorted({str(value) for value in group.get("exit_order_id", pd.Series(dtype=object)) if value not in (None, "")}),
+            "partial_fill_count": len(records),
+        })
+        first["raw_json"] = raw
+        grouped_rows.append(first)
+    return pd.DataFrame(grouped_rows)
+
+
 def trade_execution_pair_key(row: dict[str, Any]) -> tuple[str, str]:
     raw = parse_raw_json(row.get("raw_json"))
     return str(raw.get("buy_execution_id") or ""), str(raw.get("sell_execution_id") or "")
 
 
-def augment_trades_from_executions(trades: pd.DataFrame, executions: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
+def augment_trades_from_executions(
+    trades: pd.DataFrame,
+    executions: pd.DataFrame,
+    start_date: str,
+    end_date: str,
+    *,
+    per_fill: bool = False,
+) -> pd.DataFrame:
     exec_trades = execution_closed_trades(executions, start_date, end_date)
+    if not per_fill:
+        exec_trades = aggregate_reconstructed_trades(exec_trades)
     if exec_trades.empty:
+        if not trades.empty:
+            trades = trades.copy()
+            trades["analysis_source"] = trades.get("analysis_source", "sqlite_trades")
+            trades["logical_trade_group"] = [logical_group_from_row(row) for row in trades.to_dict("records")]
+            trades.attrs["source_counts"] = {
+                "sqlite_trades_count": len(trades),
+                "reconstructed_trades_count": 0,
+            }
         return trades
     if trades.empty:
+        exec_trades.attrs["source_counts"] = {
+            "sqlite_trades_count": 0,
+            "reconstructed_trades_count": len(exec_trades),
+        }
         return exec_trades
+    trades = trades.copy()
+    trades["analysis_source"] = trades.get("analysis_source", "sqlite_trades")
+    trades["logical_trade_group"] = [logical_group_from_row(row) for row in trades.to_dict("records")]
     existing_pairs = {trade_execution_pair_key(row) for row in trades.to_dict("records")}
     existing_trade_ids = {str(value) for value in trades.get("trade_id", pd.Series(dtype=str)).fillna("").astype(str)}
+    existing_match_keys = {logical_match_key(row) for row in trades.to_dict("records")}
     missing = []
     for row in exec_trades.to_dict("records"):
         pair = trade_execution_pair_key(row)
@@ -231,10 +345,24 @@ def augment_trades_from_executions(trades: pd.DataFrame, executions: pd.DataFram
             continue
         if str(row.get("trade_id") or "") in existing_trade_ids:
             continue
+        symbol, entry_order_id, entry_minute = logical_match_key(row)
+        if entry_order_id and any(key[0] == symbol and key[1] == entry_order_id for key in existing_match_keys):
+            continue
+        if entry_minute and any(key[0] == symbol and key[2] == entry_minute for key in existing_match_keys):
+            continue
         missing.append(row)
     if not missing:
+        trades.attrs["source_counts"] = {
+            "sqlite_trades_count": len(trades),
+            "reconstructed_trades_count": 0,
+        }
         return trades
-    return pd.concat([trades, pd.DataFrame(missing)], ignore_index=True, sort=False)
+    out = pd.concat([trades, pd.DataFrame(missing)], ignore_index=True, sort=False)
+    out.attrs["source_counts"] = {
+        "sqlite_trades_count": len(trades),
+        "reconstructed_trades_count": len(missing),
+    }
+    return out
 
 
 def load_spread_snapshots(recorder_dir: Path, session_date: str) -> pd.DataFrame:
@@ -460,10 +588,12 @@ def analyze_bad_entries(
     history_dir: Path,
     recorder_dir: Path,
     session_type: str = "RTH",
+    per_fill: bool = False,
 ) -> pd.DataFrame:
     trades = load_closed_trades(sqlite_path, start_date, end_date)
     executions = load_executions(sqlite_path, start_date, end_date)
-    trades = augment_trades_from_executions(trades, executions, start_date, end_date)
+    trades = augment_trades_from_executions(trades, executions, start_date, end_date, per_fill=per_fill)
+    source_counts = dict(trades.attrs.get("source_counts", {})) if hasattr(trades, "attrs") else {}
     rows: list[dict[str, Any]] = []
     spread_cache: dict[str, pd.DataFrame] = {}
     diagnostics = {
@@ -550,6 +680,8 @@ def analyze_bad_entries(
         row = {
             "date": session_date,
             "trade_id": trade.get("trade_id"),
+            "analysis_source": trade.get("analysis_source") or "sqlite_trades",
+            "logical_trade_group": trade.get("logical_trade_group") or logical_group_from_row(trade),
             "symbol": symbol,
             "entry_time": iso_ts(entry_time),
             "entry_time_source": entry_time_source,
@@ -615,6 +747,7 @@ def analyze_bad_entries(
     out = pd.DataFrame(rows)[OUTPUT_COLUMNS]
     out.attrs["diagnostics"] = diagnostics
     out.attrs["signal_age_counts"] = signal_age_counts
+    out.attrs["source_counts"] = source_counts
     return out
 
 
@@ -759,6 +892,32 @@ def print_summary(df: pd.DataFrame) -> None:
             f"metrics_computed_count={diag.get('metrics_computed_count', 0)} "
             f"metrics_missing_count={diag.get('metrics_missing_count', 0)}"
         )
+    source_counts = df.attrs.get("source_counts", {}) if hasattr(df, "attrs") else {}
+    duplicate_groups = pd.DataFrame()
+    duplicate_count = 0
+    if not df.empty and "logical_trade_group" in df.columns:
+        duplicate_groups = (
+            df.groupby("logical_trade_group", dropna=False)
+            .agg(
+                rows=("symbol", "count"),
+                symbol=("symbol", "first"),
+                entry_time=("entry_time", "first"),
+                quantity=("quantity", "sum"),
+                sources=("analysis_source", lambda values: ",".join(sorted({str(value) for value in values if value not in (None, "")}))),
+            )
+            .reset_index()
+        )
+        duplicate_groups = duplicate_groups[duplicate_groups["rows"] > 1]
+        duplicate_count = len(duplicate_groups)
+    print(
+        "BAD_ENTRIES_SOURCE_SUMMARY "
+        f"sqlite_trades_count={source_counts.get('sqlite_trades_count', 0)} "
+        f"reconstructed_trades_count={source_counts.get('reconstructed_trades_count', 0)} "
+        f"duplicate_symbol_entry_time_count={duplicate_count}"
+    )
+    if duplicate_count:
+        print("duplicate_trade_groups:")
+        print(duplicate_groups.sort_values(["rows", "symbol"], ascending=[False, True]).head(20).to_string(index=False))
     if signal_counts:
         print(
             "SIGNAL_AGE_SOURCE_COUNTS "
@@ -807,6 +966,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recorder-dir", type=Path, default=DEFAULT_RECORDER_DIR)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--session-type", default="RTH")
+    parser.add_argument("--per-fill", action="store_true", help="Keep reconstructed execution FIFO rows per partial fill instead of grouping by logical trade.")
     return parser
 
 
@@ -825,6 +985,7 @@ def main(argv: list[str] | None = None) -> int:
         history_dir=args.history_dir,
         recorder_dir=args.recorder_dir,
         session_type=args.session_type,
+        per_fill=args.per_fill,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output, index=False)
