@@ -250,6 +250,98 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_upsert_execution_corrects_ibkr_timezone_shift_against_entry_order_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_trade({
+                    "trade_id": "entry:2026-06-26:FCEL:68077",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-26",
+                    "symbol": "FCEL",
+                    "status": "ENTRY_PENDING",
+                    "entry_order_time": "2026-06-26T14:02:45.689608+00:00",
+                    "entry_signal_time": "2026-06-26T14:02:45.339756+00:00",
+                    "entry_price": 23.09,
+                    "quantity": 43,
+                    "entry_order_id": "68077",
+                    "raw_json": {"entry_decision_time": "2026-06-26T14:02:45.353137+00:00"},
+                })
+                store.upsert_execution({
+                    "execution_id": "0000dc8f.6ada6d62.01.01",
+                    "symbol": "FCEL",
+                    "side": "BOT",
+                    "quantity": 43,
+                    "price": 23.14,
+                    "order_id": "68077",
+                    "executed_at": "2026-06-26 12:02:47+00:00",
+                    "recorded_at": "2026-06-26T14:02:48.363366+00:00",
+                    "commission": 1.000129,
+                    "commission_source": "ibkr",
+                    "raw_json": {
+                        "execution": {
+                            "execId": "0000dc8f.6ada6d62.01.01",
+                            "orderId": 68077,
+                            "time": "2026-06-26 12:02:47+00:00",
+                        }
+                    },
+                })
+
+                rows = store.query("SELECT executed_at, raw_json FROM executions WHERE execution_id = ?", ["0000dc8f.6ada6d62.01.01"])
+                self.assertEqual(rows[0]["executed_at"], "2026-06-26T14:02:47+00:00")
+                raw = parse_jsonish(rows[0]["raw_json"])
+                self.assertEqual(raw["executed_at_corrected_from"], "2026-06-26 12:02:47+00:00")
+                self.assertEqual(raw["executed_at_correction_source"], "order_submitted_timezone_offset")
+            finally:
+                store.close()
+
+    def test_upsert_execution_corrects_ibkr_timezone_shift_against_exit_order_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_order({
+                    "order_key": "exit:68259",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-26",
+                    "symbol": "FCEL",
+                    "side": "SELL",
+                    "order_type": "MKT",
+                    "quantity": 43,
+                    "status": "SUBMITTED",
+                    "order_id": "68259",
+                    "submitted_at": "2026-06-26T15:14:29.367447+00:00",
+                    "exit_reason": "v46_wide_trail_trailing_stop",
+                    "exit_reason_source": "exit_order_submit",
+                })
+                store.upsert_execution({
+                    "execution_id": "00025b44.6a4052db.01.01",
+                    "symbol": "FCEL",
+                    "side": "SLD",
+                    "quantity": 43,
+                    "price": 24.6,
+                    "order_id": "68259",
+                    "executed_at": "2026-06-26 13:14:30+00:00",
+                    "recorded_at": "2026-06-26T15:14:43.340362+00:00",
+                    "commission": 1.030305,
+                    "commission_source": "ibkr",
+                    "realized_pnl": 60.749566,
+                    "raw_json": {
+                        "execution": {
+                            "execId": "00025b44.6a4052db.01.01",
+                            "orderId": 68259,
+                            "time": "2026-06-26 13:14:30+00:00",
+                        }
+                    },
+                })
+
+                rows = store.query("SELECT executed_at, exit_reason, raw_json FROM executions WHERE execution_id = ?", ["00025b44.6a4052db.01.01"])
+                self.assertEqual(rows[0]["executed_at"], "2026-06-26T15:14:30+00:00")
+                self.assertEqual(rows[0]["exit_reason"], "v46_wide_trail_trailing_stop")
+                raw = parse_jsonish(rows[0]["raw_json"])
+                self.assertEqual(raw["executed_at_correction_offset_hours"], 2)
+            finally:
+                store.close()
+
     def test_bot_fill_creates_open_position(self) -> None:
         today = date.today().isoformat()
         with tempfile.TemporaryDirectory() as tmp:

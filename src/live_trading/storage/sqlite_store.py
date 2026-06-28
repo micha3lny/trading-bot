@@ -9,7 +9,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -273,6 +273,68 @@ def iso_date_part(value: Any) -> str:
     except Exception:
         text = str(value or "")
         return text[:10] if len(text) >= 10 else ""
+
+
+def parse_utc_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def utc_iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def correct_execution_time_if_timezone_shifted(
+    executed_at: Any,
+    *,
+    order_submitted_at: Any = None,
+    recorded_at: Any = None,
+) -> tuple[str | None, dict[str, Any]]:
+    """Correct IBKR execution times that were shifted by the local timezone.
+
+    We have observed ib_insync/IBKR execution.time arriving exactly one local
+    timezone offset before the order submission time, while the recorder saw the
+    fill seconds after submission. In that case the raw execution timestamp is
+    still kept in raw_json, but the ledger timestamp is shifted back into the
+    actual order/fill window.
+    """
+    execution_dt = parse_utc_datetime(executed_at)
+    order_dt = parse_utc_datetime(order_submitted_at)
+    recorded_dt = parse_utc_datetime(recorded_at)
+    if execution_dt is None or order_dt is None:
+        return None, {}
+    if execution_dt >= order_dt - timedelta(seconds=5):
+        return None, {}
+    if recorded_dt is not None and recorded_dt < order_dt - timedelta(seconds=5):
+        return None, {}
+
+    gap_seconds = (order_dt - execution_dt).total_seconds()
+    offset_hours = round(gap_seconds / 3600.0)
+    if offset_hours < 1 or offset_hours > 14:
+        return None, {}
+    offset_seconds = offset_hours * 3600
+    if abs(gap_seconds - offset_seconds) > 120:
+        return None, {}
+
+    corrected_dt = execution_dt + timedelta(hours=offset_hours)
+    upper_bound = (recorded_dt or order_dt) + timedelta(minutes=5)
+    if corrected_dt < order_dt - timedelta(seconds=30) or corrected_dt > upper_bound:
+        return None, {}
+    return utc_iso(corrected_dt), {
+        "executed_at_raw_ibkr": str(executed_at),
+        "executed_at_corrected_from": str(executed_at),
+        "executed_at_correction_source": "order_submitted_timezone_offset",
+        "executed_at_correction_order_submitted_at": utc_iso(order_dt),
+        "executed_at_correction_recorded_at": utc_iso(recorded_dt) if recorded_dt else "",
+        "executed_at_correction_offset_hours": offset_hours,
+    }
 
 
 def execution_sort_time(row: dict[str, Any]) -> str:
@@ -872,6 +934,10 @@ class SQLiteRuntimeStore:
                 meta[field] = value
         if raw.get("entry_decision_time"):
             meta["entry_decision_time"] = raw.get("entry_decision_time")
+        if record.get("entry_order_time") not in (None, ""):
+            meta["entry_order_time"] = record.get("entry_order_time")
+        if raw.get("entry_order_time") and meta.get("entry_order_time") in (None, ""):
+            meta["entry_order_time"] = raw.get("entry_order_time")
         return meta
 
     def _entry_metadata_for_execution(self, row: dict[str, Any], raw: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -912,6 +978,7 @@ class SQLiteRuntimeStore:
                     ready_since,
                     entry_order_id,
                     entry_perm_id,
+                    entry_order_time,
                     raw_json
                 FROM trades
                 WHERE {' OR '.join(predicates)}
@@ -942,6 +1009,7 @@ class SQLiteRuntimeStore:
                     ready_since,
                     entry_order_id,
                     entry_perm_id,
+                    entry_order_time,
                     raw_json
                 FROM trades
                 WHERE UPPER(symbol) = ?
@@ -1220,6 +1288,25 @@ class SQLiteRuntimeStore:
         if entry_metadata:
             raw = self._merge_entry_metadata_into_raw(raw, entry_metadata)
             raw.setdefault("entry_metadata_source", "trade_entry_order")
+        submitted_reference = None
+        if normalized_execution_side(side) == "BUY":
+            submitted_reference = (
+                entry_metadata.get("entry_order_time")
+                or entry_metadata.get("entry_decision_time")
+                or raw.get("entry_order_time")
+                or raw.get("entry_decision_time")
+            )
+        elif matched_order:
+            submitted_reference = matched_order.get("submitted_at") or parse_jsonish(matched_order.get("raw_json")).get("exit_reason_persisted_at")
+        corrected_executed_at, correction_raw = correct_execution_time_if_timezone_shifted(
+            data.get("executed_at"),
+            order_submitted_at=submitted_reference,
+            recorded_at=data.get("recorded_at"),
+        )
+        if corrected_executed_at:
+            raw.setdefault("executed_at_original", data.get("executed_at"))
+            raw.update(correction_raw)
+            data["executed_at"] = corrected_executed_at
         if not raw.get("execution_insert_time") and data.get("recorded_at"):
             raw["execution_insert_time"] = data.get("recorded_at")
         if data.get("commission_source") == "ibkr" and not raw.get("commission_report_time"):
