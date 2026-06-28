@@ -38,6 +38,11 @@ from src.live_trading.analysis.signal_replay_analyzer import (
     filter_should_have_signaled_targets,
     merge_timeline_events,
 )
+from src.live_trading.analysis.signal_case_trace import (
+    build_parser as build_signal_case_trace_parser,
+    decision_classification,
+    pass_fail,
+)
 from src.live_trading.ranking.daily_top100_builder import parquet_path
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
@@ -506,6 +511,26 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         help_text = build_signal_replay_parser().format_help()
         self.assertIn("Replay should-have-signaled", help_text)
         self.assertIn("--missed-runners-csv", help_text)
+
+    def test_signal_case_trace_decision_offline_not_ready(self) -> None:
+        self.assertEqual(decision_classification(False, [], {}), "offline_signal_not_ready")
+
+    def test_signal_case_trace_decision_risk_guard(self) -> None:
+        decision = decision_classification(
+            True,
+            [{"event": "RISK_GUARD_BLOCK_ENTRY", "reason": "daily_loss", "details": ""}],
+            {"trades_count": 0, "executions_count": 0},
+        )
+        self.assertEqual(decision, "buy_blocked_risk_guard")
+
+    def test_signal_case_trace_cli_help(self) -> None:
+        help_text = build_signal_case_trace_parser().format_help()
+        self.assertIn("Trace one should-have-signaled symbol", help_text)
+        self.assertIn("--symbol", help_text)
+
+    def test_signal_case_trace_pass_fail(self) -> None:
+        self.assertEqual(pass_fail(True), "PASS")
+        self.assertEqual(pass_fail(False), "FAIL")
 
     def test_overnight_score_and_bucket(self) -> None:
         score, bucket, reason = overnight_score({
