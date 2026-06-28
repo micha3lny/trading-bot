@@ -45,8 +45,10 @@ from src.live_trading.analysis.signal_case_trace import (
 )
 from src.live_trading.analysis.symbol_subscription_inspector import (
     build_parser as build_subscription_inspector_parser,
+    extract_last_restart_unblock_time,
     infer_verdict,
     parse_key_values,
+    stale_or_backfill_skip_symbols,
     symbol_journal_lines,
 )
 from src.live_trading.ranking.daily_top100_builder import parquet_path
@@ -559,8 +561,37 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
             candles_rows=0,
             sqlite_count_total=0,
             center_lines=[],
+            appears_anywhere_in_journal=False,
         )
-        self.assertEqual(verdict["likely_root_cause"], "not_in_reload_requested_symbols_or_subscription_cap")
+        self.assertEqual(verdict["likely_root_cause"], "subscription_cap_or_not_subscribed")
+
+    def test_subscription_inspector_extracts_last_unblock_and_stale_symbols(self) -> None:
+        lines = [
+            "2026-06-26T14:02:40+00:00 heartbeat last_restart_unblock_time=2026-06-26T14:02:39.831068+00:00",
+            "2026-06-26T14:02:42+00:00 STALE_OR_BACKFILL_READY_SKIPPED symbol=AOUT reason=signal_before_last_unblock",
+            "2026-06-26T14:02:43+00:00 STALE_OR_BACKFILL_READY_SKIPPED symbol=COAG reason=signal_before_last_unblock",
+        ]
+        self.assertEqual(
+            str(extract_last_restart_unblock_time(lines)),
+            "2026-06-26 14:02:39.831068+00:00",
+        )
+        self.assertEqual(stale_or_backfill_skip_symbols(lines), ["AOUT", "COAG"])
+
+    def test_subscription_inspector_signal_before_last_unblock_root_cause(self) -> None:
+        verdict = infer_verdict(
+            in_top100=True,
+            journal_symbol=[],
+            journal_terms=[],
+            contract_rows=0,
+            candles_rows=0,
+            sqlite_count_total=0,
+            center_lines=["2026-06-26T13:55:00+00:00 heartbeat top100_block=1 entries_blocked=1"],
+            possible_signal_ts=pd.Timestamp("2026-06-26T13:55:00Z"),
+            last_restart_unblock_ts=pd.Timestamp("2026-06-26T14:02:39Z"),
+            appears_anywhere_in_journal=False,
+        )
+        self.assertEqual(verdict["likely_root_cause"], "signal_before_last_unblock")
+        self.assertEqual(verdict["signal_before_last_unblock"], 1)
 
     def test_subscription_inspector_infers_subscribed_but_no_market_data(self) -> None:
         verdict = infer_verdict(
