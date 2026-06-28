@@ -32,6 +32,12 @@ from src.live_trading.analysis.common import (
 from src.live_trading.analysis.missed_runners_analyzer import classify_missed_reason
 from src.live_trading.analysis.missed_runners_analyzer import add_multiday_ranks, no_signal_diagnostics, previous_session_context
 from src.live_trading.analysis.overnight_hold_ranker import analyze_trade_overnight, ensure_overnight_columns, overnight_score, score_bucket
+from src.live_trading.analysis.signal_replay_analyzer import (
+    build_parser as build_signal_replay_parser,
+    classify_replay_reason,
+    filter_should_have_signaled_targets,
+    merge_timeline_events,
+)
 from src.live_trading.ranking.daily_top100_builder import parquet_path
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
@@ -453,6 +459,53 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         help_text = build_entry_timing_parser().format_help()
         self.assertIn("Analyze whether live entries chase spikes", help_text)
         self.assertIn("--date", help_text)
+
+    def test_signal_replay_filters_should_have_signaled_targets(self) -> None:
+        missed = pd.DataFrame([
+            {"symbol": "AAA", "source_bucket": "top100", "was_bought": 0, "top100_no_signal_reason": "should_have_signaled"},
+            {"symbol": "BBB", "source_bucket": "top100", "was_bought": 1, "top100_no_signal_reason": "should_have_signaled"},
+            {"symbol": "CCC", "source_bucket": "outside_top100", "was_bought": 0, "top100_no_signal_reason": "should_have_signaled"},
+            {"symbol": "DDD", "source_bucket": "top100", "was_bought": 0, "top100_no_signal_reason": "failed_first5"},
+        ])
+        out = filter_should_have_signaled_targets(missed)
+        self.assertEqual(out["symbol"].tolist(), ["AAA"])
+
+    def test_signal_replay_timeline_merge_sort(self) -> None:
+        events = [
+            {"time": "2026-06-26T14:05:00+00:00", "source": "orders", "event": "ORDER_SUBMITTED"},
+            {"time": "2026-06-26T14:01:00+00:00", "source": "candle", "event": "possible_signal"},
+        ]
+        merged = merge_timeline_events(events)
+        self.assertEqual([event["event"] for event in merged], ["possible_signal", "ORDER_SUBMITTED"])
+
+    def test_signal_replay_classifies_risk_guard(self) -> None:
+        reason = classify_replay_reason(
+            [{"event": "RISK_GUARD_BLOCK_ENTRY", "reason": "daily_loss", "details": ""}],
+            {"trades_count": 0, "executions_count": 0},
+        )
+        self.assertEqual(reason, "risk_guard_blocked")
+
+    def test_signal_replay_classifies_max_positions(self) -> None:
+        reason = classify_replay_reason(
+            [{"event": "BUY_BLOCKED", "reason": "max_positions", "details": ""}],
+            {"trades_count": 0, "executions_count": 0},
+        )
+        self.assertEqual(reason, "max_positions_blocked")
+
+    def test_signal_replay_classifies_signal_ready_no_buy(self) -> None:
+        reason = classify_replay_reason(
+            [{"event": "SIGNAL_READY", "reason": "", "details": ""}],
+            {"trades_count": 0, "executions_count": 0},
+        )
+        self.assertEqual(reason, "signal_ready_but_no_buy_attempt")
+
+    def test_signal_replay_classifies_no_runtime_evidence(self) -> None:
+        self.assertEqual(classify_replay_reason([], {"trades_count": 0, "executions_count": 0}), "no_runtime_evidence")
+
+    def test_signal_replay_cli_help(self) -> None:
+        help_text = build_signal_replay_parser().format_help()
+        self.assertIn("Replay should-have-signaled", help_text)
+        self.assertIn("--missed-runners-csv", help_text)
 
     def test_overnight_score_and_bucket(self) -> None:
         score, bucket, reason = overnight_score({
