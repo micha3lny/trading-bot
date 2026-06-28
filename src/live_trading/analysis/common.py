@@ -319,6 +319,10 @@ def simulate_tp_sl(
 ) -> TPSLSimulation:
     if entry_price <= 0:
         return TPSLSimulation("missing_entry", None, None, None)
+    if candles.empty or "timestamp" not in candles.columns:
+        if fallback_exit_price is not None:
+            return TPSLSimulation("actual_exit", fallback_exit_time, fallback_exit_price, pct(fallback_exit_price, entry_price))
+        return TPSLSimulation("missing_candles", fallback_exit_time, None, None)
     tp_price = entry_price * (1.0 + tp_pct / 100.0)
     sl_price = entry_price * (1.0 + sl_pct / 100.0)
     for _, row in candles.sort_values("timestamp").iterrows():
@@ -359,4 +363,3 @@ def first_existing_column(row: dict[str, Any], names: Iterable[str]) -> Any:
         if value not in (None, "") and not (isinstance(value, float) and pd.isna(value)):
             return value
     return None
-

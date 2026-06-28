@@ -48,6 +48,18 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         self.assertAlmostEqual(sim.exit_price or 0.0, 9.8)
         self.assertAlmostEqual(sim.pnl_pct or 0.0, -2.0)
 
+    def test_tp_sl_simulation_handles_missing_candles(self) -> None:
+        sim = simulate_tp_sl(
+            pd.DataFrame(),
+            entry_price=10.0,
+            tp_pct=3.0,
+            sl_pct=-2.0,
+            fallback_exit_time=pd.Timestamp("2026-06-18T13:35:00Z"),
+            fallback_exit_price=10.1,
+        )
+        self.assertEqual(sim.exit_reason, "actual_exit")
+        self.assertAlmostEqual(sim.pnl_pct or 0.0, 1.0)
+
     def test_entry_time_buckets(self) -> None:
         self.assertEqual(entry_time_bucket(pd.Timestamp("2026-06-18T13:35:00Z"), "2026-06-18"), "0-15m")
         self.assertEqual(entry_time_bucket(pd.Timestamp("2026-06-18T13:50:00Z"), "2026-06-18"), "15-30m")
@@ -84,4 +96,3 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
