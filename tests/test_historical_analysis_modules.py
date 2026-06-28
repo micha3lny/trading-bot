@@ -560,13 +560,42 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         self.assertEqual(state["risk_guard_reason"], "max_single_position")
         self.assertIn("risk_guard_reason:max_single_position", state["active_reasons"])
 
+    def test_buy_decision_trace_global_risk_guard_is_not_symbol_verdict(self) -> None:
+        verdict = classify_buy_decision_verdict(
+            offline_ready=True,
+            center=pd.Timestamp("2026-06-26T15:02:00Z"),
+            last_unblock=pd.Timestamp("2026-06-26T14:02:39Z"),
+            block_state={
+                "entries_blocked": 1,
+                "active_reasons": ["risk_guard_reason:max_single_position"],
+                "risk_guard_block": 1,
+                "risk_guard_reason": "max_single_position",
+            },
+            runtime_events=[],
+            ready_candidate_seen=False,
+            competing_buys=[{"symbol": "ABSI"}],
+        )
+        self.assertEqual(verdict, "runtime_never_processed_symbol")
+
+    def test_buy_decision_trace_classifies_symbol_specific_risk_guard(self) -> None:
+        verdict = classify_buy_decision_verdict(
+            offline_ready=True,
+            center=pd.Timestamp("2026-06-26T15:02:00Z"),
+            last_unblock=pd.Timestamp("2026-06-26T14:02:39Z"),
+            block_state={"entries_blocked": 1, "active_reasons": [], "risk_guard_block": 1},
+            runtime_events=[{"event": "RISK_GUARD_BLOCK_ENTRY", "reason": "max_single_position", "details": "symbol=OMER"}],
+            ready_candidate_seen=True,
+            competing_buys=[],
+        )
+        self.assertEqual(verdict, "missed_due_to_risk_guard")
+
     def test_buy_decision_trace_classifies_missing_ready_candidate(self) -> None:
         verdict = classify_buy_decision_verdict(
             offline_ready=True,
             center=pd.Timestamp("2026-06-26T15:02:00Z"),
             last_unblock=pd.Timestamp("2026-06-26T14:02:39Z"),
             block_state={"entries_blocked": 0, "active_reasons": [], "risk_guard_block": 0},
-            runtime_events=[],
+            runtime_events=[{"event": "HEARTBEAT_CONTEXT", "reason": "", "details": ""}],
             ready_candidate_seen=False,
             competing_buys=[{"symbol": "ABSI"}],
         )

@@ -61,8 +61,9 @@ SUMMARY_COLUMNS = [
     "ready_candidate_seen",
     "entries_blocked_at_signal_time",
     "entries_blocked_reasons",
-    "risk_guard_block",
-    "risk_guard_reason",
+    "global_risk_guard_block",
+    "global_risk_guard_reason",
+    "symbol_specific_risk_guard_seen",
     "managed_open",
     "competing_buy_count",
     "competing_buy_symbols",
@@ -310,16 +311,18 @@ def classify_verdict(
         return "offline_signal_not_ready"
     if center is not None and last_unblock is not None and center < last_unblock:
         return "missed_due_to_restart_block"
-    if truthy(block_state.get("risk_guard_block", "")):
-        return "missed_due_to_risk_guard"
     reasons = set(block_state.get("active_reasons") or [])
     if "restart_block" in reasons or "reconnect_block" in reasons:
         return "missed_due_to_restart_block"
     if "top100_block" in reasons:
         return "missed_due_to_top100_block"
     text = "\n".join(f"{event.get('event')} {event.get('reason')} {event.get('details')}" for event in runtime_events).upper()
+    if "RISK_GUARD_BLOCK_ENTRY" in text or "RISK_GUARD" in text:
+        return "missed_due_to_risk_guard"
     if "STALE" in text or "CANDIDATE_AGE" in text:
         return "missed_due_to_candidate_age_stale"
+    if not runtime_events and not ready_candidate_seen:
+        return "runtime_never_processed_symbol"
     if competing_buys and not ready_candidate_seen:
         return "missed_due_to_not_in_ready_candidates"
     if competing_buys:
@@ -374,6 +377,7 @@ def trace_buy_decision(
     candles = offline["candles"]
     market_data_available = not candles.empty
     runtime_text = "\n".join(f"{event.get('event')} {event.get('details')}" for event in runtime_events).upper()
+    symbol_specific_risk_guard_seen = int("RISK_GUARD_BLOCK_ENTRY" in runtime_text or "RISK_GUARD" in runtime_text)
     runtime_signal_seen = int("SIGNAL_READY" in runtime_text)
     runtime_buy_attempt_seen = int(any(token in runtime_text for token in ["PAPER BUY", "PAPER_BUY", "BUY_ORDER_SENT", "ORDER_SUBMITTED"]))
     summary = {
@@ -394,8 +398,9 @@ def trace_buy_decision(
         "ready_candidate_seen": int(ready_candidate_seen),
         "entries_blocked_at_signal_time": block_state["entries_blocked"],
         "entries_blocked_reasons": ",".join(block_state["active_reasons"]),
-        "risk_guard_block": block_state["risk_guard_block"],
-        "risk_guard_reason": block_state["risk_guard_reason"],
+        "global_risk_guard_block": block_state["risk_guard_block"],
+        "global_risk_guard_reason": block_state["risk_guard_reason"],
+        "symbol_specific_risk_guard_seen": symbol_specific_risk_guard_seen,
         "managed_open": block_state["managed_open"],
         "competing_buy_count": len(competing_buys),
         "competing_buy_symbols": ",".join([buy["symbol"] for buy in competing_buys if buy.get("symbol")]),
@@ -414,7 +419,8 @@ def trace_buy_decision(
         f"- signal_before_last_unblock={summary['signal_before_last_unblock']}",
         f"- entries_blocked_at_signal_time={summary['entries_blocked_at_signal_time']}",
         f"- entries_blocked_reasons={summary['entries_blocked_reasons']}",
-        f"- risk_guard_block={summary['risk_guard_block']} risk_guard_reason={summary['risk_guard_reason']}",
+        f"- global_risk_guard_block={summary['global_risk_guard_block']} global_risk_guard_reason={summary['global_risk_guard_reason']}",
+        f"- symbol_specific_risk_guard_seen={summary['symbol_specific_risk_guard_seen']}",
         f"- managed_open={summary['managed_open']}",
         f"- ready_candidate_seen={summary['ready_candidate_seen']}",
         f"- competing_buy_count={summary['competing_buy_count']} competing_buy_symbols={summary['competing_buy_symbols']}",
@@ -437,11 +443,16 @@ def trace_buy_decision(
         f"- possible_signal_time={summary['possible_signal_time']}",
         f"- offline_signal_ready={'YES' if offline['offline_signal_ready'] else 'NO'}",
         "",
-        "3. Runtime / Journal At Signal Time",
+        "3. Global Heartbeat State At Signal Time",
         f"- journal_log={journal_log}",
         f"- journal_symbol_lines_count={len(symbol_lines)}",
         f"- nearest_heartbeat={nearest_hb}",
         f"- parsed_heartbeat_block_state={block_state}",
+        "- NOTE: global heartbeat blocks are diagnostics only; they are not treated as symbol-specific BUY rejection evidence.",
+        "",
+        "4. Symbol-Specific Evidence",
+        f"- symbol_specific_risk_guard_seen={summary['symbol_specific_risk_guard_seen']}",
+        f"- runtime_symbol_event_count={len(runtime_events)}",
     ]
     lines.extend(["", "Symbol-specific journal lines"])
     lines.extend(f"- {line}" for line in symbol_lines[:120])
@@ -450,7 +461,7 @@ def trace_buy_decision(
     lines.extend(["", "Journal lines around possible signal (+/-5m)"])
     for line in line_window(journal, center, minutes=5)[:180]:
         lines.append(f"- {line}")
-    lines.extend(["", "4. Competing BUY candidates/orders around signal (+/-5m)"])
+    lines.extend(["", "5. Competing BUY candidates/orders around signal (+/-5m)"])
     if competing_buys:
         for buy in competing_buys:
             lines.append(
@@ -460,14 +471,14 @@ def trace_buy_decision(
             )
     else:
         lines.append("- none")
-    lines.extend(["", "5. Runtime Artifact Evidence For Symbol"])
+    lines.extend(["", "6. Runtime Artifact Evidence For Symbol"])
     for name, count in runtime_counts.items():
         lines.append(f"- {name}_rows={count}")
     for event in runtime_events[:160]:
         lines.append(f"- {event['time']} [{event['source']}] {event['event']} reason={event['reason']} details={event['details']}")
     if len(runtime_events) > 160:
         lines.append(f"... {len(runtime_events) - 160} more runtime events omitted")
-    lines.extend(["", "6. Code Branch References"])
+    lines.extend(["", "7. Code Branch References"])
     for ref in static_line_refs(DEFAULT_TRADER_SOURCE)[:260]:
         lines.append(f"- {ref}")
     return "\n".join(lines) + "\n", summary
