@@ -41,6 +41,10 @@ OUTPUT_COLUMNS = [
     "net_pnl",
     "net_pnl_pct",
     "exit_reason",
+    "price_after_1m_pct",
+    "price_after_2m_pct",
+    "price_after_5m_pct",
+    "price_after_10m_pct",
     "mfe_pct",
     "mae_pct",
     "peak_pct",
@@ -48,9 +52,18 @@ OUTPUT_COLUMNS = [
     "immediate_drop",
     "never_green",
     "min_after_1m_pct",
+    "min_after_2m_pct",
     "min_after_3m_pct",
     "min_after_5m_pct",
     "min_after_10m_pct",
+    "max_after_1m_pct",
+    "max_after_2m_pct",
+    "max_after_5m_pct",
+    "max_after_10m_pct",
+    "first_green_seconds",
+    "entry_near_local_peak_pct",
+    "pullback_before_entry_pct",
+    "max_adverse_before_peak_pct",
     "time_to_peak_seconds",
     "time_to_low_seconds",
     "max_drawdown_from_peak_pct",
@@ -115,6 +128,57 @@ def signal_age(row: dict[str, Any], entry_time: pd.Timestamp | None) -> tuple[fl
     return age, ""
 
 
+def window_after_entry(candles: pd.DataFrame, entry_time: pd.Timestamp | None, minutes: int) -> pd.DataFrame:
+    if candles.empty or entry_time is None or "timestamp" not in candles.columns:
+        return pd.DataFrame()
+    return candles[(candles["timestamp"] >= entry_time) & (candles["timestamp"] <= entry_time + pd.Timedelta(minutes=minutes))]
+
+
+def price_after_pct(candles: pd.DataFrame, entry_price: float, entry_time: pd.Timestamp | None, minutes: int) -> float | None:
+    rows = window_after_entry(candles, entry_time, minutes)
+    if rows.empty or entry_price <= 0:
+        return None
+    return pct(fnum(rows.iloc[-1].get("close")), entry_price)
+
+
+def max_after_pct(candles: pd.DataFrame, entry_price: float, entry_time: pd.Timestamp | None, minutes: int) -> float | None:
+    rows = window_after_entry(candles, entry_time, minutes)
+    if rows.empty or entry_price <= 0:
+        return None
+    return pct(float(rows["high"].max()), entry_price)
+
+
+def first_green_seconds(candles: pd.DataFrame, entry_price: float, entry_time: pd.Timestamp | None) -> float | None:
+    if candles.empty or entry_time is None or entry_price <= 0 or "timestamp" not in candles.columns:
+        return None
+    rows = candles[candles["timestamp"] >= entry_time].sort_values("timestamp")
+    green = rows[(pd.to_numeric(rows["close"], errors="coerce") > entry_price) | (pd.to_numeric(rows["high"], errors="coerce") > entry_price)]
+    if green.empty:
+        return None
+    return (green.iloc[0]["timestamp"] - entry_time).total_seconds()
+
+
+def local_peak_before_entry(candles: pd.DataFrame, entry_price: float, entry_time: pd.Timestamp | None, minutes: int = 15) -> tuple[float | None, float | None]:
+    if candles.empty or entry_time is None or entry_price <= 0 or "timestamp" not in candles.columns:
+        return None, None
+    prior = candles[(candles["timestamp"] < entry_time) & (candles["timestamp"] >= entry_time - pd.Timedelta(minutes=minutes))]
+    if prior.empty:
+        return None, None
+    local_high = fnum(prior["high"].max())
+    if local_high is None or local_high <= 0:
+        return None, None
+    return pct(entry_price, local_high), pct(entry_price, local_high)
+
+
+def max_adverse_before_peak(candles: pd.DataFrame, entry_price: float, entry_time: pd.Timestamp | None, peak_time: pd.Timestamp | None) -> float | None:
+    if candles.empty or entry_time is None or peak_time is None or entry_price <= 0 or "timestamp" not in candles.columns:
+        return None
+    before_peak = candles[(candles["timestamp"] >= entry_time) & (candles["timestamp"] <= peak_time)]
+    if before_peak.empty:
+        return None
+    return pct(float(before_peak["low"].min()), entry_price)
+
+
 def row_value(row: dict[str, Any], raw: dict[str, Any], names: list[str]) -> Any:
     direct = first_existing_column(row, names)
     if direct not in (None, ""):
@@ -154,6 +218,10 @@ def analyze_bad_entries(
             net_pnl = gross - commission
         candles = load_trade_candles(history_dir, recorder_dir, symbol, session_date, entry_time, exit_time, session_type)
         stats = calculate_path_stats(candles, entry_price or 0.0, entry_time)
+        first_green = first_green_seconds(candles, entry_price or 0.0, entry_time)
+        local_peak_pct, pullback_pct = local_peak_before_entry(candles, entry_price or 0.0, entry_time)
+        first_window = window_after_entry(candles, entry_time, 1)
+        first_close = fnum(first_window.iloc[0].get("close")) if not first_window.empty else None
         fallback_exit_time = exit_time
         fallback_exit_price = exit_price
         sim_2 = simulate_tp_sl(candles, entry_price=entry_price or 0.0, tp_pct=2.0, sl_pct=-1.5, fallback_exit_time=fallback_exit_time, fallback_exit_price=fallback_exit_price)
@@ -178,16 +246,29 @@ def analyze_bad_entries(
             "net_pnl": net_pnl,
             "net_pnl_pct": net_pnl_pct,
             "exit_reason": first_existing_column(trade, ["exit_reason"]) or raw.get("exit_reason") or "unknown_exit_reason",
+            "price_after_1m_pct": price_after_pct(candles, entry_price or 0.0, entry_time, 1),
+            "price_after_2m_pct": price_after_pct(candles, entry_price or 0.0, entry_time, 2),
+            "price_after_5m_pct": price_after_pct(candles, entry_price or 0.0, entry_time, 5),
+            "price_after_10m_pct": price_after_pct(candles, entry_price or 0.0, entry_time, 10),
             "mfe_pct": stats.mfe_pct,
             "mae_pct": stats.mae_pct,
             "peak_pct": stats.mfe_pct,
             "low_after_entry_pct": stats.mae_pct,
-            "immediate_drop": int((min_after_pct(candles, entry_price or 0.0, entry_time, 1) or 0.0) < 0.0),
-            "never_green": int((stats.mfe_pct or 0.0) <= 0.0),
+            "immediate_drop": int(((first_close is not None and entry_price is not None and first_close < entry_price) or ((min_after_pct(candles, entry_price or 0.0, entry_time, 1) or 0.0) < 0.0))),
+            "never_green": int(first_green is None),
             "min_after_1m_pct": min_after_pct(candles, entry_price or 0.0, entry_time, 1),
+            "min_after_2m_pct": min_after_pct(candles, entry_price or 0.0, entry_time, 2),
             "min_after_3m_pct": min_after_pct(candles, entry_price or 0.0, entry_time, 3),
             "min_after_5m_pct": min_after_pct(candles, entry_price or 0.0, entry_time, 5),
             "min_after_10m_pct": min_after_pct(candles, entry_price or 0.0, entry_time, 10),
+            "max_after_1m_pct": max_after_pct(candles, entry_price or 0.0, entry_time, 1),
+            "max_after_2m_pct": max_after_pct(candles, entry_price or 0.0, entry_time, 2),
+            "max_after_5m_pct": max_after_pct(candles, entry_price or 0.0, entry_time, 5),
+            "max_after_10m_pct": max_after_pct(candles, entry_price or 0.0, entry_time, 10),
+            "first_green_seconds": first_green,
+            "entry_near_local_peak_pct": local_peak_pct,
+            "pullback_before_entry_pct": pullback_pct,
+            "max_adverse_before_peak_pct": max_adverse_before_peak(candles, entry_price or 0.0, entry_time, stats.peak_time),
             "time_to_peak_seconds": stats.time_to_peak_seconds,
             "time_to_low_seconds": stats.time_to_low_seconds,
             "max_drawdown_from_peak_pct": stats.max_drawdown_from_peak_pct,
@@ -264,6 +345,38 @@ def signal_age_bucket(value: Any, warning: Any = "") -> str:
     return "5m+"
 
 
+def seconds_bucket(value: Any) -> str:
+    seconds = fnum(value)
+    if seconds is None:
+        return "missing"
+    if seconds <= 30:
+        return "0-30s"
+    if seconds <= 60:
+        return "30-60s"
+    if seconds <= 180:
+        return "1-3m"
+    if seconds <= 300:
+        return "3-5m"
+    return "5m+"
+
+
+def pct_bucket(value: Any) -> str:
+    val = fnum(value)
+    if val is None:
+        return "missing"
+    if val <= -5:
+        return "<=-5%"
+    if val <= -2:
+        return "-5..-2%"
+    if val < 0:
+        return "-2..0%"
+    if val < 2:
+        return "0..2%"
+    if val < 5:
+        return "2..5%"
+    return ">=5%"
+
+
 def generic_bucket(value: Any) -> str:
     if value in (None, "") or (isinstance(value, float) and pd.isna(value)):
         return "missing"
@@ -281,6 +394,10 @@ def print_bucket_summary(df: pd.DataFrame, column: str) -> None:
     elif column == "signal_age_seconds":
         warnings = tmp["signal_age_warning"] if "signal_age_warning" in tmp.columns else pd.Series([""] * len(tmp))
         tmp["_bucket"] = [signal_age_bucket(value, warning) for value, warning in zip(tmp[column], warnings)]
+    elif column == "first_green_seconds":
+        tmp["_bucket"] = tmp[column].map(seconds_bucket)
+    elif column in {"pullback_before_entry_pct", "entry_near_local_peak_pct"}:
+        tmp["_bucket"] = tmp[column].map(pct_bucket)
     else:
         tmp["_bucket"] = tmp[column].map(generic_bucket)
     grouped = tmp.groupby("_bucket", dropna=False).agg(
@@ -306,12 +423,23 @@ def print_summary(df: pd.DataFrame) -> None:
     )
     if df.empty:
         return
+    first_green = pd.to_numeric(df.get("first_green_seconds", pd.Series(dtype=float)), errors="coerce")
     print(
         f"peak_ge_1={(mfe >= 1).sum()} peak_ge_2={(mfe >= 2).sum()} peak_ge_3={(mfe >= 3).sum()} "
-        f"peak_eq_0={(mfe == 0).sum()} immediate_drop={int(df['immediate_drop'].sum())} never_green={int(df['never_green'].sum())}"
+        f"peak_eq_0={(mfe == 0).sum()} immediate_drop={int(df['immediate_drop'].sum())} never_green={int(df['never_green'].sum())} "
+        f"avg_first_green_seconds={first_green.mean():.2f} median_first_green_seconds={first_green.median():.2f}"
     )
-    for column in ["live_entry_score", "top100_rank", "entry_time_bucket", "spread_bps_at_entry", "signal_age_seconds"]:
+    for col in ["min_after_1m_pct", "min_after_2m_pct", "min_after_5m_pct", "min_after_10m_pct", "max_after_1m_pct", "max_after_2m_pct", "max_after_5m_pct", "max_after_10m_pct"]:
+        vals = pd.to_numeric(df.get(col, pd.Series(dtype=float)), errors="coerce")
+        print(f"{col} avg={vals.mean():.2f} median={vals.median():.2f}")
+    for column in ["live_entry_score", "top100_rank", "entry_time_bucket", "spread_bps_at_entry", "signal_age_seconds", "first_green_seconds", "pullback_before_entry_pct", "entry_near_local_peak_pct"]:
         print_bucket_summary(df, column)
+    print("worst_immediate_drops_by_min_after_5m_pct:")
+    print(df.sort_values("min_after_5m_pct", ascending=True)[["symbol", "entry_time", "min_after_5m_pct", "first_green_seconds", "mfe_pct", "live_entry_score"]].head(20).to_string(index=False))
+    print("worst_never_green_trades:")
+    print(df[df["never_green"] == 1].sort_values("net_pnl_pct", ascending=True)[["symbol", "entry_time", "net_pnl_pct", "mae_pct", "live_entry_score"]].head(20).to_string(index=False))
+    print("best_clean_entries:")
+    print(df[df["never_green"] == 0].sort_values(["first_green_seconds", "mfe_pct"], ascending=[True, False])[["symbol", "entry_time", "first_green_seconds", "mfe_pct", "net_pnl_pct", "live_entry_score"]].head(20).to_string(index=False))
     print("worst20_by_net_pnl_pct:")
     print(df.sort_values("net_pnl_pct", ascending=True)[["symbol", "entry_time", "net_pnl_pct", "mfe_pct", "mae_pct", "live_entry_score"]].head(20).to_string(index=False))
     print("best20_by_peak_pct:")

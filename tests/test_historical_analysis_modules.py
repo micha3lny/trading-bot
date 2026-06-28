@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.live_trading.analysis.bad_entries_analyzer import (
+    first_green_seconds,
     load_closed_trades,
     rank_bucket,
     signal_age,
@@ -21,6 +22,9 @@ from src.live_trading.analysis.common import (
     simulate_tp_sl,
 )
 from src.live_trading.analysis.missed_runners_analyzer import classify_missed_reason
+from src.live_trading.analysis.missed_runners_analyzer import previous_session_context
+from src.live_trading.analysis.overnight_hold_ranker import ensure_overnight_columns, overnight_score, score_bucket
+from src.live_trading.ranking.daily_top100_builder import parquet_path
 
 
 class HistoricalAnalysisModuleTests(unittest.TestCase):
@@ -150,6 +154,69 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         self.assertEqual(signal_age_bucket(29), "0-30s")
         self.assertEqual(signal_age_bucket(90), "1-3m")
         self.assertEqual(signal_age_bucket(None), "missing")
+
+    def test_first_green_and_never_green_inputs(self) -> None:
+        entry_time = pd.Timestamp("2026-06-18T13:30:00Z")
+        self.assertEqual(first_green_seconds(self.candles(), 10.0, entry_time), 0.0)
+        red = pd.DataFrame([
+            {"timestamp": pd.Timestamp("2026-06-18T13:30:00Z"), "open": 10.0, "high": 10.0, "low": 9.8, "close": 9.9, "volume": 1000},
+            {"timestamp": pd.Timestamp("2026-06-18T13:31:00Z"), "open": 9.9, "high": 9.95, "low": 9.7, "close": 9.8, "volume": 1000},
+        ])
+        self.assertIsNone(first_green_seconds(red, 10.0, entry_time))
+
+    def test_missed_runner_detectability_from_previous_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            history = Path(tmp) / "history"
+            # 2026-06-18 previous trading days are 2026-06-17, 16, 15, 12, 11.
+            for day, open_price, close_price, high_price in [
+                ("2026-06-17", 10.0, 10.5, 10.8),
+                ("2026-06-16", 9.7, 10.0, 10.2),
+                ("2026-06-15", 9.4, 9.7, 10.0),
+            ]:
+                path = parquet_path(history, "AAA", pd.Timestamp(day).date(), "RTH")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame([
+                    {"timestamp": f"{day}T13:30:00+00:00", "open": open_price, "high": high_price, "low": open_price * 0.99, "close": close_price, "volume": 1000},
+                ]).to_parquet(path, index=False)
+            ctx = previous_session_context(history, "AAA", "2026-06-18")
+            self.assertEqual(ctx["was_detectable_from_history"], 1)
+            self.assertIn("prev_1d_return>=3", ctx["detectability_reason"])
+
+    def test_overnight_score_and_bucket(self) -> None:
+        score, bucket, reason = overnight_score({
+            "next_session_high_from_entry_pct": 6.0,
+            "next_session_close_from_entry_pct": 3.0,
+            "next_session_open_gap_pct": 1.2,
+            "mfe_pct": 4.0,
+            "live_entry_score": 40.0,
+            "top100_rank": 5,
+            "next_session_max_drawdown_from_entry_pct": -1.0,
+            "mae_pct": -1.0,
+            "never_green": 0,
+            "immediate_drop": 0,
+        })
+        self.assertEqual(score, 80.0)
+        self.assertEqual(bucket, "strong_hold_candidate")
+        self.assertIn("next_high>=5", reason)
+        self.assertEqual(score_bucket(20), "avoid_overnight")
+
+    def test_overnight_migration_adds_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            conn = sqlite3.connect(db)
+            try:
+                conn.execute("CREATE TABLE trades (trade_id TEXT PRIMARY KEY, status TEXT)")
+                conn.commit()
+            finally:
+                conn.close()
+            added = ensure_overnight_columns(db)
+            self.assertIn("overnight_hold_score", added)
+            conn = sqlite3.connect(db)
+            try:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+            finally:
+                conn.close()
+            self.assertIn("overnight_hold_features_json", cols)
 
 
 if __name__ == "__main__":

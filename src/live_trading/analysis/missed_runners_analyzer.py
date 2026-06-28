@@ -21,6 +21,7 @@ from src.live_trading.analysis.common import (
     read_sql_table,
     safe_read_csv,
 )
+from src.live_trading.market_calendar import previous_us_equity_trading_day
 
 
 DEFAULT_HISTORY_DIR = Path("data/history/universe_1m")
@@ -55,6 +56,19 @@ OUTPUT_COLUMNS = [
     "first_5m_high_pct",
     "first_15m_high_pct",
     "or_range_pct",
+    "was_detectable_from_history",
+    "detectability_reason",
+    "prev_1d_return_pct",
+    "prev_2d_return_pct",
+    "prev_3d_return_pct",
+    "prev_5d_return_pct",
+    "prev_1d_intraday_high_pct",
+    "prev_3d_max_intraday_high_pct",
+    "prev_5d_max_intraday_high_pct",
+    "prev_3d_avg_volume",
+    "prev_5d_avg_volume",
+    "prev_3d_relative_volume_like",
+    "prev_5d_relative_volume_like",
 ]
 
 
@@ -173,6 +187,81 @@ def classify_missed_reason(
     return "unknown"
 
 
+def prior_trading_days(session_date: str, count: int) -> list[pd.Timestamp]:
+    days: list[pd.Timestamp] = []
+    cur = pd.Timestamp(session_date).date()
+    for _ in range(count):
+        cur = previous_us_equity_trading_day(cur)
+        days.append(pd.Timestamp(cur))
+    return days
+
+
+def previous_session_context(history_dir: Path, symbol: str, session_date: str) -> dict[str, Any]:
+    days = prior_trading_days(session_date, 5)
+    sessions: list[dict[str, Any]] = []
+    for day in days:
+        candles = load_session_candles(history_dir, symbol, day.date())
+        stats = calculate_runner_stats(candles)
+        if stats is None or candles.empty:
+            sessions.append({})
+            continue
+        close = fnum(candles.iloc[-1].get("close"))
+        volume = fnum(candles.get("volume", pd.Series(dtype=float)).sum())
+        sessions.append({
+            "date": day.strftime("%F"),
+            "open": stats.open_price,
+            "close": close,
+            "intraday_high_pct": stats.open_to_high_pct,
+            "volume": volume,
+        })
+
+    def ret(n: int) -> float | None:
+        available = [s for s in sessions[:n] if s.get("open") and s.get("close")]
+        if not available:
+            return None
+        newest_close = fnum(available[0].get("close"))
+        oldest_open = fnum(available[-1].get("open"))
+        return pct(newest_close, oldest_open)
+
+    highs = [fnum(s.get("intraday_high_pct")) for s in sessions if s]
+    volumes = [fnum(s.get("volume")) for s in sessions if s]
+    prev_3_vol = [v for v in volumes[:3] if v is not None]
+    prev_5_vol = [v for v in volumes[:5] if v is not None]
+    prev_1d_return = ret(1)
+    prev_2d_return = ret(2)
+    prev_3d_return = ret(3)
+    prev_5d_return = ret(5)
+    prev_1d_high = highs[0] if highs else None
+    prev_3d_high = max([h for h in highs[:3] if h is not None], default=None)
+    prev_5d_high = max([h for h in highs[:5] if h is not None], default=None)
+    reasons: list[str] = []
+    if prev_1d_return is not None and prev_1d_return >= 3:
+        reasons.append("prev_1d_return>=3")
+    if prev_3d_return is not None and prev_3d_return >= 5:
+        reasons.append("prev_3d_return>=5")
+    if prev_5d_return is not None and prev_5d_return >= 8:
+        reasons.append("prev_5d_return>=8")
+    if prev_3d_high is not None and prev_3d_high >= 6:
+        reasons.append("prev_3d_high>=6")
+    if prev_5d_high is not None and prev_5d_high >= 8:
+        reasons.append("prev_5d_high>=8")
+    return {
+        "was_detectable_from_history": int(bool(reasons)),
+        "detectability_reason": ",".join(reasons),
+        "prev_1d_return_pct": prev_1d_return,
+        "prev_2d_return_pct": prev_2d_return,
+        "prev_3d_return_pct": prev_3d_return,
+        "prev_5d_return_pct": prev_5d_return,
+        "prev_1d_intraday_high_pct": prev_1d_high,
+        "prev_3d_max_intraday_high_pct": prev_3d_high,
+        "prev_5d_max_intraday_high_pct": prev_5d_high,
+        "prev_3d_avg_volume": (sum(prev_3_vol) / len(prev_3_vol)) if prev_3_vol else None,
+        "prev_5d_avg_volume": (sum(prev_5_vol) / len(prev_5_vol)) if prev_5_vol else None,
+        "prev_3d_relative_volume_like": (prev_3_vol[0] / (sum(prev_3_vol) / len(prev_3_vol))) if len(prev_3_vol) >= 2 and sum(prev_3_vol) > 0 else None,
+        "prev_5d_relative_volume_like": (prev_5_vol[0] / (sum(prev_5_vol) / len(prev_5_vol))) if len(prev_5_vol) >= 2 and sum(prev_5_vol) > 0 else None,
+    }
+
+
 def analyze_missed_runners(
     *,
     session_date: str,
@@ -208,6 +297,7 @@ def analyze_missed_runners(
         order = symbol_event_row(order_rows, symbol)
         spread = nearest_row(spread_rows, entry_time or stats.high_time, symbol)
         was_bought = bool(entry)
+        prior = previous_session_context(history_dir, symbol, session_date)
         rows.append({
             "date": session_date,
             "symbol": symbol,
@@ -242,6 +332,7 @@ def analyze_missed_runners(
             "first_5m_high_pct": first_existing_column(sig, ["first_5m_high_pct"]) or stats.first_5m_high_pct,
             "first_15m_high_pct": first_existing_column(sig, ["first_15m_high_pct"]) or stats.first_15m_high_pct,
             "or_range_pct": first_existing_column(sig, ["or_range_pct"]) or stats.or_range_pct,
+            **prior,
         })
     out = pd.DataFrame(rows)
     if out.empty:
@@ -257,10 +348,23 @@ def print_summary(df: pd.DataFrame) -> None:
     if df.empty:
         return
     reasons = Counter(df["missed_reason_group"].fillna("unknown").astype(str))
+    detectable = int(pd.to_numeric(df.get("was_detectable_from_history", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    not_in_top100 = int((df["missed_reason_group"] == "not_in_top100").sum())
+    no_signal = int((df["missed_reason_group"] == "no_signal").sum())
+    bought_late = int((df["missed_reason_group"] == "bought_late").sum())
+    detectable_not_top100 = int(((df["was_detectable_from_history"] == 1) & (df["missed_reason_group"] == "not_in_top100")).sum())
+    print(
+        f"missed_breakdown not_in_top100={not_in_top100} no_signal={no_signal} bought_late={bought_late} "
+        f"detectable_from_history={detectable} not_detectable_from_history={total - detectable} detectable_but_not_in_top100={detectable_not_top100}"
+    )
     print("reason_counts=" + ", ".join(f"{k}:{v}" for k, v in reasons.most_common()))
     cols = ["symbol", "source_bucket", "open_to_high_pct", "was_bought", "missed_reason_group", "top100_rank", "top100_score"]
     print("top20_by_open_to_high_pct:")
     print(df[cols].head(20).to_string(index=False))
+    print("top_missed_detectable_runners:")
+    print(df[(df["was_bought"] == 0) & (df["was_detectable_from_history"] == 1)].head(20)[["symbol", "open_to_high_pct", "missed_reason_group", "detectability_reason", "top100_rank"]].to_string(index=False))
+    print("top_missed_not_detectable_runners:")
+    print(df[(df["was_bought"] == 0) & (df["was_detectable_from_history"] == 0)].head(20)[["symbol", "open_to_high_pct", "missed_reason_group", "top100_rank"]].to_string(index=False))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -299,4 +403,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
