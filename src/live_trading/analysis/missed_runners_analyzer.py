@@ -72,6 +72,17 @@ OUTPUT_COLUMNS = [
     "hypothetical_multiday_score",
     "hypothetical_multiday_rank",
     "would_enter_multiday_top100",
+    "top100_no_signal_reason",
+    "first_time_above_5pct",
+    "first_time_above_8pct",
+    "opening_range_high_pct",
+    "opening_range_low_pct",
+    "opening_range_break_time",
+    "did_break_or_high",
+    "had_required_first5",
+    "had_required_first15",
+    "had_required_or_range",
+    "possible_signal_time",
 ]
 
 
@@ -295,6 +306,81 @@ def add_multiday_ranks(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def first_time_above(candles: pd.DataFrame, open_price: float | None, threshold_pct: float) -> pd.Timestamp | None:
+    if candles.empty or open_price is None or open_price <= 0:
+        return None
+    rows = candles[pd.to_numeric(candles.get("high", pd.Series(dtype=float)), errors="coerce") >= open_price * (1.0 + threshold_pct / 100.0)]
+    if rows.empty:
+        return None
+    return rows.sort_values("timestamp").iloc[0]["timestamp"]
+
+
+def no_signal_diagnostics(
+    candles: pd.DataFrame,
+    *,
+    min_first_5m_high_pct: float,
+    min_first_15m_high_pct: float,
+    min_or_range_pct: float,
+) -> dict[str, Any]:
+    stats = calculate_runner_stats(candles)
+    if stats is None or candles.empty:
+        return {
+            "top100_no_signal_reason": "missing_candles",
+            "first_time_above_5pct": "",
+            "first_time_above_8pct": "",
+            "opening_range_high_pct": None,
+            "opening_range_low_pct": None,
+            "opening_range_break_time": "",
+            "did_break_or_high": 0,
+            "had_required_first5": 0,
+            "had_required_first15": 0,
+            "had_required_or_range": 0,
+            "possible_signal_time": "",
+        }
+    rows = candles.sort_values("timestamp").reset_index(drop=True)
+    start = rows.iloc[0]["timestamp"]
+    first15 = rows[rows["timestamp"] < start + pd.Timedelta(minutes=15)]
+    or_high = fnum(first15["high"].max()) if not first15.empty else None
+    or_low = fnum(first15["low"].min()) if not first15.empty else None
+    or_high_pct = pct(or_high, stats.open_price)
+    or_low_pct = pct(or_low, stats.open_price)
+    break_time: pd.Timestamp | None = None
+    if or_high is not None:
+        after_or = rows[rows["timestamp"] >= start + pd.Timedelta(minutes=15)]
+        broke = after_or[pd.to_numeric(after_or["high"], errors="coerce") >= or_high]
+        if not broke.empty:
+            break_time = broke.iloc[0]["timestamp"]
+    had_first5 = bool((stats.first_5m_high_pct or -999.0) >= min_first_5m_high_pct)
+    had_first15 = bool((stats.first_15m_high_pct or -999.0) >= min_first_15m_high_pct)
+    had_or = bool((stats.or_range_pct or -999.0) >= min_or_range_pct)
+    possible_signal_time = break_time if had_first5 and had_first15 and had_or and break_time is not None else None
+    if not had_first5:
+        reason = "failed_first5"
+    elif not had_first15:
+        reason = "failed_first15"
+    elif not had_or:
+        reason = "failed_or_range"
+    elif break_time is not None and stats.high_time is not None and break_time > stats.high_time:
+        reason = "broke_too_late"
+    elif possible_signal_time is not None:
+        reason = "should_have_signaled"
+    else:
+        reason = "unknown"
+    return {
+        "top100_no_signal_reason": reason,
+        "first_time_above_5pct": iso_ts(first_time_above(rows, stats.open_price, 5.0)),
+        "first_time_above_8pct": iso_ts(first_time_above(rows, stats.open_price, 8.0)),
+        "opening_range_high_pct": or_high_pct,
+        "opening_range_low_pct": or_low_pct,
+        "opening_range_break_time": iso_ts(break_time),
+        "did_break_or_high": int(break_time is not None),
+        "had_required_first5": int(had_first5),
+        "had_required_first15": int(had_first15),
+        "had_required_or_range": int(had_or),
+        "possible_signal_time": iso_ts(possible_signal_time),
+    }
+
+
 def analyze_missed_runners(
     *,
     session_date: str,
@@ -304,6 +390,9 @@ def analyze_missed_runners(
     sqlite_path: Path,
     recorder_dir: Path,
     threshold_pct: float,
+    min_first_5m_high_pct: float = 0.5,
+    min_first_15m_high_pct: float = 1.0,
+    min_or_range_pct: float = 0.5,
 ) -> pd.DataFrame:
     symbols = load_universe_symbols(universe_path)
     top100 = load_top100(top100_path)
@@ -331,6 +420,32 @@ def analyze_missed_runners(
         spread = nearest_row(spread_rows, entry_time or stats.high_time, symbol)
         was_bought = bool(entry)
         prior = previous_session_context(history_dir, symbol, session_date)
+        missed_reason = classify_missed_reason(
+            source_bucket=source_bucket,
+            was_bought=was_bought,
+            entry_time=entry_time,
+            high_time=stats.high_time,
+            signal_row=sig,
+            order_row=order,
+        )
+        no_signal = no_signal_diagnostics(
+            candles,
+            min_first_5m_high_pct=min_first_5m_high_pct,
+            min_first_15m_high_pct=min_first_15m_high_pct,
+            min_or_range_pct=min_or_range_pct,
+        ) if source_bucket == "top100" and missed_reason == "no_signal" else {
+            "top100_no_signal_reason": "",
+            "first_time_above_5pct": "",
+            "first_time_above_8pct": "",
+            "opening_range_high_pct": None,
+            "opening_range_low_pct": None,
+            "opening_range_break_time": "",
+            "did_break_or_high": "",
+            "had_required_first5": "",
+            "had_required_first15": "",
+            "had_required_or_range": "",
+            "possible_signal_time": "",
+        }
         rows.append({
             "date": session_date,
             "symbol": symbol,
@@ -346,14 +461,7 @@ def analyze_missed_runners(
             "entry_price": entry_price,
             "entry_vs_open_pct": pct(entry_price, stats.open_price),
             "entry_vs_high_pct": pct(entry_price, stats.high_price),
-            "missed_reason_group": classify_missed_reason(
-                source_bucket=source_bucket,
-                was_bought=was_bought,
-                entry_time=entry_time,
-                high_time=stats.high_time,
-                signal_row=sig,
-                order_row=order,
-            ),
+            "missed_reason_group": missed_reason,
             "rejection_reason": first_existing_column(order, ["reject_reason", "rejection_reason", "reason", "error"]),
             "blocked_reason": first_existing_column(sig, ["blocked_reason", "entries_blocked_reason", "risk_guard_reason", "reject_reason", "reason"]),
             "signal_time": first_existing_column(sig, ["signal_time", "timestamp", "event_time"]),
@@ -366,6 +474,7 @@ def analyze_missed_runners(
             "first_15m_high_pct": first_existing_column(sig, ["first_15m_high_pct"]) or stats.first_15m_high_pct,
             "or_range_pct": first_existing_column(sig, ["or_range_pct"]) or stats.or_range_pct,
             **prior,
+            **no_signal,
         })
     out = pd.DataFrame(rows)
     if out.empty:
@@ -401,6 +510,14 @@ def print_summary(df: pd.DataFrame) -> None:
     print(df[(df["was_bought"] == 0) & (df["was_detectable_from_history"] == 1)].head(20)[["symbol", "open_to_high_pct", "missed_reason_group", "detectability_reason", "top100_rank", "hypothetical_multiday_score", "hypothetical_multiday_rank", "would_enter_multiday_top100"]].to_string(index=False))
     print("top_missed_not_detectable_runners:")
     print(df[(df["was_bought"] == 0) & (df["was_detectable_from_history"] == 0)].head(20)[["symbol", "open_to_high_pct", "missed_reason_group", "top100_rank"]].to_string(index=False))
+    top_no_signal = df[(df["source_bucket"] == "top100") & (df["missed_reason_group"] == "no_signal")]
+    print(f"top100_no_signal_count={len(top_no_signal)}")
+    if not top_no_signal.empty:
+        counts = Counter(top_no_signal["top100_no_signal_reason"].fillna("unknown").astype(str))
+        print("top100_no_signal_reason_counts=" + ", ".join(f"{k}:{v}" for k, v in counts.most_common()))
+        print("top20_top100_no_signal_runners:")
+        print(top_no_signal.sort_values("open_to_high_pct", ascending=False)[["symbol", "open_to_high_pct", "top100_rank", "first_5m_high_pct", "first_15m_high_pct", "or_range_pct", "top100_no_signal_reason", "possible_signal_time"]].head(20).to_string(index=False))
+        print(f"top100_no_signal_should_have_signaled={int((top_no_signal['top100_no_signal_reason'] == 'should_have_signaled').sum())}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -412,6 +529,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sqlite-path", type=Path, default=DEFAULT_SQLITE_PATH)
     parser.add_argument("--recorder-dir", type=Path, default=DEFAULT_RECORDER_DIR)
     parser.add_argument("--threshold-pct", type=float, default=8.0)
+    parser.add_argument("--min-first-5m-high-pct", type=float, default=0.5)
+    parser.add_argument("--min-first-15m-high-pct", type=float, default=1.0)
+    parser.add_argument("--min-or-range-pct", type=float, default=0.5)
     parser.add_argument("--output", type=Path, default=None)
     return parser
 
@@ -429,6 +549,9 @@ def main(argv: list[str] | None = None) -> int:
         sqlite_path=args.sqlite_path,
         recorder_dir=args.recorder_dir,
         threshold_pct=args.threshold_pct,
+        min_first_5m_high_pct=args.min_first_5m_high_pct,
+        min_first_15m_high_pct=args.min_first_15m_high_pct,
+        min_or_range_pct=args.min_or_range_pct,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output, index=False)

@@ -15,6 +15,12 @@ from src.live_trading.analysis.bad_entries_analyzer import (
     signal_age,
     signal_age_bucket,
 )
+from src.live_trading.analysis.entry_timing_analyzer import (
+    build_parser as build_entry_timing_parser,
+    entry_chasing_score,
+    pullback_from_recent_high,
+    simulate_pullback_entry,
+)
 from src.live_trading.analysis.common import (
     calculate_path_stats,
     calculate_runner_stats,
@@ -24,7 +30,7 @@ from src.live_trading.analysis.common import (
     simulate_tp_sl,
 )
 from src.live_trading.analysis.missed_runners_analyzer import classify_missed_reason
-from src.live_trading.analysis.missed_runners_analyzer import add_multiday_ranks, previous_session_context
+from src.live_trading.analysis.missed_runners_analyzer import add_multiday_ranks, no_signal_diagnostics, previous_session_context
 from src.live_trading.analysis.overnight_hold_ranker import analyze_trade_overnight, ensure_overnight_columns, overnight_score, score_bucket
 from src.live_trading.ranking.daily_top100_builder import parquet_path
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
@@ -395,6 +401,58 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
             self.assertAlmostEqual(float(grouped.iloc[0]["quantity"]), 113.0)
             self.assertEqual(len(per_fill), 2)
             self.assertTrue((per_fill["analysis_source"] == "reconstructed_execution_fifo_fill").all())
+
+    def test_entry_timing_pullback_from_recent_high(self) -> None:
+        self.assertAlmostEqual(pullback_from_recent_high(9.9, 10.0) or 0.0, -1.0)
+        self.assertIsNone(pullback_from_recent_high(10.0, None))
+
+    def test_entry_timing_chasing_score(self) -> None:
+        score = entry_chasing_score(
+            pullback_5m_pct=-0.1,
+            momentum_3m_pct=2.5,
+            entry_vs_prev_high_pct=-0.05,
+            green_count_3m=2,
+            min_after_5m_pct=-1.2,
+        )
+        self.assertEqual(score, 100.0)
+        self.assertEqual(entry_chasing_score(pullback_5m_pct=-2.0, momentum_3m_pct=0.0, entry_vs_prev_high_pct=-1.0, green_count_3m=0, min_after_5m_pct=0.0), 0.0)
+
+    def test_entry_timing_pullback_simulation_enter_and_no_enter(self) -> None:
+        candles = pd.DataFrame([
+            {"timestamp": pd.Timestamp("2026-06-26T14:00:00Z"), "open": 10.0, "high": 10.2, "low": 10.0, "close": 10.1, "volume": 100},
+            {"timestamp": pd.Timestamp("2026-06-26T14:02:00Z"), "open": 10.1, "high": 10.3, "low": 9.9, "close": 10.2, "volume": 100},
+            {"timestamp": pd.Timestamp("2026-06-26T14:05:00Z"), "open": 10.2, "high": 10.6, "low": 10.1, "close": 10.5, "volume": 100},
+        ])
+        hit = simulate_pullback_entry(candles, original_entry_time=pd.Timestamp("2026-06-26T14:00:00Z"), original_entry_price=10.0, exit_time=None, pullback_pct=1.0)
+        miss = simulate_pullback_entry(candles, original_entry_time=pd.Timestamp("2026-06-26T14:00:00Z"), original_entry_price=10.0, exit_time=None, pullback_pct=2.0)
+        self.assertEqual(hit["would_enter"], 1)
+        self.assertEqual(hit["entry_price"], 9.9)
+        self.assertEqual(miss["would_enter"], 0)
+
+    def test_missed_runner_no_signal_classification_should_have_signaled(self) -> None:
+        candles = pd.DataFrame([
+            {"timestamp": pd.Timestamp("2026-06-26T13:30:00Z"), "open": 10.0, "high": 10.2, "low": 9.9, "close": 10.1, "volume": 100},
+            {"timestamp": pd.Timestamp("2026-06-26T13:34:00Z"), "open": 10.1, "high": 10.7, "low": 10.0, "close": 10.6, "volume": 100},
+            {"timestamp": pd.Timestamp("2026-06-26T13:44:00Z"), "open": 10.6, "high": 11.2, "low": 10.5, "close": 11.0, "volume": 100},
+            {"timestamp": pd.Timestamp("2026-06-26T13:46:00Z"), "open": 11.0, "high": 11.5, "low": 10.9, "close": 11.4, "volume": 100},
+        ])
+        diag = no_signal_diagnostics(candles, min_first_5m_high_pct=0.5, min_first_15m_high_pct=1.0, min_or_range_pct=0.5)
+        self.assertEqual(diag["top100_no_signal_reason"], "should_have_signaled")
+        self.assertEqual(diag["had_required_first5"], 1)
+        self.assertEqual(diag["had_required_first15"], 1)
+
+    def test_missed_runner_no_signal_classification_failed_first5(self) -> None:
+        candles = pd.DataFrame([
+            {"timestamp": pd.Timestamp("2026-06-26T13:30:00Z"), "open": 10.0, "high": 10.01, "low": 9.9, "close": 10.0, "volume": 100},
+            {"timestamp": pd.Timestamp("2026-06-26T13:46:00Z"), "open": 10.0, "high": 11.0, "low": 9.9, "close": 10.8, "volume": 100},
+        ])
+        diag = no_signal_diagnostics(candles, min_first_5m_high_pct=0.5, min_first_15m_high_pct=1.0, min_or_range_pct=0.5)
+        self.assertEqual(diag["top100_no_signal_reason"], "failed_first5")
+
+    def test_entry_timing_cli_help(self) -> None:
+        help_text = build_entry_timing_parser().format_help()
+        self.assertIn("Analyze whether live entries chase spikes", help_text)
+        self.assertIn("--date", help_text)
 
     def test_overnight_score_and_bucket(self) -> None:
         score, bucket, reason = overnight_score({
