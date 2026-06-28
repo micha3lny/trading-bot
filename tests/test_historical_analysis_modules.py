@@ -15,6 +15,11 @@ from src.live_trading.analysis.bad_entries_analyzer import (
     signal_age,
     signal_age_bucket,
 )
+from src.live_trading.analysis.buy_decision_trace import (
+    build_parser as build_buy_decision_trace_parser,
+    classify_verdict as classify_buy_decision_verdict,
+    heartbeat_block_state,
+)
 from src.live_trading.analysis.entry_timing_analyzer import (
     build_parser as build_entry_timing_parser,
     entry_chasing_score,
@@ -539,6 +544,33 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
     def test_signal_case_trace_pass_fail(self) -> None:
         self.assertEqual(pass_fail(True), "PASS")
         self.assertEqual(pass_fail(False), "FAIL")
+
+    def test_buy_decision_trace_cli_help(self) -> None:
+        help_text = build_buy_decision_trace_parser().format_help()
+        self.assertIn("Trace why a should-have-signaled", help_text)
+        self.assertIn("--symbol", help_text)
+
+    def test_buy_decision_trace_parses_heartbeat_block_reason(self) -> None:
+        state = heartbeat_block_state(
+            "2026-06-26T15:02:00+00:00 heartbeat entries_blocked=1 "
+            "risk_guard_block=1 risk_guard_reason=max_single_position managed_open=62"
+        )
+        self.assertEqual(state["entries_blocked"], 1)
+        self.assertEqual(state["risk_guard_block"], 1)
+        self.assertEqual(state["risk_guard_reason"], "max_single_position")
+        self.assertIn("risk_guard_reason:max_single_position", state["active_reasons"])
+
+    def test_buy_decision_trace_classifies_missing_ready_candidate(self) -> None:
+        verdict = classify_buy_decision_verdict(
+            offline_ready=True,
+            center=pd.Timestamp("2026-06-26T15:02:00Z"),
+            last_unblock=pd.Timestamp("2026-06-26T14:02:39Z"),
+            block_state={"entries_blocked": 0, "active_reasons": [], "risk_guard_block": 0},
+            runtime_events=[],
+            ready_candidate_seen=False,
+            competing_buys=[{"symbol": "ABSI"}],
+        )
+        self.assertEqual(verdict, "missed_due_to_not_in_ready_candidates")
 
     def test_subscription_inspector_symbol_journal_lines_exact_symbol(self) -> None:
         lines = [
