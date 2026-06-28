@@ -23,7 +23,7 @@ Type=oneshot
 User=$USER_NAME
 WorkingDirectory=$REPO_DIR
 Environment=PYTHONUNBUFFERED=1
-ExecStart=$PYTHON_BIN -m src.live_trading.data.v68_universe_1m_parquet_collector --start-date 2026-01-01 --session-type RTH --client-id 168 --max-tasks 300 --request-sleep-seconds 0.7 --batch-size 25 --batch-sleep-seconds 10
+ExecStart=$PYTHON_BIN -m src.live_trading.data.v68_universe_1m_parquet_collector --priority-recent-catchup --recent-sessions 5 --session-type RTH --client-id 168 --max-tasks 3000 --request-sleep-seconds 0.7 --batch-size 25 --batch-sleep-seconds 10
 
 # Each run is intentionally bounded. Missing candles are resumed in later timer runs.
 TimeoutStartSec=75min

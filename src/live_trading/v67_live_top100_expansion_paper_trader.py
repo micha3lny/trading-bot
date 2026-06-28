@@ -3536,7 +3536,10 @@ def overnight_backlog_start_date(end_date: str, args: argparse.Namespace) -> str
             return (end - timedelta(days=lookback_days)).isoformat()
         except Exception:
             pass
-    return str(getattr(args, "overnight_collector_start_date", "2026-01-01"))
+    wide_repair_enabled = str(os.environ.get("TRADING_BOT_ALLOW_WIDE_HISTORY_REPAIR", "")).strip().lower() in {"1", "true", "yes", "on"}
+    if wide_repair_enabled:
+        return str(getattr(args, "overnight_collector_start_date", end_date) or end_date)
+    return end_date
 
 
 def history_parquet_path(history_dir: str | Path, symbol: str, session_date: date, session_type: str = "RTH") -> Path:
@@ -3748,6 +3751,16 @@ def history_is_acceptable_for_top100_build(assessment: dict[str, Any], min_compl
     failed = int(assessment.get("failed") or assessment.get("failed_symbols") or 0)
     effective_completion_pct = float(assessment.get("effective_completion_pct") or assessment.get("completion_pct") or 0.0)
     return missing == 0 and failed == 0 and effective_completion_pct >= float(min_completion_pct)
+
+
+def count_csv_data_rows(path: str | Path) -> int:
+    try:
+        with Path(path).open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle)
+            next(reader, None)
+            return sum(1 for row in reader if row)
+    except Exception:
+        return 0
 
 
 def _history_command_priority(command: dict[str, Any]) -> int:
@@ -4088,7 +4101,7 @@ def enqueue_overnight_collector_if_due(runtime_state: dict[str, Any], args: argp
         end_date = latest_day.isoformat()
         min_pct = float(getattr(args, "startup_history_repair_min_completion_pct", 100.0))
         latest_assessment = latest_history_is_complete(args=args, session_date=latest_day, min_completion_pct=min_pct, runtime_state=runtime_state)
-        latest_complete = bool(latest_assessment.get("complete"))
+        latest_complete = history_is_acceptable_for_top100_build(latest_assessment, min_pct)
         modes: list[str] = []
         if not latest_complete:
             modes.append("daily")
@@ -4201,11 +4214,18 @@ def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Nam
             return
         command = runtime_state.get("daily_top100_running_command") or {}
         if rc == 0:
+            rows = count_csv_data_rows(str(command.get("dated_output") or ""))
             print(
                 f"{now_utc()} DAILY_TOP100_BUILD_DONE ranking_date={command.get('ranking_date')} "
-                f"returncode={rc} latest_output={command.get('latest_output')}",
+                f"returncode={rc} rows={rows} latest_output={command.get('latest_output')}",
                 flush=True,
             )
+            if str(command.get("trigger") or "") == "auto_missing_dated":
+                print(
+                    f"{now_utc()} DAILY_TOP100_AUTO_BUILD_DONE date={command.get('ranking_date')} "
+                    f"rows={rows} latest_output={command.get('latest_output')}",
+                    flush=True,
+                )
             runtime_state["top100_reload_requested"] = True
             runtime_state["top100_reload_path"] = command.get("latest_output")
             runtime_state["top100_reload_ranking_date"] = command.get("ranking_date")
@@ -4255,6 +4275,16 @@ def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Nam
     assessment = latest_history_is_complete(args=args, session_date=date.fromisoformat(ranking_date), min_completion_pct=min_pct, runtime_state=runtime_state)
     acceptable_history = history_is_acceptable_for_top100_build(assessment, min_pct)
     if not acceptable_history:
+        if auto_build_needed and not slot_due:
+            print(
+                f"{now_utc()} DAILY_TOP100_AUTO_BUILD_BLOCKED date={ranking_date} "
+                f"reason=history_not_acceptable effective_completion_pct={assessment.get('effective_completion_pct')} "
+                f"parquet_completion_pct={assessment.get('parquet_completion_pct')} "
+                f"missing={assessment.get('missing')} failed={assessment.get('failed')} "
+                f"partial={assessment.get('partial_symbols')} no_data={assessment.get('no_data_symbols')} "
+                f"threshold={min_pct}",
+                flush=True,
+            )
         last_key = f"{ranking_date}_{slot}_{assessment.get('completion_pct')}_{assessment.get('missing')}_{assessment.get('failed')}"
         wait_keys = _runtime_set(runtime_state, "daily_top100_build_wait_logged_keys")
         if last_key not in wait_keys:
@@ -4284,6 +4314,11 @@ def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Nam
             f"parquet_completion_pct={assessment.get('parquet_completion_pct')} "
             f"partial={assessment.get('partial_symbols')} no_data={assessment.get('no_data_symbols')} "
             f"missing={assessment.get('missing')} failed={assessment.get('failed')} output={dated_output}",
+            flush=True,
+        )
+        print(
+            f"{now_utc()} DAILY_TOP100_AUTO_BUILD_START date={ranking_date} "
+            f"output={dated_output} latest_output={latest_output}",
             flush=True,
         )
     command = [
@@ -4316,8 +4351,10 @@ def process_daily_top100_build(runtime_state: dict[str, Any], args: argparse.Nam
     runtime_state["daily_top100_process"] = proc
     runtime_state["daily_top100_running_command"] = {
         "ranking_date": ranking_date,
+        "dated_output": str(dated_output),
         "latest_output": str(latest_output),
         "command": command,
+        "trigger": trigger,
     }
     run_keys.add(key)
 
@@ -5765,9 +5802,9 @@ def main() -> int:
     parser.add_argument("--reconnect-max-attempts", type=int, default=999999)
     parser.add_argument("--enable-overnight-automation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overnight-collector-times-utc", default="20:15,23:00,03:00,07:00,10:30")
-    parser.add_argument("--overnight-backlog-collector-times-utc", default="07:00")
+    parser.add_argument("--overnight-backlog-collector-times-utc", default=os.environ.get("TRADING_BOT_OVERNIGHT_BACKLOG_COLLECTOR_TIMES_UTC", ""))
     parser.add_argument("--overnight-prioritize-previous-day", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--overnight-collector-start-date", default="2026-01-01")
+    parser.add_argument("--overnight-collector-start-date", default=os.environ.get("TRADING_BOT_OVERNIGHT_COLLECTOR_START_DATE", ""))
     parser.add_argument("--overnight-backlog-lookback-days", type=int, default=30)
     parser.add_argument("--overnight-daily-collector-max-tasks", type=int, default=3000)
     parser.add_argument("--overnight-collector-max-tasks", type=int, default=3000)

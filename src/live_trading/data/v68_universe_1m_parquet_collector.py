@@ -609,7 +609,7 @@ def main() -> int:
     parser.add_argument("--alpha-rank-csv", default=DEFAULT_ALPHA_RANK)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--status-dir", default=DEFAULT_STATUS_DIR)
-    parser.add_argument("--start-date", default="2026-01-01")
+    parser.add_argument("--start-date", default=date.today().isoformat())
     parser.add_argument("--end-date", default=None)
     parser.add_argument("--date", default=None)
     parser.add_argument("--session-type", choices=["RTH", "EXT"], default="RTH")

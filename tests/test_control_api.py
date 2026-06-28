@@ -445,7 +445,7 @@ class ControlApiHelperTests(unittest.TestCase):
         self.assertEqual(queue[0]["start_date"], "2026-05-22")
         self.assertEqual(queue[0]["end_date"], "2026-05-22")
 
-    def test_overnight_backlog_can_fall_back_to_configured_start_date(self) -> None:
+    def test_overnight_backlog_without_wide_flag_stays_on_latest_day(self) -> None:
         runtime_state = {}
         args = SimpleNamespace(
             enable_overnight_automation=True,
@@ -471,8 +471,77 @@ class ControlApiHelperTests(unittest.TestCase):
         queue = runtime_state["history_collector_commands"]
         self.assertEqual(len(queue), 1)
         self.assertEqual(queue[0]["collector_mode"], "backlog")
+        self.assertEqual(queue[0]["start_date"], "2026-05-20")
+        self.assertEqual(queue[0]["end_date"], "2026-05-20")
+
+    def test_overnight_backlog_uses_configured_start_date_only_with_wide_flag(self) -> None:
+        runtime_state = {}
+        args = SimpleNamespace(
+            enable_overnight_automation=True,
+            overnight_collector_times_utc="07:00",
+            overnight_backlog_collector_times_utc="07:00",
+            overnight_prioritize_previous_day=False,
+            market_close_utc="20:00",
+            overnight_collector_start_date="2026-02-01",
+            overnight_backlog_lookback_days=0,
+            overnight_daily_collector_max_tasks=3000,
+            overnight_collector_max_tasks=3000,
+            overnight_collector_max_attempts=5,
+            history_collector_client_id=168,
+            overnight_collector_retry_failed=False,
+        )
+        previous = os.environ.get("TRADING_BOT_ALLOW_WIDE_HISTORY_REPAIR")
+        os.environ["TRADING_BOT_ALLOW_WIDE_HISTORY_REPAIR"] = "1"
+        try:
+            enqueue_overnight_collector_if_due(
+                runtime_state,
+                args,
+                now=datetime(2026, 5, 21, 7, 1, tzinfo=timezone.utc),
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("TRADING_BOT_ALLOW_WIDE_HISTORY_REPAIR", None)
+            else:
+                os.environ["TRADING_BOT_ALLOW_WIDE_HISTORY_REPAIR"] = previous
+
+        queue = runtime_state["history_collector_commands"]
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["collector_mode"], "backlog")
         self.assertEqual(queue[0]["start_date"], "2026-02-01")
         self.assertEqual(queue[0]["end_date"], "2026-05-20")
+
+    def test_overnight_backlog_does_not_start_from_year_start_without_wide_flag(self) -> None:
+        runtime_state = {}
+        args = SimpleNamespace(
+            enable_overnight_automation=True,
+            overnight_collector_times_utc="07:00",
+            overnight_backlog_collector_times_utc="07:00",
+            overnight_prioritize_previous_day=False,
+            market_close_utc="20:00",
+            overnight_collector_start_date="2026-01-01",
+            overnight_backlog_lookback_days=0,
+            overnight_daily_collector_max_tasks=3000,
+            overnight_collector_max_tasks=3000,
+            overnight_collector_max_attempts=5,
+            history_collector_client_id=168,
+            overnight_collector_retry_failed=False,
+        )
+        previous = os.environ.get("TRADING_BOT_ALLOW_WIDE_HISTORY_REPAIR")
+        os.environ.pop("TRADING_BOT_ALLOW_WIDE_HISTORY_REPAIR", None)
+        try:
+            enqueue_overnight_collector_if_due(
+                runtime_state,
+                args,
+                now=datetime(2026, 5, 21, 7, 1, tzinfo=timezone.utc),
+            )
+        finally:
+            if previous is not None:
+                os.environ["TRADING_BOT_ALLOW_WIDE_HISTORY_REPAIR"] = previous
+
+        queue = runtime_state["history_collector_commands"]
+        self.assertEqual(len(queue), 1)
+        self.assertNotEqual(queue[0]["start_date"], "2026-01-01")
+        self.assertEqual(queue[0]["start_date"], "2026-05-20")
 
     def test_startup_history_repair_queues_when_previous_day_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

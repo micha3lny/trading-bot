@@ -67,7 +67,7 @@ def maybe_run_history_collector(args: Any, state: dict[str, Any]) -> int:
         "-m",
         "src.live_trading.data.v68_universe_1m_parquet_collector",
         "--start-date",
-        str(getattr(args, "history_collector_start_date", "2026-01-01")),
+        str(getattr(args, "history_collector_start_date", today) or today),
         "--end-date",
         today,
         "--session-type",
