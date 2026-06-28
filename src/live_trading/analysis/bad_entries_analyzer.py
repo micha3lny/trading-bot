@@ -57,6 +57,7 @@ OUTPUT_COLUMNS = [
     "entry_minutes_after_open",
     "entry_time_bucket",
     "signal_age_seconds",
+    "signal_age_warning",
     "spread_bps_at_entry",
     "top100_rank",
     "top100_score",
@@ -76,13 +77,13 @@ def load_closed_trades(sqlite_path: str | Path, start_date: str, end_date: str) 
         sqlite_path,
         "trades",
         where=(
-            "UPPER(COALESCE(status, '')) = 'CLOSED' AND ("
-            "substr(exit_fill_time, 1, 10) BETWEEN ? AND ? "
-            "OR substr(closed_at, 1, 10) BETWEEN ? AND ? "
-            "OR (COALESCE(exit_fill_time, closed_at) IS NULL AND session_date BETWEEN ? AND ?)"
+            "UPPER(COALESCE(status, '')) = 'CLOSED' "
+            "AND ("
+            "(COALESCE(session_date, '') != '' AND session_date BETWEEN ? AND ?) "
+            "OR (COALESCE(session_date, '') = '' AND substr(entry_fill_time, 1, 10) BETWEEN ? AND ?)"
             ")"
         ),
-        params=[start_date, end_date, start_date, end_date, start_date, end_date],
+        params=[start_date, end_date, start_date, end_date],
         order_by="COALESCE(exit_fill_time, closed_at), symbol, trade_id",
     )
     return trades
@@ -90,22 +91,28 @@ def load_closed_trades(sqlite_path: str | Path, start_date: str, end_date: str) 
 
 def load_spread_snapshots(recorder_dir: Path, session_date: str) -> pd.DataFrame:
     root = recorder_dir / session_date
-    for name in ["spread_snapshots.csv", "market_snapshots.csv", "signal_snapshots.csv"]:
+    for name in ["spread_snapshots.csv", "market_snapshots.csv"]:
         df = safe_read_csv(root / name)
         if not df.empty:
             return df
+    print(f"SPREAD_DATA_MISSING date={session_date} reason=no_spread_or_market_snapshots")
     return pd.DataFrame()
 
 
-def signal_age_seconds(row: dict[str, Any], entry_time: pd.Timestamp | None) -> float | None:
+def signal_age(row: dict[str, Any], entry_time: pd.Timestamp | None) -> tuple[float | None, str]:
     if entry_time is None:
-        return None
+        return None, ""
     raw = parse_raw_json(row.get("raw_json"))
-    signal_time = first_existing_column(row, ["ready_since", "signal_time"]) or raw.get("ready_since") or raw.get("signal_time")
+    signal_time = first_existing_column(row, ["ready_since"]) or raw.get("ready_since")
+    if signal_time in (None, ""):
+        signal_time = first_existing_column(row, ["signal_time"]) or raw.get("signal_time")
     signal_ts = parse_dt(signal_time)
     if signal_ts is None:
-        return None
-    return (entry_time - signal_ts).total_seconds()
+        return None, ""
+    age = (entry_time - signal_ts).total_seconds()
+    if age < 0:
+        return None, "negative_age"
+    return age, ""
 
 
 def row_value(row: dict[str, Any], raw: dict[str, Any], names: list[str]) -> Any:
@@ -155,6 +162,7 @@ def analyze_bad_entries(
         if session_date not in spread_cache:
             spread_cache[session_date] = load_spread_snapshots(recorder_dir, session_date)
         spread = nearest_row(spread_cache[session_date], entry_time, symbol)
+        sig_age, sig_age_warning = signal_age(trade, entry_time)
         net_pnl_pct = None
         if entry_price and entry_price > 0 and quantity > 0 and net_pnl is not None:
             net_pnl_pct = net_pnl / (entry_price * quantity) * 100.0
@@ -185,7 +193,8 @@ def analyze_bad_entries(
             "max_drawdown_from_peak_pct": stats.max_drawdown_from_peak_pct,
             "entry_minutes_after_open": entry_minutes_after_open(entry_time, session_date),
             "entry_time_bucket": entry_time_bucket(entry_time, session_date),
-            "signal_age_seconds": signal_age_seconds(trade, entry_time),
+            "signal_age_seconds": sig_age,
+            "signal_age_warning": sig_age_warning,
             "spread_bps_at_entry": first_existing_column(spread, ["spread_bps", "bid_ask_spread_bps"]),
             "top100_rank": row_value(trade, raw, ["top100_rank"]),
             "top100_score": row_value(trade, raw, ["top100_score"]),
@@ -219,11 +228,61 @@ def score_bucket(value: Any) -> str:
     return "<20"
 
 
+def rank_bucket(value: Any) -> str:
+    rank = fnum(value)
+    if rank is None:
+        return "missing"
+    if rank <= 10:
+        return "1-10"
+    if rank <= 25:
+        return "11-25"
+    if rank <= 50:
+        return "26-50"
+    if rank <= 75:
+        return "51-75"
+    if rank <= 100:
+        return "76-100"
+    return "missing"
+
+
+def signal_age_bucket(value: Any, warning: Any = "") -> str:
+    if str(warning or "") == "negative_age":
+        return "invalid_negative"
+    seconds = fnum(value)
+    if seconds is None:
+        return "missing"
+    if seconds < 0:
+        return "invalid_negative"
+    if seconds <= 30:
+        return "0-30s"
+    if seconds <= 60:
+        return "30-60s"
+    if seconds <= 180:
+        return "1-3m"
+    if seconds <= 300:
+        return "3-5m"
+    return "5m+"
+
+
+def generic_bucket(value: Any) -> str:
+    if value in (None, "") or (isinstance(value, float) and pd.isna(value)):
+        return "missing"
+    return str(value)
+
+
 def print_bucket_summary(df: pd.DataFrame, column: str) -> None:
     if df.empty or column not in df.columns:
         return
     tmp = df.copy()
-    tmp["_bucket"] = tmp[column].map(score_bucket) if "score" in column else tmp[column].fillna("missing").astype(str)
+    if "score" in column:
+        tmp["_bucket"] = tmp[column].map(score_bucket)
+    elif column == "top100_rank":
+        tmp["_bucket"] = tmp[column].map(rank_bucket)
+    elif column == "signal_age_seconds":
+        warnings = tmp["signal_age_warning"] if "signal_age_warning" in tmp.columns else pd.Series([""] * len(tmp))
+        tmp["_bucket"] = [signal_age_bucket(value, warning) for value, warning in zip(tmp[column], warnings)]
+    else:
+        tmp["_bucket"] = tmp[column].map(generic_bucket)
     grouped = tmp.groupby("_bucket", dropna=False).agg(
         trade_count=("symbol", "count"),
         win_rate=("net_pnl", lambda values: float((pd.to_numeric(values, errors="coerce") > 0).mean() * 100.0) if len(values) else 0.0),
@@ -302,4 +361,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

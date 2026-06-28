@@ -84,7 +84,8 @@ def read_sql_table(
     path = Path(sqlite_path)
     if not path.exists():
         return pd.DataFrame()
-    with sqlite_connect_readonly(path) as conn:
+    conn = sqlite_connect_readonly(path)
+    try:
         available = table_columns(conn, table)
         if not available:
             return pd.DataFrame()
@@ -97,6 +98,8 @@ def read_sql_table(
         if order_by:
             sql += f" ORDER BY {order_by}"
         return pd.read_sql_query(sql, conn, params=list(params))
+    finally:
+        conn.close()
 
 
 def safe_read_csv(path: str | Path) -> pd.DataFrame:

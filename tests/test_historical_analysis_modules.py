@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import sqlite3
+import tempfile
 import unittest
+from pathlib import Path
 
 import pandas as pd
 
+from src.live_trading.analysis.bad_entries_analyzer import (
+    load_closed_trades,
+    rank_bucket,
+    signal_age,
+    signal_age_bucket,
+)
 from src.live_trading.analysis.common import (
     calculate_path_stats,
     calculate_runner_stats,
@@ -92,6 +101,55 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
             order_row={},
         )
         self.assertEqual(outside, "not_in_top100")
+
+    def test_bad_entries_filters_primarily_by_session_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            conn = sqlite3.connect(db)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE trades (
+                        trade_id TEXT,
+                        status TEXT,
+                        session_date TEXT,
+                        symbol TEXT,
+                        entry_fill_time TEXT,
+                        exit_fill_time TEXT,
+                        closed_at TEXT
+                    )
+                    """
+                )
+                conn.executemany(
+                    "INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        ("wanted", "CLOSED", "2026-06-26", "AAA", "2026-06-26T13:31:00+00:00", "2026-06-26T13:40:00+00:00", None),
+                        ("old_session_closed_today", "CLOSED", "2026-05-20", "OLD", "2026-05-20T13:31:00+00:00", "2026-06-26T13:40:00+00:00", None),
+                        ("fallback_empty_session", "CLOSED", "", "BBB", "2026-06-26T13:32:00+00:00", "2026-06-26T13:50:00+00:00", None),
+                    ],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            trades = load_closed_trades(db, "2026-06-26", "2026-06-26")
+            self.assertEqual(set(trades["trade_id"]), {"wanted", "fallback_empty_session"})
+
+    def test_signal_age_negative_is_warning_and_null(self) -> None:
+        age, warning = signal_age(
+            {"ready_since": "2026-06-26T13:35:00+00:00"},
+            pd.Timestamp("2026-06-26T13:34:00Z"),
+        )
+        self.assertIsNone(age)
+        self.assertEqual(warning, "negative_age")
+        self.assertEqual(signal_age_bucket(age, warning), "invalid_negative")
+
+    def test_rank_and_signal_age_buckets(self) -> None:
+        self.assertEqual(rank_bucket(7), "1-10")
+        self.assertEqual(rank_bucket(25), "11-25")
+        self.assertEqual(rank_bucket(80), "76-100")
+        self.assertEqual(signal_age_bucket(29), "0-30s")
+        self.assertEqual(signal_age_bucket(90), "1-3m")
+        self.assertEqual(signal_age_bucket(None), "missing")
 
 
 if __name__ == "__main__":
