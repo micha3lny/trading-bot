@@ -21,27 +21,12 @@ from src.live_trading.analysis.common import (
     pct,
 )
 from src.live_trading.market_calendar import is_us_equity_trading_day
+from src.live_trading.storage.sqlite_store import OVERNIGHT_HOLD_TRADE_COLUMNS
 
 
 DEFAULT_SQLITE_PATH = Path("data/runtime/trading_runtime.sqlite")
 DEFAULT_HISTORY_DIR = Path("data/history/universe_1m")
 DEFAULT_RECORDER_DIR = Path("data/live/recorder")
-
-OVERNIGHT_COLUMNS: dict[str, str] = {
-    "overnight_hold_score": "REAL",
-    "overnight_hold_bucket": "TEXT",
-    "overnight_hold_reason": "TEXT",
-    "overnight_hold_features_json": "TEXT",
-    "next_session_open": "REAL",
-    "next_session_high": "REAL",
-    "next_session_low": "REAL",
-    "next_session_close": "REAL",
-    "next_session_open_gap_pct": "REAL",
-    "next_session_high_from_entry_pct": "REAL",
-    "next_session_close_from_entry_pct": "REAL",
-    "next_session_max_drawdown_from_entry_pct": "REAL",
-    "overnight_hold_updated_at": "TEXT",
-}
 
 
 def next_us_equity_trading_day(value: date | datetime | str) -> date:
@@ -67,7 +52,7 @@ def ensure_overnight_columns(sqlite_path: str | Path) -> list[str]:
     added: list[str] = []
     try:
         existing = {str(row[1]) for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
-        for column, col_type in OVERNIGHT_COLUMNS.items():
+        for column, col_type in OVERNIGHT_HOLD_TRADE_COLUMNS.items():
             if column not in existing:
                 conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {col_type}")
                 added.append(column)
@@ -316,4 +301,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

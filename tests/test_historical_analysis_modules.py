@@ -25,6 +25,7 @@ from src.live_trading.analysis.missed_runners_analyzer import classify_missed_re
 from src.live_trading.analysis.missed_runners_analyzer import previous_session_context
 from src.live_trading.analysis.overnight_hold_ranker import ensure_overnight_columns, overnight_score, score_bucket
 from src.live_trading.ranking.daily_top100_builder import parquet_path
+from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
 
 class HistoricalAnalysisModuleTests(unittest.TestCase):
@@ -217,6 +218,19 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
             finally:
                 conn.close()
             self.assertIn("overnight_hold_features_json", cols)
+
+    def test_runtime_store_schema_includes_overnight_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.close()
+            conn = sqlite3.connect(db)
+            try:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+            finally:
+                conn.close()
+            self.assertIn("overnight_hold_score", cols)
+            self.assertIn("next_session_high_from_entry_pct", cols)
 
 
 if __name__ == "__main__":

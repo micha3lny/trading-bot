@@ -95,6 +95,21 @@ ENTRY_METADATA_FIELDS = (
     "entry_order_id",
     "entry_perm_id",
 )
+OVERNIGHT_HOLD_TRADE_COLUMNS: dict[str, str] = {
+    "overnight_hold_score": "REAL",
+    "overnight_hold_bucket": "TEXT",
+    "overnight_hold_reason": "TEXT",
+    "overnight_hold_features_json": "TEXT",
+    "next_session_open": "REAL",
+    "next_session_high": "REAL",
+    "next_session_low": "REAL",
+    "next_session_close": "REAL",
+    "next_session_open_gap_pct": "REAL",
+    "next_session_high_from_entry_pct": "REAL",
+    "next_session_close_from_entry_pct": "REAL",
+    "next_session_max_drawdown_from_entry_pct": "REAL",
+    "overnight_hold_updated_at": "TEXT",
+}
 
 
 def utc_now_iso() -> str:
@@ -507,6 +522,19 @@ class SQLiteRuntimeStore:
                 ready_since TEXT,
                 entry_order_id TEXT,
                 entry_perm_id TEXT,
+                overnight_hold_score REAL,
+                overnight_hold_bucket TEXT,
+                overnight_hold_reason TEXT,
+                overnight_hold_features_json TEXT,
+                next_session_open REAL,
+                next_session_high REAL,
+                next_session_low REAL,
+                next_session_close REAL,
+                next_session_open_gap_pct REAL,
+                next_session_high_from_entry_pct REAL,
+                next_session_close_from_entry_pct REAL,
+                next_session_max_drawdown_from_entry_pct REAL,
+                overnight_hold_updated_at TEXT,
                 ibkr_entry_confirmed INTEGER DEFAULT 0,
                 ibkr_exit_confirmed INTEGER DEFAULT 0,
                 ibkr_position_flat_confirmed INTEGER DEFAULT 0,
@@ -746,6 +774,8 @@ class SQLiteRuntimeStore:
         self._ensure_column("trades", "peak_unrealized_pnl", "REAL")
         self._ensure_column("trades", "max_adverse_unrealized_pnl", "REAL")
         self._ensure_column("trades", "giveback_from_peak", "REAL")
+        for column, definition in OVERNIGHT_HOLD_TRADE_COLUMNS.items():
+            self._ensure_column("trades", column, definition)
         for table in ("trades", "positions"):
             self._ensure_column(table, "top100_rank", "INTEGER")
             self._ensure_column(table, "top100_score", "REAL")
