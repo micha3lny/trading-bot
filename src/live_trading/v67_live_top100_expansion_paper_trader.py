@@ -602,6 +602,123 @@ def snapshot_from_ticker(symbol: str, ticker: Any) -> dict[str, Any]:
     }
 
 
+def ticker_time_value(ticker: Any) -> str:
+    for attr in ("time", "rtTime", "lastTime"):
+        value = getattr(ticker, attr, None)
+        if value in (None, ""):
+            continue
+        if hasattr(value, "isoformat"):
+            try:
+                return value.isoformat()
+            except Exception:
+                return str(value)
+        return str(value)
+    return ""
+
+
+def subscription_age_seconds(runtime_state: dict[str, Any], symbol: str, now_ts: float | None = None) -> float | None:
+    started_by_symbol = _runtime_dict(runtime_state, "subscription_started_monotonic_by_symbol")
+    started = safe_float(started_by_symbol.get(symbol))
+    if started is None:
+        return None
+    return max(0.0, float(now_ts if now_ts is not None else time.monotonic()) - started)
+
+
+def log_no_usable_ticker_price(
+    runtime_state: dict[str, Any],
+    symbol: str,
+    ticker: Any,
+    snap: dict[str, Any],
+    contract: Any,
+    *,
+    now_ts: float | None = None,
+) -> None:
+    age = subscription_age_seconds(runtime_state, symbol, now_ts=now_ts)
+    runtime_rate_limited_log(
+        runtime_state,
+        "NO_USABLE_TICKER_PRICE",
+        f"{now_utc()} NO_USABLE_TICKER_PRICE symbol={symbol} "
+        f"bid={snap.get('bid')} ask={snap.get('ask')} last={snap.get('last')} close={snap.get('close')} "
+        f"midpoint={snap.get('mid_price')} volume={snap.get('volume')} "
+        f"ticker_time={ticker_time_value(ticker)} "
+        f"subscription_age_seconds={round(age, 3) if age is not None else ''} "
+        f"contract_conid={getattr(contract, 'conId', '')}",
+        key=symbol,
+        max_unique=200,
+        window_seconds=60.0,
+    )
+
+
+def emit_runtime_scan_summary(
+    runtime_state: dict[str, Any],
+    contracts: list[tuple[str, Any]],
+    tickers: dict[str, Any],
+    states: dict[str, SymbolState],
+    symbols_with_price: list[str],
+    symbols_without_price: list[str],
+) -> None:
+    print(
+        f"{now_utc()} runtime_scan_summary contracts_count={len(contracts)} "
+        f"tickers_count={len(tickers)} states_count={len(states)} "
+        f"symbols_with_price={len(symbols_with_price)} symbols_without_price={len(symbols_without_price)}",
+        flush=True,
+    )
+    if len(contracts) != len(symbols_with_price) and symbols_without_price:
+        print(
+            f"{now_utc()} runtime_scan_missing_price_symbols count={len(symbols_without_price)} "
+            f"symbols={','.join(symbols_without_price[:200])}",
+            flush=True,
+        )
+    runtime_state["runtime_scan_last_summary_at"] = now_utc()
+    runtime_state["runtime_scan_symbols_with_price"] = len(symbols_with_price)
+    runtime_state["runtime_scan_symbols_without_price"] = len(symbols_without_price)
+
+
+def emit_symbol_pipeline_health(
+    runtime_state: dict[str, Any],
+    args: argparse.Namespace,
+    contracts: list[tuple[str, Any]],
+    contract_by_symbol: dict[str, Any],
+    tickers: dict[str, Any],
+    states: dict[str, SymbolState],
+    *,
+    now_ts: float,
+) -> None:
+    last_health = float(runtime_state.get("symbol_pipeline_health_last_ts", 0.0) or 0.0)
+    if now_ts - last_health < 300.0:
+        return
+    runtime_state["symbol_pipeline_health_last_ts"] = now_ts
+    contract_symbols = {symbol for symbol, _contract in contracts}
+    top100_symbols = set(str(symbol).upper() for symbol in runtime_state.get("top100_reload_symbols") or [])
+    entry_symbols = _runtime_set(runtime_state, "entry_symbols")
+    all_symbols = sorted(top100_symbols or entry_symbols or contract_symbols)
+    print(f"{now_utc()} SYMBOL_PIPELINE_HEALTH_START symbols={len(all_symbols)}", flush=True)
+    for symbol in all_symbols:
+        ticker = tickers.get(symbol)
+        snap = snapshot_from_ticker(symbol, ticker) if ticker is not None else {}
+        usable_price = snap.get("price") is not None
+        state = states.get(symbol)
+        ready = 0
+        if state is not None and usable_price:
+            try:
+                ready = 1 if compute_live_safe_features(state, snap, args).get("ready") else 0
+            except Exception:
+                ready = 0
+        print(
+            f"{now_utc()} SYMBOL_PIPELINE_HEALTH symbol={symbol} "
+            f"contract_present={1 if symbol in contract_by_symbol or symbol in contract_symbols else 0} "
+            f"ticker_present={1 if ticker is not None else 0} "
+            f"usable_price={1 if usable_price else 0} "
+            f"state_present={1 if state is not None else 0} "
+            f"first_price_initialized={1 if state is not None and state.first_price is not None else 0} "
+            f"first5_initialized={1 if state is not None and state.first_5m_high is not None else 0} "
+            f"first15_initialized={1 if state is not None and state.first_15m_high is not None else 0} "
+            f"ready={ready} "
+            f"signal_sent={1 if state is not None and state.signal_sent else 0}",
+            flush=True,
+        )
+
+
 def market_open_datetime_utc(args: argparse.Namespace, now: datetime | None = None) -> datetime:
     now = now or datetime.now(timezone.utc)
     hh, mm = [int(x) for x in str(args.market_open_utc).split(":", 1)]
@@ -4445,6 +4562,7 @@ def reload_top100_universe_if_requested(
 
         for symbol in sorted(previous_symbol_set - subscription_symbol_set):
             ticker = tickers.pop(symbol, None)
+            _runtime_dict(runtime_state, "subscription_started_monotonic_by_symbol").pop(symbol, None)
             contract = getattr(ticker, "contract", None) or contract_by_symbol.get(symbol)
             if contract is not None:
                 try:
@@ -4498,6 +4616,7 @@ def reload_top100_universe_if_requested(
                 print(f"{now_utc()} TOP100_RELOAD_REQUESTED symbol={symbol} conId={getattr(contract, 'conId', '')}", flush=True)
                 try:
                     tickers[symbol] = ib.reqMktData(contract, "", False, False)
+                    _runtime_dict(runtime_state, "subscription_started_monotonic_by_symbol")[symbol] = time.monotonic()
                     subscribed += 1
                     print(f"{now_utc()} TOP100_RELOAD_SUBSCRIBED symbol={symbol} conId={getattr(contract, 'conId', '')}", flush=True)
                 except Exception as exc:
@@ -4521,6 +4640,7 @@ def reload_top100_universe_if_requested(
                     continue
             else:
                 reused += 1
+                _runtime_dict(runtime_state, "subscription_started_monotonic_by_symbol").setdefault(symbol, time.monotonic())
             new_contracts.append((symbol, contract))
             new_contract_by_symbol[symbol] = contract
 
@@ -5980,6 +6100,8 @@ def main() -> int:
         "top100_entries_blocked": False,
         "top100_freshness": {},
         "top100_entry_metadata_by_symbol": dict(top100_entry_metadata_by_symbol),
+        "subscription_started_monotonic_by_symbol": {},
+        "symbol_pipeline_health_last_ts": 0.0,
         "sqlite_writer_status": {},
         "market_closed_logged_dates": set(),
         "risk_guard_last_status": {
@@ -6016,6 +6138,7 @@ def main() -> int:
             contract = Stock(symbol, "SMART", "USD")
             qualified = ib.qualifyContracts(contract)
             if not qualified:
+                print(f"{now_utc()} TOP100_STARTUP_CONTRACT_FAILED symbol={symbol} reason=not_qualified", flush=True)
                 continue
             q = qualified[0]
             record_contract_metadata(recorder, q, source="startup")
@@ -6038,6 +6161,7 @@ def main() -> int:
             contracts.append((symbol, q))
             contract_by_symbol[symbol] = q
             tickers[symbol] = ib.reqMktData(q, "", False, False)
+            _runtime_dict(runtime_state, "subscription_started_monotonic_by_symbol")[symbol] = time.monotonic()
             print(f"Subscribed {symbol} conId={q.conId}", flush=True)
 
         startup_broker_rows = ibkr_portfolio_position_rows(ib)
@@ -6341,11 +6465,17 @@ def main() -> int:
 
             mark_entry_block_state(runtime_state, entries_blocked, loop_now)
             entry_candidates: list[dict[str, Any]] = []
+            symbols_with_price: list[str] = []
+            symbols_without_price: list[str] = []
 
             for symbol, q in contracts:
-                snap = snapshot_from_ticker(symbol, tickers[symbol])
+                ticker = tickers[symbol]
+                snap = snapshot_from_ticker(symbol, ticker)
                 if snap.get("price") is None:
+                    symbols_without_price.append(symbol)
+                    log_no_usable_ticker_price(runtime_state, symbol, ticker, snap, q, now_ts=time.monotonic())
                     continue
+                symbols_with_price.append(symbol)
                 latest_snapshots[symbol] = snap
                 data_count += 1
                 state = states[symbol]
@@ -6427,6 +6557,17 @@ def main() -> int:
                             "entries_blocked_reason": runtime_state.get("entries_blocked_reason"),
                         },
                     )
+
+            emit_runtime_scan_summary(runtime_state, contracts, tickers, states, symbols_with_price, symbols_without_price)
+            emit_symbol_pipeline_health(
+                runtime_state,
+                args,
+                contracts,
+                contract_by_symbol,
+                tickers,
+                states,
+                now_ts=loop_now,
+            )
 
             ranking_position_by_symbol = {
                 symbol: idx + 1 for idx, (symbol, _score, _features) in enumerate(sorted(ranked, key=lambda item: item[1], reverse=True))
