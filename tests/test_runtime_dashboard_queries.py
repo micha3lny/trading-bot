@@ -231,6 +231,72 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(row["entry_order_id"], "7011")
             self.assertEqual(row["entry_perm_id"], "9011")
 
+    def test_closed_positions_use_execution_truth_and_keep_unattributed_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_date = "2026-07-01"
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_trade({
+                    "trade_id": "T_ATTR",
+                    "strategy_name": "v67",
+                    "session_date": session_date,
+                    "symbol": "ATTR",
+                    "status": "CLOSED",
+                    "entry_fill_time": f"{session_date}T13:30:00+00:00",
+                    "exit_fill_time": f"{session_date}T13:45:00+00:00",
+                    "closed_at": f"{session_date}T13:45:00+00:00",
+                    "entry_price": 10,
+                    "exit_price": 11,
+                    "quantity": 10,
+                    "gross_pnl": 10,
+                    "commission": 99,
+                    "net_pnl": -89,
+                    "live_entry_score": 72.0,
+                    "live_entry_rank": 3,
+                    "entry_order_id": "7010",
+                    "raw_json": {"commission_status": "OK"},
+                })
+                for execution_id, symbol, side, qty, price, realized_pnl, commission in [
+                    ("B_ATTR", "ATTR", "BOT", 10, 10, 0, 0.5),
+                    ("S_ATTR", "ATTR", "SLD", 10, 11, 10, 0.25),
+                    ("B_MISS", "MISS", "BOT", 5, 20, 0, 0.5),
+                    ("S_MISS", "MISS", "SLD", 5, 18, -10, 0.75),
+                ]:
+                    store.upsert_execution({
+                        "execution_id": execution_id,
+                        "session_date": session_date,
+                        "strategy_name": "v67",
+                        "symbol": symbol,
+                        "side": side,
+                        "quantity": qty,
+                        "price": price,
+                        "executed_at": f"{session_date}T13:40:00+00:00",
+                        "recorded_at": f"{session_date}T13:40:01+00:00",
+                        "commission": commission,
+                        "commission_source": "ibkr",
+                        "realized_pnl": realized_pnl,
+                    })
+                store.conn.execute("DELETE FROM trades WHERE trade_id LIKE 'reconstructed:%'")
+                store.conn.commit()
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow(session_date, session_date), "v67")
+            closed = snapshot["closed_positions"].sort_values("symbol").reset_index(drop=True)
+
+            self.assertEqual(snapshot["summary"]["closed_trades"], 2)
+            self.assertAlmostEqual(snapshot["summary"]["commissions"], 1.0)
+            self.assertAlmostEqual(snapshot["summary"]["net_actual_pnl"], -1.0)
+            self.assertEqual(snapshot["data_quality_summary"]["closed_trades_count"], 2)
+            self.assertEqual(closed["symbol"].tolist(), ["ATTR", "MISS"])
+            self.assertAlmostEqual(closed.loc[closed["symbol"] == "ATTR", "live_entry_score"].iloc[0], 72.0)
+            self.assertTrue(pd.isna(closed.loc[closed["symbol"] == "MISS", "live_entry_score"].iloc[0]))
+            self.assertIn("UNATTRIBUTED_EXECUTION_CLOSED", closed.loc[closed["symbol"] == "MISS", "data_quality"].iloc[0])
+            self.assertEqual(snapshot["diagnostics"]["exported_closed_rows_count"], 2)
+            self.assertAlmostEqual(snapshot["diagnostics"]["pnl_gap"], 0.0)
+            self.assertEqual(snapshot["diagnostics"]["unattributed_closed_count"], 1)
+
     def test_runtime_executions_use_sqlite_and_sort_descending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             session_date = utc_today()

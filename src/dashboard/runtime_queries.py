@@ -1408,6 +1408,23 @@ def closest_sell_execution(
     )
 
 
+def trade_execution_time_fallbacks(executions: pd.DataFrame, trade_id: str, symbol: str) -> tuple[str, str]:
+    if executions.empty:
+        return "", ""
+    rows = executions.copy()
+    if trade_id and "trade_id" in rows.columns:
+        rows = rows[rows["trade_id"].fillna("").astype(str) == trade_id]
+    if rows.empty and symbol and "symbol" in executions.columns:
+        rows = executions[executions["symbol"].fillna("").astype(str).str.upper() == symbol.upper()].copy()
+    if rows.empty:
+        return "", ""
+    side = rows.get("side", rows.get("action", pd.Series("", index=rows.index))).fillna("").astype(str).str.upper()
+    times = rows.get("executed_at", rows.get("time", pd.Series("", index=rows.index))).fillna(rows.get("recorded_at", pd.Series("", index=rows.index))).astype(str)
+    buy_times = sorted(t for t in times[side.isin(["BOT", "BUY"])].tolist() if t and t.lower() != "nan")
+    sell_times = sorted(t for t in times[side.isin(["SLD", "SELL"])].tolist() if t and t.lower() != "nan")
+    return (buy_times[0] if buy_times else "", sell_times[-1] if sell_times else "")
+
+
 def closed_from_trades(
     conn: sqlite3.Connection,
     window: DateWindow,
@@ -1529,6 +1546,12 @@ def closed_from_trades(
         flags: set[str] = set()
         entry_time = row.get("entry_time")
         exit_time = row.get("exit_time") or row.get("closed_at")
+        symbol = str(row.get("symbol") or "").upper()
+        fallback_entry_time, fallback_exit_time = trade_execution_time_fallbacks(executions, normalized_identifier(row.get("trade_id")), symbol)
+        if not entry_time and fallback_entry_time:
+            entry_time = fallback_entry_time
+        if not exit_time and fallback_exit_time:
+            exit_time = fallback_exit_time
         if not entry_time:
             flags.add("MISSING_ENTRY")
         if not exit_time:
@@ -1536,7 +1559,6 @@ def closed_from_trades(
         enriched_row = {**row, "entry_time": entry_time, "exit_time": exit_time}
         raw = parse_raw_json(row.get("raw_json"))
         exit_date = date_part(exit_time) or date_part(row.get("closed_at")) or str(row.get("session_date") or "")
-        symbol = str(row.get("symbol") or "").upper()
         row_strategy = str(row.get("strategy") or "unknown")
         if row_strategy == "unknown":
             inferred_strategy = inferred_strategy_by_exit_symbol.get((exit_date, symbol)) or inferred_strategy_by_exit_symbol.get((str(row.get("session_date") or ""), symbol))
@@ -1805,6 +1827,117 @@ def closed_from_trades(
     ]
 
 
+def closed_from_execution_realized_pnl(executions: pd.DataFrame, trade_rows: pd.DataFrame | None = None) -> pd.DataFrame:
+    if executions.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    trade_by_symbol: dict[str, dict[str, Any]] = {}
+    if trade_rows is not None and not trade_rows.empty and "symbol" in trade_rows.columns:
+        for row in trade_rows.to_dict("records"):
+            symbol = str(row.get("symbol") or "").upper()
+            if symbol and symbol not in trade_by_symbol:
+                trade_by_symbol[symbol] = row
+    working = executions.copy()
+    working["symbol"] = working.get("symbol", pd.Series(dtype=str)).fillna("").astype(str).str.upper()
+    working["side_upper"] = working.get("side", working.get("action", pd.Series(dtype=str))).fillna("").astype(str).str.upper()
+    working["quantity"] = pd.to_numeric(working.get("quantity", working.get("qty", pd.Series(dtype=float))), errors="coerce").fillna(0.0).abs()
+    working["price"] = pd.to_numeric(working.get("price", working.get("fill_price", pd.Series(dtype=float))), errors="coerce")
+    working["commission"] = pd.to_numeric(working.get("commission", pd.Series(dtype=float)), errors="coerce").fillna(0.0).abs()
+    working["realized_pnl"] = pd.to_numeric(working.get("realized_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+    for symbol, group in working[working["symbol"] != ""].groupby("symbol", sort=True):
+        buy_mask = group["side_upper"].isin(["BOT", "BUY"])
+        sell_mask = group["side_upper"].isin(["SLD", "SELL"])
+        buy_qty = float(group.loc[buy_mask, "quantity"].sum())
+        sell_qty = float(group.loc[sell_mask, "quantity"].sum())
+        net_qty = buy_qty - sell_qty
+        if abs(net_qty) > 0.000001 or sell_qty <= 0:
+            continue
+        gross = float(group["realized_pnl"].sum())
+        sell_commission = float(group.loc[sell_mask, "commission"].sum())
+        buy_value = float((group.loc[buy_mask, "quantity"] * group.loc[buy_mask, "price"]).sum())
+        sell_value = float((group.loc[sell_mask, "quantity"] * group.loc[sell_mask, "price"]).sum())
+        buy_price = buy_value / buy_qty if buy_qty else None
+        sell_price = sell_value / sell_qty if sell_qty else None
+        times = group.get("executed_at", group.get("time", pd.Series(dtype=object))).fillna(group.get("recorded_at", pd.Series(dtype=object)))
+        buy_times = times[buy_mask].dropna().astype(str).tolist()
+        sell_times = times[sell_mask].dropna().astype(str).tolist()
+        exit_time = max(sell_times) if sell_times else ""
+        entry_time = min(buy_times) if buy_times else ""
+        session_values = [str(x) for x in group.get("session_date", pd.Series(dtype=object)).dropna().tolist() if str(x)]
+        session_date = session_values[0] if session_values else (date_part(exit_time) or date_part(entry_time))
+        metadata = dict(trade_by_symbol.get(symbol, {}))
+        quality = str(metadata.get("data_quality") or "OK")
+        metadata_status = "attributed" if metadata else "unattributed"
+        if not metadata:
+            quality = append_quality(quality, "UNATTRIBUTED_EXECUTION_CLOSED")
+        elif str(metadata.get("source") or "").lower() in {"sqlite_execution_reducer", "executions_pair", "reconstructed_executions"}:
+            quality = append_quality(quality, "RECONSTRUCTED_CLOSED_METADATA")
+        source = str(metadata.get("source") or "")
+        rows.append(
+            {
+                **metadata,
+                "trade_id": metadata.get("trade_id") or f"execution_realized:{session_date}:{symbol}",
+                "symbol": symbol,
+                "qty": sell_qty,
+                "ibkr_commission": sell_commission,
+                "commission_status": "OK" if sell_commission > 0 else "MISSING",
+                "buy": buy_price,
+                "sell": sell_price,
+                "gross": gross,
+                "net_actual": gross - sell_commission,
+                "net_pct": ((gross - sell_commission) / (buy_price * sell_qty) * 100.0) if buy_price and sell_qty else 0.0,
+                "pnl_pct": ((gross - sell_commission) / (buy_price * sell_qty) * 100.0) if buy_price and sell_qty else 0.0,
+                "entry_time": metadata.get("entry_time") or entry_time,
+                "exit_time": metadata.get("exit_time") or exit_time,
+                "entry_date": date_part(metadata.get("entry_time") or entry_time) or session_date,
+                "exit_date": date_part(metadata.get("exit_time") or exit_time) or session_date,
+                "session_date": metadata.get("session_date") or session_date,
+                "strategy": metadata.get("strategy") or "unknown",
+                "exit_reason": metadata.get("exit_reason") or "unknown_exit_reason",
+                "exit_reason_source": metadata.get("exit_reason_source") or "missing_explicit_exit_event",
+                "data_quality": quality,
+                "closed_source": "executions_realized_pnl",
+                "source": source or "executions_realized_pnl",
+                "runtime_pnl_trusted": True,
+                "runtime_pnl_untrusted_reason": "",
+                "attribution_status": metadata_status,
+                "entry_execution_count": int(buy_mask.sum()),
+                "exit_execution_count": int(sell_mask.sum()),
+                "confirmed_commission_execution_count": int((group.loc[sell_mask, "commission"] > 0).sum()),
+                "expected_commission_execution_count": int(len(group)),
+                "commission_source_detail": "matched_by=execution_symbol_closed_pnl sell_side_commission_only",
+                "entry_execution_id": ", ".join(str(x) for x in group.loc[buy_mask, "execution_id"].dropna().tolist() if str(x)),
+                "exit_execution_id": ", ".join(str(x) for x in group.loc[sell_mask, "execution_id"].dropna().tolist() if str(x)),
+                "peak_source": metadata.get("peak_source") or "missing",
+                "peak_match_quality": metadata.get("peak_match_quality") or "missing",
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    for col in (
+        "peak_pct",
+        "mae_pct",
+        "peak_price",
+        "low_price",
+        "peak_unrealized_pnl",
+        "max_adverse_unrealized_pnl",
+        "giveback_from_peak",
+        "drop_from_peak_pct",
+        "top100_rank",
+        "top100_score",
+        "live_entry_score",
+        "live_entry_rank",
+    ):
+        if col not in out.columns:
+            out[col] = pd.NA
+    for col in ("entry_order_id", "entry_perm_id", "matched_event_type", "matched_event_time", "matched_order_id", "updated_at", "trade_reduction_version"):
+        if col not in out.columns:
+            out[col] = ""
+    out["hold_minutes"] = [hold_minutes(a, b) for a, b in zip(out["entry_time"], out["exit_time"])]
+    return out
+
+
 def closed_from_executions(
     executions: pd.DataFrame,
     window: DateWindow,
@@ -1964,6 +2097,7 @@ def load_closed_positions(
     executions: pd.DataFrame,
     *,
     include_reconstructed: bool = False,
+    current_executions: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     lookup_window = expanded_lookup_window(window)
     runtime_peak_map = load_runtime_peak_map(conn, window, strategy)
@@ -2005,6 +2139,7 @@ def load_closed_positions(
             )
         ]
     persisted_count = int(len(trades))
+    execution_closed = closed_from_execution_realized_pnl(current_executions if current_executions is not None else pd.DataFrame(), trades)
     displayed_frames = [trades]
     if include_reconstructed:
         displayed_frames.append(reconstructed)
@@ -2015,7 +2150,13 @@ def load_closed_positions(
         "displayed_closed_trades_count": 0,
         "execution_reconstruction_disabled": int(not include_reconstructed and persisted_count == 0 and not executions.empty),
         "runtime_closed_source": "persisted_trades",
+        "execution_realized_closed_count": int(len(execution_closed)),
     }
+    if not execution_closed.empty and len(execution_closed) > persisted_count:
+        closed = execution_closed.sort_values(["net_actual", "symbol"], na_position="last").reset_index(drop=True)
+        diag["displayed_closed_trades_count"] = int(len(closed))
+        diag["runtime_closed_source"] = "executions_realized_pnl"
+        return closed, diag
     if not frames:
         return pd.DataFrame(), diag
     closed = pd.concat(frames, ignore_index=True, sort=False)
@@ -3158,6 +3299,7 @@ def load_dashboard_snapshot(
             strategy,
             execution_lookup,
             include_reconstructed=include_reconstructed,
+            current_executions=executions,
         )
         open_positions = load_open_positions(conn, window, strategy, executions, execution_lookup, broker_portfolio)
         pending_trades = load_pending_trades(conn, window, strategy)
@@ -3216,6 +3358,31 @@ def load_dashboard_snapshot(
         else:
             diagnostics["untrusted_carry_closed_count"] = 0
             diagnostics["untrusted_carry_closed_symbols"] = ""
+        if not closed.empty:
+            quality_series = closed.get("data_quality", pd.Series("", index=closed.index)).fillna("").astype(str)
+            source_series = closed.get("source", pd.Series("", index=closed.index)).fillna("").astype(str).str.lower()
+            attribution_series = closed.get("attribution_status", pd.Series("", index=closed.index)).fillna("").astype(str)
+            exported_view = aggregate_closed_positions(closed)
+            exported_pnl = float(pd.to_numeric(exported_view.get("net_actual", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not exported_view.empty else 0.0
+            all_execution_pnl = float(execution_pnl.get("net_actual_pnl") or 0.0)
+            diagnostics["attributed_closed_count"] = int((attribution_series == "attributed").sum())
+            diagnostics["reconstructed_closed_count"] = int(source_series.str.contains("reconstructed|execution_reducer|executions_pair", regex=True).sum())
+            diagnostics["carry_closed_count"] = int(quality_series.str.contains("CARRIED_POSITION_CLOSED_TODAY|CARRY_BASIS_UNVERIFIED", regex=True).sum())
+            unattributed_mask = (attribution_series == "unattributed") | quality_series.str.contains("UNATTRIBUTED_EXECUTION_CLOSED", regex=False)
+            diagnostics["unattributed_closed_count"] = int(unattributed_mask.sum())
+            diagnostics["exported_closed_rows_count"] = int(len(exported_view))
+            diagnostics["pnl_from_exported_rows"] = exported_pnl
+            diagnostics["pnl_from_all_closed_executions"] = all_execution_pnl
+            diagnostics["pnl_gap"] = exported_pnl - all_execution_pnl
+        else:
+            diagnostics["attributed_closed_count"] = 0
+            diagnostics["reconstructed_closed_count"] = 0
+            diagnostics["carry_closed_count"] = 0
+            diagnostics["unattributed_closed_count"] = 0
+            diagnostics["exported_closed_rows_count"] = 0
+            diagnostics["pnl_from_exported_rows"] = 0.0
+            diagnostics["pnl_from_all_closed_executions"] = float(execution_pnl.get("net_actual_pnl") or 0.0)
+            diagnostics["pnl_gap"] = -float(execution_pnl.get("net_actual_pnl") or 0.0)
         raw_closed_ids = {
             str(row.get("trade_id") or "")
             for row in raw_closed_rows.to_dict("records")

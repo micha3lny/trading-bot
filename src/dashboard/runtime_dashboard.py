@@ -1048,17 +1048,15 @@ def render_closed_positions(df: pd.DataFrame) -> None:
     if df.empty:
         st.info("No confirmed closed trades in trades table.")
         return
-    normal = df[closed_normal_mask(df)].copy()
-    diagnostics = df[~closed_normal_mask(df)].copy()
-    if diagnostics.empty:
-        st.caption("Showing normal strategy closed trades only.")
-    else:
-        st.warning(f"{len(diagnostics)} carried/unattributed closed rows are excluded from the main strategy table and shown below.")
-    if normal.empty:
-        st.info("No normal attributed strategy closed trades. See carry/unattributed diagnostics below.")
-    else:
-        render_live_entry_score_summary(normal)
-    aggregate = aggregate_closed_positions(normal)
+    normal_mask = closed_normal_mask(df)
+    diagnostics = df[~normal_mask].copy()
+    render_live_entry_score_summary(df)
+    st.caption(
+        "Closed Positions uses the execution-realized PnL source of truth when available. "
+        "Carry means a position/trade was carried, adopted, or reconstructed rather than a clean same-day persisted lifecycle trade. "
+        "Unattributed means closed PnL from executions could not be joined to clean entry metadata."
+    )
+    aggregate = aggregate_closed_positions(df)
     out = format_closed_positions(aggregate, "closed") if not aggregate.empty else pd.DataFrame()
     if not out.empty:
         st.dataframe(
@@ -1066,12 +1064,16 @@ def render_closed_positions(df: pd.DataFrame) -> None:
             width="stretch",
             hide_index=True,
         )
-    if not normal.empty:
+    if not df.empty:
         with st.expander("Closed trade partial execution details", expanded=False):
-            details = format_closed_positions(normal, "closed_details")
+            details = format_closed_positions(df, "closed_details")
             st.dataframe(style_pnl(details, ["Gross", "Net", "Net %"]), width="stretch", hide_index=True)
     if not diagnostics.empty:
         st.subheader("Carry / Unattributed Closed Diagnostics")
+        st.caption(
+            "Carry = position/trade carried, adopted, or reconstructed. "
+            "Unattributed = execution-closed PnL without a clean persisted trade/entry metadata join."
+        )
         aggregate_diag = aggregate_closed_positions(diagnostics)
         diag_out = format_closed_positions(aggregate_diag, "closed_carry_diag")
         st.dataframe(
@@ -1251,9 +1253,25 @@ def render_diagnostics(diag: dict) -> None:
         ("Dropped Closed", "dropped_closed_trade_count"),
         ("Untrusted Carry", "untrusted_carry_closed_count"),
         ("Carried Closed Today", "carried_closed_today_count"),
+        ("Unattributed Closed", "unattributed_closed_count"),
     ]
     for col, (label, key) in zip(closed_cols, closed_labels):
         col.metric(label, int(diag.get(key, 0)))
+    closed_diag_cols = st.columns(6)
+    closed_diag_labels = [
+        ("Attributed Closed", "attributed_closed_count"),
+        ("Reconstructed Closed", "reconstructed_closed_count"),
+        ("Carry Closed", "carry_closed_count"),
+        ("Export Rows", "exported_closed_rows_count"),
+        ("Export PnL", "pnl_from_exported_rows"),
+        ("PnL Gap", "pnl_gap"),
+    ]
+    for col, (label, key) in zip(closed_diag_cols, closed_diag_labels):
+        value = diag.get(key, 0)
+        if key.startswith("pnl_"):
+            col.metric(label, money(value))
+        else:
+            col.metric(label, int(value or 0))
     reducer_cols = st.columns(4)
     reducer_cols[0].metric("SQLite Closed Trades", int(diag.get("closed_trades_count", 0) or 0))
     reducer_cols[1].metric("Broker Closed Trades", str(diag.get("broker_closed_trades_count", "N/A")))
