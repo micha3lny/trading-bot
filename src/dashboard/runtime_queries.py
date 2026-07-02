@@ -1637,6 +1637,49 @@ def merge_entry_metadata(*sources: dict[str, Any]) -> tuple[dict[str, Any], str,
     return merged, "+".join(dict.fromkeys(used_sources)) if used_sources else "missing", confidence, warning
 
 
+def execution_date_mismatch(metadata: dict[str, Any], entry_time: Any, exit_time: Any) -> bool:
+    if not metadata:
+        return False
+    metadata_entry_date = date_part(metadata.get("entry_time") or metadata.get("entry_date"))
+    metadata_exit_date = date_part(metadata.get("exit_time") or metadata.get("exit_date"))
+    execution_entry_date = date_part(entry_time)
+    execution_exit_date = date_part(exit_time)
+    if metadata_entry_date and execution_entry_date and metadata_entry_date != execution_entry_date:
+        return True
+    if metadata_exit_date and execution_exit_date and metadata_exit_date != execution_exit_date:
+        return True
+    return False
+
+
+def sanitize_symbol_trade_metadata_for_execution_row(metadata: dict[str, Any], entry_time: Any, exit_time: Any) -> dict[str, Any]:
+    """Keep useful score metadata but prevent stale symbol-only trade rows from changing the execution dates."""
+    if not metadata:
+        return {}
+    out = dict(metadata)
+    if not execution_date_mismatch(out, entry_time, exit_time):
+        return out
+    for key in (
+        "trade_id",
+        "entry_time",
+        "exit_time",
+        "entry_date",
+        "exit_date",
+        "session_date",
+        "buy",
+        "sell",
+        "qty",
+        "gross",
+        "net_actual",
+        "source",
+        "closed_source",
+        "data_quality",
+    ):
+        out.pop(key, None)
+    out["metadata_attribution_confidence"] = "low"
+    out["metadata_attribution_warning"] = "symbol_trade_metadata_date_mismatch"
+    return out
+
+
 def nearest_top100_metadata(top100_metadata: dict[tuple[str, str], dict[str, Any]], session_date: str, entry_date: str, symbol: str) -> dict[str, Any]:
     for key_date in (session_date, entry_date):
         row = top100_metadata.get((key_date, symbol))
@@ -2137,13 +2180,24 @@ def closed_from_execution_realized_pnl(
         order_nearest = nearest_symbol_metadata(order_metadata_by_symbol.get(symbol, []), entry_time) if not order_exact else {}
         lifecycle_nearest = nearest_symbol_metadata(lifecycle_metadata_by_symbol.get(symbol, []), entry_time)
         top100_meta = nearest_top100_metadata(top100_metadata, session_date, date_part(entry_time), symbol)
-        metadata, meta_source, meta_confidence, meta_warning = merge_entry_metadata(
+        symbol_trade_metadata = sanitize_symbol_trade_metadata_for_execution_row(
             dict(trade_by_symbol.get(symbol, {})),
+            entry_time,
+            exit_time,
+        )
+        metadata, meta_source, meta_confidence, meta_warning = merge_entry_metadata(
             order_exact,
             order_nearest,
             lifecycle_nearest,
+            symbol_trade_metadata,
             top100_meta,
         )
+        if symbol_trade_metadata.get("metadata_attribution_warning"):
+            meta_warning = ";".join(
+                part
+                for part in [meta_warning, str(symbol_trade_metadata.get("metadata_attribution_warning") or "")]
+                if part
+            )
         quality = str(metadata.get("data_quality") or "OK")
         metadata_status = "attributed" if meta_source != "missing" else "unattributed"
         if metadata_status == "unattributed":
@@ -2154,7 +2208,7 @@ def closed_from_execution_realized_pnl(
         rows.append(
             {
                 **metadata,
-                "trade_id": metadata.get("trade_id") or f"execution_realized:{session_date}:{symbol}",
+                "trade_id": f"execution_realized:{session_date}:{symbol}",
                 "symbol": symbol,
                 "qty": sell_qty,
                 "ibkr_commission": sell_commission,
@@ -2165,11 +2219,11 @@ def closed_from_execution_realized_pnl(
                 "net_actual": gross - sell_commission,
                 "net_pct": ((gross - sell_commission) / (buy_price * sell_qty) * 100.0) if buy_price and sell_qty else 0.0,
                 "pnl_pct": ((gross - sell_commission) / (buy_price * sell_qty) * 100.0) if buy_price and sell_qty else 0.0,
-                "entry_time": metadata.get("entry_time") or entry_time,
-                "exit_time": metadata.get("exit_time") or exit_time,
-                "entry_date": date_part(metadata.get("entry_time") or entry_time) or session_date,
-                "exit_date": date_part(metadata.get("exit_time") or exit_time) or session_date,
-                "session_date": metadata.get("session_date") or session_date,
+                "entry_time": entry_time,
+                "exit_time": exit_time,
+                "entry_date": date_part(entry_time) or session_date,
+                "exit_date": date_part(exit_time) or session_date,
+                "session_date": session_date,
                 "strategy": metadata.get("strategy") or "unknown",
                 "exit_reason": metadata.get("exit_reason") or "unknown_exit_reason",
                 "exit_reason_source": metadata.get("exit_reason_source") or "missing_explicit_exit_event",
@@ -2217,6 +2271,69 @@ def closed_from_execution_realized_pnl(
             out[col] = ""
     out["hold_minutes"] = [hold_minutes(a, b) for a, b in zip(out["entry_time"], out["exit_time"])]
     return out
+
+
+def reconstructed_fifo_diagnostics(trades: pd.DataFrame, execution_closed: pd.DataFrame | None = None) -> dict[str, int]:
+    if trades is None or trades.empty:
+        return {
+            "reused_sell_execution_id_count": 0,
+            "reused_buy_execution_id_count": 0,
+            "cross_session_fifo_match_count": 0,
+            "stale_buy_match_count": 0,
+            "same_day_match_preferred_count": 0,
+            "duplicate_reconstructed_sell_rows": 0,
+        }
+    working = trades.copy()
+    source = working.get("source", pd.Series("", index=working.index)).fillna("").astype(str).str.lower()
+    trade_id = working.get("trade_id", pd.Series("", index=working.index)).fillna("").astype(str)
+    quality = working.get("data_quality", pd.Series("", index=working.index)).fillna("").astype(str)
+    reconstructed = (
+        trade_id.str.startswith("reconstructed:")
+        | source.isin({"sqlite_execution_reducer", "executions_pair_repair", "executions_pair", "reconstructed_executions", "carried_recovered"})
+        | quality.str.contains("RECONSTRUCTED|CARRY_BASIS_UNVERIFIED", regex=True, na=False)
+    )
+    recon = working[reconstructed].copy()
+    if recon.empty:
+        return {
+            "reused_sell_execution_id_count": 0,
+            "reused_buy_execution_id_count": 0,
+            "cross_session_fifo_match_count": 0,
+            "stale_buy_match_count": 0,
+            "same_day_match_preferred_count": 0,
+            "duplicate_reconstructed_sell_rows": 0,
+        }
+    sell_ids = recon.get("exit_execution_id", pd.Series("", index=recon.index)).fillna("").astype(str)
+    buy_ids = recon.get("entry_execution_id", pd.Series("", index=recon.index)).fillna("").astype(str)
+    sell_counts = sell_ids[sell_ids.str.strip() != ""].value_counts()
+    buy_counts = buy_ids[buy_ids.str.strip() != ""].value_counts()
+    duplicated_sell_counts = sell_counts[sell_counts > 1]
+    entry_dates = recon.get("entry_date", pd.Series("", index=recon.index)).fillna("").astype(str)
+    exit_dates = recon.get("exit_date", pd.Series("", index=recon.index)).fillna("").astype(str)
+    cross_session = (entry_dates != "") & (exit_dates != "") & (entry_dates < exit_dates)
+    same_day_preferred = 0
+    if execution_closed is not None and not execution_closed.empty and cross_session.any():
+        exec_keys = {
+            (str(row.get("exit_date") or date_part(row.get("exit_time")) or row.get("session_date") or ""), str(row.get("symbol") or "").upper())
+            for row in execution_closed.to_dict("records")
+        }
+        same_day_preferred = int(
+            recon[cross_session].apply(
+                lambda row: (
+                    str(row.get("exit_date") or date_part(row.get("exit_time")) or row.get("session_date") or ""),
+                    str(row.get("symbol") or "").upper(),
+                )
+                in exec_keys,
+                axis=1,
+            ).sum()
+        )
+    return {
+        "reused_sell_execution_id_count": int(len(duplicated_sell_counts)),
+        "reused_buy_execution_id_count": int((buy_counts > 1).sum()),
+        "cross_session_fifo_match_count": int(cross_session.sum()),
+        "stale_buy_match_count": int(cross_session.sum()),
+        "same_day_match_preferred_count": same_day_preferred,
+        "duplicate_reconstructed_sell_rows": int((duplicated_sell_counts - 1).sum()) if not duplicated_sell_counts.empty else 0,
+    }
 
 
 def closed_from_executions(
@@ -2431,6 +2548,7 @@ def load_closed_positions(
         lifecycle_metadata_by_symbol=lifecycle_metadata_by_symbol,
         top100_metadata=top100_metadata,
     )
+    fifo_diag = reconstructed_fifo_diagnostics(trades, execution_closed)
     displayed_frames = [trades]
     if include_reconstructed:
         displayed_frames.append(reconstructed)
@@ -2442,8 +2560,17 @@ def load_closed_positions(
         "execution_reconstruction_disabled": int(not include_reconstructed and persisted_count == 0 and not executions.empty),
         "runtime_closed_source": "persisted_trades",
         "execution_realized_closed_count": int(len(execution_closed)),
+        **fifo_diag,
     }
-    if not execution_closed.empty and len(execution_closed) > persisted_count:
+    prefer_execution_closed = (
+        not execution_closed.empty
+        and (
+            len(execution_closed) > persisted_count
+            or int(fifo_diag.get("duplicate_reconstructed_sell_rows") or 0) > 0
+            or int(fifo_diag.get("cross_session_fifo_match_count") or 0) > 0
+        )
+    )
+    if prefer_execution_closed:
         closed = apply_symbol_session_peak_fallbacks(execution_closed, runtime_symbol_peak_map, lifecycle_symbol_peak_map)
         closed = closed.sort_values(["net_actual", "symbol"], na_position="last").reset_index(drop=True)
         diag["displayed_closed_trades_count"] = int(len(closed))

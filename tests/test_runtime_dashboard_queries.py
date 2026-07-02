@@ -2992,6 +2992,136 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["diagnostics"]["attribution_success_count"], 1)
             self.assertEqual(snapshot["diagnostics"]["attribution_failed_count"], 0)
 
+    def test_execution_closed_rows_override_stale_reconstructed_fifo_carry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_order({
+                    "order_key": "BUY-HUT-70603",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-29",
+                    "symbol": "HUT",
+                    "side": "BUY",
+                    "order_id": "70603",
+                    "submitted_at": "2026-06-29T13:35:20+00:00",
+                    "raw_json": {
+                        "entry_order_id": "70603",
+                        "top100_rank": 12,
+                        "top100_score": 81.5,
+                        "live_entry_score": 77.0,
+                        "live_entry_rank": 3,
+                        "signal_source": "live",
+                    },
+                })
+                store.upsert_execution({
+                    "execution_id": "OLD_BUY_HUT",
+                    "trade_id": None,
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-02",
+                    "symbol": "HUT",
+                    "side": "BOT",
+                    "quantity": 1,
+                    "price": 100,
+                    "order_id": "60001",
+                    "executed_at": "2026-06-02T13:35:00+00:00",
+                    "commission_source": "ibkr",
+                    "commission": 0.1,
+                })
+                store.upsert_execution({
+                    "execution_id": "BUY_HUT_20260629",
+                    "trade_id": None,
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-29",
+                    "symbol": "HUT",
+                    "side": "BOT",
+                    "quantity": 8,
+                    "price": 124.30,
+                    "order_id": "70603",
+                    "executed_at": "2026-06-29T13:35:26+00:00",
+                    "commission_source": "ibkr",
+                    "commission": 0.8,
+                })
+                store.upsert_execution({
+                    "execution_id": "SELL_HUT_20260629",
+                    "trade_id": None,
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-29",
+                    "symbol": "HUT",
+                    "side": "SLD",
+                    "quantity": 8,
+                    "price": 113.97,
+                    "order_id": "70710",
+                    "executed_at": "2026-06-29T14:11:25+00:00",
+                    "commission_source": "ibkr",
+                    "commission": 0.8,
+                    "realized_pnl": -82.64,
+                })
+                store.upsert_trade({
+                    "trade_id": "reconstructed:2026-06-02:2026-06-29:HUT:OLD_BUY_HUT:SELL_HUT_20260629",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-02",
+                    "symbol": "HUT",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-06-02T13:35:00+00:00",
+                    "exit_fill_time": "2026-06-29T14:11:25+00:00",
+                    "entry_price": 100,
+                    "exit_price": 113.97,
+                    "quantity": 1,
+                    "gross_pnl": 13.97,
+                    "commission": 0.2,
+                    "net_pnl": 13.77,
+                    "raw_json": {
+                        "reconstruction_source": "sqlite_execution_reducer",
+                        "buy_execution_id": "OLD_BUY_HUT",
+                        "sell_execution_id": "SELL_HUT_20260629",
+                    },
+                })
+                store.upsert_trade({
+                    "trade_id": "reconstructed:2026-06-29:2026-06-29:HUT:BUY_HUT_20260629:SELL_HUT_20260629",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-29",
+                    "symbol": "HUT",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-06-29T13:35:26+00:00",
+                    "exit_fill_time": "2026-06-29T14:11:25+00:00",
+                    "entry_price": 124.30,
+                    "exit_price": 113.97,
+                    "quantity": 7,
+                    "gross_pnl": -72.31,
+                    "commission": 1.4,
+                    "net_pnl": -73.71,
+                    "top100_rank": 12,
+                    "top100_score": 81.5,
+                    "live_entry_score": 77.0,
+                    "live_entry_rank": 3,
+                    "entry_order_id": "70603",
+                    "raw_json": {
+                        "reconstruction_source": "sqlite_execution_reducer",
+                        "buy_execution_id": "BUY_HUT_20260629",
+                        "sell_execution_id": "SELL_HUT_20260629",
+                    },
+                })
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-29", "2026-06-29"), "v67")
+            closed = snapshot["closed_positions"]
+
+            self.assertEqual(len(closed), 1)
+            row = closed.iloc[0]
+            self.assertEqual(row["symbol"], "HUT")
+            self.assertAlmostEqual(row["qty"], 8.0)
+            self.assertEqual(row["entry_date"], "2026-06-29")
+            self.assertEqual(row["exit_date"], "2026-06-29")
+            self.assertEqual(row["entry_order_id"], "70603")
+            self.assertAlmostEqual(row["live_entry_score"], 77.0)
+            self.assertEqual(snapshot["diagnostics"]["reused_sell_execution_id_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["cross_session_fifo_match_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["duplicate_reconstructed_sell_rows"], 1)
+            self.assertEqual(snapshot["diagnostics"]["same_day_match_preferred_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["runtime_closed_source"], "executions_realized_pnl")
+
 
 if __name__ == "__main__":
     unittest.main()

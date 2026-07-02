@@ -1289,6 +1289,17 @@ def render_diagnostics(diag: dict) -> None:
     ]
     for col, (label, key) in zip(attribution_cols, attribution_labels):
         col.metric(label, int(diag.get(key, 0) or 0))
+    fifo_cols = st.columns(6)
+    fifo_labels = [
+        ("Reused SELL Exec IDs", "reused_sell_execution_id_count"),
+        ("Reused BUY Exec IDs", "reused_buy_execution_id_count"),
+        ("Cross-Session FIFO", "cross_session_fifo_match_count"),
+        ("Stale BUY Matches", "stale_buy_match_count"),
+        ("Same-Day Preferred", "same_day_match_preferred_count"),
+        ("Duplicate Recon SELL Rows", "duplicate_reconstructed_sell_rows"),
+    ]
+    for col, (label, key) in zip(fifo_cols, fifo_labels):
+        col.metric(label, int(diag.get(key, 0) or 0))
     reducer_cols = st.columns(4)
     reducer_cols[0].metric("SQLite Closed Trades", int(diag.get("closed_trades_count", 0) or 0))
     reducer_cols[1].metric("Broker Closed Trades", str(diag.get("broker_closed_trades_count", "N/A")))
