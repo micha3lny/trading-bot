@@ -2918,6 +2918,80 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
         self.assertAlmostEqual(row["sell"], 8.79)
         self.assertEqual(row["partial_rows"], 2)
 
+    def test_execution_closed_rows_attribute_metadata_from_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_order({
+                    "order_key": "BUY-META-1",
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-26",
+                    "symbol": "META",
+                    "side": "BUY",
+                    "order_id": "65020",
+                    "perm_id": "91020",
+                    "submitted_at": "2026-06-26T14:02:45+00:00",
+                    "raw_json": {
+                        "entry_order_id": "65020",
+                        "entry_perm_id": "91020",
+                        "live_entry_score": 75.23,
+                        "live_entry_rank": 1,
+                        "top100_rank": 6,
+                        "top100_score": 83.5,
+                        "signal_source": "live",
+                        "signal_time": "2026-06-26T14:02:00+00:00",
+                        "ready_since": "2026-06-26T14:02:00+00:00",
+                    },
+                })
+                store.upsert_execution({
+                    "execution_id": "B_META",
+                    "trade_id": None,
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-26",
+                    "symbol": "META",
+                    "side": "BOT",
+                    "quantity": 10,
+                    "price": 10,
+                    "order_id": "65020",
+                    "perm_id": "91020",
+                    "executed_at": "2026-06-26T14:02:58+00:00",
+                    "commission_source": "ibkr",
+                    "commission": 0.5,
+                })
+                store.upsert_execution({
+                    "execution_id": "S_META",
+                    "trade_id": None,
+                    "strategy_name": "v67",
+                    "session_date": "2026-06-26",
+                    "symbol": "META",
+                    "side": "SLD",
+                    "quantity": 10,
+                    "price": 11,
+                    "executed_at": "2026-06-26T14:30:00+00:00",
+                    "commission_source": "ibkr",
+                    "commission": 0.75,
+                    "realized_pnl": 10,
+                })
+                store.execute("DELETE FROM trades")
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-06-26", "2026-06-26"), "v67")
+            row = snapshot["closed_positions"].iloc[0]
+
+            self.assertEqual(row["symbol"], "META")
+            self.assertEqual(row["entry_order_id"], "65020")
+            self.assertAlmostEqual(row["live_entry_score"], 75.23)
+            self.assertEqual(row["live_entry_rank"], 1)
+            self.assertEqual(row["top100_rank"], 6)
+            self.assertAlmostEqual(row["top100_score"], 83.5)
+            self.assertEqual(row["metadata_attribution_source"], "sqlite_orders")
+            self.assertEqual(row["metadata_attribution_confidence"], "high")
+            self.assertNotIn("UNATTRIBUTED_EXECUTION_CLOSED", str(row["data_quality"]))
+            self.assertEqual(snapshot["diagnostics"]["attribution_success_count"], 1)
+            self.assertEqual(snapshot["diagnostics"]["attribution_failed_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

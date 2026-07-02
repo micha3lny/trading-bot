@@ -1427,6 +1427,232 @@ def trade_execution_time_fallbacks(executions: pd.DataFrame, trade_id: str, symb
     return (buy_times[0] if buy_times else "", sell_times[-1] if sell_times else "")
 
 
+def metadata_value(row: dict[str, Any], raw: dict[str, Any], key: str) -> Any:
+    aliases = {
+        "top100_rank": ["top100_rank", "rank"],
+        "top100_score": ["top100_score", "final_score", "alpha_score"],
+        "top100_source_date": ["top100_source_date", "ranking_date", "source_date"],
+        "live_entry_score": ["live_entry_score", "score", "entry_score"],
+        "live_entry_rank": ["live_entry_rank", "ranking_position", "entry_rank"],
+        "entry_order_id": ["entry_order_id", "order_id", "ib_order_id"],
+        "entry_perm_id": ["entry_perm_id", "perm_id", "permId"],
+        "signal_source": ["signal_source"],
+        "signal_time": ["signal_time", "entry_decision_time"],
+        "ready_since": ["ready_since"],
+    }.get(key, [key])
+    for alias in aliases:
+        value = row.get(alias)
+        if value not in (None, ""):
+            return value
+        value = raw.get(alias)
+        if value not in (None, ""):
+            return value
+    features = raw.get("entry_metadata") or raw.get("features") or raw.get("signal_payload") or {}
+    if isinstance(features, dict):
+        for alias in aliases:
+            value = features.get(alias)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def compact_entry_metadata(row: dict[str, Any], *, source: str, confidence: str, warning: str = "") -> dict[str, Any]:
+    raw = parse_raw_json(row.get("raw_json"))
+    out = {
+        "metadata_attribution_source": source,
+        "metadata_attribution_confidence": confidence,
+        "metadata_attribution_warning": warning,
+    }
+    for key in (
+        "top100_rank",
+        "top100_score",
+        "top100_source_date",
+        "live_entry_score",
+        "live_entry_rank",
+        "entry_order_id",
+        "entry_perm_id",
+        "signal_source",
+        "signal_time",
+        "ready_since",
+    ):
+        out[key] = metadata_value(row, raw, key)
+    if not out.get("entry_order_id"):
+        out["entry_order_id"] = row.get("order_id") or raw.get("order_id") or raw.get("ib_order_id")
+    return out
+
+
+def load_order_entry_metadata(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    clause, params = strategy_clause("o", strategy)
+    try:
+        rows = read_sql(
+            conn,
+            f"""
+            SELECT
+                order_key, trade_id, strategy_name AS strategy, session_date, symbol, side,
+                order_id, perm_id, submitted_at, filled_at, status, raw_json
+            FROM orders o
+            WHERE UPPER(COALESCE(o.side, '')) IN ('BOT', 'BUY')
+              AND (
+                o.session_date BETWEEN ? AND ?
+                OR substr(COALESCE(o.submitted_at, o.filled_at), 1, 10) BETWEEN ? AND ?
+              )
+              {clause}
+            """,
+            [window.start_date, window.end_date, window.start_date, window.end_date, *params],
+        )
+    except Exception:
+        return {}, {}
+    by_order_id: dict[str, dict[str, Any]] = {}
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for row in rows.to_dict("records"):
+        symbol = str(row.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        meta = compact_entry_metadata(row, source="sqlite_orders", confidence="high")
+        meta["event_time"] = row.get("submitted_at") or row.get("filled_at")
+        order_id = normalized_identifier(row.get("order_id") or meta.get("entry_order_id"))
+        perm_id = normalized_identifier(row.get("perm_id") or meta.get("entry_perm_id"))
+        if order_id:
+            by_order_id[order_id] = meta
+        if perm_id:
+            by_order_id[f"perm:{perm_id}"] = meta
+        by_symbol.setdefault(symbol, []).append(meta)
+    for rows_for_symbol in by_symbol.values():
+        rows_for_symbol.sort(key=lambda item: parse_dt(item.get("event_time")) or datetime.min.replace(tzinfo=timezone.utc))
+    return by_order_id, by_symbol
+
+
+def load_lifecycle_entry_metadata(window: DateWindow, root: Path | None = None) -> dict[str, list[dict[str, Any]]]:
+    base = root or recorder_root()
+    out: dict[str, list[dict[str, Any]]] = {}
+    entry_events = {"BUY_ORDER_SENT", "PAPER_BUY_SENT", "SIGNAL_READY", "ENTRY_ORDER_SUBMITTED", "BUY_SUBMITTED"}
+    for session_dir in sorted(base.glob("*")):
+        if not session_dir.is_dir():
+            continue
+        session_date = session_dir.name
+        if session_date < window.start_date or session_date > window.end_date:
+            continue
+        csv_path = session_dir / "trade_lifecycle.csv"
+        if csv_path.exists():
+            try:
+                csv_rows = pd.read_csv(csv_path).to_dict("records")
+            except Exception:
+                csv_rows = []
+            for row in csv_rows:
+                event_type = str(row.get("event") or row.get("event_type") or "").upper()
+                if event_type not in entry_events:
+                    continue
+                symbol = str(row.get("symbol") or "").upper()
+                if not symbol:
+                    continue
+                meta = compact_entry_metadata(row, source="trade_lifecycle.csv", confidence="medium")
+                meta["event_time"] = row.get("recorded_at") or row.get("event_time") or row.get("timestamp")
+                out.setdefault(symbol, []).append(meta)
+        jsonl_path = session_dir / "order_lifecycle.jsonl"
+        if jsonl_path.exists():
+            try:
+                lines = jsonl_path.read_text(errors="replace").splitlines()
+            except Exception:
+                lines = []
+            for line in lines:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                event_type = str(row.get("legacy_event") or row.get("event_type") or row.get("type") or row.get("event") or "").upper()
+                if event_type not in entry_events:
+                    continue
+                symbol = str(row.get("symbol") or "").upper()
+                if not symbol:
+                    continue
+                meta = compact_entry_metadata(row, source="order_lifecycle.jsonl", confidence="medium")
+                meta["event_time"] = row.get("event_time") or row.get("recorded_at") or row.get("timestamp")
+                out.setdefault(symbol, []).append(meta)
+    for rows_for_symbol in out.values():
+        rows_for_symbol.sort(key=lambda item: parse_dt(item.get("event_time")) or datetime.min.replace(tzinfo=timezone.utc))
+    return out
+
+
+def load_top100_metadata(window: DateWindow, root: Path | None = None) -> dict[tuple[str, str], dict[str, Any]]:
+    base = root or Path("data/universe")
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    start = datetime.fromisoformat(window.start_date).date()
+    end = datetime.fromisoformat(window.end_date).date()
+    cur = start - timedelta(days=5)
+    while cur <= end:
+        path = base / f"daily_top100_{cur.isoformat()}.csv"
+        if path.exists():
+            try:
+                rows = pd.read_csv(path)
+            except Exception:
+                rows = pd.DataFrame()
+            if not rows.empty and "symbol" in rows.columns:
+                for idx, row in enumerate(rows.to_dict("records")):
+                    symbol = str(row.get("symbol") or "").upper()
+                    if not symbol:
+                        continue
+                    rank = row.get("top100_rank") or row.get("rank") or row.get("ranking_position") or idx + 1
+                    score = row.get("top100_score") or row.get("score") or row.get("final_score") or row.get("alpha_score")
+                    out[(cur.isoformat(), symbol)] = {
+                        "top100_rank": rank,
+                        "top100_score": score,
+                        "top100_source_date": cur.isoformat(),
+                        "metadata_attribution_source": "daily_top100_csv",
+                        "metadata_attribution_confidence": "low",
+                    }
+        cur += timedelta(days=1)
+    return out
+
+
+def nearest_symbol_metadata(rows: list[dict[str, Any]], before_time: Any) -> dict[str, Any]:
+    if not rows:
+        return {}
+    target = parse_dt(before_time)
+    if target is None:
+        return rows[-1]
+    previous = [row for row in rows if (parse_dt(row.get("event_time")) or target) <= target + pd.Timedelta(minutes=2)]
+    if previous:
+        return min(previous, key=lambda row: abs((target - (parse_dt(row.get("event_time")) or target)).total_seconds()))
+    return min(rows, key=lambda row: abs((target - (parse_dt(row.get("event_time")) or target)).total_seconds()))
+
+
+def merge_entry_metadata(*sources: dict[str, Any]) -> tuple[dict[str, Any], str, str, str]:
+    merged: dict[str, Any] = {}
+    used_sources: list[str] = []
+    confidence = "none"
+    for source in sources:
+        if not source:
+            continue
+        src = str(source.get("metadata_attribution_source") or "")
+        if src:
+            used_sources.append(src)
+        if confidence == "none":
+            confidence = str(source.get("metadata_attribution_confidence") or "low")
+        for key, value in source.items():
+            if key.startswith("metadata_attribution_") or key == "event_time":
+                continue
+            if merged.get(key) in (None, "") and value not in (None, ""):
+                merged[key] = value
+    warning = "" if used_sources else "metadata_not_found"
+    return merged, "+".join(dict.fromkeys(used_sources)) if used_sources else "missing", confidence, warning
+
+
+def nearest_top100_metadata(top100_metadata: dict[tuple[str, str], dict[str, Any]], session_date: str, entry_date: str, symbol: str) -> dict[str, Any]:
+    for key_date in (session_date, entry_date):
+        row = top100_metadata.get((key_date, symbol))
+        if row:
+            return row
+    candidates = [
+        (key_date, row)
+        for (key_date, key_symbol), row in top100_metadata.items()
+        if key_symbol == symbol and key_date <= (session_date or entry_date or "9999-99-99")
+    ]
+    if not candidates:
+        return {}
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
 def closed_from_trades(
     conn: sqlite3.Connection,
     window: DateWindow,
@@ -1753,6 +1979,9 @@ def closed_from_trades(
     out["matched_order_id"] = matched_order_ids
     out["strategy"] = strategy_values
     out["closed_source"] = "trades"
+    out["metadata_attribution_source"] = "sqlite_trades"
+    out["metadata_attribution_confidence"] = "high"
+    out["metadata_attribution_warning"] = ""
     for col in ("top100_rank", "top100_score", "live_entry_score", "live_entry_rank", "entry_order_id", "entry_perm_id"):
         values: list[float | None] = []
         for row in out.to_dict("records"):
@@ -1824,12 +2053,22 @@ def closed_from_trades(
             "entry_execution_count", "exit_execution_count", "confirmed_commission_execution_count",
             "expected_commission_execution_count", "peak_source", "peak_match_quality", "commission_source_detail",
             "entry_execution_id", "exit_execution_id", "exit_reason_source", "matched_event_type",
-            "matched_event_time", "matched_order_id", "source", "closed_source", "updated_at", "trade_reduction_version",
+            "matched_event_time", "matched_order_id", "source", "closed_source",
+            "metadata_attribution_source", "metadata_attribution_confidence", "metadata_attribution_warning",
+            "updated_at", "trade_reduction_version",
         ]
     ]
 
 
-def closed_from_execution_realized_pnl(executions: pd.DataFrame, trade_rows: pd.DataFrame | None = None) -> pd.DataFrame:
+def closed_from_execution_realized_pnl(
+    executions: pd.DataFrame,
+    trade_rows: pd.DataFrame | None = None,
+    *,
+    order_metadata_by_id: dict[str, dict[str, Any]] | None = None,
+    order_metadata_by_symbol: dict[str, list[dict[str, Any]]] | None = None,
+    lifecycle_metadata_by_symbol: dict[str, list[dict[str, Any]]] | None = None,
+    top100_metadata: dict[tuple[str, str], dict[str, Any]] | None = None,
+) -> pd.DataFrame:
     if executions.empty:
         return pd.DataFrame()
     rows: list[dict[str, Any]] = []
@@ -1838,7 +2077,15 @@ def closed_from_execution_realized_pnl(executions: pd.DataFrame, trade_rows: pd.
         for row in trade_rows.to_dict("records"):
             symbol = str(row.get("symbol") or "").upper()
             if symbol and symbol not in trade_by_symbol:
-                trade_by_symbol[symbol] = row
+                trade_by_symbol[symbol] = {
+                    **row,
+                    "metadata_attribution_source": "sqlite_trades",
+                    "metadata_attribution_confidence": "high",
+                }
+    order_metadata_by_id = order_metadata_by_id or {}
+    order_metadata_by_symbol = order_metadata_by_symbol or {}
+    lifecycle_metadata_by_symbol = lifecycle_metadata_by_symbol or {}
+    top100_metadata = top100_metadata or {}
     working = executions.copy()
     working["symbol"] = working.get("symbol", pd.Series(dtype=str)).fillna("").astype(str).str.upper()
     working["side_upper"] = working.get("side", working.get("action", pd.Series(dtype=str))).fillna("").astype(str).str.upper()
@@ -1867,10 +2114,39 @@ def closed_from_execution_realized_pnl(executions: pd.DataFrame, trade_rows: pd.
         entry_time = min(buy_times) if buy_times else ""
         session_values = [str(x) for x in group.get("session_date", pd.Series(dtype=object)).dropna().tolist() if str(x)]
         session_date = session_values[0] if session_values else (date_part(exit_time) or date_part(entry_time))
-        metadata = dict(trade_by_symbol.get(symbol, {}))
+        buy_order_ids = (
+            [normalized_identifier(x) for x in group.loc[buy_mask, "order_id"].dropna().tolist() if normalized_identifier(x)]
+            if "order_id" in group.columns
+            else []
+        )
+        buy_perm_ids = (
+            [normalized_identifier(x) for x in group.loc[buy_mask, "perm_id"].dropna().tolist() if normalized_identifier(x)]
+            if "perm_id" in group.columns
+            else []
+        )
+        order_exact = {}
+        for order_id in buy_order_ids:
+            if order_id in order_metadata_by_id:
+                order_exact = order_metadata_by_id[order_id]
+                break
+        if not order_exact:
+            for perm_id in buy_perm_ids:
+                if f"perm:{perm_id}" in order_metadata_by_id:
+                    order_exact = order_metadata_by_id[f"perm:{perm_id}"]
+                    break
+        order_nearest = nearest_symbol_metadata(order_metadata_by_symbol.get(symbol, []), entry_time) if not order_exact else {}
+        lifecycle_nearest = nearest_symbol_metadata(lifecycle_metadata_by_symbol.get(symbol, []), entry_time)
+        top100_meta = nearest_top100_metadata(top100_metadata, session_date, date_part(entry_time), symbol)
+        metadata, meta_source, meta_confidence, meta_warning = merge_entry_metadata(
+            dict(trade_by_symbol.get(symbol, {})),
+            order_exact,
+            order_nearest,
+            lifecycle_nearest,
+            top100_meta,
+        )
         quality = str(metadata.get("data_quality") or "OK")
-        metadata_status = "attributed" if metadata else "unattributed"
-        if not metadata:
+        metadata_status = "attributed" if meta_source != "missing" else "unattributed"
+        if metadata_status == "unattributed":
             quality = append_quality(quality, "UNATTRIBUTED_EXECUTION_CLOSED")
         elif str(metadata.get("source") or "").lower() in {"sqlite_execution_reducer", "executions_pair", "reconstructed_executions"}:
             quality = append_quality(quality, "RECONSTRUCTED_CLOSED_METADATA")
@@ -1903,6 +2179,9 @@ def closed_from_execution_realized_pnl(executions: pd.DataFrame, trade_rows: pd.
                 "runtime_pnl_trusted": True,
                 "runtime_pnl_untrusted_reason": "",
                 "attribution_status": metadata_status,
+                "metadata_attribution_source": meta_source,
+                "metadata_attribution_confidence": meta_confidence,
+                "metadata_attribution_warning": meta_warning,
                 "entry_execution_count": int(buy_mask.sum()),
                 "exit_execution_count": int(sell_mask.sum()),
                 "confirmed_commission_execution_count": int((group.loc[sell_mask, "commission"] > 0).sum()),
@@ -2106,6 +2385,9 @@ def load_closed_positions(
     runtime_symbol_peak_map = load_runtime_symbol_peak_map(conn, window, strategy)
     lifecycle_peak_map = load_lifecycle_peak_map(window)
     lifecycle_symbol_peak_map = load_lifecycle_symbol_peak_map(window)
+    order_metadata_by_id, order_metadata_by_symbol = load_order_entry_metadata(conn, window, strategy)
+    lifecycle_metadata_by_symbol = load_lifecycle_entry_metadata(window)
+    top100_metadata = load_top100_metadata(window)
     candle_rows: dict[tuple[str, str], pd.DataFrame] = {}
     trades = closed_from_trades(
         conn,
@@ -2141,7 +2423,14 @@ def load_closed_positions(
             )
         ]
     persisted_count = int(len(trades))
-    execution_closed = closed_from_execution_realized_pnl(current_executions if current_executions is not None else pd.DataFrame(), trades)
+    execution_closed = closed_from_execution_realized_pnl(
+        current_executions if current_executions is not None else pd.DataFrame(),
+        trades,
+        order_metadata_by_id=order_metadata_by_id,
+        order_metadata_by_symbol=order_metadata_by_symbol,
+        lifecycle_metadata_by_symbol=lifecycle_metadata_by_symbol,
+        top100_metadata=top100_metadata,
+    )
     displayed_frames = [trades]
     if include_reconstructed:
         displayed_frames.append(reconstructed)
@@ -2155,7 +2444,8 @@ def load_closed_positions(
         "execution_realized_closed_count": int(len(execution_closed)),
     }
     if not execution_closed.empty and len(execution_closed) > persisted_count:
-        closed = execution_closed.sort_values(["net_actual", "symbol"], na_position="last").reset_index(drop=True)
+        closed = apply_symbol_session_peak_fallbacks(execution_closed, runtime_symbol_peak_map, lifecycle_symbol_peak_map)
+        closed = closed.sort_values(["net_actual", "symbol"], na_position="last").reset_index(drop=True)
         diag["displayed_closed_trades_count"] = int(len(closed))
         diag["runtime_closed_source"] = "executions_realized_pnl"
         return closed, diag
@@ -3381,6 +3671,17 @@ def load_dashboard_snapshot(
             diagnostics["pnl_from_exported_rows"] = exported_pnl
             diagnostics["pnl_from_all_closed_executions"] = all_execution_pnl
             diagnostics["pnl_gap"] = exported_pnl - all_execution_pnl
+            closed_index = closed.index
+            diagnostics["missing_peak_count"] = int(pd.to_numeric(closed.get("peak_pct", pd.Series(pd.NA, index=closed_index)), errors="coerce").isna().sum())
+            top100_rank_missing = pd.to_numeric(closed.get("top100_rank", pd.Series(pd.NA, index=closed_index)), errors="coerce").isna()
+            top100_score_missing = pd.to_numeric(closed.get("top100_score", pd.Series(pd.NA, index=closed_index)), errors="coerce").isna()
+            diagnostics["missing_top100_count"] = int((top100_rank_missing | top100_score_missing).sum())
+            diagnostics["missing_live_entry_score_count"] = int(pd.to_numeric(closed.get("live_entry_score", pd.Series(pd.NA, index=closed_index)), errors="coerce").isna().sum())
+            entry_order = closed.get("entry_order_id", pd.Series("", index=closed_index)).fillna("").astype(str).str.strip()
+            diagnostics["missing_entry_order_id_count"] = int((entry_order == "").sum())
+            attribution = closed.get("metadata_attribution_source", pd.Series("missing", index=closed_index)).fillna("missing").astype(str)
+            diagnostics["attribution_success_count"] = int(((attribution != "") & (attribution != "missing")).sum())
+            diagnostics["attribution_failed_count"] = int(((attribution == "") | (attribution == "missing")).sum())
         else:
             diagnostics["attributed_closed_count"] = 0
             diagnostics["reconstructed_closed_count"] = 0
@@ -3390,6 +3691,12 @@ def load_dashboard_snapshot(
             diagnostics["pnl_from_exported_rows"] = 0.0
             diagnostics["pnl_from_all_closed_executions"] = float(execution_pnl.get("net_actual_pnl") or 0.0)
             diagnostics["pnl_gap"] = -float(execution_pnl.get("net_actual_pnl") or 0.0)
+            diagnostics["missing_peak_count"] = 0
+            diagnostics["missing_top100_count"] = 0
+            diagnostics["missing_live_entry_score_count"] = 0
+            diagnostics["missing_entry_order_id_count"] = 0
+            diagnostics["attribution_success_count"] = 0
+            diagnostics["attribution_failed_count"] = 0
         raw_closed_ids = {
             str(row.get("trade_id") or "")
             for row in raw_closed_rows.to_dict("records")

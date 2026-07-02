@@ -691,6 +691,7 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         self.assertEqual(bucket, "strong_hold_candidate")
         self.assertIn("next_high>=5", reason)
         self.assertEqual(score_bucket(20), "avoid_overnight")
+        self.assertEqual(score_bucket(50), "hold_candidate")
 
     def test_overnight_missing_next_session_data_has_no_score(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

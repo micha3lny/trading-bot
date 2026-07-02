@@ -915,6 +915,7 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
         "mae_pct", "peak_price", "low_price", "peak_unrealized_pnl", "max_adverse_unrealized_pnl",
         "giveback_from_peak", "drop_from_peak_pct", "top100_rank", "top100_score",
         "live_entry_score", "live_entry_rank", "entry_order_id", "entry_perm_id",
+        "metadata_attribution_source", "metadata_attribution_confidence", "metadata_attribution_warning",
         "hold_minutes", "exit_reason", "strategy",
         "entry_time", "exit_time", "exit_reason_source", "matched_event_type",
         "matched_event_time", "matched_order_id", "data_quality", "partial_rows",
@@ -969,6 +970,9 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
             "live_entry_rank": "Live Entry Rank",
             "entry_order_id": "Entry Order ID",
             "entry_perm_id": "Entry Perm ID",
+            "metadata_attribution_source": "Metadata Attribution Source",
+            "metadata_attribution_confidence": "Metadata Attribution Confidence",
+            "metadata_attribution_warning": "Metadata Attribution Warning",
             "hold_minutes": "Min",
             "exit_reason": "Exit Reason",
             "entry_time": "Entry Time",
@@ -986,6 +990,7 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
         "Symbol", "Quantity", "IBKR Comm", "Commission Status", "Buy", "Sell", "Gross", "Net", "Net %",
         "Peak %", "Drop from Peak %", "Top100 Rank", "Top100 Score",
         "Live Entry Score", "Live Entry Rank", "Entry Order ID", "Entry Perm ID",
+        "Metadata Attribution Source", "Metadata Attribution Confidence", "Metadata Attribution Warning",
         "Min", "Exit Reason", "Exit Reason Source",
         "Matched Event Type", "Matched Event Time", "Matched Order ID",
         "Entry Date", "Exit Date", "Entry Time", "Exit Time", "Strategy",
@@ -1273,6 +1278,17 @@ def render_diagnostics(diag: dict) -> None:
             col.metric(label, money(value))
         else:
             col.metric(label, int(value or 0))
+    attribution_cols = st.columns(6)
+    attribution_labels = [
+        ("Missing Peak", "missing_peak_count"),
+        ("Missing Top100", "missing_top100_count"),
+        ("Missing Live Score", "missing_live_entry_score_count"),
+        ("Missing Entry Order", "missing_entry_order_id_count"),
+        ("Attribution OK", "attribution_success_count"),
+        ("Attribution Failed", "attribution_failed_count"),
+    ]
+    for col, (label, key) in zip(attribution_cols, attribution_labels):
+        col.metric(label, int(diag.get(key, 0) or 0))
     reducer_cols = st.columns(4)
     reducer_cols[0].metric("SQLite Closed Trades", int(diag.get("closed_trades_count", 0) or 0))
     reducer_cols[1].metric("Broker Closed Trades", str(diag.get("broker_closed_trades_count", "N/A")))

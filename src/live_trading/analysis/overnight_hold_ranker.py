@@ -66,7 +66,7 @@ def score_bucket(score: float) -> str:
     if score >= 70:
         return "strong_hold_candidate"
     if score >= 50:
-        return "possible_hold_candidate"
+        return "hold_candidate"
     if score >= 30:
         return "weak_hold_candidate"
     return "avoid_overnight"
@@ -89,17 +89,38 @@ def overnight_score(features: dict[str, Any]) -> tuple[float, str, str]:
         add(10, "gap>=1")
     if (features.get("mfe_pct") or 0) >= 3:
         add(10, "mfe>=3")
+    if (features.get("peak_pct") or 0) >= 5:
+        add(10, "peak>=5")
+    if (features.get("final_pnl_pct") or 0) >= 1:
+        add(8, "net_pct>=1")
+    if (features.get("exit_location_vs_day_high_pct") or -100) >= -2:
+        add(8, "exit_near_day_high")
     if (features.get("live_entry_score") or 0) >= 30:
         add(10, "live_score>=30")
+    if (features.get("live_entry_score") or 0) >= 70:
+        add(8, "live_score>=70")
+    live_rank = fnum(features.get("live_entry_rank"))
+    if live_rank is not None and live_rank <= 25:
+        add(6, "live_rank<=25")
+    if (features.get("top100_score") or 0) >= 70:
+        add(6, "top100_score>=70")
     rank = fnum(features.get("top100_rank"))
     if rank is not None and rank <= 25:
         add(10, "rank<=25")
+    if (features.get("drop_from_peak_pct") or 0) <= -5:
+        add(-12, "drop_from_peak<=-5")
+    if (features.get("giveback_from_peak_pct") or 0) >= 5:
+        add(-8, "giveback>=5")
+    if (features.get("exit_location_vs_day_high_pct") or 0) <= -8:
+        add(-10, "exit_far_from_day_high")
     if (features.get("next_session_max_drawdown_from_entry_pct") or 0) <= -5:
         add(-25, "next_dd<=-5")
     if (features.get("next_session_close_from_entry_pct") or 0) <= -2:
         add(-15, "next_close<=-2")
     if (features.get("mae_pct") or 0) <= -5:
         add(-10, "mae<=-5")
+    if (features.get("final_pnl_pct") or 0) <= -1:
+        add(-8, "net_pct<=-1")
     if int(features.get("never_green") or 0) == 1:
         add(-10, "never_green")
     if int(features.get("immediate_drop") or 0) == 1:
@@ -127,6 +148,7 @@ def analyze_trade_overnight(
     trade_candles = load_trade_candles(history_dir, recorder_dir, symbol, session_date, entry_time, exit_time, session_type)
     path_stats = calculate_path_stats(trade_candles, entry_price or 0.0, entry_time)
     first_green = first_green_seconds(trade_candles, entry_price or 0.0, entry_time)
+    day_high = fnum(trade_candles["high"].max()) if not trade_candles.empty else None
     next_open = fnum(next_candles.iloc[0].get("open")) if not next_candles.empty else None
     next_high = fnum(next_candles["high"].max()) if not next_candles.empty else None
     next_low = fnum(next_candles["low"].min()) if not next_candles.empty else None
@@ -134,6 +156,17 @@ def analyze_trade_overnight(
     net_pnl = fnum(first_existing_column(trade, ["net_pnl"]))
     quantity = abs(fnum(trade.get("quantity"), 0.0) or 0.0)
     final_pnl_pct = (net_pnl / (entry_price * quantity) * 100.0) if net_pnl is not None and entry_price and quantity > 0 else None
+    mfe_pct = fnum(trade.get("mfe_pct")) if fnum(trade.get("mfe_pct")) is not None else path_stats.mfe_pct
+    mae_pct = fnum(trade.get("mae_pct")) if fnum(trade.get("mae_pct")) is not None else path_stats.mae_pct
+    peak_pct = fnum(trade.get("peak_pct"))
+    if peak_pct is None:
+        peak_pct = fnum(trade.get("mfe_pct"))
+    if peak_pct is None:
+        peak_pct = path_stats.mfe_pct
+    drop_from_peak_pct = fnum(trade.get("drop_from_peak_pct"))
+    if drop_from_peak_pct is None and final_pnl_pct is not None and peak_pct is not None:
+        drop_from_peak_pct = final_pnl_pct - peak_pct
+    giveback_from_peak_pct = abs(drop_from_peak_pct) if drop_from_peak_pct is not None and drop_from_peak_pct < 0 else None
     features = {
         "trade_id": trade.get("trade_id"),
         "symbol": symbol,
@@ -141,10 +174,14 @@ def analyze_trade_overnight(
         "next_session_date": next_day.strftime("%F"),
         "entry_price": entry_price,
         "exit_price": exit_price,
-        "mfe_pct": fnum(trade.get("mfe_pct")) if fnum(trade.get("mfe_pct")) is not None else path_stats.mfe_pct,
-        "mae_pct": fnum(trade.get("mae_pct")) if fnum(trade.get("mae_pct")) is not None else path_stats.mae_pct,
-        "peak_pct": fnum(trade.get("peak_pct")) or path_stats.mfe_pct,
+        "mfe_pct": mfe_pct,
+        "mae_pct": mae_pct,
+        "peak_pct": peak_pct,
+        "drop_from_peak_pct": drop_from_peak_pct,
+        "giveback_from_peak_pct": giveback_from_peak_pct,
         "final_pnl_pct": final_pnl_pct,
+        "day_high": day_high,
+        "exit_location_vs_day_high_pct": pct(exit_price, day_high),
         "top100_rank": first_existing_column(trade, ["top100_rank"]) or raw.get("top100_rank"),
         "top100_score": first_existing_column(trade, ["top100_score"]) or raw.get("top100_score"),
         "live_entry_score": first_existing_column(trade, ["live_entry_score"]) or raw.get("live_entry_score"),
