@@ -288,6 +288,8 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["summary"]["closed_trades"], 2)
             self.assertAlmostEqual(snapshot["summary"]["commissions"], 1.0)
             self.assertAlmostEqual(snapshot["summary"]["net_actual_pnl"], -1.0)
+            self.assertAlmostEqual(snapshot["summary"]["full_net_pnl_after_all_commissions"], -2.0)
+            self.assertAlmostEqual(snapshot["summary"]["realized_minus_all_commission"], -2.0)
             self.assertEqual(snapshot["data_quality_summary"]["closed_trades_count"], 2)
             self.assertEqual(closed["symbol"].tolist(), ["ATTR", "MISS"])
             self.assertAlmostEqual(closed.loc[closed["symbol"] == "ATTR", "live_entry_score"].iloc[0], 72.0)
@@ -296,6 +298,7 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["diagnostics"]["exported_closed_rows_count"], 2)
             self.assertAlmostEqual(snapshot["diagnostics"]["pnl_gap"], 0.0)
             self.assertEqual(snapshot["diagnostics"]["unattributed_closed_count"], 1)
+            self.assertAlmostEqual(snapshot["diagnostics"]["execution_full_net_pnl_after_all_commissions"], -2.0)
 
     def test_runtime_executions_use_sqlite_and_sort_descending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

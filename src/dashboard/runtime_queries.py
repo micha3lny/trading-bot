@@ -505,6 +505,8 @@ def load_execution_pnl_summary(conn: sqlite3.Connection, window: DateWindow, str
         "sell_commissions": sell_commissions,
         "all_commissions": all_commissions,
         "net_actual_pnl": gross - sell_commissions,
+        "full_net_pnl_after_all_commissions": gross - all_commissions,
+        "realized_minus_all_commission": gross - all_commissions,
         "main_pnl_source": "executions_realized_pnl_minus_sell_commission",
     }
 
@@ -3179,7 +3181,10 @@ def build_summary(
         gross = float(execution_pnl.get("gross_pnl") or 0.0)
         commissions = float(execution_pnl.get("commissions") or 0.0)
         net = float(execution_pnl.get("net_actual_pnl") or 0.0)
+        full_net_after_all_commissions = float(execution_pnl.get("full_net_pnl_after_all_commissions") or (gross - float(execution_pnl.get("all_commissions") or 0.0)))
         pnl_source = str(execution_pnl.get("main_pnl_source") or "executions_realized_pnl_minus_sell_commission")
+    if execution_pnl is None:
+        full_net_after_all_commissions = net
     open_upnl = float(pd.to_numeric(open_positions["upnl"], errors="coerce").fillna(0).sum()) if not open_positions.empty else 0.0
     wins = trusted_closed[trusted_closed["gross"].fillna(0) > 0] if not trusted_closed.empty else trusted_closed
     win_rate = (len(wins) / len(trusted_closed) * 100.0) if len(trusted_closed) else 0.0
@@ -3188,6 +3193,8 @@ def build_summary(
     return {
         "gross_pnl": gross,
         "net_actual_pnl": net,
+        "full_net_pnl_after_all_commissions": full_net_after_all_commissions,
+        "realized_minus_all_commission": full_net_after_all_commissions,
         "open_upnl": open_upnl,
         "total_pnl": net + open_upnl,
         "win_rate": win_rate,
@@ -3430,6 +3437,7 @@ def load_dashboard_snapshot(
         diagnostics["execution_sell_commissions"] = float(execution_pnl.get("sell_commissions") or 0.0)
         diagnostics["execution_all_commissions"] = float(execution_pnl.get("all_commissions") or 0.0)
         diagnostics["execution_net_pnl"] = float(execution_pnl.get("net_actual_pnl") or 0.0)
+        diagnostics["execution_full_net_pnl_after_all_commissions"] = float(execution_pnl.get("full_net_pnl_after_all_commissions") or 0.0)
         snapshot_version = (
             f"closed={len(closed)};"
             f"trades={diagnostics.get('trades_count', 0)};"

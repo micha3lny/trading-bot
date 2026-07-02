@@ -636,12 +636,13 @@ def render_summary(summary: dict) -> None:
     row1[3].metric("Total PnL", money(summary.get("total_pnl", 0.0)))
     row1[4].metric("Win Rate", pct(summary.get("win_rate", 0.0)))
     row1[5].metric("Expectancy", money(summary.get("expectancy", 0.0)))
-    row2 = st.columns(5)
+    row2 = st.columns(6)
     row2[0].metric("Avg Peak", pct(summary.get("avg_peak", 0.0)))
     row2[1].metric("Avg Giveback", pct(summary.get("avg_giveback", 0.0)))
     row2[2].metric("Commissions", money(summary.get("commissions", 0.0)))
-    row2[3].metric("Closed Trades", int(summary.get("closed_trades", 0)))
-    row2[4].metric("Open Trades", int(summary.get("open_trades", 0)))
+    row2[3].metric("Full Net PnL after all commissions", money(summary.get("full_net_pnl_after_all_commissions", 0.0)))
+    row2[4].metric("Closed Trades", int(summary.get("closed_trades", 0)))
+    row2[5].metric("Open Trades", int(summary.get("open_trades", 0)))
     source = summary.get("main_pnl_source") or summary.get("closed_pnl_source") or ""
     if source:
         st.caption(f"main_pnl_source={source}")
