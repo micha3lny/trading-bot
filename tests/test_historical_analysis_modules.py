@@ -48,6 +48,7 @@ from src.live_trading.analysis.signal_case_trace import (
     decision_classification,
     pass_fail,
 )
+from src.live_trading.analysis.strategy_coverage_report import summarize_coverage_from_missed
 from src.live_trading.analysis.symbol_subscription_inspector import (
     build_parser as build_subscription_inspector_parser,
     extract_last_restart_unblock_time,
@@ -138,6 +139,71 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
             order_row={},
         )
         self.assertEqual(outside, "not_in_top100")
+
+    def test_strategy_coverage_summary_buckets_runners_and_misses(self) -> None:
+        missed = pd.DataFrame([
+            {
+                "symbol": "AAA",
+                "open_to_high_pct": 12.0,
+                "source_bucket": "top100",
+                "was_bought": 1,
+                "was_detectable_from_history": 1,
+                "top100_no_signal_reason": "",
+                "signal_time": "2026-06-26T14:00:00Z",
+                "ready_since": "2026-06-26T14:00:00Z",
+                "blocked_reason": "",
+                "rejection_reason": "",
+            },
+            {
+                "symbol": "BBB",
+                "open_to_high_pct": 18.0,
+                "source_bucket": "outside_top100",
+                "was_bought": 0,
+                "was_detectable_from_history": 1,
+                "top100_no_signal_reason": "",
+                "signal_time": "",
+                "ready_since": "",
+                "blocked_reason": "",
+                "rejection_reason": "",
+            },
+            {
+                "symbol": "CCC",
+                "open_to_high_pct": 6.0,
+                "source_bucket": "top100",
+                "was_bought": 0,
+                "was_detectable_from_history": 1,
+                "top100_no_signal_reason": "should_have_signaled",
+                "signal_time": "",
+                "ready_since": "",
+                "blocked_reason": "",
+                "rejection_reason": "",
+            },
+            {
+                "symbol": "DDD",
+                "open_to_high_pct": 22.0,
+                "source_bucket": "outside_top100",
+                "was_bought": 0,
+                "was_detectable_from_history": 0,
+                "top100_no_signal_reason": "",
+                "signal_time": "",
+                "ready_since": "",
+                "blocked_reason": "",
+                "rejection_reason": "",
+            },
+        ])
+        summary = summarize_coverage_from_missed(missed, session_date="2026-06-26")
+        self.assertEqual(summary["universe_gt_5"], 4)
+        self.assertEqual(summary["top100_gt_5"], 2)
+        self.assertEqual(summary["bought_gt_5"], 1)
+        self.assertEqual(summary["missed_gt_5"], 3)
+        self.assertAlmostEqual(float(summary["coverage_gt_5_pct"]), 50.0)
+        self.assertEqual(summary["universe_gt_10"], 3)
+        self.assertEqual(summary["top100_gt_10"], 1)
+        self.assertEqual(summary["bought_gt_10"], 1)
+        self.assertEqual(summary["missed_detectable"], 2)
+        self.assertEqual(summary["missed_undetectable"], 1)
+        self.assertEqual(summary["missed_should_have_signaled"], 1)
+        self.assertEqual(summary["missed_runtime_missing"], 1)
 
     def test_bad_entries_filters_primarily_by_session_date(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -2192,6 +2192,89 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
             st.code("$ " + " ".join(command) + f"\nreturncode={rc}\n{output}", language="bash")
 
 
+def _date_range_strings(start_date: str, end_date: str) -> list[str]:
+    start = pd.to_datetime(start_date).date()
+    end = pd.to_datetime(end_date).date()
+    dates: list[str] = []
+    current = start
+    while current <= end:
+        dates.append(current.isoformat())
+        current += timedelta(days=1)
+    return dates
+
+
+@st.cache_data(ttl=60)
+def load_strategy_coverage_reports(start_date: str, end_date: str) -> pd.DataFrame:
+    rows: list[pd.DataFrame] = []
+    for session_date in _date_range_strings(start_date, end_date):
+        path = REPO_ROOT / "data" / "analysis" / f"coverage_report_{session_date}.csv"
+        if not path.exists():
+            continue
+        try:
+            frame = pd.read_csv(path)
+        except Exception:
+            continue
+        frame["report_path"] = str(path)
+        rows.append(frame)
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True).sort_values("date", ascending=False)
+
+
+def render_strategy_coverage_tab(start_date: str, end_date: str) -> None:
+    st.header("Strategy Coverage KPI")
+    reports = load_strategy_coverage_reports(start_date, end_date)
+    selected_report_path = REPO_ROOT / "data" / "analysis" / f"coverage_report_{end_date}.csv"
+    if reports.empty:
+        st.warning("No Strategy Coverage reports found for the selected date range.")
+        st.code(f"python scripts/build_strategy_coverage_report.py --date {end_date}", language="bash")
+    else:
+        latest = reports.iloc[0]
+        cols = st.columns(5)
+        cols[0].metric("Universe >5%", int(latest.get("universe_gt_5", 0) or 0))
+        cols[1].metric("Top100 >5%", int(latest.get("top100_gt_5", 0) or 0))
+        cols[2].metric("Coverage >5%", f"{float(latest.get('coverage_gt_5_pct', 0.0) or 0.0):.2f}%")
+        cols[3].metric("Bought >5%", int(latest.get("bought_gt_5", 0) or 0))
+        cols[4].metric("Runtime Missing", int(latest.get("missed_runtime_missing", 0) or 0))
+
+        miss_cols = st.columns(4)
+        miss_cols[0].metric("Missed Detectable", int(latest.get("missed_detectable", 0) or 0))
+        miss_cols[1].metric("Missed Undetectable", int(latest.get("missed_undetectable", 0) or 0))
+        miss_cols[2].metric("Should Have Signaled", int(latest.get("missed_should_have_signaled", 0) or 0))
+        miss_cols[3].metric("Report Date", str(latest.get("date", "")))
+
+        st.subheader("Coverage By Threshold")
+        threshold_rows = []
+        for threshold in ("5", "10", "15", "20"):
+            threshold_rows.append({
+                "Threshold": f">{threshold}%",
+                "Universe": latest.get(f"universe_gt_{threshold}", 0),
+                "Top100": latest.get(f"top100_gt_{threshold}", 0),
+                "Coverage %": latest.get(f"coverage_gt_{threshold}_pct", 0.0),
+                "Bought": latest.get(f"bought_gt_{threshold}", 0),
+                "Missed": latest.get(f"missed_gt_{threshold}", 0),
+            })
+        st.dataframe(pd.DataFrame(threshold_rows), width="stretch", hide_index=True)
+
+        st.subheader("Daily Reports")
+        st.dataframe(reports, width="stretch", hide_index=True)
+
+    st.divider()
+    st.subheader("Generate Report")
+    st.caption("Read-only analysis. This scans historical candles and writes coverage_report_YYYY-MM-DD.csv.")
+    if st.button("Build coverage report for selected end date"):
+        command = [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "build_strategy_coverage_report.py"),
+            "--date",
+            end_date,
+        ]
+        rc, output = run_dashboard_command(command, timeout=1200)
+        st.code("$ " + " ".join(command) + f"\nreturncode={rc}\n{output}", language="bash")
+        if selected_report_path.exists():
+            st.success(f"Report written: {selected_report_path}")
+
+
 def main() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
     st.title("Runtime Trading Dashboard")
@@ -2218,10 +2301,11 @@ def main() -> None:
         include_reconstructed = st.toggle("Show execution-reconstructed trades", value=False, disabled=True)
         auto_refresh = st.toggle("Auto refresh current session", value=False)
 
-    runtime_tab, broker_tab, readiness_tab = st.tabs([
+    runtime_tab, broker_tab, readiness_tab, coverage_tab = st.tabs([
         "Runtime Dashboard",
         "Broker Reality / IBKR Reconciliation",
         "Operational Readiness",
+        "Strategy Coverage KPI",
     ])
     with runtime_tab:
         render_runtime_tab(sqlite_path, start_date, end_date, strategy, include_reconstructed, auto_refresh)
@@ -2229,6 +2313,8 @@ def main() -> None:
         render_broker_reality_tab(sqlite_path)
     with readiness_tab:
         render_operational_readiness_tab(sqlite_path, end_date)
+    with coverage_tab:
+        render_strategy_coverage_tab(start_date, end_date)
 
     if auto_refresh and start_date == end_date == utc_today():
         st.caption("Auto refresh is intentionally disabled on Runtime Dashboard to avoid reading partial reducer state.")
