@@ -36,6 +36,11 @@ from src.live_trading.analysis.common import (
 )
 from src.live_trading.analysis.missed_runners_analyzer import build_parser as build_missed_runners_parser, classify_missed_reason
 from src.live_trading.analysis.missed_runners_analyzer import add_multiday_ranks, no_signal_diagnostics, previous_session_context
+from src.live_trading.analysis.no_buy_after_signal_investigator import (
+    build_parser as build_no_buy_after_signal_parser,
+    classify_no_buy_reason,
+    summary_for_cases as no_buy_after_signal_summary_for_cases,
+)
 from src.live_trading.analysis.overnight_hold_ranker import analyze_trade_overnight, ensure_overnight_columns, overnight_score, score_bucket
 from src.live_trading.analysis.signal_replay_analyzer import (
     build_parser as build_signal_replay_parser,
@@ -565,6 +570,65 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         self.assertEqual(int(summary["runtime_signal_ready_but_no_buy"]), 1)
         self.assertEqual(int(summary["risk_guard_blocked"]), 1)
         self.assertEqual(int(summary["runtime_never_processed_symbol"]), 1)
+
+    def test_no_buy_after_signal_parser_and_summary(self) -> None:
+        help_text = build_no_buy_after_signal_parser().format_help()
+        self.assertIn("--max-cases", help_text)
+        self.assertIn("--start-date", help_text)
+        cases = pd.DataFrame([
+            {"final_no_buy_reason": "dispatch_bug_or_missing_reason"},
+            {"final_no_buy_reason": "entries_blocked"},
+            {"final_no_buy_reason": "lower_rank_candidate_not_selected"},
+        ])
+        summary = no_buy_after_signal_summary_for_cases(cases, "2026-06-26").iloc[0]
+        self.assertEqual(int(summary["total_runtime_signal_ready_but_no_buy"]), 3)
+        self.assertEqual(int(summary["dispatch_bug_or_missing_reason"]), 1)
+        self.assertEqual(int(summary["entries_blocked"]), 1)
+        self.assertEqual(int(summary["lower_rank_candidate_not_selected"]), 1)
+
+    def test_no_buy_after_signal_classification_priority(self) -> None:
+        self.assertEqual(
+            classify_no_buy_reason(
+                {
+                    "entries_blocked_at_scan": 1,
+                    "failed_final_entry_filter_reason": "",
+                    "order_dispatch_skip_reason": "",
+                    "max_entries_per_scan_reached": 0,
+                    "candidates_ahead_count": 0,
+                    "order_dispatch_attempted": 0,
+                    "signal_ready_time": "2026-06-26T14:00:00Z",
+                }
+            ),
+            "entries_blocked",
+        )
+        self.assertEqual(
+            classify_no_buy_reason(
+                {
+                    "entries_blocked_at_scan": 0,
+                    "failed_final_entry_filter_reason": "spread_too_wide",
+                    "order_dispatch_skip_reason": "",
+                    "max_entries_per_scan_reached": 0,
+                    "candidates_ahead_count": 0,
+                    "order_dispatch_attempted": 0,
+                    "signal_ready_time": "2026-06-26T14:00:00Z",
+                }
+            ),
+            "final_filter_failed_spread",
+        )
+        self.assertEqual(
+            classify_no_buy_reason(
+                {
+                    "entries_blocked_at_scan": 0,
+                    "failed_final_entry_filter_reason": "",
+                    "order_dispatch_skip_reason": "",
+                    "max_entries_per_scan_reached": 0,
+                    "candidates_ahead_count": 2,
+                    "order_dispatch_attempted": 0,
+                    "signal_ready_time": "2026-06-26T14:00:00Z",
+                }
+            ),
+            "lower_rank_candidate_not_selected",
+        )
 
     def test_strategy_coverage_runner_rows_uses_default_signal_thresholds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
