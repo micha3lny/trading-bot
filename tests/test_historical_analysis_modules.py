@@ -48,6 +48,10 @@ from src.live_trading.analysis.signal_case_trace import (
     decision_classification,
     pass_fail,
 )
+from src.live_trading.analysis.should_have_signaled_investigator import (
+    build_parser as build_shs_investigator_parser,
+    summary_for_cases,
+)
 from src.live_trading.analysis.strategy_coverage_report import build_runner_rows, summarize_coverage_from_missed
 from src.live_trading.analysis.symbol_subscription_inspector import (
     build_parser as build_subscription_inspector_parser,
@@ -546,6 +550,21 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         help_text = build_missed_runners_parser().format_help()
         self.assertIn("--max-symbols", help_text)
         self.assertIn("--force", help_text)
+
+    def test_should_have_signaled_investigator_parser_and_summary(self) -> None:
+        help_text = build_shs_investigator_parser().format_help()
+        self.assertIn("--max-cases", help_text)
+        self.assertIn("--start-date", help_text)
+        cases = pd.DataFrame([
+            {"final_classification": "runtime_signal_ready_but_no_buy"},
+            {"final_classification": "risk_guard_blocked"},
+            {"final_classification": "runtime_never_processed_symbol"},
+        ])
+        summary = summary_for_cases(cases, "2026-06-26").iloc[0]
+        self.assertEqual(int(summary["total_should_have_signaled"]), 3)
+        self.assertEqual(int(summary["runtime_signal_ready_but_no_buy"]), 1)
+        self.assertEqual(int(summary["risk_guard_blocked"]), 1)
+        self.assertEqual(int(summary["runtime_never_processed_symbol"]), 1)
 
     def test_strategy_coverage_runner_rows_uses_default_signal_thresholds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
