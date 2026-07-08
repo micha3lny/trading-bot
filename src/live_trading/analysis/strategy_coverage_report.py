@@ -30,6 +30,9 @@ from src.live_trading.ranking.daily_top100_builder import normalize_history_df
 
 DEFAULT_OUTPUT_DIR = Path("data/analysis")
 DEFAULT_THRESHOLDS = (5.0, 10.0, 15.0, 20.0)
+DEFAULT_MIN_FIRST_5M_HIGH_PCT = 0.5
+DEFAULT_MIN_FIRST_15M_HIGH_PCT = 1.0
+DEFAULT_MIN_OR_RANGE_PCT = 0.5
 NEEDED_PARQUET_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 
@@ -176,7 +179,16 @@ def build_runner_rows(
         candles = read_history_for_coverage(history_files[symbol])
         stats = calculate_runner_stats(candles)
         if stats is not None and stats.open_to_high_pct >= base_threshold:
-            no_signal = no_signal_diagnostics(candles) if symbol in top100_symbols and symbol not in bought_symbols else {}
+            no_signal = (
+                no_signal_diagnostics(
+                    candles,
+                    min_first_5m_high_pct=DEFAULT_MIN_FIRST_5M_HIGH_PCT,
+                    min_first_15m_high_pct=DEFAULT_MIN_FIRST_15M_HIGH_PCT,
+                    min_or_range_pct=DEFAULT_MIN_OR_RANGE_PCT,
+                )
+                if symbol in top100_symbols and symbol not in bought_symbols
+                else {}
+            )
             should_have = no_signal.get("top100_no_signal_reason") == "should_have_signaled"
             rows.append({
                 "date": session_date,

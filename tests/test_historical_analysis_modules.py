@@ -48,7 +48,7 @@ from src.live_trading.analysis.signal_case_trace import (
     decision_classification,
     pass_fail,
 )
-from src.live_trading.analysis.strategy_coverage_report import summarize_coverage_from_missed
+from src.live_trading.analysis.strategy_coverage_report import build_runner_rows, summarize_coverage_from_missed
 from src.live_trading.analysis.symbol_subscription_inspector import (
     build_parser as build_subscription_inspector_parser,
     extract_last_restart_unblock_time,
@@ -541,6 +541,35 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         ])
         diag = no_signal_diagnostics(candles, min_first_5m_high_pct=0.5, min_first_15m_high_pct=1.0, min_or_range_pct=0.5)
         self.assertEqual(diag["top100_no_signal_reason"], "failed_first5")
+
+    def test_strategy_coverage_runner_rows_uses_default_signal_thresholds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history = root / "history"
+            session = "2026-06-26"
+            symbol_dir = history / "session_type=RTH" / "symbol=AAA" / "year=2026" / "month=06"
+            symbol_dir.mkdir(parents=True)
+            pd.DataFrame([
+                {"timestamp": "2026-06-26T13:30:00Z", "open": 10.0, "high": 10.2, "low": 9.9, "close": 10.1, "volume": 100},
+                {"timestamp": "2026-06-26T13:34:00Z", "open": 10.1, "high": 10.7, "low": 10.0, "close": 10.6, "volume": 100},
+                {"timestamp": "2026-06-26T13:44:00Z", "open": 10.6, "high": 11.2, "low": 10.5, "close": 11.0, "volume": 100},
+                {"timestamp": "2026-06-26T13:46:00Z", "open": 11.0, "high": 11.5, "low": 10.9, "close": 11.4, "volume": 100},
+            ]).to_parquet(symbol_dir / "day=26.parquet")
+            universe = root / "universe.csv"
+            top100 = root / "top100.csv"
+            sqlite_path = root / "runtime.sqlite"
+            pd.DataFrame([{"symbol": "AAA"}]).to_csv(universe, index=False)
+            pd.DataFrame([{"symbol": "AAA", "top100_rank": 1, "top100_score": 90.0}]).to_csv(top100, index=False)
+            rows, diagnostics = build_runner_rows(
+                session_date=session,
+                history_dir=history,
+                universe_path=universe,
+                top100_path=top100,
+                sqlite_path=sqlite_path,
+            )
+            self.assertEqual(diagnostics["processed_symbols"], 1)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows.iloc[0]["top100_no_signal_reason"], "should_have_signaled")
 
     def test_entry_timing_cli_help(self) -> None:
         help_text = build_entry_timing_parser().format_help()
