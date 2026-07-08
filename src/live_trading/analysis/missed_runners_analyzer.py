@@ -439,6 +439,7 @@ def analyze_missed_runners(
     min_or_range_pct: float = 0.5,
     max_symbols: int | None = None,
     progress_every: int = 250,
+    output_path: Path | None = None,
 ) -> pd.DataFrame:
     started = time.monotonic()
     symbols = load_universe_symbols(universe_path)
@@ -542,12 +543,12 @@ def analyze_missed_runners(
         print(f"MISSED_PROGRESS date={session_date} processed={total}/{total} elapsed={elapsed:.1f}", flush=True)
     if out.empty:
         elapsed = time.monotonic() - started
-        print(f"MISSED_DONE date={session_date} rows=0 elapsed_seconds={elapsed:.1f}", flush=True)
+        print(f"MISSED_DONE date={session_date} rows=0 elapsed_seconds={elapsed:.1f} output={output_path or ''}", flush=True)
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
     out = add_multiday_ranks(out)
     result = out.sort_values("open_to_high_pct", ascending=False)[OUTPUT_COLUMNS]
     elapsed = time.monotonic() - started
-    print(f"MISSED_DONE date={session_date} rows={len(result)} elapsed_seconds={elapsed:.1f}", flush=True)
+    print(f"MISSED_DONE date={session_date} rows={len(result)} elapsed_seconds={elapsed:.1f} output={output_path or ''}", flush=True)
     return result
 
 
@@ -627,6 +628,7 @@ def main(argv: list[str] | None = None) -> int:
         min_first_15m_high_pct=args.min_first_15m_high_pct,
         min_or_range_pct=args.min_or_range_pct,
         max_symbols=args.max_symbols,
+        output_path=output,
     )
     elapsed = time.monotonic() - started
     if elapsed > 120.0:
