@@ -1779,7 +1779,8 @@ def send_exit_order(ib: IB, recorder: LiveDataRecorder, pos: ManagedPosition, re
     order.tif = "DAY"
     order.outsideRth = False
     trade = ib.placeOrder(pos.contract, order)
-    order_id = trade.order.orderId
+    order_obj = getattr(trade, "order", None)
+    order_id = getattr(order_obj, "orderId", "") or ""
     submitted_at = now_utc()
     position_key = f"{STRATEGY_NAME}:{getattr(recorder, 'session_date', '')}:{pos.symbol}"
     safe_sqlite_call(
@@ -6819,6 +6820,15 @@ def main() -> int:
                             trade_status=trade_status,
                             trade_repr=repr(trade)[:500],
                         )
+                        if not order_id_for_entry:
+                            log_entry_order_stage(
+                                recorder,
+                                "ENTRY_ORDER_DISPATCH_RETURNED_MISSING_ORDER_ID",
+                                symbol,
+                                permId=entry_perm_id,
+                                trade_status=trade_status,
+                                trade_repr=repr(trade)[:500],
+                            )
                         log_entry_order_stage(
                             recorder,
                             "ENTRY_ORDER_IBKR_SUBMITTED",
@@ -6986,7 +6996,17 @@ def main() -> int:
                                     orderId=order_id_for_entry,
                                     error=repr(exc),
                                 )
-                                raise
+                                log_entry_order_exception(
+                                    recorder,
+                                    symbol,
+                                    "managed_position_persist",
+                                    exc,
+                                    orderId=order_id_for_entry,
+                                    qty=qty,
+                                    price=price,
+                                    live_entry_score=live_entry_score,
+                                    ranking_position=ranking_position,
+                                )
                         order_payload = {
                             **diagnostics,
                             **entry_metadata,
@@ -7023,7 +7043,17 @@ def main() -> int:
                                 orderId=order_id_for_entry,
                                 error=repr(exc),
                             )
-                            raise
+                            log_entry_order_exception(
+                                recorder,
+                                symbol,
+                                "buy_order_lifecycle_record",
+                                exc,
+                                orderId=order_id_for_entry,
+                                qty=qty,
+                                price=price,
+                                live_entry_score=live_entry_score,
+                                ranking_position=ranking_position,
+                            )
                         entry_dispatch_stage = "paper_buy_print"
                         print(
                             f"PAPER BUY SENT symbol={symbol} qty={qty} price={price:.2f} "
