@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from collections import Counter
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
@@ -23,8 +25,11 @@ from src.live_trading.analysis.signal_replay_analyzer import (
     build_symbol_timeline,
     filter_should_have_signaled_targets,
     has_event,
+    load_recorder_source,
     read_sqlite_sources,
-    recorder_events,
+    row_symbol,
+    row_text,
+    row_time,
 )
 from src.live_trading.analysis.symbol_subscription_inspector import (
     line_time,
@@ -68,9 +73,6 @@ CASE_COLUMNS = [
     "already_open",
     "unknown_reason",
     "final_classification",
-    "duplicate_trade_groups_count",
-    "duplicate_symbol_entry_time_count",
-    "duplicate_order_id_count",
 ]
 
 SUMMARY_CLASSIFICATIONS = [
@@ -86,6 +88,24 @@ SUMMARY_CLASSIFICATIONS = [
     "runtime_never_processed_symbol",
     "unknown",
 ]
+
+RECORDER_SOURCE_NAMES = {
+    "trade_lifecycle": "trade_lifecycle",
+    "order_lifecycle": "order_lifecycle",
+    "fills": "fills",
+    "run_metadata": "run_metadata",
+    "strategy_equity": "strategy_equity",
+}
+
+
+@dataclass
+class EvidenceBundle:
+    sqlite_sources: dict[str, pd.DataFrame]
+    recorder_sources: dict[str, pd.DataFrame]
+    sqlite_by_symbol: dict[str, dict[str, pd.DataFrame]]
+    recorder_by_symbol: dict[str, dict[str, pd.DataFrame]]
+    journal_lines: list[str]
+    heartbeat_states: list[tuple[pd.Timestamp, dict[str, str]]]
 
 
 def iter_dates(start_date: str, end_date: str) -> Iterable[str]:
@@ -148,18 +168,108 @@ def journal_text_for_symbol(lines: list[str], symbol: str, center: pd.Timestamp 
     return "\n".join(out).upper()
 
 
-def nearest_heartbeat_state(lines: list[str], center: pd.Timestamp | None) -> dict[str, str]:
-    heartbeats = [line for line in lines if "heartbeat" in line.lower()]
-    if not heartbeats:
+def nearest_heartbeat_state_from_index(index: list[tuple[pd.Timestamp, dict[str, str]]], center: pd.Timestamp | None) -> dict[str, str]:
+    if not index:
         return {}
     if center is None:
-        return parse_key_values(heartbeats[-1])
-    timed = [(line, line_time(line)) for line in heartbeats]
-    timed = [(line, ts) for line, ts in timed if ts is not None]
-    if not timed:
-        return parse_key_values(heartbeats[-1])
-    nearest = min(timed, key=lambda item: abs((item[1] - center).total_seconds()))[0]
-    return parse_key_values(nearest)
+        return index[-1][1]
+    return min(index, key=lambda item: abs((item[0] - center).total_seconds()))[1]
+
+
+def load_recorder_sources(recorder_dir: Path, session_date: str) -> dict[str, pd.DataFrame]:
+    return {
+        key: load_recorder_source(recorder_dir, session_date, name)
+        for key, name in RECORDER_SOURCE_NAMES.items()
+    }
+
+
+def rows_in_window(df: pd.DataFrame, center: pd.Timestamp | None, minutes: int = 30) -> pd.DataFrame:
+    if df.empty or center is None:
+        return df
+    records = []
+    start = center - pd.Timedelta(minutes=minutes)
+    end = center + pd.Timedelta(minutes=minutes)
+    for row in df.to_dict("records"):
+        ts = row_time(row)
+        if ts is None or start <= ts <= end:
+            records.append(row)
+    return pd.DataFrame(records)
+
+
+def build_symbol_index(sources: dict[str, pd.DataFrame], target_symbols: set[str]) -> dict[str, dict[str, pd.DataFrame]]:
+    indexed: dict[str, dict[str, list[dict[str, Any]]]] = {
+        source: {symbol: [] for symbol in target_symbols}
+        for source in sources
+    }
+    pattern = None
+    if target_symbols:
+        body = "|".join(re.escape(symbol) for symbol in sorted(target_symbols, key=len, reverse=True))
+        pattern = re.compile(rf"(?<![A-Z0-9])({body})(?![A-Z0-9])")
+    for source, df in sources.items():
+        if df.empty:
+            continue
+        for row in df.to_dict("records"):
+            symbol = row_symbol(row)
+            text = row_text(row).upper()
+            matched: set[str] = set()
+            if symbol in target_symbols:
+                matched.add(symbol)
+            if pattern is not None:
+                matched.update(match.group(1) for match in pattern.finditer(text))
+            for target in matched:
+                indexed[source][target].append(row)
+    return {
+        source: {
+            symbol: pd.DataFrame(rows)
+            for symbol, rows in symbol_map.items()
+        }
+        for source, symbol_map in indexed.items()
+    }
+
+
+def build_heartbeat_index(lines: list[str]) -> list[tuple[pd.Timestamp, dict[str, str]]]:
+    out: list[tuple[pd.Timestamp, dict[str, str]]] = []
+    for line in lines:
+        if "heartbeat" not in line.lower():
+            continue
+        ts = line_time(line)
+        if ts is not None:
+            out.append((ts, parse_key_values(line)))
+    return sorted(out, key=lambda item: item[0])
+
+
+def load_evidence_bundle(
+    *,
+    sqlite_path: Path,
+    recorder_dir: Path,
+    session_date: str,
+    journal_log: Path | None,
+    target_symbols: set[str],
+) -> EvidenceBundle:
+    sqlite_sources = read_sqlite_sources(sqlite_path, session_date)
+    recorder_sources = load_recorder_sources(recorder_dir, session_date)
+    journal = read_text_lines(journal_log or default_journal_path(session_date))
+    return EvidenceBundle(
+        sqlite_sources=sqlite_sources,
+        recorder_sources=recorder_sources,
+        sqlite_by_symbol=build_symbol_index(sqlite_sources, target_symbols),
+        recorder_by_symbol=build_symbol_index(recorder_sources, target_symbols),
+        journal_lines=journal,
+        heartbeat_states=build_heartbeat_index(journal),
+    )
+
+
+def sources_for_symbol(
+    indexed_sources: dict[str, dict[str, pd.DataFrame]],
+    symbol: str,
+    center: pd.Timestamp | None,
+    window_minutes: int = 30,
+) -> dict[str, pd.DataFrame]:
+    out: dict[str, pd.DataFrame] = {}
+    symbol = normalize_symbol(symbol)
+    for source, symbol_map in indexed_sources.items():
+        out[source] = rows_in_window(symbol_map.get(symbol, pd.DataFrame()), center, window_minutes)
+    return out
 
 
 def bool_text(text: str, *needles: str) -> int:
@@ -255,11 +365,7 @@ def investigate_case(
     *,
     target: dict[str, Any],
     session_date: str,
-    sqlite_sources: dict[str, pd.DataFrame],
-    sqlite_path: Path,
-    recorder_dir: Path,
-    journal_lines: list[str],
-    duplicate_diag: dict[str, int],
+    evidence: EvidenceBundle,
 ) -> dict[str, Any]:
     symbol = normalize_symbol(target.get("symbol"))
     center = parse_dt(
@@ -267,7 +373,8 @@ def investigate_case(
         or target.get("opening_range_break_time")
         or target.get("first_time_above_8pct")
     )
-    recorder_sources = recorder_events(recorder_dir, session_date, symbol, center)
+    sqlite_sources = sources_for_symbol(evidence.sqlite_by_symbol, symbol, center)
+    recorder_sources = sources_for_symbol(evidence.recorder_by_symbol, symbol, center)
     timeline, raw_counts = build_symbol_timeline(
         row=target,
         sqlite_sources=sqlite_sources,
@@ -275,8 +382,8 @@ def investigate_case(
         center=center,
     )
     text = event_text(timeline)
-    symbol_journal = journal_text_for_symbol(journal_lines, symbol, center)
-    heartbeat = nearest_heartbeat_state(journal_lines, center)
+    symbol_journal = journal_text_for_symbol(evidence.journal_lines, symbol, center)
+    heartbeat = nearest_heartbeat_state_from_index(evidence.heartbeat_states, center)
     heartbeat_text = json.dumps(heartbeat, default=str).upper()
     combined = "\n".join([text, symbol_journal])
     global_combined = "\n".join([combined, heartbeat_text])
@@ -332,15 +439,19 @@ def investigate_case(
         "buy_order_id": buy_order_id,
         **{key: int(value) for key, value in flags.items() if key not in {"buy_time"}},
         "final_classification": final,
-        **duplicate_diag,
     }
 
 
-def summary_for_cases(cases: pd.DataFrame, session_date: str) -> pd.DataFrame:
+def summary_for_cases(cases: pd.DataFrame, session_date: str, duplicate_diag: dict[str, int] | None = None) -> pd.DataFrame:
     counts = Counter(cases.get("final_classification", pd.Series(dtype=str)).fillna("unknown").astype(str)) if not cases.empty else Counter()
     row: dict[str, Any] = {"date": session_date, "total_should_have_signaled": int(len(cases))}
     for name in SUMMARY_CLASSIFICATIONS:
         row[name] = int(counts.get(name, 0))
+    row.update(duplicate_diag or {
+        "duplicate_trade_groups_count": 0,
+        "duplicate_symbol_entry_time_count": 0,
+        "duplicate_order_id_count": 0,
+    })
     return pd.DataFrame([row])
 
 
@@ -367,29 +478,39 @@ def investigate_date(
     if max_cases is not None and not targets.empty:
         targets = targets.head(max_cases).copy()
     print(f"SHS_START date={session_date} targets={len(targets)}", flush=True)
-    sqlite_sources = read_sqlite_sources(sqlite_path, session_date)
-    journal = read_text_lines(journal_log or default_journal_path(session_date))
+    target_symbols = set(targets["symbol"].map(normalize_symbol).dropna().tolist()) if not targets.empty else set()
+    evidence = load_evidence_bundle(
+        sqlite_path=sqlite_path,
+        recorder_dir=recorder_dir,
+        session_date=session_date,
+        journal_log=journal_log,
+        target_symbols=target_symbols,
+    )
     duplicate_diag = duplicate_trade_diagnostics(sqlite_path, session_date)
+    load_elapsed = time.monotonic() - started
+    sqlite_rows = sum(len(df) for df in evidence.sqlite_sources.values())
+    recorder_rows = sum(len(df) for df in evidence.recorder_sources.values())
+    print(
+        f"SHS_LOAD_EVIDENCE_DONE date={session_date} elapsed={load_elapsed:.1f} "
+        f"sqlite_rows={sqlite_rows} recorder_rows={recorder_rows} journal_lines={len(evidence.journal_lines)}",
+        flush=True,
+    )
     rows: list[dict[str, Any]] = []
     for idx, target in enumerate(targets.to_dict("records"), start=1):
         rows.append(
             investigate_case(
                 target=target,
                 session_date=session_date,
-                sqlite_sources=sqlite_sources,
-                sqlite_path=sqlite_path,
-                recorder_dir=recorder_dir,
-                journal_lines=journal,
-                duplicate_diag=duplicate_diag,
+                evidence=evidence,
             )
         )
-        if idx % 25 == 0 or idx == len(targets):
+        if idx % 10 == 0 or idx == len(targets):
             elapsed = time.monotonic() - started
             print(f"SHS_PROGRESS date={session_date} processed={idx}/{len(targets)} elapsed={elapsed:.1f}", flush=True)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     cases = pd.DataFrame(rows, columns=CASE_COLUMNS) if rows else pd.DataFrame(columns=CASE_COLUMNS)
-    summary = summary_for_cases(cases, session_date)
+    summary = summary_for_cases(cases, session_date, duplicate_diag)
     cases.to_csv(cases_path, index=False)
     summary.to_csv(summary_path, index=False)
     elapsed = time.monotonic() - started
