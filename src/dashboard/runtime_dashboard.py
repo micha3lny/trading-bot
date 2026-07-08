@@ -2205,6 +2205,17 @@ def _date_range_strings(start_date: str, end_date: str) -> list[str]:
 
 @st.cache_data(ttl=60)
 def load_strategy_coverage_reports(start_date: str, end_date: str) -> pd.DataFrame:
+    history_path = REPO_ROOT / "data" / "analysis" / "coverage_history.csv"
+    if history_path.exists():
+        try:
+            history = pd.read_csv(history_path)
+            if not history.empty and "date" in history.columns:
+                mask = history["date"].astype(str).between(start_date, end_date)
+                out = history[mask].copy()
+                out["report_path"] = str(history_path)
+                return out.sort_values("date", ascending=False)
+        except Exception:
+            pass
     rows: list[pd.DataFrame] = []
     for session_date in _date_range_strings(start_date, end_date):
         path = REPO_ROOT / "data" / "analysis" / f"coverage_report_{session_date}.csv"
@@ -2234,7 +2245,7 @@ def render_strategy_coverage_tab(start_date: str, end_date: str) -> None:
         cols[0].metric("Universe >5%", int(latest.get("universe_gt_5", 0) or 0))
         cols[1].metric("Top100 >5%", int(latest.get("top100_gt_5", 0) or 0))
         cols[2].metric("Coverage >5%", f"{float(latest.get('coverage_gt_5_pct', 0.0) or 0.0):.2f}%")
-        cols[3].metric("Bought >5%", int(latest.get("bought_gt_5", 0) or 0))
+        cols[3].metric("Capture >5%", f"{float(latest.get('capture_gt_5_pct', 0.0) or 0.0):.2f}%")
         cols[4].metric("Runtime Missing", int(latest.get("missed_runtime_missing", 0) or 0))
 
         miss_cols = st.columns(4)
@@ -2252,6 +2263,7 @@ def render_strategy_coverage_tab(start_date: str, end_date: str) -> None:
                 "Top100": latest.get(f"top100_gt_{threshold}", 0),
                 "Coverage %": latest.get(f"coverage_gt_{threshold}_pct", 0.0),
                 "Bought": latest.get(f"bought_gt_{threshold}", 0),
+                "Capture %": latest.get(f"capture_gt_{threshold}_pct", 0.0),
                 "Missed": latest.get(f"missed_gt_{threshold}", 0),
             })
         st.dataframe(pd.DataFrame(threshold_rows), width="stretch", hide_index=True)
@@ -2268,6 +2280,7 @@ def render_strategy_coverage_tab(start_date: str, end_date: str) -> None:
             str(REPO_ROOT / "scripts" / "build_strategy_coverage_report.py"),
             "--date",
             end_date,
+            "--force",
         ]
         rc, output = run_dashboard_command(command, timeout=1200)
         st.code("$ " + " ".join(command) + f"\nreturncode={rc}\n{output}", language="bash")
