@@ -1183,6 +1183,47 @@ def record_lifecycle_with_formal(recorder: LiveDataRecorder, event: str, symbol:
     )
 
 
+def log_entry_order_stage(recorder: LiveDataRecorder, event: str, symbol: str, **kwargs: Any) -> None:
+    """Best-effort diagnostic marker for the post-SIGNAL_READY entry path."""
+    printable = " ".join(
+        f"{key}={str(value).replace(' ', '_')}"
+        for key, value in kwargs.items()
+        if value not in (None, "")
+    )
+    print(f"{now_utc()} {event} symbol={symbol} {printable}".rstrip(), flush=True)
+    try:
+        record_lifecycle(
+            recorder,
+            event,
+            symbol,
+            action="BUY",
+            quantity=kwargs.get("qty") or kwargs.get("quantity"),
+            price=kwargs.get("price"),
+            order_id=kwargs.get("orderId") or kwargs.get("order_id"),
+            reason=kwargs.get("reason") or kwargs.get("stage"),
+            raw_json=dict(kwargs),
+        )
+    except Exception as exc:
+        print(f"{now_utc()} ENTRY_ORDER_DIAGNOSTIC_RECORD_FAILED event={event} symbol={symbol} error={exc!r}", flush=True)
+
+
+def log_entry_order_exception(recorder: LiveDataRecorder, symbol: str, stage: str, exc: BaseException, **kwargs: Any) -> None:
+    traceback_summary = ""
+    try:
+        traceback_summary = (format_traceback(exc) or repr(exc)).splitlines()[-1]
+    except Exception:
+        traceback_summary = repr(exc)
+    log_entry_order_stage(
+        recorder,
+        "ENTRY_ORDER_DISPATCH_EXCEPTION",
+        symbol,
+        stage=stage,
+        error=repr(exc),
+        traceback_summary=traceback_summary,
+        **kwargs,
+    )
+
+
 def load_existing_fill_keys(recorder: LiveDataRecorder) -> set[str]:
     path = recorder.path("fills.csv")
     seen: set[str] = set()
@@ -6743,170 +6784,272 @@ def main() -> int:
                             raw_json={**risk_status, **diagnostics},
                         )
                         continue
-                    order = MarketOrder("BUY", qty)
-                    order.tif = "DAY"
-                    order.outsideRth = False
-                    trade = ib.placeOrder(q, order)
-                    order_id_for_entry = getattr(getattr(trade, "order", None), "orderId", "")
-                    entry_perm_id = str(getattr(getattr(trade, "order", None), "permId", "") or "")
-                    top100_meta = dict(_runtime_dict(runtime_state, "top100_entry_metadata_by_symbol").get(symbol, {}))
-                    live_features_json = json.dumps(features, ensure_ascii=False, default=str, sort_keys=True)
-                    entry_trade_id = f"entry:{getattr(recorder, 'session_date', '')}:{symbol}:{order_id_for_entry}"
-                    entry_metadata = {
-                        **top100_meta,
-                        "live_entry_score": live_entry_score,
-                        "live_entry_rank": ranking_position,
-                        "live_entry_features_json": live_features_json,
-                        "signal_source": diagnostics.get("signal_source"),
-                        "signal_time": diagnostics.get("signal_time"),
-                        "ready_since": diagnostics.get("ready_since"),
-                        "entry_order_id": str(order_id_for_entry or ""),
-                        "entry_perm_id": entry_perm_id,
-                    }
-                    _runtime_dict(runtime_state, "entry_order_by_order_id")[_runtime_order_id(order_id_for_entry)] = {
-                        "symbol": symbol,
-                        "quantity": qty,
-                        "price": price,
-                        "submitted_at": now_utc(),
-                        "ranking_position": ranking_position,
-                        "score": features.get("score"),
-                        "trade_id": entry_trade_id,
-                        **entry_metadata,
-                        "conId": getattr(q, "conId", None),
-                    }
-                    safe_sqlite_call(
-                        getattr(recorder, "sqlite_store", None),
-                        "upsert_trade",
-                        {
-                            "trade_id": entry_trade_id,
-                            "strategy_name": STRATEGY_NAME,
-                            "session_date": getattr(recorder, "session_date", None),
-                            "symbol": symbol,
-                            "status": "ENTRY_PENDING",
-                            "entry_signal_time": diagnostics.get("signal_time"),
-                            "entry_order_time": now_utc(),
-                            "entry_price": price,
-                            "quantity": qty,
-                            "remaining_quantity": qty,
-                            "ibkr_entry_confirmed": 0,
-                            "raw_json": {**signal_payload, **entry_metadata, "order_id": order_id_for_entry},
-                            **entry_metadata,
-                        },
-                    )
-                    safe_sqlite_call(
-                        getattr(recorder, "sqlite_store", None),
-                        "upsert_order",
-                        {
-                            "order_key": f"entry:{order_id_for_entry or entry_trade_id}",
-                            "trade_id": entry_trade_id,
-                            "strategy_name": STRATEGY_NAME,
-                            "session_date": getattr(recorder, "session_date", None),
-                            "symbol": symbol,
-                            "side": "BUY",
-                            "order_type": "MKT",
-                            "quantity": qty,
-                            "limit_price": None,
-                            "status": "SUBMITTED",
-                            "ibkr_status": getattr(trade, "orderStatus", None).status if getattr(trade, "orderStatus", None) else None,
-                            "order_id": str(order_id_for_entry or ""),
-                            "perm_id": entry_perm_id,
-                            "submitted_at": now_utc(),
-                            "raw_json": {**signal_payload, **entry_metadata, "entry_decision_time": diagnostics.get("entry_decision_time")},
-                        },
-                    )
-                    submission_count = record_entry_submission(runtime_state, loop_now)
-                    entries_submitted_this_cycle += 1
-                    backlog_window = float(args.entry_backlog_window_seconds or 60.0)
-                    backlog_threshold = int(args.entry_backlog_threshold or 0)
-                    if backlog_threshold > 0:
-                        recent_for_backlog = prune_entry_submit_timestamps(runtime_state, loop_now, window_seconds=backlog_window)
-                        if len(recent_for_backlog) > backlog_threshold:
-                            backlog_key = int(loop_now // max(1.0, backlog_window))
-                            if runtime_state.get("entry_backlog_last_key") != backlog_key:
-                                runtime_state["entry_backlog_last_key"] = backlog_key
-                                print(
-                                    f"{now_utc()} ENTRY_BACKLOG_DETECTED count={len(recent_for_backlog)} "
-                                    f"window_seconds={backlog_window:.1f} threshold={backlog_threshold} "
-                                    f"latest_symbol={symbol}",
-                                    flush=True,
-                                )
-                                safe_sqlite_call(
-                                    getattr(recorder, "sqlite_store", None),
-                                    "record_runtime_event",
-                                    event_type="ENTRY_BACKLOG_DETECTED",
-                                    severity="WARN",
-                                    strategy_name=STRATEGY_NAME,
-                                    session_date=getattr(recorder, "session_date", None),
-                                    symbol=symbol,
-                                    source="v67_live_runtime",
-                                    reason="entry_rate_burst",
-                                    raw_json={
-                                        "count": len(recent_for_backlog),
-                                        "window_seconds": backlog_window,
-                                        "threshold": backlog_threshold,
-                                        "latest_symbol": symbol,
-                                    },
-                                )
-                    if qty > 0 and price and price > 0:
-                        managed_positions[symbol] = ManagedPosition(
-                            symbol=symbol,
-                            contract=q,
-                            quantity=qty,
-                            entry_price=float(price),
-                            entry_time=now_utc(),
-                            peak_price=float(price),
-                            entry_fill_verified=False,
-                            top100_rank=safe_int(top100_meta.get("top100_rank")),
-                            top100_score=safe_float(top100_meta.get("top100_score")),
-                            top100_source_date=str(top100_meta.get("top100_source_date") or "") or None,
-                            top100_features_json=str(top100_meta.get("top100_features_json") or "") or None,
+                    entry_dispatch_stage = "market_order_create"
+                    order_id_for_entry = ""
+                    entry_perm_id = ""
+                    try:
+                        log_entry_order_stage(
+                            recorder,
+                            "ENTRY_ORDER_DISPATCH_ATTEMPT",
+                            symbol,
+                            qty=qty,
+                            price=price,
                             live_entry_score=live_entry_score,
-                            live_entry_rank=ranking_position,
-                            live_entry_features_json=live_features_json,
-                            signal_source=str(diagnostics.get("signal_source") or "") or None,
-                            signal_time=str(diagnostics.get("signal_time") or "") or None,
-                            ready_since=str(diagnostics.get("ready_since") or "") or None,
-                            entry_order_id=str(order_id_for_entry or "") or None,
-                            entry_perm_id=entry_perm_id or None,
+                            ranking_position=ranking_position,
+                            candidate_age_seconds=diagnostics.get("candidate_age_seconds"),
+                            ready_since=diagnostics.get("ready_since"),
+                            signal_time=diagnostics.get("signal_time"),
                         )
-                        persist_managed_positions(recorder, managed_positions)
-                    order_payload = {
-                        **diagnostics,
-                        **entry_metadata,
-                        "entries_submitted_last_minute": submission_count,
-                        "max_entries_per_cycle": int(args.max_entries_per_cycle or 0),
-                        "max_entries_per_minute": int(args.max_entries_per_minute or 0),
-                    }
-                    record_lifecycle_with_formal(
-                        recorder,
-                        "BUY_ORDER_SENT",
-                        symbol,
-                        action="BUY",
-                        quantity=qty,
-                        price=price,
-                        order_id=trade.order.orderId,
-                        entry_price=price,
-                        peak_price=price,
-                        decision_bid=snap.get("bid"),
-                        decision_ask=snap.get("ask"),
-                        decision_mid=snap.get("mid_price"),
-                        decision_last=snap.get("last"),
-                        spread_pct=((snap.get("spread") / snap.get("mid_price") * 100.0) if snap.get("spread") and snap.get("mid_price") else None),
-                        entry_fill_verified="false",
-                        raw_json=order_payload,
-                    )
-                    print(
-                        f"PAPER BUY SENT symbol={symbol} qty={qty} price={price:.2f} "
-                        f"score={features['score']:.2f} ranking_position={ranking_position or ''} "
-                        f"signal_source={diagnostics.get('signal_source') or ''} "
-                        f"signal_time={diagnostics.get('signal_time') or ''} ready_since={diagnostics.get('ready_since') or ''} "
-                        f"last_live_update_at={diagnostics.get('last_live_update_at') or ''} "
-                        f"candidate_age_seconds={diagnostics.get('candidate_age_seconds')} "
-                        f"last_restart_unblock_time={diagnostics.get('last_restart_unblock_time') or ''} "
-                        f"entry_decision_time={diagnostics.get('entry_decision_time')} "
-                        f"orderId={order_id_for_entry} tif={order.tif} outsideRth={order.outsideRth}",
-                        flush=True,
-                    )
+                        order = MarketOrder("BUY", qty)
+                        order.tif = "DAY"
+                        order.outsideRth = False
+                        entry_dispatch_stage = "ib_place_order"
+                        trade = ib.placeOrder(q, order)
+                        order_obj = getattr(trade, "order", None)
+                        order_status_obj = getattr(trade, "orderStatus", None)
+                        order_id_for_entry = getattr(order_obj, "orderId", "") or ""
+                        entry_perm_id = str(getattr(order_obj, "permId", "") or "")
+                        trade_status = getattr(order_status_obj, "status", "") if order_status_obj else ""
+                        log_entry_order_stage(
+                            recorder,
+                            "ENTRY_ORDER_DISPATCH_RETURNED",
+                            symbol,
+                            orderId=order_id_for_entry,
+                            permId=entry_perm_id,
+                            trade_status=trade_status,
+                            trade_repr=repr(trade)[:500],
+                        )
+                        log_entry_order_stage(
+                            recorder,
+                            "ENTRY_ORDER_IBKR_SUBMITTED",
+                            symbol,
+                            orderId=order_id_for_entry,
+                            permId=entry_perm_id,
+                            trade_status=trade_status,
+                            qty=qty,
+                            price=price,
+                        )
+                        entry_dispatch_stage = "entry_metadata_build"
+                        top100_meta = dict(_runtime_dict(runtime_state, "top100_entry_metadata_by_symbol").get(symbol, {}))
+                        live_features_json = json.dumps(features, ensure_ascii=False, default=str, sort_keys=True)
+                        entry_trade_id = f"entry:{getattr(recorder, 'session_date', '')}:{symbol}:{order_id_for_entry}"
+                        entry_metadata = {
+                            **top100_meta,
+                            "live_entry_score": live_entry_score,
+                            "live_entry_rank": ranking_position,
+                            "live_entry_features_json": live_features_json,
+                            "signal_source": diagnostics.get("signal_source"),
+                            "signal_time": diagnostics.get("signal_time"),
+                            "ready_since": diagnostics.get("ready_since"),
+                            "entry_order_id": str(order_id_for_entry or ""),
+                            "entry_perm_id": entry_perm_id,
+                        }
+                        entry_dispatch_stage = "runtime_order_map"
+                        _runtime_dict(runtime_state, "entry_order_by_order_id")[_runtime_order_id(order_id_for_entry)] = {
+                            "symbol": symbol,
+                            "quantity": qty,
+                            "price": price,
+                            "submitted_at": now_utc(),
+                            "ranking_position": ranking_position,
+                            "score": features.get("score"),
+                            "trade_id": entry_trade_id,
+                            **entry_metadata,
+                            "conId": getattr(q, "conId", None),
+                        }
+                        entry_dispatch_stage = "sqlite_upsert_trade"
+                        sqlite_trade_result = safe_sqlite_call(
+                            getattr(recorder, "sqlite_store", None),
+                            "upsert_trade",
+                            {
+                                "trade_id": entry_trade_id,
+                                "strategy_name": STRATEGY_NAME,
+                                "session_date": getattr(recorder, "session_date", None),
+                                "symbol": symbol,
+                                "status": "ENTRY_PENDING",
+                                "entry_signal_time": diagnostics.get("signal_time"),
+                                "entry_order_time": now_utc(),
+                                "entry_price": price,
+                                "quantity": qty,
+                                "remaining_quantity": qty,
+                                "ibkr_entry_confirmed": 0,
+                                "raw_json": {**signal_payload, **entry_metadata, "order_id": order_id_for_entry},
+                                **entry_metadata,
+                            },
+                        )
+                        if getattr(recorder, "sqlite_store", None) is not None and sqlite_trade_result is None:
+                            log_entry_order_stage(
+                                recorder,
+                                "ENTRY_ORDER_SQLITE_PERSIST_FAILED",
+                                symbol,
+                                stage="sqlite_upsert_trade",
+                                orderId=order_id_for_entry,
+                                trade_id=entry_trade_id,
+                                reason="safe_sqlite_call_returned_none",
+                            )
+                        entry_dispatch_stage = "sqlite_upsert_order"
+                        sqlite_order_result = safe_sqlite_call(
+                            getattr(recorder, "sqlite_store", None),
+                            "upsert_order",
+                            {
+                                "order_key": f"entry:{order_id_for_entry or entry_trade_id}",
+                                "trade_id": entry_trade_id,
+                                "strategy_name": STRATEGY_NAME,
+                                "session_date": getattr(recorder, "session_date", None),
+                                "symbol": symbol,
+                                "side": "BUY",
+                                "order_type": "MKT",
+                                "quantity": qty,
+                                "limit_price": None,
+                                "status": "SUBMITTED",
+                                "ibkr_status": trade_status,
+                                "order_id": str(order_id_for_entry or ""),
+                                "perm_id": entry_perm_id,
+                                "submitted_at": now_utc(),
+                                "raw_json": {**signal_payload, **entry_metadata, "entry_decision_time": diagnostics.get("entry_decision_time")},
+                            },
+                        )
+                        if getattr(recorder, "sqlite_store", None) is not None and sqlite_order_result is None:
+                            log_entry_order_stage(
+                                recorder,
+                                "ENTRY_ORDER_SQLITE_PERSIST_FAILED",
+                                symbol,
+                                stage="sqlite_upsert_order",
+                                orderId=order_id_for_entry,
+                                trade_id=entry_trade_id,
+                                reason="safe_sqlite_call_returned_none",
+                            )
+                        entry_dispatch_stage = "entry_submission_counter"
+                        submission_count = record_entry_submission(runtime_state, loop_now)
+                        entries_submitted_this_cycle += 1
+                        backlog_window = float(args.entry_backlog_window_seconds or 60.0)
+                        backlog_threshold = int(args.entry_backlog_threshold or 0)
+                        if backlog_threshold > 0:
+                            recent_for_backlog = prune_entry_submit_timestamps(runtime_state, loop_now, window_seconds=backlog_window)
+                            if len(recent_for_backlog) > backlog_threshold:
+                                backlog_key = int(loop_now // max(1.0, backlog_window))
+                                if runtime_state.get("entry_backlog_last_key") != backlog_key:
+                                    runtime_state["entry_backlog_last_key"] = backlog_key
+                                    print(
+                                        f"{now_utc()} ENTRY_BACKLOG_DETECTED count={len(recent_for_backlog)} "
+                                        f"window_seconds={backlog_window:.1f} threshold={backlog_threshold} "
+                                        f"latest_symbol={symbol}",
+                                        flush=True,
+                                    )
+                                    safe_sqlite_call(
+                                        getattr(recorder, "sqlite_store", None),
+                                        "record_runtime_event",
+                                        event_type="ENTRY_BACKLOG_DETECTED",
+                                        severity="WARN",
+                                        strategy_name=STRATEGY_NAME,
+                                        session_date=getattr(recorder, "session_date", None),
+                                        symbol=symbol,
+                                        source="v67_live_runtime",
+                                        reason="entry_rate_burst",
+                                        raw_json={
+                                            "count": len(recent_for_backlog),
+                                            "window_seconds": backlog_window,
+                                            "threshold": backlog_threshold,
+                                            "latest_symbol": symbol,
+                                        },
+                                    )
+                        entry_dispatch_stage = "managed_position_persist"
+                        if qty > 0 and price and price > 0:
+                            managed_positions[symbol] = ManagedPosition(
+                                symbol=symbol,
+                                contract=q,
+                                quantity=qty,
+                                entry_price=float(price),
+                                entry_time=now_utc(),
+                                peak_price=float(price),
+                                entry_fill_verified=False,
+                                top100_rank=safe_int(top100_meta.get("top100_rank")),
+                                top100_score=safe_float(top100_meta.get("top100_score")),
+                                top100_source_date=str(top100_meta.get("top100_source_date") or "") or None,
+                                top100_features_json=str(top100_meta.get("top100_features_json") or "") or None,
+                                live_entry_score=live_entry_score,
+                                live_entry_rank=ranking_position,
+                                live_entry_features_json=live_features_json,
+                                signal_source=str(diagnostics.get("signal_source") or "") or None,
+                                signal_time=str(diagnostics.get("signal_time") or "") or None,
+                                ready_since=str(diagnostics.get("ready_since") or "") or None,
+                                entry_order_id=str(order_id_for_entry or "") or None,
+                                entry_perm_id=entry_perm_id or None,
+                            )
+                            try:
+                                persist_managed_positions(recorder, managed_positions)
+                            except Exception as exc:
+                                log_entry_order_stage(
+                                    recorder,
+                                    "ENTRY_MANAGED_POSITION_PERSIST_FAILED",
+                                    symbol,
+                                    stage="managed_position_persist",
+                                    orderId=order_id_for_entry,
+                                    error=repr(exc),
+                                )
+                                raise
+                        order_payload = {
+                            **diagnostics,
+                            **entry_metadata,
+                            "entries_submitted_last_minute": submission_count,
+                            "max_entries_per_cycle": int(args.max_entries_per_cycle or 0),
+                            "max_entries_per_minute": int(args.max_entries_per_minute or 0),
+                        }
+                        entry_dispatch_stage = "buy_order_lifecycle_record"
+                        try:
+                            record_lifecycle_with_formal(
+                                recorder,
+                                "BUY_ORDER_SENT",
+                                symbol,
+                                action="BUY",
+                                quantity=qty,
+                                price=price,
+                                order_id=order_id_for_entry,
+                                entry_price=price,
+                                peak_price=price,
+                                decision_bid=snap.get("bid"),
+                                decision_ask=snap.get("ask"),
+                                decision_mid=snap.get("mid_price"),
+                                decision_last=snap.get("last"),
+                                spread_pct=((snap.get("spread") / snap.get("mid_price") * 100.0) if snap.get("spread") and snap.get("mid_price") else None),
+                                entry_fill_verified="false",
+                                raw_json=order_payload,
+                            )
+                        except Exception as exc:
+                            log_entry_order_stage(
+                                recorder,
+                                "ENTRY_ORDER_LIFECYCLE_RECORD_FAILED",
+                                symbol,
+                                stage="buy_order_lifecycle_record",
+                                orderId=order_id_for_entry,
+                                error=repr(exc),
+                            )
+                            raise
+                        entry_dispatch_stage = "paper_buy_print"
+                        print(
+                            f"PAPER BUY SENT symbol={symbol} qty={qty} price={price:.2f} "
+                            f"score={features['score']:.2f} ranking_position={ranking_position or ''} "
+                            f"signal_source={diagnostics.get('signal_source') or ''} "
+                            f"signal_time={diagnostics.get('signal_time') or ''} ready_since={diagnostics.get('ready_since') or ''} "
+                            f"last_live_update_at={diagnostics.get('last_live_update_at') or ''} "
+                            f"candidate_age_seconds={diagnostics.get('candidate_age_seconds')} "
+                            f"last_restart_unblock_time={diagnostics.get('last_restart_unblock_time') or ''} "
+                            f"entry_decision_time={diagnostics.get('entry_decision_time')} "
+                            f"orderId={order_id_for_entry} tif={order.tif} outsideRth={order.outsideRth}",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        log_entry_order_exception(
+                            recorder,
+                            symbol,
+                            entry_dispatch_stage,
+                            exc,
+                            orderId=order_id_for_entry,
+                            qty=qty,
+                            price=price,
+                            live_entry_score=live_entry_score,
+                            ranking_position=ranking_position,
+                        )
+                        raise
                     state.signal_sent = True
 
             adopted_count = 0

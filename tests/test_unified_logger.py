@@ -17,7 +17,18 @@ from src.live_trading.unified_logger import (
     normalize_log_line,
     run_log_retention,
 )
-from src.live_trading.v67_live_top100_expansion_paper_trader import emit_heartbeat
+from src.live_trading.v67_live_top100_expansion_paper_trader import emit_heartbeat, log_entry_order_stage
+
+
+class _RecorderStub:
+    session_date = "2026-07-08"
+    sqlite_store = None
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def path(self, name: str) -> Path:
+        return self.root / name
 
 
 class UnifiedLoggerTests(unittest.TestCase):
@@ -66,6 +77,26 @@ class UnifiedLoggerTests(unittest.TestCase):
             side_effect=TypeError("logger boom"),
         ):
             emit_heartbeat("2026-05-28T12:00:31+00:00 heartbeat scanned=100", runtime_state, log_dir=tempfile.mkdtemp())
+
+    def test_entry_order_stage_log_records_lifecycle_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = _RecorderStub(Path(tmp))
+            out = io.StringIO()
+            with patch("sys.stdout", out):
+                log_entry_order_stage(
+                    recorder,
+                    "ENTRY_ORDER_DISPATCH_ATTEMPT",
+                    "OMER",
+                    qty=12,
+                    price=3.21,
+                    live_entry_score=77.7,
+                    ranking_position=4,
+                )
+
+            self.assertIn("ENTRY_ORDER_DISPATCH_ATTEMPT symbol=OMER", out.getvalue())
+            content = (Path(tmp) / "trade_lifecycle.csv").read_text(encoding="utf-8")
+            self.assertIn("ENTRY_ORDER_DISPATCH_ATTEMPT", content)
+            self.assertIn("OMER", content)
 
     def test_retention_compresses_old_logs_and_deletes_old_gz(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
