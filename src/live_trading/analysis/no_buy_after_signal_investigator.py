@@ -62,6 +62,16 @@ CASE_COLUMNS = [
     "failed_final_entry_filter_reason",
     "order_dispatch_attempted",
     "order_dispatch_skip_reason",
+    "ready_list_stage",
+    "ranking_stage",
+    "selection_stage",
+    "final_filter_stage",
+    "dispatch_queue_stage",
+    "ibkr_order_submission_stage",
+    "order_ack_stage",
+    "candidate_disappeared_stage",
+    "candidate_lifecycle_trace",
+    "runtime_code_path",
     "final_no_buy_reason",
 ]
 
@@ -248,6 +258,17 @@ def order_dispatch_attempted(text: str, symbol: str) -> int:
     return 0
 
 
+def order_ack_seen(text: str, symbol: str) -> int:
+    pattern = symbol_pattern(symbol)
+    for line in text.splitlines():
+        upper = line.upper()
+        if not pattern.search(upper):
+            continue
+        if any(token in upper for token in ["ENTRY_ORDER_PARTIAL", "ENTRY_ORDER_FILLED", "ORDER_STATUS", "IBKR_STATUS", "SUBMITTED"]):
+            return 1
+    return 0
+
+
 def skip_reason_from_text(text: str, symbol: str) -> str:
     pattern = symbol_pattern(symbol)
     preferred = [
@@ -321,6 +342,90 @@ def final_filter_reason(text: str, symbol: str, heartbeat_reason: str) -> str:
     return heartbeat_reason
 
 
+def lifecycle_stage_trace(
+    *,
+    symbol: str,
+    signal_ready_seen: bool,
+    dispatch: int,
+    ack: int,
+    skip_reason: str,
+    failed_reason: str,
+    entries_blocked: int,
+    max_entries_reached: int,
+    better: list[str],
+) -> dict[str, str]:
+    # In v67, SIGNAL_READY is emitted inside ordered_entry_candidates after the
+    # symbol has entered entry_candidates, survived candidate_rejection_reasons,
+    # passed per-cycle/per-minute checks, and has been selected for entry
+    # evaluation. Missing dispatch after SIGNAL_READY therefore narrows the
+    # disappearance point to the final-filter/placeOrder/ack segment.
+    if signal_ready_seen:
+        ready_stage = "seen_in_entry_candidates_inferred_from_SIGNAL_READY"
+        ranking_stage = "ranked_in_ordered_entry_candidates_inferred_from_SIGNAL_READY"
+        selection_stage = "selected_for_entry_evaluation_SIGNAL_READY"
+    else:
+        ready_stage = "not_proven_in_ready_list"
+        ranking_stage = "not_proven_ranked"
+        selection_stage = "not_selected_or_signal_missing"
+
+    final_stage = "passed_or_no_explicit_final_filter"
+    disappeared = ""
+    if skip_reason:
+        final_stage = f"blocked_after_SIGNAL_READY:{skip_reason}"
+        disappeared = "final_entry_filter"
+    elif failed_reason:
+        final_stage = f"blocked_or_global_state_after_SIGNAL_READY:{failed_reason}"
+        disappeared = "final_entry_filter_or_global_block"
+    elif entries_blocked and not signal_ready_seen:
+        final_stage = "entries_blocked_before_signal_ready"
+        disappeared = "ready_list_before_selection"
+    elif max_entries_reached and not signal_ready_seen:
+        final_stage = "rate_limited_before_signal_ready"
+        disappeared = "per_scan_entry_limit"
+
+    if dispatch:
+        dispatch_stage = "dispatch_attempt_seen"
+        ibkr_stage = "ibkr_placeOrder_or_BUY_ORDER_SENT_seen"
+    elif signal_ready_seen and not disappeared:
+        dispatch_stage = "missing_after_SIGNAL_READY_before_BUY_ORDER_SENT"
+        ibkr_stage = "not_seen"
+        disappeared = "dispatch_queue_or_ibkr_placeOrder_gap"
+    elif better and not signal_ready_seen:
+        dispatch_stage = "not_dispatched_lower_rank_candidates_ahead"
+        ibkr_stage = "not_seen"
+        disappeared = "ranking_selection"
+    else:
+        dispatch_stage = "not_seen"
+        ibkr_stage = "not_seen"
+
+    ack_stage = "ack_seen" if ack else ("not_seen_after_dispatch" if dispatch else "not_applicable_no_dispatch")
+    trace = [
+        f"ready_list={ready_stage}",
+        f"ranking={ranking_stage}",
+        f"selection={selection_stage}",
+        f"final_filter={final_stage}",
+        f"dispatch_queue={dispatch_stage}",
+        f"ibkr_order_submission={ibkr_stage}",
+        f"ack={ack_stage}",
+    ]
+    return {
+        "ready_list_stage": ready_stage,
+        "ranking_stage": ranking_stage,
+        "selection_stage": selection_stage,
+        "final_filter_stage": final_stage,
+        "dispatch_queue_stage": dispatch_stage,
+        "ibkr_order_submission_stage": ibkr_stage,
+        "order_ack_stage": ack_stage,
+        "candidate_disappeared_stage": disappeared or "unknown",
+        "candidate_lifecycle_trace": " | ".join(trace),
+        "runtime_code_path": (
+            "entry_candidates -> candidate_rejection_reasons -> ordered_entry_candidates "
+            "-> SIGNAL_READY -> ENTRY_BLOCKED_LOW_SCORE/RISK_GUARD_BLOCK_ENTRY "
+            "-> ib.placeOrder -> upsert_order -> BUY_ORDER_SENT"
+        ),
+    }
+
+
 def investigate_case(target: dict[str, Any], session_date: str, evidence: EvidenceBundle) -> dict[str, Any]:
     symbol = normalize_symbol(target.get("symbol"))
     center = parse_dt(
@@ -352,9 +457,22 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
     skip_reason = skip_reason_from_text(combined, symbol)
     failed_reason = final_filter_reason(combined, symbol, heartbeat_reason)
     dispatch = order_dispatch_attempted(combined, symbol)
+    ack = order_ack_seen(combined, symbol)
     max_entries_reached = int("ENTRY_RATE_LIMIT_BLOCK" in combined.upper() or "MAX_ENTRIES_PER" in combined.upper())
     managed_open = heartbeat.get("managed_open", "")
     max_positions = heartbeat.get("max_positions") or heartbeat.get("max_open_positions") or ""
+    signal_ready_seen = "SIGNAL_READY" in combined.upper()
+    lifecycle = lifecycle_stage_trace(
+        symbol=symbol,
+        signal_ready_seen=signal_ready_seen,
+        dispatch=dispatch,
+        ack=ack,
+        skip_reason=skip_reason,
+        failed_reason=failed_reason,
+        entries_blocked=entries_blocked,
+        max_entries_reached=max_entries_reached,
+        better=better,
+    )
     row = {
         "date": session_date,
         "symbol": symbol,
@@ -385,6 +503,7 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
         "failed_final_entry_filter_reason": failed_reason,
         "order_dispatch_attempted": dispatch,
         "order_dispatch_skip_reason": skip_reason,
+        **lifecycle,
     }
     row["final_no_buy_reason"] = classify_no_buy_reason(row)
     return row

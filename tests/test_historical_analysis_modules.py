@@ -39,6 +39,7 @@ from src.live_trading.analysis.missed_runners_analyzer import add_multiday_ranks
 from src.live_trading.analysis.no_buy_after_signal_investigator import (
     build_parser as build_no_buy_after_signal_parser,
     classify_no_buy_reason,
+    lifecycle_stage_trace,
     summary_for_cases as no_buy_after_signal_summary_for_cases,
 )
 from src.live_trading.analysis.overnight_hold_ranker import analyze_trade_overnight, ensure_overnight_columns, overnight_score, score_bucket
@@ -629,6 +630,24 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
             ),
             "lower_rank_candidate_not_selected",
         )
+
+    def test_no_buy_after_signal_lifecycle_traces_dispatch_gap_after_signal_ready(self) -> None:
+        trace = lifecycle_stage_trace(
+            symbol="OMER",
+            signal_ready_seen=True,
+            dispatch=0,
+            ack=0,
+            skip_reason="",
+            failed_reason="",
+            entries_blocked=0,
+            max_entries_reached=0,
+            better=[],
+        )
+        self.assertEqual(trace["ready_list_stage"], "seen_in_entry_candidates_inferred_from_SIGNAL_READY")
+        self.assertEqual(trace["ranking_stage"], "ranked_in_ordered_entry_candidates_inferred_from_SIGNAL_READY")
+        self.assertEqual(trace["selection_stage"], "selected_for_entry_evaluation_SIGNAL_READY")
+        self.assertEqual(trace["candidate_disappeared_stage"], "dispatch_queue_or_ibkr_placeOrder_gap")
+        self.assertIn("SIGNAL_READY", trace["candidate_lifecycle_trace"])
 
     def test_strategy_coverage_runner_rows_uses_default_signal_thresholds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
