@@ -34,7 +34,7 @@ from src.live_trading.analysis.common import (
     min_after_pct,
     simulate_tp_sl,
 )
-from src.live_trading.analysis.missed_runners_analyzer import classify_missed_reason
+from src.live_trading.analysis.missed_runners_analyzer import build_parser as build_missed_runners_parser, classify_missed_reason
 from src.live_trading.analysis.missed_runners_analyzer import add_multiday_ranks, no_signal_diagnostics, previous_session_context
 from src.live_trading.analysis.overnight_hold_ranker import analyze_trade_overnight, ensure_overnight_columns, overnight_score, score_bucket
 from src.live_trading.analysis.signal_replay_analyzer import (
@@ -541,6 +541,11 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         ])
         diag = no_signal_diagnostics(candles, min_first_5m_high_pct=0.5, min_first_15m_high_pct=1.0, min_or_range_pct=0.5)
         self.assertEqual(diag["top100_no_signal_reason"], "failed_first5")
+
+    def test_missed_runners_cli_has_performance_flags(self) -> None:
+        help_text = build_missed_runners_parser().format_help()
+        self.assertIn("--max-symbols", help_text)
+        self.assertIn("--force", help_text)
 
     def test_strategy_coverage_runner_rows_uses_default_signal_thresholds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

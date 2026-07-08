@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import glob
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -22,12 +24,14 @@ from src.live_trading.analysis.common import (
     safe_read_csv,
 )
 from src.live_trading.market_calendar import previous_us_equity_trading_day
+from src.live_trading.ranking.daily_top100_builder import normalize_history_df
 
 
 DEFAULT_HISTORY_DIR = Path("data/history/universe_1m")
 DEFAULT_UNIVERSE = Path("data/universe/v68_final_daytrading_universe.csv")
 DEFAULT_SQLITE_PATH = Path("data/runtime/trading_runtime.sqlite")
 DEFAULT_RECORDER_DIR = Path("data/live/recorder")
+NEEDED_PARQUET_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 OUTPUT_COLUMNS = [
     "date",
@@ -84,6 +88,46 @@ OUTPUT_COLUMNS = [
     "had_required_or_range",
     "possible_signal_time",
 ]
+
+
+def dated_history_glob(history_dir: Path, session_date: str, session_type: str = "RTH") -> str:
+    d = pd.Timestamp(session_date).date()
+    return str(
+        Path(history_dir)
+        / f"session_type={session_type.upper()}"
+        / "symbol=*"
+        / f"year={d.year:04d}"
+        / f"month={d.month:02d}"
+        / f"day={d.day:02d}.parquet"
+    )
+
+
+def symbol_from_parquet_path(path: Path) -> str:
+    for part in path.parts:
+        if part.startswith("symbol="):
+            return normalize_symbol(part.split("=", 1)[1])
+    return ""
+
+
+def find_history_files(history_dir: Path, session_date: str, session_type: str = "RTH") -> dict[str, Path]:
+    files = sorted(Path(value) for value in glob.glob(dated_history_glob(history_dir, session_date, session_type)))
+    out: dict[str, Path] = {}
+    for path in files:
+        symbol = symbol_from_parquet_path(path)
+        if symbol:
+            out[symbol] = path
+    return out
+
+
+def read_history_for_missed(path: Path) -> pd.DataFrame:
+    try:
+        try:
+            raw = pd.read_parquet(path, columns=NEEDED_PARQUET_COLUMNS)
+        except Exception:
+            raw = pd.read_parquet(path)
+        return normalize_history_df(raw)
+    except Exception:
+        return pd.DataFrame()
 
 
 def load_recorder_table(recorder_dir: Path, session_date: str, names: list[str]) -> pd.DataFrame:
@@ -393,8 +437,14 @@ def analyze_missed_runners(
     min_first_5m_high_pct: float = 0.5,
     min_first_15m_high_pct: float = 1.0,
     min_or_range_pct: float = 0.5,
+    max_symbols: int | None = None,
+    progress_every: int = 250,
 ) -> pd.DataFrame:
+    started = time.monotonic()
     symbols = load_universe_symbols(universe_path)
+    history_files = find_history_files(history_dir, session_date)
+    if max_symbols is not None:
+        symbols = symbols[:max_symbols]
     top100 = load_top100(top100_path)
     top100_by_symbol = top100.set_index("symbol").to_dict("index") if not top100.empty else {}
     entries = load_entries(sqlite_path, session_date)
@@ -403,10 +453,20 @@ def analyze_missed_runners(
     order_rows = load_recorder_table(recorder_dir, session_date, ["order_intents", "orders", "entry_orders"])
     spread_rows = load_recorder_table(recorder_dir, session_date, ["spread_snapshots", "market_snapshots"])
 
+    print(
+        f"MISSED_START date={session_date} universe_symbols={len(symbols)} "
+        f"universe_files_found={len(history_files)} top100_symbols={len(top100_by_symbol)}",
+        flush=True,
+    )
     rows: list[dict[str, Any]] = []
-    for symbol in symbols:
-        candles = load_session_candles(history_dir, symbol, session_date)
+    total = len(symbols)
+    for idx, symbol in enumerate(symbols, start=1):
+        path = history_files.get(symbol)
+        candles = read_history_for_missed(path) if path is not None else pd.DataFrame()
         stats = calculate_runner_stats(candles)
+        if idx % progress_every == 0:
+            elapsed = time.monotonic() - started
+            print(f"MISSED_PROGRESS date={session_date} processed={idx}/{total} elapsed={elapsed:.1f}", flush=True)
         if stats is None or stats.open_to_high_pct < threshold_pct:
             continue
         top_row = top100_by_symbol.get(symbol, {})
@@ -477,10 +537,18 @@ def analyze_missed_runners(
             **no_signal,
         })
     out = pd.DataFrame(rows)
+    if total and total % progress_every:
+        elapsed = time.monotonic() - started
+        print(f"MISSED_PROGRESS date={session_date} processed={total}/{total} elapsed={elapsed:.1f}", flush=True)
     if out.empty:
+        elapsed = time.monotonic() - started
+        print(f"MISSED_DONE date={session_date} rows=0 elapsed_seconds={elapsed:.1f}", flush=True)
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
     out = add_multiday_ranks(out)
-    return out.sort_values("open_to_high_pct", ascending=False)[OUTPUT_COLUMNS]
+    result = out.sort_values("open_to_high_pct", ascending=False)[OUTPUT_COLUMNS]
+    elapsed = time.monotonic() - started
+    print(f"MISSED_DONE date={session_date} rows={len(result)} elapsed_seconds={elapsed:.1f}", flush=True)
+    return result
 
 
 def print_summary(df: pd.DataFrame) -> None:
@@ -533,6 +601,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-first-15m-high-pct", type=float, default=1.0)
     parser.add_argument("--min-or-range-pct", type=float, default=0.5)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--max-symbols", type=int, default=None, help="Limit processed universe symbols for quick testing.")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing output CSV.")
     return parser
 
 
@@ -541,6 +611,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     top100 = args.top100 or Path(f"data/universe/daily_top100_{args.date}.csv")
     output = args.output or Path(f"data/analysis/missed_runners_{args.date}.csv")
+    if output.exists() and not args.force:
+        print(f"MISSED_SKIPPED_EXISTING date={args.date} output={output}", flush=True)
+        return 0
+    started = time.monotonic()
     df = analyze_missed_runners(
         session_date=args.date,
         history_dir=args.history_dir,
@@ -552,7 +626,11 @@ def main(argv: list[str] | None = None) -> int:
         min_first_5m_high_pct=args.min_first_5m_high_pct,
         min_first_15m_high_pct=args.min_first_15m_high_pct,
         min_or_range_pct=args.min_or_range_pct,
+        max_symbols=args.max_symbols,
     )
+    elapsed = time.monotonic() - started
+    if elapsed > 120.0:
+        print(f"MISSED_SLOW_DATE date={args.date} elapsed={elapsed:.1f}", flush=True)
     output.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output, index=False)
     print_summary(df)
