@@ -227,6 +227,19 @@ def first_non_empty(values: pd.Series) -> Any:
     return None
 
 
+def first_non_empty_from_records(records: list[dict[str, Any]], names: list[str]) -> Any:
+    for record in records:
+        raw = parse_raw_json(record.get("raw_json"))
+        for name in names:
+            value = record.get(name)
+            if value not in (None, "") and not (isinstance(value, float) and pd.isna(value)):
+                return value
+            raw_value = raw.get(name)
+            if raw_value not in (None, "") and not (isinstance(raw_value, float) and pd.isna(raw_value)):
+                return raw_value
+    return None
+
+
 def logical_group_from_row(row: dict[str, Any]) -> str:
     raw = parse_raw_json(row.get("raw_json"))
     symbol = str(row.get("symbol") or "").upper()
@@ -254,6 +267,252 @@ def logical_match_key(row: dict[str, Any]) -> tuple[str, str, str]:
     entry_time = parse_dt(first_existing_column(row, ["entry_fill_time", "entry_time"]) or raw.get("entry_time"))
     entry_minute = entry_time.floor("min").isoformat() if entry_time is not None else ""
     return symbol, entry_order_id, entry_minute
+
+
+def row_metadata_score(row: dict[str, Any]) -> tuple[int, int, int, str]:
+    raw = parse_raw_json(row.get("raw_json"))
+    trade_id = str(row.get("trade_id") or "")
+    source = str(row.get("analysis_source") or "")
+    reconstructed = int(
+        trade_id.startswith(("reconstructed:", "exec_fifo:"))
+        or "reconstructed" in trade_id.lower()
+        or "execution_fifo" in source.lower()
+        or "reconstructed" in str(raw.get("reconstruction_source") or "").lower()
+    )
+    metadata_names = [
+        "entry_order_id",
+        "top100_rank",
+        "top100_score",
+        "live_entry_score",
+        "live_entry_rank",
+        "signal_time",
+        "ready_since",
+        "exit_reason",
+    ]
+    metadata_count = 0
+    for name in metadata_names:
+        value = row.get(name)
+        if value in (None, ""):
+            value = raw.get(name)
+        if value not in (None, "") and not (isinstance(value, float) and pd.isna(value)):
+            metadata_count += 1
+    # Lower tuple is better: non-reconstructed first, richer metadata first,
+    # then stable trade_id ordering for deterministic output.
+    return reconstructed, -metadata_count, 0 if source == "sqlite_trades" else 1, trade_id
+
+
+def is_reconstructed_analysis_row(row: dict[str, Any]) -> bool:
+    raw = parse_raw_json(row.get("raw_json"))
+    trade_id = str(row.get("trade_id") or "").lower()
+    source = str(row.get("analysis_source") or "").lower()
+    reconstruction_source = str(raw.get("reconstruction_source") or "").lower()
+    return (
+        trade_id.startswith(("reconstructed:", "exec_fifo:"))
+        or "reconstructed" in trade_id
+        or "execution_fifo" in source
+        or "reconstructed" in reconstruction_source
+        or "execution_fifo" in reconstruction_source
+    )
+
+
+def duplicate_representation_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    raw = parse_raw_json(row.get("raw_json"))
+    return (
+        str(row.get("analysis_source") or ""),
+        str(row.get("symbol") or "").upper(),
+        str(row.get("entry_order_id") or raw.get("entry_order_id") or raw.get("order_id") or ""),
+        iso_ts(first_existing_column(row, ["entry_fill_time", "entry_time"]) or raw.get("entry_time")),
+        iso_ts(first_existing_column(row, ["exit_fill_time", "closed_at", "exit_time"]) or raw.get("exit_time")),
+        round(fnum(row.get("quantity"), 0.0) or 0.0, 8),
+        round(fnum(row.get("entry_price"), 0.0) or 0.0, 8),
+        round(fnum(row.get("exit_price"), 0.0) or 0.0, 8),
+        round(fnum(row.get("gross_pnl"), 0.0) or 0.0, 8),
+        round(fnum(row.get("commission"), 0.0) or 0.0, 8),
+        round(fnum(row.get("net_pnl"), 0.0) or 0.0, 8),
+        str(raw.get("buy_execution_id") or ""),
+        str(raw.get("sell_execution_id") or ""),
+    )
+
+
+def duplicate_trade_group_diagnostics(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return pd.DataFrame(columns=[
+            "logical_trade_group",
+            "rows",
+            "symbol",
+            "entry_time",
+            "exit_times",
+            "quantity_sum",
+            "net_pnl_sum",
+            "sources",
+            "trade_ids",
+            "entry_order_ids",
+            "buy_execution_ids",
+            "sell_execution_ids",
+        ])
+    rows = trades.copy()
+    if "logical_trade_group" not in rows.columns:
+        rows["logical_trade_group"] = [logical_group_from_row(row) for row in rows.to_dict("records")]
+    records_by_group: list[dict[str, Any]] = []
+    for group_id, group in rows.groupby("logical_trade_group", dropna=False, sort=False):
+        if len(group) <= 1:
+            continue
+        records = group.to_dict("records")
+        raws = [parse_raw_json(row.get("raw_json")) for row in records]
+        buy_ids = sorted({str(raw.get("buy_execution_id") or "") for raw in raws if raw.get("buy_execution_id")})
+        sell_ids = sorted({str(raw.get("sell_execution_id") or "") for raw in raws if raw.get("sell_execution_id")})
+        entry_order_ids = sorted({
+            str(row.get("entry_order_id") or raw.get("entry_order_id") or raw.get("order_id") or "")
+            for row, raw in zip(records, raws)
+            if row.get("entry_order_id") or raw.get("entry_order_id") or raw.get("order_id")
+        })
+        entry_times = [
+            iso_ts(parse_dt(first_existing_column(row, ["entry_fill_time", "entry_time"]) or parse_raw_json(row.get("raw_json")).get("entry_time")))
+            for row in records
+        ]
+        exit_times = [
+            iso_ts(parse_dt(first_existing_column(row, ["exit_fill_time", "closed_at", "exit_time"]) or parse_raw_json(row.get("raw_json")).get("exit_time")))
+            for row in records
+        ]
+        records_by_group.append({
+            "logical_trade_group": group_id,
+            "rows": len(group),
+            "symbol": str(first_non_empty(group.get("symbol", pd.Series(dtype=object))) or ""),
+            "entry_time": first_non_empty(pd.Series([value for value in entry_times if value])),
+            "exit_times": ",".join(sorted({value for value in exit_times if value})),
+            "quantity_sum": float(pd.to_numeric(group.get("quantity", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()),
+            "net_pnl_sum": float(pd.to_numeric(group.get("net_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()),
+            "sources": ",".join(sorted({str(value) for value in group.get("analysis_source", pd.Series(dtype=object)) if value not in (None, "")})),
+            "trade_ids": ",".join(sorted({str(value) for value in group.get("trade_id", pd.Series(dtype=object)) if value not in (None, "")})),
+            "entry_order_ids": ",".join(entry_order_ids),
+            "buy_execution_ids": ",".join(buy_ids),
+            "sell_execution_ids": ",".join(sell_ids),
+        })
+    return pd.DataFrame(records_by_group)
+
+
+def collapse_duplicate_trade_group(group_id: str, group: pd.DataFrame) -> dict[str, Any]:
+    all_records = group.to_dict("records")
+    reconstructed_flags = [is_reconstructed_analysis_row(row) for row in all_records]
+    if any(reconstructed_flags) and not all(reconstructed_flags):
+        records = [row for row, reconstructed in zip(all_records, reconstructed_flags) if not reconstructed]
+        group = pd.DataFrame(records)
+        dropped_records = [row for row, reconstructed in zip(all_records, reconstructed_flags) if reconstructed]
+    else:
+        records = all_records
+        dropped_records = []
+    unique_records: list[dict[str, Any]] = []
+    dropped_exact_records: list[dict[str, Any]] = []
+    seen_representation_keys: set[tuple[Any, ...]] = set()
+    for row in records:
+        key = duplicate_representation_key(row)
+        if key in seen_representation_keys:
+            dropped_exact_records.append(row)
+            continue
+        seen_representation_keys.add(key)
+        unique_records.append(row)
+    records = unique_records
+    group = pd.DataFrame(records)
+    records = sorted(records, key=row_metadata_score)
+    base = dict(records[0])
+    qty = pd.to_numeric(group.get("quantity", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+    total_qty = float(qty.abs().sum())
+    if total_qty <= 0:
+        total_qty = float(qty.sum())
+    entry_prices = pd.to_numeric(group.get("entry_price", pd.Series(dtype=float)), errors="coerce")
+    exit_prices = pd.to_numeric(group.get("exit_price", pd.Series(dtype=float)), errors="coerce")
+    for col in ["quantity", "gross_pnl", "commission", "net_pnl"]:
+        if col in group.columns:
+            base[col] = float(pd.to_numeric(group[col], errors="coerce").fillna(0.0).sum())
+    if total_qty > 0 and entry_prices.notna().any():
+        base["entry_price"] = float((entry_prices.fillna(0.0) * qty.abs()).sum() / total_qty)
+    if total_qty > 0 and exit_prices.notna().any():
+        base["exit_price"] = float((exit_prices.fillna(0.0) * qty.abs()).sum() / total_qty)
+    entry_times = [
+        parse_dt(first_existing_column(row, ["entry_fill_time", "entry_time"]) or parse_raw_json(row.get("raw_json")).get("entry_time"))
+        for row in records
+    ]
+    exit_times = [
+        parse_dt(first_existing_column(row, ["exit_fill_time", "closed_at", "exit_time"]) or parse_raw_json(row.get("raw_json")).get("exit_time"))
+        for row in records
+    ]
+    entry_times = [value for value in entry_times if value is not None]
+    exit_times = [value for value in exit_times if value is not None]
+    if entry_times:
+        base["entry_fill_time"] = iso_ts(min(entry_times))
+    if exit_times:
+        base["exit_fill_time"] = iso_ts(max(exit_times))
+        base["closed_at"] = base["exit_fill_time"]
+    for col, names in {
+        "entry_order_id": ["entry_order_id", "order_id", "buy_order_id"],
+        "exit_order_id": ["exit_order_id", "sell_order_id"],
+        "top100_rank": ["top100_rank"],
+        "top100_score": ["top100_score"],
+        "live_entry_score": ["live_entry_score", "entry_score", "score"],
+        "live_entry_rank": ["live_entry_rank", "ranking_position"],
+        "signal_time": ["signal_time"],
+        "ready_since": ["ready_since"],
+        "exit_reason": ["exit_reason"],
+    }.items():
+        value = first_non_empty_from_records(records, names)
+        if value not in (None, ""):
+            base[col] = value
+    raw = parse_raw_json(base.get("raw_json"))
+    raw.update({
+        "analysis_dedupe_source": "bad_entries_logical_trade_group",
+        "dedupe_logical_trade_group": group_id,
+        "dedupe_row_count": len(records),
+        "dedupe_source_row_count": len(all_records),
+        "dedupe_dropped_reconstructed_row_count": len(dropped_records),
+        "dedupe_dropped_exact_row_count": len(dropped_exact_records),
+        "dedupe_trade_ids": [str(row.get("trade_id") or "") for row in records if row.get("trade_id") not in (None, "")],
+        "dedupe_dropped_trade_ids": [str(row.get("trade_id") or "") for row in dropped_records if row.get("trade_id") not in (None, "")],
+        "dedupe_dropped_exact_trade_ids": [str(row.get("trade_id") or "") for row in dropped_exact_records if row.get("trade_id") not in (None, "")],
+        "dedupe_sources": sorted({str(row.get("analysis_source") or "") for row in records if row.get("analysis_source") not in (None, "")}),
+    })
+    base["raw_json"] = raw
+    base["trade_id"] = str(base.get("trade_id") or f"deduped:{group_id}")
+    base["analysis_source"] = str(base.get("analysis_source") or "sqlite_trades")
+    if len(records) > 1:
+        base["analysis_source"] = "deduped_logical_trade"
+    base["logical_trade_group"] = group_id
+    return base
+
+
+def dedupe_logical_trades_for_analysis(trades: pd.DataFrame, *, enabled: bool = True) -> pd.DataFrame:
+    if trades.empty:
+        trades.attrs["dedupe_diagnostics"] = {
+            "source_rows_before_dedupe": 0,
+            "source_rows_after_dedupe": 0,
+            "dedupe_removed_rows": 0,
+            "duplicate_group_count": 0,
+            "duplicate_groups": [],
+        }
+        return trades
+    rows = trades.copy()
+    rows["logical_trade_group"] = [logical_group_from_row(row) for row in rows.to_dict("records")]
+    duplicate_groups = duplicate_trade_group_diagnostics(rows)
+    diagnostics = {
+        "source_rows_before_dedupe": len(rows),
+        "source_rows_after_dedupe": len(rows),
+        "dedupe_removed_rows": 0,
+        "duplicate_group_count": len(duplicate_groups),
+        "duplicate_groups": duplicate_groups.to_dict("records") if not duplicate_groups.empty else [],
+    }
+    if not enabled or duplicate_groups.empty:
+        rows.attrs["dedupe_diagnostics"] = diagnostics
+        return rows
+    collapsed: list[dict[str, Any]] = []
+    for group_id, group in rows.groupby("logical_trade_group", sort=False, dropna=False):
+        if len(group) == 1:
+            collapsed.append(group.iloc[0].to_dict())
+        else:
+            collapsed.append(collapse_duplicate_trade_group(str(group_id), group))
+    out = pd.DataFrame(collapsed)
+    diagnostics["source_rows_after_dedupe"] = len(out)
+    diagnostics["dedupe_removed_rows"] = len(rows) - len(out)
+    out.attrs["dedupe_diagnostics"] = diagnostics
+    return out
 
 
 def aggregate_reconstructed_trades(exec_trades: pd.DataFrame) -> pd.DataFrame:
@@ -594,6 +853,8 @@ def analyze_bad_entries(
     executions = load_executions(sqlite_path, start_date, end_date)
     trades = augment_trades_from_executions(trades, executions, start_date, end_date, per_fill=per_fill)
     source_counts = dict(trades.attrs.get("source_counts", {})) if hasattr(trades, "attrs") else {}
+    trades = dedupe_logical_trades_for_analysis(trades, enabled=not per_fill)
+    dedupe_diagnostics = dict(trades.attrs.get("dedupe_diagnostics", {})) if hasattr(trades, "attrs") else {}
     rows: list[dict[str, Any]] = []
     spread_cache: dict[str, pd.DataFrame] = {}
     diagnostics = {
@@ -748,6 +1009,7 @@ def analyze_bad_entries(
     out.attrs["diagnostics"] = diagnostics
     out.attrs["signal_age_counts"] = signal_age_counts
     out.attrs["source_counts"] = source_counts
+    out.attrs["dedupe_diagnostics"] = dedupe_diagnostics
     return out
 
 
@@ -893,6 +1155,7 @@ def print_summary(df: pd.DataFrame) -> None:
             f"metrics_missing_count={diag.get('metrics_missing_count', 0)}"
         )
     source_counts = df.attrs.get("source_counts", {}) if hasattr(df, "attrs") else {}
+    dedupe_diag = df.attrs.get("dedupe_diagnostics", {}) if hasattr(df, "attrs") else {}
     duplicate_groups = pd.DataFrame()
     duplicate_count = 0
     if not df.empty and "logical_trade_group" in df.columns:
@@ -913,10 +1176,33 @@ def print_summary(df: pd.DataFrame) -> None:
         "BAD_ENTRIES_SOURCE_SUMMARY "
         f"sqlite_trades_count={source_counts.get('sqlite_trades_count', 0)} "
         f"reconstructed_trades_count={source_counts.get('reconstructed_trades_count', 0)} "
+        f"source_rows_before_dedupe={dedupe_diag.get('source_rows_before_dedupe', total)} "
+        f"source_rows_after_dedupe={dedupe_diag.get('source_rows_after_dedupe', total)} "
+        f"dedupe_removed_rows={dedupe_diag.get('dedupe_removed_rows', 0)} "
+        f"duplicate_groups_before_dedupe={dedupe_diag.get('duplicate_group_count', 0)} "
         f"duplicate_symbol_entry_time_count={duplicate_count}"
     )
+    removed_groups = pd.DataFrame(dedupe_diag.get("duplicate_groups") or [])
+    if not removed_groups.empty:
+        print("duplicate_trade_groups_removed:")
+        display_cols = [
+            "logical_trade_group",
+            "rows",
+            "symbol",
+            "entry_time",
+            "exit_times",
+            "quantity_sum",
+            "net_pnl_sum",
+            "sources",
+            "trade_ids",
+            "entry_order_ids",
+            "buy_execution_ids",
+            "sell_execution_ids",
+        ]
+        display_cols = [col for col in display_cols if col in removed_groups.columns]
+        print(removed_groups.sort_values(["rows", "symbol"], ascending=[False, True])[display_cols].head(20).to_string(index=False))
     if duplicate_count:
-        print("duplicate_trade_groups:")
+        print("duplicate_trade_groups_after_dedupe:")
         print(duplicate_groups.sort_values(["rows", "symbol"], ascending=[False, True]).head(20).to_string(index=False))
     if signal_counts:
         print(

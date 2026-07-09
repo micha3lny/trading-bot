@@ -9,6 +9,7 @@ import pandas as pd
 
 from src.live_trading.analysis.bad_entries_analyzer import (
     analyze_bad_entries,
+    dedupe_logical_trades_for_analysis,
     first_green_seconds,
     load_closed_trades,
     rank_bucket,
@@ -504,6 +505,137 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
             self.assertAlmostEqual(float(grouped.iloc[0]["quantity"]), 113.0)
             self.assertEqual(len(per_fill), 2)
             self.assertTrue((per_fill["analysis_source"] == "reconstructed_execution_fifo_fill").all())
+
+    def test_bad_entries_dedupe_collapses_duplicate_partial_fill_rows(self) -> None:
+        rows = pd.DataFrame([
+            {
+                "trade_id": "CAST_100",
+                "analysis_source": "sqlite_trades",
+                "session_date": "2026-07-08",
+                "symbol": "CAST",
+                "entry_order_id": 65046,
+                "entry_fill_time": "2026-07-08T14:08:00+00:00",
+                "exit_fill_time": "2026-07-08T14:18:00+00:00",
+                "entry_price": 8.81,
+                "exit_price": 8.79,
+                "quantity": 100,
+                "net_pnl": -2.0,
+                "raw_json": {"entry_order_id": 65046},
+            },
+            {
+                "trade_id": "CAST_13",
+                "analysis_source": "sqlite_trades",
+                "session_date": "2026-07-08",
+                "symbol": "CAST",
+                "entry_order_id": 65046,
+                "entry_fill_time": "2026-07-08T14:08:00+00:00",
+                "exit_fill_time": "2026-07-08T14:18:05+00:00",
+                "entry_price": 8.81,
+                "exit_price": 8.79,
+                "quantity": 13,
+                "net_pnl": -0.26,
+                "raw_json": {"entry_order_id": 65046},
+            },
+        ])
+        out = dedupe_logical_trades_for_analysis(rows)
+        self.assertEqual(len(out), 1)
+        self.assertAlmostEqual(float(out.iloc[0]["quantity"]), 113.0)
+        self.assertAlmostEqual(float(out.iloc[0]["net_pnl"]), -2.26)
+        self.assertEqual(out.attrs["dedupe_diagnostics"]["dedupe_removed_rows"], 1)
+
+    def test_bad_entries_dedupe_keeps_independent_same_symbol_trades(self) -> None:
+        rows = pd.DataFrame([
+            {
+                "trade_id": "RXT_1",
+                "analysis_source": "sqlite_trades",
+                "session_date": "2026-07-08",
+                "symbol": "RXT",
+                "entry_order_id": 70001,
+                "entry_fill_time": "2026-07-08T14:08:00+00:00",
+                "quantity": 50,
+                "net_pnl": 1.0,
+                "raw_json": {"entry_order_id": 70001},
+            },
+            {
+                "trade_id": "RXT_2",
+                "analysis_source": "sqlite_trades",
+                "session_date": "2026-07-08",
+                "symbol": "RXT",
+                "entry_order_id": 70002,
+                "entry_fill_time": "2026-07-08T15:08:00+00:00",
+                "quantity": 50,
+                "net_pnl": 2.0,
+                "raw_json": {"entry_order_id": 70002},
+            },
+        ])
+        out = dedupe_logical_trades_for_analysis(rows)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out.attrs["dedupe_diagnostics"]["dedupe_removed_rows"], 0)
+
+    def test_bad_entries_dedupe_prefers_sqlite_over_reconstructed_duplicate(self) -> None:
+        rows = pd.DataFrame([
+            {
+                "trade_id": "SQL_AMPG",
+                "analysis_source": "sqlite_trades",
+                "session_date": "2026-07-08",
+                "symbol": "AMPG",
+                "entry_order_id": 71001,
+                "entry_fill_time": "2026-07-08T14:08:00+00:00",
+                "exit_fill_time": "2026-07-08T14:18:00+00:00",
+                "entry_price": 10.0,
+                "exit_price": 10.5,
+                "quantity": 100,
+                "net_pnl": 50.0,
+                "live_entry_score": 72.0,
+                "raw_json": {"entry_order_id": 71001, "live_entry_score": 72.0},
+            },
+            {
+                "trade_id": "exec_fifo:2026-07-08:AMPG:B1:S1:100",
+                "analysis_source": "reconstructed_execution_fifo",
+                "session_date": "2026-07-08",
+                "symbol": "AMPG",
+                "entry_order_id": 71001,
+                "entry_fill_time": "2026-07-08T14:08:00+00:00",
+                "exit_fill_time": "2026-07-08T14:18:00+00:00",
+                "entry_price": 10.0,
+                "exit_price": 10.5,
+                "quantity": 100,
+                "net_pnl": 50.0,
+                "raw_json": {"entry_order_id": 71001, "reconstruction_source": "bad_entries_execution_fifo_grouped"},
+            },
+        ])
+        out = dedupe_logical_trades_for_analysis(rows)
+        self.assertEqual(len(out), 1)
+        self.assertAlmostEqual(float(out.iloc[0]["quantity"]), 100.0)
+        self.assertAlmostEqual(float(out.iloc[0]["net_pnl"]), 50.0)
+        self.assertAlmostEqual(float(out.iloc[0]["live_entry_score"]), 72.0)
+        raw = out.iloc[0]["raw_json"]
+        self.assertEqual(raw["dedupe_dropped_reconstructed_row_count"], 1)
+
+    def test_bad_entries_dedupe_does_not_double_count_exact_duplicate_rows(self) -> None:
+        row = {
+            "trade_id": "AXTI_1",
+            "analysis_source": "sqlite_trades",
+            "session_date": "2026-07-08",
+            "symbol": "AXTI",
+            "entry_order_id": 72001,
+            "entry_fill_time": "2026-07-08T14:08:00+00:00",
+            "exit_fill_time": "2026-07-08T14:18:00+00:00",
+            "entry_price": 10.0,
+            "exit_price": 9.9,
+            "quantity": 100,
+            "net_pnl": -10.0,
+            "raw_json": {"entry_order_id": 72001},
+        }
+        duplicate = dict(row)
+        duplicate["trade_id"] = "AXTI_1_COPY"
+        rows = pd.DataFrame([row, duplicate])
+        out = dedupe_logical_trades_for_analysis(rows)
+        self.assertEqual(len(out), 1)
+        self.assertAlmostEqual(float(out.iloc[0]["quantity"]), 100.0)
+        self.assertAlmostEqual(float(out.iloc[0]["net_pnl"]), -10.0)
+        raw = out.iloc[0]["raw_json"]
+        self.assertEqual(raw["dedupe_dropped_exact_row_count"], 1)
 
     def test_entry_timing_pullback_from_recent_high(self) -> None:
         self.assertAlmostEqual(pullback_from_recent_high(9.9, 10.0) or 0.0, -1.0)
