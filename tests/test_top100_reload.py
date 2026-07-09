@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -115,6 +117,41 @@ class Top100ReloadTests(unittest.TestCase):
             self.assertNotIn("AAA", tickers)
             self.assertFalse(runtime_state["top100_reload_requested"])
             self.assertFalse(runtime_state["entries_blocked"])
+
+    def test_reload_emits_subscription_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            latest = root / "daily_top100_latest.csv"
+            self.write_latest(latest, ["AAA", "BBB"])
+            recorder = LiveDataRecorder(root / "recorder", session_date="2026-05-22")
+            ib = FakeIB()
+            runtime_state = {"top100_reload_requested": True, "top100_reload_path": str(latest), "top100_reload_ranking_date": "2026-05-21"}
+            contracts: list[tuple[str, FakeContract]] = []
+            contract_by_symbol: dict[str, FakeContract] = {}
+            tickers = {}
+            states: dict[str, SymbolState] = {}
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                changed = reload_top100_universe_if_requested(
+                    ib,
+                    recorder,
+                    states,
+                    contracts,
+                    contract_by_symbol,
+                    tickers,
+                    {},
+                    {},
+                    runtime_state,
+                    self.args_for(latest, top_n=2, cap=100),
+                )
+
+            self.assertTrue(changed)
+            text = output.getvalue()
+            self.assertIn("TOP100_REFRESH_DIFF", text)
+            self.assertIn("TOP100_SUBSCRIPTION_RECONCILE", text)
+            self.assertIn("MARKET_DATA_SUBSCRIPTION_ACTIONS", text)
+            self.assertIn("RUNTIME_STATE_SESSION_BOUNDARY_CHECK", text)
 
     def test_reload_caps_top100_after_active_positions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

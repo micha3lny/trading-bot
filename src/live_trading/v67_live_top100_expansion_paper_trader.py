@@ -16,7 +16,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import pandas as pd
 from ib_insync import IB, Stock, MarketOrder
@@ -646,6 +646,128 @@ def log_no_usable_ticker_price(
         key=symbol,
         max_unique=200,
         window_seconds=60.0,
+    )
+
+
+def diagnostic_symbol_sample(symbols: Iterable[str], limit: int = 50) -> str:
+    return ",".join(sorted(str(symbol).upper() for symbol in symbols if str(symbol).strip())[:limit])
+
+
+def path_mtime_iso(path: str | Path | None) -> str:
+    if not path:
+        return ""
+    try:
+        p = Path(path)
+        if not p.exists():
+            return ""
+        return datetime.fromtimestamp(p.stat().st_mtime, timezone.utc).isoformat()
+    except Exception:
+        return ""
+
+
+def emit_top100_refresh_diff(
+    *,
+    old_symbols: Iterable[str],
+    new_symbols: Iterable[str],
+    top100_file_path: str | Path | None,
+    refresh_reason: str,
+) -> None:
+    old_set = {str(symbol).upper() for symbol in old_symbols}
+    new_set = {str(symbol).upper() for symbol in new_symbols}
+    added = sorted(new_set - old_set)
+    removed = sorted(old_set - new_set)
+    print(
+        f"{now_utc()} TOP100_REFRESH_DIFF "
+        f"old_symbols_count={len(old_set)} new_symbols_count={len(new_set)} "
+        f"added_count={len(added)} removed_count={len(removed)} "
+        f"added_symbols={diagnostic_symbol_sample(added)} "
+        f"removed_symbols={diagnostic_symbol_sample(removed)} "
+        f"top100_file_path={top100_file_path or ''} "
+        f"top100_file_mtime={path_mtime_iso(top100_file_path)} "
+        f"refresh_reason={refresh_reason}",
+        flush=True,
+    )
+
+
+def emit_top100_subscription_reconcile(
+    *,
+    desired_symbols: Iterable[str],
+    contract_by_symbol: dict[str, Any],
+    contracts: list[tuple[str, Any]],
+    tickers: dict[str, Any],
+    states: dict[str, SymbolState],
+) -> None:
+    desired = {str(symbol).upper() for symbol in desired_symbols}
+    contract_symbols = {str(symbol).upper() for symbol in contract_by_symbol} | {
+        str(symbol).upper() for symbol, _contract in contracts
+    }
+    ticker_symbols = {str(symbol).upper() for symbol in tickers}
+    state_symbols = {str(symbol).upper() for symbol in states}
+    active_subscription_symbols = contract_symbols | ticker_symbols
+    missing = sorted(desired - active_subscription_symbols)
+    extra = sorted(active_subscription_symbols - desired)
+    stale_state = sorted(state_symbols - desired)
+    print(
+        f"{now_utc()} TOP100_SUBSCRIPTION_RECONCILE "
+        f"desired_count={len(desired)} contract_count={len(contract_symbols)} "
+        f"ticker_count={len(ticker_symbols)} state_count={len(state_symbols)} "
+        f"missing_subscription_count={len(missing)} extra_subscription_count={len(extra)} "
+        f"stale_state_count={len(stale_state)} "
+        f"missing_subscription_symbols={diagnostic_symbol_sample(missing)} "
+        f"extra_subscription_symbols={diagnostic_symbol_sample(extra)} "
+        f"stale_state_symbols={diagnostic_symbol_sample(stale_state)}",
+        flush=True,
+    )
+
+
+def emit_market_data_subscription_actions(
+    *,
+    subscribed_symbols: Iterable[str],
+    unsubscribed_symbols: Iterable[str],
+    active_after_count: int,
+) -> None:
+    subscribed = sorted({str(symbol).upper() for symbol in subscribed_symbols})
+    unsubscribed = sorted({str(symbol).upper() for symbol in unsubscribed_symbols})
+    print(
+        f"{now_utc()} MARKET_DATA_SUBSCRIPTION_ACTIONS "
+        f"reqMktData_called_count={len(subscribed)} "
+        f"cancelMktData_called_count={len(unsubscribed)} "
+        f"subscribed_symbols={diagnostic_symbol_sample(subscribed)} "
+        f"unsubscribed_symbols={diagnostic_symbol_sample(unsubscribed)} "
+        f"active_after_count={active_after_count}",
+        flush=True,
+    )
+
+
+def emit_runtime_state_session_boundary_check(
+    *,
+    runtime_state: dict[str, Any],
+    states: dict[str, SymbolState],
+    managed_positions: dict[str, ManagedPosition],
+    top100_symbols: Iterable[str],
+    reason: str,
+) -> None:
+    top100_set = {str(symbol).upper() for symbol in top100_symbols}
+    state_symbols = {str(symbol).upper() for symbol in states}
+    signal_sent_symbols = sorted(symbol for symbol, state in states.items() if state.signal_sent)
+    ready_symbols = sorted(symbol for symbol, state in states.items() if state.ready_since_utc)
+    stale_ready_symbols = sorted(
+        symbol
+        for symbol, state in states.items()
+        if state.ready_since_utc and (state.signal_source or state.last_update_source) != "live"
+    )
+    symbols_with_state_not_in_top100 = sorted(state_symbols - top100_set)
+    symbols_in_top100_without_state = sorted(top100_set - state_symbols)
+    print(
+        f"{now_utc()} RUNTIME_STATE_SESSION_BOUNDARY_CHECK "
+        f"reason={reason} "
+        f"managed_positions_count={sum(1 for pos in managed_positions.values() if pos.active)} "
+        f"signal_sent_count={len(signal_sent_symbols)} ready_state_count={len(ready_symbols)} "
+        f"stale_ready_count={len(stale_ready_symbols)} "
+        f"symbols_with_state_not_in_top100={diagnostic_symbol_sample(symbols_with_state_not_in_top100)} "
+        f"symbols_in_top100_without_state={diagnostic_symbol_sample(symbols_in_top100_without_state)} "
+        f"last_restart_unblock_time={runtime_state.get('last_restart_unblock_utc') or ''}",
+        flush=True,
     )
 
 
@@ -4553,6 +4675,13 @@ def reload_top100_universe_if_requested(
             symbol_denylist_path=getattr(args, "symbol_denylist", DEFAULT_SYMBOL_DENYLIST),
             runtime_ineligible_path=getattr(args, "runtime_ineligible_path", DEFAULT_RUNTIME_INELIGIBLE),
         )
+        previous_top100_symbols = list(runtime_state.get("top100_reload_symbols") or [])
+        emit_top100_refresh_diff(
+            old_symbols=previous_top100_symbols,
+            new_symbols=entry_symbols,
+            top100_file_path=reload_path,
+            refresh_reason="top100_reload",
+        )
         for symbol, info in skipped_ineligible.items():
             reason = str(info.get("reason") or "ineligible")
             mark_runtime_symbol_ineligible(
@@ -4601,12 +4730,14 @@ def reload_top100_universe_if_requested(
         previous_symbol_set = set(previous_symbols)
         subscription_symbol_set = set(subscription_symbols)
         skipped_due_to_subscription_cap = len(skipped_symbols_due_to_cap)
+        unsubscribed_symbols: list[str] = []
 
         for symbol in sorted(previous_symbol_set - subscription_symbol_set):
             ticker = tickers.pop(symbol, None)
             _runtime_dict(runtime_state, "subscription_started_monotonic_by_symbol").pop(symbol, None)
             contract = getattr(ticker, "contract", None) or contract_by_symbol.get(symbol)
             if contract is not None:
+                unsubscribed_symbols.append(symbol)
                 try:
                     ib.cancelMktData(contract)
                 except Exception as exc:
@@ -4617,6 +4748,7 @@ def reload_top100_universe_if_requested(
         new_contract_by_symbol: dict[str, Any] = {}
         subscribed = 0
         reused = 0
+        subscribed_symbols: list[str] = []
         ibkr_error_101_count = 0
         failed_symbols: list[str] = []
         for symbol in subscription_symbols:
@@ -4660,6 +4792,7 @@ def reload_top100_universe_if_requested(
                     tickers[symbol] = ib.reqMktData(contract, "", False, False)
                     _runtime_dict(runtime_state, "subscription_started_monotonic_by_symbol")[symbol] = time.monotonic()
                     subscribed += 1
+                    subscribed_symbols.append(symbol)
                     print(f"{now_utc()} TOP100_RELOAD_SUBSCRIBED symbol={symbol} conId={getattr(contract, 'conId', '')}", flush=True)
                 except Exception as exc:
                     failed_symbols.append(symbol)
@@ -4693,6 +4826,11 @@ def reload_top100_universe_if_requested(
         contracts[:] = new_contracts
         contract_by_symbol.clear()
         contract_by_symbol.update(new_contract_by_symbol)
+        emit_market_data_subscription_actions(
+            subscribed_symbols=subscribed_symbols,
+            unsubscribed_symbols=unsubscribed_symbols,
+            active_after_count=len(tickers),
+        )
         runtime_state["entry_symbols"] = set(entry_symbols)
         runtime_state["top100_reload_requested"] = False
         runtime_state["top100_reload_done_at"] = now_utc()
@@ -4719,6 +4857,20 @@ def reload_top100_universe_if_requested(
                 if symbol in states:
                     states[symbol].signal_sent = True
         rebuilt = rebuild_symbol_states_from_1m_candles(recorder, states, args)
+        emit_top100_subscription_reconcile(
+            desired_symbols=entry_symbols,
+            contract_by_symbol=contract_by_symbol,
+            contracts=contracts,
+            tickers=tickers,
+            states=states,
+        )
+        emit_runtime_state_session_boundary_check(
+            runtime_state=runtime_state,
+            states=states,
+            managed_positions=managed_positions,
+            top100_symbols=entry_symbols,
+            reason="top100_reload",
+        )
 
         print(
             f"{now_utc()} TOP100_RELOAD_DONE ranking_date={ranking_date} entry_symbols={len(entry_symbols)} "
@@ -6170,12 +6322,19 @@ def main() -> int:
     runtime_state["history_collector_start_date"] = startup_ranking_date.isoformat()
     runtime_state["history_collector_end_date"] = startup_ranking_date.isoformat()
     apply_top100_freshness_gate(runtime_state, args, startup_ranking_date)
+    emit_top100_refresh_diff(
+        old_symbols=[],
+        new_symbols=symbols,
+        top100_file_path=args.alpha_rank_csv,
+        refresh_reason="startup",
+    )
     latest_snapshots: dict[str, dict[str, Any]] = {}
     last_portfolio_record = 0.0
     adopted_once = False
     normal_exit = False
 
     try:
+        startup_subscribed_symbols: list[str] = []
         for symbol in symbols:
             contract = Stock(symbol, "SMART", "USD")
             qualified = ib.qualifyContracts(contract)
@@ -6204,7 +6363,20 @@ def main() -> int:
             contract_by_symbol[symbol] = q
             tickers[symbol] = ib.reqMktData(q, "", False, False)
             _runtime_dict(runtime_state, "subscription_started_monotonic_by_symbol")[symbol] = time.monotonic()
+            startup_subscribed_symbols.append(symbol)
             print(f"Subscribed {symbol} conId={q.conId}", flush=True)
+        emit_market_data_subscription_actions(
+            subscribed_symbols=startup_subscribed_symbols,
+            unsubscribed_symbols=[],
+            active_after_count=len(tickers),
+        )
+        emit_top100_subscription_reconcile(
+            desired_symbols=symbols,
+            contract_by_symbol=contract_by_symbol,
+            contracts=contracts,
+            tickers=tickers,
+            states=states,
+        )
 
         startup_broker_rows = ibkr_portfolio_position_rows(ib)
         startup_broker_qty_by_symbol = {row["symbol"]: float(row["quantity"]) for row in startup_broker_rows}
@@ -6319,6 +6491,13 @@ def main() -> int:
             f"requested_symbols_count={len(startup_rebuild_symbols)} "
             f"result={json.dumps(sqlite_rebuild_result or {}, sort_keys=True, default=str)}",
             flush=True,
+        )
+        emit_runtime_state_session_boundary_check(
+            runtime_state=runtime_state,
+            states=states,
+            managed_positions=managed_positions,
+            top100_symbols=runtime_state.get("top100_reload_symbols") or symbols,
+            reason="startup",
         )
         if runtime_state.get("pending_eod_flatten"):
             process_pending_eod_flatten_retry(
@@ -6439,6 +6618,17 @@ def main() -> int:
             session_elapsed = (observed_at - market_open).total_seconds()
             today_session = get_us_equity_session(observed_at.date())
             market_closed_today = not today_session.is_trading_day
+            if today_session.is_trading_day:
+                boundary_key = today_session.session_date.isoformat()
+                if runtime_state.get("last_session_boundary_check_date") != boundary_key:
+                    runtime_state["last_session_boundary_check_date"] = boundary_key
+                    emit_runtime_state_session_boundary_check(
+                        runtime_state=runtime_state,
+                        states=states,
+                        managed_positions=managed_positions,
+                        top100_symbols=runtime_state.get("top100_reload_symbols") or runtime_state.get("entry_symbols") or [],
+                        reason="session_start",
+                    )
             if market_closed_today:
                 runtime_state["entries_blocked_reason"] = "market_closed_holiday"
                 closed_key = today_session.session_date.isoformat()
