@@ -1903,8 +1903,11 @@ class SQLiteRuntimeStore:
         qty = quantity or 0.0
         price_peak_pnl = (peak_price - entry_price) * qty if peak_price is not None else None
         price_adverse_pnl = (low_price - entry_price) * qty if low_price is not None else None
-        peak_unrealized_pnl = max(value for value in (raw_peak_pnl, price_peak_pnl) if value is not None) if raw_peak_pnl is not None or price_peak_pnl is not None else None
-        max_adverse_unrealized_pnl = min(value for value in (raw_adverse_pnl, price_adverse_pnl) if value is not None) if raw_adverse_pnl is not None or price_adverse_pnl is not None else None
+        # PnL must be calculated for the canonical trade quantity. Historical
+        # raw snapshots can be stale or belong to a partial lot, so use raw PnL
+        # only when price-derived PnL is unavailable.
+        peak_unrealized_pnl = price_peak_pnl if price_peak_pnl is not None else raw_peak_pnl
+        max_adverse_unrealized_pnl = price_adverse_pnl if price_adverse_pnl is not None else raw_adverse_pnl
         giveback_from_peak = None
         if peak_unrealized_pnl is not None and net_pnl is not None:
             giveback_from_peak = peak_unrealized_pnl - net_pnl
@@ -1995,6 +1998,49 @@ class SQLiteRuntimeStore:
         latest_strategy = strategy_name or "unknown"
         latest_session = session_date_utc()
         latest_price: float | None = None
+        closed_components_by_group: dict[str, list[dict[str, Any]]] = {}
+
+        def _component_entry_identity(lot: dict[str, Any], buy_raw: dict[str, Any], entry_metadata: dict[str, Any]) -> str:
+            entry_trade_id = str(entry_metadata.get("trade_id") or "").strip()
+            if entry_trade_id:
+                return f"trade:{entry_trade_id}"
+            entry_order_id = normalized_identifier(
+                entry_metadata.get("entry_order_id")
+                or lot.get("order_id")
+                or buy_raw.get("entry_order_id")
+                or buy_raw.get("order_id")
+            )
+            if entry_order_id:
+                return f"entry_order:{entry_order_id}"
+            entry_perm_id = normalized_identifier(entry_metadata.get("entry_perm_id") or lot.get("perm_id") or buy_raw.get("entry_perm_id") or buy_raw.get("perm_id"))
+            if entry_perm_id:
+                return f"entry_perm:{entry_perm_id}"
+            return f"buy_exec:{lot.get('execution_id') or ''}"
+
+        def _component_exit_identity(row: dict[str, Any], sell_raw: dict[str, Any]) -> str:
+            exit_order_id = normalized_identifier(row.get("order_id") or sell_raw.get("exit_order_id") or sell_raw.get("order_id"))
+            if exit_order_id:
+                return f"exit_order:{exit_order_id}"
+            exit_perm_id = normalized_identifier(row.get("perm_id") or sell_raw.get("exit_perm_id") or sell_raw.get("perm_id"))
+            if exit_perm_id:
+                return f"exit_perm:{exit_perm_id}"
+            return f"sell_exec:{row.get('execution_id') or ''}"
+
+        def _canonical_trade_id_for_group(group_id: str, components: list[dict[str, Any]]) -> str:
+            first = components[0]
+            entry_metadata = first.get("entry_metadata") or {}
+            entry_trade_id = str(entry_metadata.get("trade_id") or "").strip()
+            if entry_trade_id:
+                return entry_trade_id
+            entry_order_id = normalized_identifier(entry_metadata.get("entry_order_id") or first.get("entry_order_id"))
+            if entry_order_id:
+                entry_date = str(first.get("entry_date") or "")
+                return f"entry:{entry_date}:{symbol}:{entry_order_id}"
+            buy_exec_ids = ",".join(str(comp.get("buy_execution_id") or "") for comp in components if comp.get("buy_execution_id"))
+            sell_exec_ids = ",".join(str(comp.get("sell_execution_id") or "") for comp in components if comp.get("sell_execution_id"))
+            entry_date = str(first.get("entry_date") or "")
+            exit_date = str(max(str(comp.get("exit_date") or "") for comp in components))
+            return reconstructed_trade_id(entry_date, exit_date, symbol, buy_exec_ids, sell_exec_ids)
 
         for row in rows:
             side = normalized_execution_side(row.get("side"))
@@ -2042,18 +2088,11 @@ class SQLiteRuntimeStore:
                 commission = execution_commission(lot, buy_fraction) + execution_commission(row, sell_fraction)
                 gross = (sell_price - buy_price) * matched_qty
                 net_pnl = gross - commission
-                trade_id = self._closed_trade_id_for_pair(lot, row, matched_qty)
                 strategy = str(lot.get("strategy_name") or row.get("strategy_name") or latest_strategy or "unknown")
                 buy_raw = parse_jsonish(lot.get("raw_json"))
                 sell_raw = parse_jsonish(row.get("raw_json"))
+                entry_metadata = self._entry_metadata_for_execution(lot, buy_raw)
                 position_raw = self._latest_position_excursion_raw(symbol, lot.get("execution_id"))
-                excursion = self._trade_excursion_stats(
-                    entry_price=buy_price,
-                    exit_price=sell_price,
-                    quantity=matched_qty,
-                    net_pnl=net_pnl,
-                    raw_sources=(position_raw, buy_raw, sell_raw),
-                )
                 sell_realized_expected = sell_commission_confirmed or sell_commission_missing
                 sell_realized_ready = safe_float(row.get("realized_pnl")) is not None
                 broker_flat_for_symbol = self._broker_flat_for_symbol(symbol, broker_net_positions)
@@ -2128,6 +2167,170 @@ class SQLiteRuntimeStore:
                     "buy_commission_fallback_source": FALLBACK_BUY_COMMISSION_SOURCE if buy_commission_fallback else "",
                     "buy_commission_unavailable_after_eod": bool(buy_commission_fallback),
                     "broker_flat_at_fallback": bool(broker_flat_for_symbol),
+                    "entry_date": entry_date,
+                    "exit_date": exit_date,
+                    "buy_commission_confirmed": buy_commission_confirmed,
+                    "sell_commission_confirmed": sell_commission_confirmed,
+                }
+                entry_order_id = normalized_identifier(
+                    entry_metadata.get("entry_order_id")
+                    or lot.get("order_id")
+                    or buy_raw.get("entry_order_id")
+                    or buy_raw.get("order_id")
+                )
+                exit_order_id = normalized_identifier(row.get("order_id") or sell_raw.get("exit_order_id") or sell_raw.get("order_id"))
+                group_id = "|".join([
+                    symbol,
+                    str(entry_date),
+                    _component_entry_identity(lot, buy_raw, entry_metadata),
+                    _component_exit_identity(row, sell_raw),
+                ])
+                closed_components_by_group.setdefault(group_id, []).append({
+                    "group_id": group_id,
+                    "strategy": strategy,
+                    "entry_metadata": entry_metadata,
+                    "entry_order_id": entry_order_id,
+                    "exit_order_id": exit_order_id,
+                    "entry_date": entry_date,
+                    "exit_date": exit_date,
+                    "buy_time": buy_time,
+                    "sell_time": sell_time,
+                    "buy_price": buy_price,
+                    "sell_price": sell_price,
+                    "matched_qty": matched_qty,
+                    "gross": gross,
+                    "commission": commission,
+                    "net_pnl": net_pnl,
+                    "trade_status": trade_status,
+                    "pending_commission_count": pending_commission_count,
+                    "pending_realized_pnl_count": pending_realized_pnl_count,
+                    "pnl_status": pnl_status,
+                    "commission_status": commission_status,
+                    "buy_execution_id": lot.get("execution_id"),
+                    "sell_execution_id": row.get("execution_id"),
+                    "buy_original_quantity": safe_float(lot.get("original_qty")) or matched_qty,
+                    "sell_original_quantity": qty,
+                    "buy_raw": buy_raw,
+                    "sell_raw": sell_raw,
+                    "position_raw": position_raw,
+                    "raw": raw,
+                })
+                lot["remaining_qty"] = lot_remaining - matched_qty
+                remaining -= matched_qty
+                if (safe_float(lot.get("remaining_qty")) or 0.0) <= 1e-9:
+                    open_lots.pop(0)
+
+        sell_exec_group_counts: dict[str, int] = {}
+        for components in closed_components_by_group.values():
+            for sell_exec_id in {str(comp.get("sell_execution_id") or "") for comp in components if comp.get("sell_execution_id")}:
+                sell_exec_group_counts[sell_exec_id] = sell_exec_group_counts.get(sell_exec_id, 0) + 1
+
+        for group_id, components in closed_components_by_group.items():
+            if not components:
+                continue
+            total_qty = sum(safe_float(comp.get("matched_qty")) or 0.0 for comp in components)
+            if total_qty <= 1e-9:
+                continue
+            entry_price = sum((safe_float(comp.get("buy_price")) or 0.0) * (safe_float(comp.get("matched_qty")) or 0.0) for comp in components) / total_qty
+            exit_price = sum((safe_float(comp.get("sell_price")) or 0.0) * (safe_float(comp.get("matched_qty")) or 0.0) for comp in components) / total_qty
+            gross = sum(safe_float(comp.get("gross")) or 0.0 for comp in components)
+            commission = sum(safe_float(comp.get("commission")) or 0.0 for comp in components)
+            net_pnl = sum(safe_float(comp.get("net_pnl")) or 0.0 for comp in components)
+            buy_times = [str(comp.get("buy_time") or "") for comp in components if comp.get("buy_time")]
+            sell_times = [str(comp.get("sell_time") or "") for comp in components if comp.get("sell_time")]
+            entry_time = min(buy_times) if buy_times else ""
+            exit_time = max(sell_times) if sell_times else ""
+            entry_date = str(components[0].get("entry_date") or iso_date_part(entry_time) or latest_session)
+            exit_date = str(max(str(comp.get("exit_date") or "") for comp in components))
+            entry_metadata = components[0].get("entry_metadata") or {}
+            strategy = str(entry_metadata.get("strategy_name") or components[0].get("strategy") or latest_strategy or "unknown")
+            pending_commission_count = sum(int(safe_int(comp.get("pending_commission_count")) or 0) for comp in components)
+            pending_realized_pnl_count = sum(int(safe_int(comp.get("pending_realized_pnl_count")) or 0) for comp in components)
+            if pending_commission_count:
+                trade_status = "COMMISSION_PENDING"
+            elif pending_realized_pnl_count:
+                trade_status = "PNL_PENDING"
+            else:
+                trade_status = "CLOSED"
+            excursion = self._trade_excursion_stats(
+                entry_price=entry_price,
+                exit_price=exit_price,
+                quantity=total_qty,
+                net_pnl=net_pnl,
+                raw_sources=[
+                    raw
+                    for comp in components
+                    for raw in (comp.get("position_raw") or {}, comp.get("buy_raw") or {}, comp.get("sell_raw") or {})
+                    if raw
+                ],
+            )
+            trade_id = _canonical_trade_id_for_group(group_id, components)
+            existing_trade = self.query("SELECT * FROM trades WHERE trade_id = ?", [trade_id])
+            existing_raw = parse_jsonish(existing_trade[0].get("raw_json")) if existing_trade else {}
+            component_raws = [comp.get("raw") or {} for comp in components]
+            first_raw = dict(component_raws[0]) if component_raws else {}
+            raw = dict(existing_raw)
+            raw.update(first_raw)
+            buy_execution_ids = [str(comp.get("buy_execution_id") or "") for comp in components if comp.get("buy_execution_id")]
+            sell_execution_ids = [str(comp.get("sell_execution_id") or "") for comp in components if comp.get("sell_execution_id")]
+            raw.update({
+                "reconstruction_source": "sqlite_execution_reducer_logical_group",
+                "logical_trade_group": group_id,
+                "component_count": len(components),
+                "buy_execution_id": buy_execution_ids[0] if buy_execution_ids else "",
+                "sell_execution_id": sell_execution_ids[-1] if sell_execution_ids else "",
+                "buy_execution_ids": buy_execution_ids,
+                "sell_execution_ids": sell_execution_ids,
+                "entry_order_id": components[0].get("entry_order_id") or entry_metadata.get("entry_order_id") or raw.get("entry_order_id") or "",
+                "exit_order_ids": sorted({str(comp.get("exit_order_id") or "") for comp in components if comp.get("exit_order_id")}),
+                "matched_quantity": total_qty,
+                "entry_executed_at": entry_time,
+                "exit_executed_at": exit_time,
+                "entry_date": entry_date,
+                "exit_date": exit_date,
+                "weighted_entry_price": entry_price,
+                "weighted_exit_price": exit_price,
+                "pending_commission_count": pending_commission_count,
+                "pending_realized_pnl_count": pending_realized_pnl_count,
+                "closed_trade_finalized_time": reducer_started_at if trade_status == "CLOSED" else "",
+                "mfe_pct": excursion.get("mfe_pct"),
+                "mae_pct": excursion.get("mae_pct"),
+                "peak_price": excursion.get("peak_price"),
+                "low_price": excursion.get("low_price"),
+                "peak_unrealized_pnl": excursion.get("peak_unrealized_pnl"),
+                "max_adverse_unrealized_pnl": excursion.get("max_adverse_unrealized_pnl"),
+                "giveback_from_peak": excursion.get("giveback_from_peak"),
+            })
+            preserved: dict[str, Any] = {}
+            if existing_trade:
+                current = existing_trade[0]
+                for key in (
+                    "entry_signal_time",
+                    "entry_order_time",
+                    "exit_signal_time",
+                    "exit_order_time",
+                ):
+                    if current.get(key) not in (None, ""):
+                        preserved[key] = current.get(key)
+                if not raw.get("exit_reason") and current.get("exit_reason") not in (None, ""):
+                    preserved["exit_reason"] = current.get("exit_reason")
+            self.upsert_trade(
+                {
+                    "trade_id": trade_id,
+                    "strategy_name": strategy,
+                    "session_date": entry_date,
+                    "symbol": symbol,
+                    "status": trade_status,
+                    "entry_fill_time": entry_time,
+                    "exit_fill_time": exit_time,
+                    "closed_at": exit_time,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "quantity": total_qty,
+                    "remaining_quantity": 0,
+                    "gross_pnl": gross,
+                    "commission": commission,
+                    "net_pnl": net_pnl,
                     "mfe_pct": excursion.get("mfe_pct"),
                     "mae_pct": excursion.get("mae_pct"),
                     "peak_price": excursion.get("peak_price"),
@@ -2135,82 +2338,27 @@ class SQLiteRuntimeStore:
                     "peak_unrealized_pnl": excursion.get("peak_unrealized_pnl"),
                     "max_adverse_unrealized_pnl": excursion.get("max_adverse_unrealized_pnl"),
                     "giveback_from_peak": excursion.get("giveback_from_peak"),
-                    "entry_date": entry_date,
-                    "exit_date": exit_date,
-                    "buy_commission_confirmed": buy_commission_confirmed,
-                    "sell_commission_confirmed": sell_commission_confirmed,
+                    "exit_reason": raw.get("exit_reason") or "",
+                    "ibkr_entry_confirmed": True,
+                    "ibkr_exit_confirmed": True,
+                    "ibkr_position_flat_confirmed": True,
+                    "ibkr_position_flat_confirmed_at": exit_time,
+                    "updated_at": reducer_started_at,
+                    "raw_json": raw,
+                    **preserved,
                 }
-                existing_trade = self.query("SELECT * FROM trades WHERE trade_id = ?", [trade_id])
-                existing_raw = parse_jsonish(existing_trade[0].get("raw_json")) if existing_trade else {}
-                if existing_raw:
-                    existing_raw.update(raw)
-                    raw = existing_raw
-                preserved: dict[str, Any] = {}
-                if existing_trade:
-                    current = existing_trade[0]
-                    for key in (
-                        "mfe_pct",
-                        "mae_pct",
-                        "peak_price",
-                        "low_price",
-                        "peak_unrealized_pnl",
-                        "max_adverse_unrealized_pnl",
-                        "giveback_from_peak",
-                        "entry_signal_time",
-                        "entry_order_time",
-                        "exit_signal_time",
-                        "exit_order_time",
-                    ):
-                        if current.get(key) not in (None, ""):
-                            preserved[key] = current.get(key)
-                    if not raw.get("exit_reason") and current.get("exit_reason") not in (None, ""):
-                        preserved["exit_reason"] = current.get("exit_reason")
-                self.upsert_trade(
-                    {
-                        "trade_id": trade_id,
-                        "strategy_name": strategy,
-                        "session_date": entry_date,
-                        "symbol": symbol,
-                        "status": trade_status,
-                        "entry_fill_time": buy_time,
-                        "exit_fill_time": sell_time,
-                        "closed_at": sell_time,
-                        "entry_price": buy_price,
-                        "exit_price": sell_price,
-                        "quantity": matched_qty,
-                        "remaining_quantity": 0,
-                        "gross_pnl": gross,
-                        "commission": commission,
-                        "net_pnl": net_pnl,
-                        "mfe_pct": excursion.get("mfe_pct"),
-                        "mae_pct": excursion.get("mae_pct"),
-                        "peak_price": excursion.get("peak_price"),
-                        "low_price": excursion.get("low_price"),
-                        "peak_unrealized_pnl": excursion.get("peak_unrealized_pnl"),
-                        "max_adverse_unrealized_pnl": excursion.get("max_adverse_unrealized_pnl"),
-                        "giveback_from_peak": excursion.get("giveback_from_peak"),
-                        "exit_reason": raw.get("exit_reason") or "",
-                        "ibkr_entry_confirmed": True,
-                        "ibkr_exit_confirmed": True,
-                        "ibkr_position_flat_confirmed": True,
-                        "ibkr_position_flat_confirmed_at": sell_time,
-                        "updated_at": reducer_started_at,
-                        "raw_json": raw,
-                        **preserved,
-                    }
-                )
-                buy_fully_consumed_by_trade = abs(matched_qty - (safe_float(lot.get("original_qty")) or matched_qty)) <= 1e-9
-                sell_fully_consumed_by_trade = abs(matched_qty - qty) <= 1e-9
-                if buy_fully_consumed_by_trade and sell_fully_consumed_by_trade:
-                    self.execute(
-                        "UPDATE executions SET trade_id = ? WHERE execution_id IN (?, ?)",
-                        (trade_id, lot.get("execution_id"), row.get("execution_id")),
-                    )
-                closed_count += 1
-                lot["remaining_qty"] = lot_remaining - matched_qty
-                remaining -= matched_qty
-                if (safe_float(lot.get("remaining_qty")) or 0.0) <= 1e-9:
-                    open_lots.pop(0)
+            )
+            buy_exec_ids = {str(comp.get("buy_execution_id") or "") for comp in components if comp.get("buy_execution_id")}
+            sell_exec_ids = {
+                str(comp.get("sell_execution_id") or "")
+                for comp in components
+                if comp.get("sell_execution_id") and sell_exec_group_counts.get(str(comp.get("sell_execution_id") or ""), 0) == 1
+            }
+            exec_ids = sorted(buy_exec_ids | sell_exec_ids)
+            if exec_ids:
+                placeholders = ",".join("?" for _ in exec_ids)
+                self.execute(f"UPDATE executions SET trade_id = ? WHERE execution_id IN ({placeholders})", [trade_id, *exec_ids])
+            closed_count += 1
 
         today = session_date_utc()
         suppressed_historical_lots: list[dict[str, Any]] = []

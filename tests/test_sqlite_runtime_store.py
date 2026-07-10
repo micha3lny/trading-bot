@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from scripts.cleanup_runtime_events import cleanup_runtime_events
-from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore, SQLiteWriteQueue, parse_jsonish, safe_sqlite_call
+from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore, SQLiteWriteQueue, parse_jsonish, safe_sqlite_call, session_date_utc
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.v66_ibkr_account_recorder import record_recent_fills
 
@@ -615,15 +615,16 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
             try:
-                trade_id = "entry:2026-06-24:ABSI:65020"
+                session = session_date_utc()
+                trade_id = f"entry:{session}:ABSI:65020"
                 store.upsert_trade({
                     "trade_id": trade_id,
                     "strategy_name": "v67_top100_live_safe_expansion_v46_wide_trail",
-                    "session_date": "2026-06-24",
+                    "session_date": session,
                     "symbol": "ABSI",
                     "status": "ENTRY_PENDING",
-                    "entry_signal_time": "2026-06-24T13:34:59+00:00",
-                    "entry_order_time": "2026-06-24T13:35:00+00:00",
+                    "entry_signal_time": f"{session}T13:34:59+00:00",
+                    "entry_order_time": f"{session}T13:35:00+00:00",
                     "entry_price": 8.83,
                     "quantity": 113,
                     "remaining_quantity": 113,
@@ -633,11 +634,11 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                     "live_entry_score": 75.23,
                     "live_entry_rank": 1,
                     "signal_source": "live",
-                    "signal_time": "2026-06-24T13:34:59+00:00",
-                    "ready_since": "2026-06-24T13:34:55+00:00",
+                    "signal_time": f"{session}T13:34:59+00:00",
+                    "ready_since": f"{session}T13:34:55+00:00",
                     "entry_order_id": "65020",
                     "entry_perm_id": "99020",
-                    "raw_json": {"entry_decision_time": "2026-06-24T13:35:00+00:00"},
+                    "raw_json": {"entry_decision_time": f"{session}T13:35:00+00:00"},
                 })
 
                 store.upsert_execution({
@@ -648,15 +649,15 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                     "price": 8.83,
                     "order_id": "65020",
                     "perm_id": "99020",
-                    "executed_at": "2026-06-24T13:35:01+00:00",
-                    "recorded_at": "2026-06-24T13:35:02+00:00",
+                    "executed_at": f"{session}T13:35:01+00:00",
+                    "recorded_at": f"{session}T13:35:02+00:00",
                 })
 
                 execution = store.query("SELECT trade_id, strategy_name, session_date, raw_json FROM executions WHERE execution_id = ?", ["ABSI-BUY-1"])[0]
                 execution_raw = parse_jsonish(execution["raw_json"])
                 self.assertEqual(execution["trade_id"], trade_id)
                 self.assertEqual(execution["strategy_name"], "v67_top100_live_safe_expansion_v46_wide_trail")
-                self.assertEqual(execution["session_date"], "2026-06-24")
+                self.assertEqual(execution["session_date"], session)
                 self.assertAlmostEqual(execution_raw["live_entry_score"], 75.23)
                 self.assertEqual(execution_raw["live_entry_rank"], 1)
                 self.assertEqual(execution_raw["signal_source"], "live")
@@ -734,6 +735,152 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 self.assertAlmostEqual(rows[1]["gross_pnl"], 101)
                 self.assertEqual(json.loads(rows[0]["raw_json"])["buy_execution_id"], "B15")
                 self.assertEqual(json.loads(rows[1]["raw_json"])["buy_execution_id"], "B101")
+            finally:
+                store.close()
+
+    def test_logical_trade_one_entry_fill_one_exit_updates_entry_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            session = session_date_utc()
+            try:
+                store.upsert_trade({
+                    "trade_id": f"entry:{session}:ONE:9001",
+                    "strategy_name": "v67",
+                    "session_date": session,
+                    "symbol": "ONE",
+                    "status": "ENTRY_PENDING",
+                    "entry_order_id": "9001",
+                    "live_entry_score": 81.0,
+                    "raw_json": {"entry_order_id": "9001", "live_entry_score": 81.0},
+                })
+                store.upsert_execution({"execution_id": "B_ONE", "strategy_name": "v67", "session_date": session, "symbol": "ONE", "side": "BOT", "quantity": 10, "price": 10, "order_id": "9001", "executed_at": f"{session}T13:30:00+00:00", "commission": 0.5, "commission_source": "ibkr"})
+                store.upsert_execution({"execution_id": "S_ONE", "strategy_name": "v67", "session_date": session, "symbol": "ONE", "side": "SLD", "quantity": 10, "price": 11, "order_id": "9002", "executed_at": f"{session}T13:40:00+00:00", "commission": 0.5, "commission_source": "ibkr", "realized_pnl": 10})
+
+                rows = store.query("SELECT trade_id, status, quantity, entry_price, exit_price, live_entry_score FROM trades WHERE symbol = 'ONE'")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["trade_id"], f"entry:{session}:ONE:9001")
+                self.assertEqual(rows[0]["status"], "CLOSED")
+                self.assertAlmostEqual(rows[0]["quantity"], 10)
+                self.assertAlmostEqual(rows[0]["entry_price"], 10)
+                self.assertAlmostEqual(rows[0]["exit_price"], 11)
+                self.assertAlmostEqual(rows[0]["live_entry_score"], 81.0)
+            finally:
+                store.close()
+
+    def test_logical_trade_multiple_entry_partials_one_exit_merges_to_one_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            session = session_date_utc()
+            try:
+                trade_id = f"entry:{session}:MENTRY:9101"
+                store.upsert_trade({"trade_id": trade_id, "strategy_name": "v67", "session_date": session, "symbol": "MENTRY", "status": "ENTRY_PENDING", "entry_order_id": "9101"})
+                store.upsert_execution({"execution_id": "B_ME_1", "strategy_name": "v67", "session_date": session, "symbol": "MENTRY", "side": "BOT", "quantity": 4, "price": 10, "order_id": "9101", "executed_at": f"{session}T13:30:00+00:00", "commission": 0.2, "commission_source": "ibkr"})
+                store.upsert_execution({"execution_id": "B_ME_2", "strategy_name": "v67", "session_date": session, "symbol": "MENTRY", "side": "BOT", "quantity": 6, "price": 11, "order_id": "9101", "executed_at": f"{session}T13:31:00+00:00", "commission": 0.3, "commission_source": "ibkr"})
+                store.upsert_execution({"execution_id": "S_ME", "strategy_name": "v67", "session_date": session, "symbol": "MENTRY", "side": "SLD", "quantity": 10, "price": 12, "order_id": "9102", "executed_at": f"{session}T13:40:00+00:00", "commission": 0.5, "commission_source": "ibkr", "realized_pnl": 14})
+
+                rows = store.query("SELECT trade_id, status, quantity, entry_price, exit_price, gross_pnl, net_pnl, raw_json FROM trades WHERE symbol = 'MENTRY'")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["trade_id"], trade_id)
+                self.assertAlmostEqual(rows[0]["quantity"], 10)
+                self.assertAlmostEqual(rows[0]["entry_price"], 10.6)
+                self.assertAlmostEqual(rows[0]["exit_price"], 12)
+                self.assertAlmostEqual(rows[0]["gross_pnl"], 14)
+                self.assertAlmostEqual(rows[0]["net_pnl"], 13)
+                raw = json.loads(rows[0]["raw_json"])
+                self.assertEqual(raw["component_count"], 2)
+                self.assertEqual(set(raw["buy_execution_ids"]), {"B_ME_1", "B_ME_2"})
+                self.assertEqual(raw["sell_execution_ids"], ["S_ME", "S_ME"])
+            finally:
+                store.close()
+
+    def test_logical_trade_one_entry_multiple_exit_partials_merges_by_exit_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            session = session_date_utc()
+            try:
+                trade_id = f"entry:{session}:MEXIT:9201"
+                store.upsert_trade({"trade_id": trade_id, "strategy_name": "v67", "session_date": session, "symbol": "MEXIT", "status": "ENTRY_PENDING", "entry_order_id": "9201"})
+                store.upsert_execution({"execution_id": "B_MX", "strategy_name": "v67", "session_date": session, "symbol": "MEXIT", "side": "BOT", "quantity": 10, "price": 10, "order_id": "9201", "executed_at": f"{session}T13:30:00+00:00", "commission": 0.5, "commission_source": "ibkr"})
+                store.upsert_execution({"execution_id": "S_MX_1", "strategy_name": "v67", "session_date": session, "symbol": "MEXIT", "side": "SLD", "quantity": 4, "price": 11, "order_id": "9202", "executed_at": f"{session}T13:40:00+00:00", "commission": 0.2, "commission_source": "ibkr", "realized_pnl": 4})
+                store.upsert_execution({"execution_id": "S_MX_2", "strategy_name": "v67", "session_date": session, "symbol": "MEXIT", "side": "SLD", "quantity": 6, "price": 12, "order_id": "9202", "executed_at": f"{session}T13:41:00+00:00", "commission": 0.3, "commission_source": "ibkr", "realized_pnl": 12})
+
+                rows = store.query("SELECT trade_id, quantity, exit_price, gross_pnl FROM trades WHERE symbol = 'MEXIT'")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["trade_id"], trade_id)
+                self.assertAlmostEqual(rows[0]["quantity"], 10)
+                self.assertAlmostEqual(rows[0]["exit_price"], 11.6)
+                self.assertAlmostEqual(rows[0]["gross_pnl"], 16)
+            finally:
+                store.close()
+
+    def test_logical_trade_multiple_entry_and_exit_partials_merges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            session = session_date_utc()
+            try:
+                trade_id = f"entry:{session}:BOTH:9301"
+                store.upsert_trade({"trade_id": trade_id, "strategy_name": "v67", "session_date": session, "symbol": "BOTH", "status": "ENTRY_PENDING", "entry_order_id": "9301"})
+                for exec_id, qty, price, minute in [("B_BOTH_1", 4, 10, 30), ("B_BOTH_2", 6, 11, 31)]:
+                    store.upsert_execution({"execution_id": exec_id, "strategy_name": "v67", "session_date": session, "symbol": "BOTH", "side": "BOT", "quantity": qty, "price": price, "order_id": "9301", "executed_at": f"{session}T13:{minute}:00+00:00", "commission": 0.1, "commission_source": "ibkr"})
+                for exec_id, qty, price, minute in [("S_BOTH_1", 5, 12, 40), ("S_BOTH_2", 5, 13, 41)]:
+                    store.upsert_execution({"execution_id": exec_id, "strategy_name": "v67", "session_date": session, "symbol": "BOTH", "side": "SLD", "quantity": qty, "price": price, "order_id": "9302", "executed_at": f"{session}T13:{minute}:00+00:00", "commission": 0.1, "commission_source": "ibkr", "realized_pnl": 10})
+
+                rows = store.query("SELECT trade_id, quantity, entry_price, exit_price FROM trades WHERE symbol = 'BOTH'")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["trade_id"], trade_id)
+                self.assertAlmostEqual(rows[0]["quantity"], 10)
+                self.assertAlmostEqual(rows[0]["entry_price"], 10.6)
+                self.assertAlmostEqual(rows[0]["exit_price"], 12.5)
+            finally:
+                store.close()
+
+    def test_logical_trade_reconstruction_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            session = session_date_utc()
+            try:
+                trade_id = f"entry:{session}:IDEMP:9401"
+                store.upsert_trade({"trade_id": trade_id, "strategy_name": "v67", "session_date": session, "symbol": "IDEMP", "status": "ENTRY_PENDING", "entry_order_id": "9401"})
+                store.upsert_execution({"execution_id": "B_IDEMP", "strategy_name": "v67", "session_date": session, "symbol": "IDEMP", "side": "BOT", "quantity": 10, "price": 10, "order_id": "9401", "executed_at": f"{session}T13:30:00+00:00", "commission": 0.5, "commission_source": "ibkr"})
+                store.upsert_execution({"execution_id": "S_IDEMP", "strategy_name": "v67", "session_date": session, "symbol": "IDEMP", "side": "SLD", "quantity": 10, "price": 11, "order_id": "9402", "executed_at": f"{session}T13:40:00+00:00", "commission": 0.5, "commission_source": "ibkr", "realized_pnl": 10})
+                before = store.query("SELECT trade_id, quantity, net_pnl FROM trades WHERE symbol = 'IDEMP'")
+                store.rebuild_symbol_trade_state("IDEMP")
+                after = store.query("SELECT trade_id, quantity, net_pnl FROM trades WHERE symbol = 'IDEMP'")
+                self.assertEqual(before, after)
+                self.assertEqual(len(after), 1)
+            finally:
+                store.close()
+
+    def test_peak_equal_exit_has_small_giveback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            session = session_date_utc()
+            try:
+                trade_id = f"entry:{session}:PEAKX:9501"
+                store.upsert_trade({"trade_id": trade_id, "strategy_name": "v67", "session_date": session, "symbol": "PEAKX", "status": "ENTRY_PENDING", "entry_order_id": "9501"})
+                store.upsert_execution({"execution_id": "B_PEAKX", "strategy_name": "v67", "session_date": session, "symbol": "PEAKX", "side": "BOT", "quantity": 10, "price": 10, "order_id": "9501", "executed_at": f"{session}T13:30:00+00:00", "commission": 0.5, "commission_source": "ibkr", "raw_json": {"peak_price": 11, "peak_unrealized_pnl": 999}})
+                store.upsert_execution({"execution_id": "S_PEAKX", "strategy_name": "v67", "session_date": session, "symbol": "PEAKX", "side": "SLD", "quantity": 10, "price": 11, "order_id": "9502", "executed_at": f"{session}T13:40:00+00:00", "commission": 0.5, "commission_source": "ibkr", "realized_pnl": 10, "raw_json": {"peak_price": 11, "peak_unrealized_pnl": 999}})
+                row = store.query("SELECT peak_price, peak_unrealized_pnl, net_pnl, giveback_from_peak FROM trades WHERE symbol = 'PEAKX'")[0]
+                self.assertAlmostEqual(row["peak_price"], 11)
+                self.assertAlmostEqual(row["peak_unrealized_pnl"], 10)
+                self.assertAlmostEqual(row["net_pnl"], 9)
+                self.assertAlmostEqual(row["giveback_from_peak"], 1)
+            finally:
+                store.close()
+
+    def test_two_independent_same_symbol_entry_orders_remain_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            session = session_date_utc()
+            try:
+                for suffix, order_id, minute in [("A", "9601", 30), ("B", "9603", 50)]:
+                    trade_id = f"entry:{session}:TWICE:{order_id}"
+                    store.upsert_trade({"trade_id": trade_id, "strategy_name": "v67", "session_date": session, "symbol": "TWICE", "status": "ENTRY_PENDING", "entry_order_id": order_id})
+                    store.upsert_execution({"execution_id": f"B_TWICE_{suffix}", "strategy_name": "v67", "session_date": session, "symbol": "TWICE", "side": "BOT", "quantity": 10, "price": 10, "order_id": order_id, "executed_at": f"{session}T13:{minute}:00+00:00", "commission": 0.5, "commission_source": "ibkr"})
+                    store.upsert_execution({"execution_id": f"S_TWICE_{suffix}", "strategy_name": "v67", "session_date": session, "symbol": "TWICE", "side": "SLD", "quantity": 10, "price": 11, "order_id": str(int(order_id) + 1), "executed_at": f"{session}T13:{minute + 5}:00+00:00", "commission": 0.5, "commission_source": "ibkr", "realized_pnl": 10})
+                rows = store.query("SELECT trade_id, quantity FROM trades WHERE symbol = 'TWICE' ORDER BY trade_id")
+                self.assertEqual(len(rows), 2)
+                self.assertEqual({row["trade_id"] for row in rows}, {f"entry:{session}:TWICE:9601", f"entry:{session}:TWICE:9603"})
             finally:
                 store.close()
 
