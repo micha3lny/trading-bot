@@ -985,7 +985,7 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
                     "same_attempt_match_confirmed": 0,
                 }
             ),
-            "offline_signal_expected_runtime_signal_not_observed",
+            "offline_should_have_signaled_runtime_signal_not_observed",
         )
 
     def test_no_buy_after_signal_candle_signal_ready_is_not_runtime_signal_ready(self) -> None:

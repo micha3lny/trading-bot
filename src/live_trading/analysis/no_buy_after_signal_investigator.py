@@ -111,7 +111,7 @@ NO_BUY_CLASSIFICATIONS = [
     "post_signal_already_open_skip",
     "unexplained_after_signal_before_dispatch",
     "ambiguous_event_correlation",
-    "offline_signal_expected_runtime_signal_not_observed",
+    "offline_should_have_signaled_runtime_signal_not_observed",
     "unknown_no_buy_after_signal",
 ]
 
@@ -347,7 +347,7 @@ def correlation_issue_reason(
     if signal_ready_ts is None:
         return "missing_signal_ready_event"
     if selection_reason.startswith("fallback"):
-        return "offline_signal_expected_runtime_signal_not_observed"
+        return "offline_should_have_signaled_runtime_signal_not_observed"
     same_ts_count = sum(1 for ts in candidates if abs((ts - signal_ready_ts).total_seconds()) <= 0.001)
     if same_ts_count > 1:
         return ""
@@ -555,7 +555,7 @@ def classify_no_buy_reason(row: dict[str, Any]) -> str:
     terminal_event = str(row.get("post_signal_terminal_event") or "").upper()
     terminal_reason = str(row.get("post_signal_terminal_reason") or "").lower()
     if not truthy(row.get("signal_ready_event_observed")):
-        return "offline_signal_expected_runtime_signal_not_observed"
+        return "offline_should_have_signaled_runtime_signal_not_observed"
     if str(row.get("correlation_issue_reason") or ""):
         return "ambiguous_event_correlation"
     if (
@@ -739,7 +739,7 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
         default=None,
     )
     all_records = timeline_records(timeline, evidence.journal_lines, symbol)
-    attempt_records = records_in_window(all_records, signal_ready_ts, correlation_end)
+    attempt_records = records_in_window(all_records, signal_ready_ts, correlation_end) if signal_ready_observed else []
     attempt_text = records_text(attempt_records)
     scan_ts, heartbeat = heartbeat_after_signal(evidence.heartbeat_states, signal_ready_ts)
     journal_symbol = journal_text_for_symbol(evidence.journal_lines, symbol, signal_ready_ts or center, minutes=90)
@@ -803,7 +803,7 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
         "top100_score": target.get("top100_score"),
         "possible_signal_time": target.get("possible_signal_time"),
         "signal_ready_event_timestamp": iso_ts(signal_ready_ts),
-        "signal_ready_timestamp_source": signal_selection_reason if not signal_ready_event else str(signal_ready_event.get("source") or signal_selection_reason),
+        "signal_ready_timestamp_source": "offline_candle" if not signal_ready_event else str(signal_ready_event.get("source") or signal_selection_reason),
         "signal_ready_event_observed": int(signal_ready_observed),
         "signal_ready_event_raw_timestamp": "" if not signal_ready_event else signal_ready_event.get("raw_timestamp", ""),
         "signal_ready_event_payload_signal_time": "" if not signal_ready_event else signal_ready_event.get("payload_signal_time", ""),
@@ -816,7 +816,7 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
         "matched_terminal_event_timestamp": iso_ts(terminal_ts),
         "matched_buy_timestamp": iso_ts(buy_ts),
         "correlation_key_used": "symbol+selected_signal_ready_timestamp+until_next_signal_ready_or_2m",
-        "correlation_confidence": "high" if same_attempt_confirmed else ("offline_fallback" if not signal_ready_observed else "ambiguous"),
+        "correlation_confidence": "high" if same_attempt_confirmed else ("not_applicable" if not signal_ready_observed else "ambiguous"),
         "duplicate_signal_ready_count": sum(1 for ts in signal_ready_candidates if signal_ready_ts is not None and abs((ts - signal_ready_ts).total_seconds()) <= 0.001),
         "same_attempt_match_confirmed": same_attempt_confirmed,
         "correlation_issue_reason": corr_issue,
@@ -853,9 +853,14 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
 
 def summary_for_cases(cases: pd.DataFrame, session_date: str) -> pd.DataFrame:
     counts = Counter(cases.get("final_no_buy_reason", pd.Series(dtype=str)).fillna("unknown_no_buy_after_signal").astype(str)) if not cases.empty else Counter()
+    observed_runtime_signal_ready = 0
+    if not cases.empty and "signal_ready_event_observed" in cases.columns:
+        observed_runtime_signal_ready = int(pd.to_numeric(cases["signal_ready_event_observed"], errors="coerce").fillna(0).astype(int).sum())
     row: dict[str, Any] = {
         "date": session_date,
         "total_runtime_signal_ready_but_no_buy": int(len(cases)),
+        "observed_runtime_signal_ready_no_buy": observed_runtime_signal_ready,
+        "offline_should_have_signaled_runtime_signal_not_observed": int(counts.get("offline_should_have_signaled_runtime_signal_not_observed", 0)),
     }
     for name in NO_BUY_CLASSIFICATIONS:
         row[name] = int(counts.get(name, 0))
