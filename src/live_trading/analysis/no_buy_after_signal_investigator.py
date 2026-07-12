@@ -62,6 +62,11 @@ CASE_COLUMNS = [
     "failed_final_entry_filter_reason",
     "order_dispatch_attempted",
     "order_dispatch_skip_reason",
+    "post_signal_terminal_event",
+    "post_signal_terminal_reason",
+    "stale_or_backfill_reason",
+    "already_open_after_signal",
+    "post_signal_continue_detected",
     "ready_list_stage",
     "ranking_stage",
     "selection_stage",
@@ -84,7 +89,9 @@ NO_BUY_CLASSIFICATIONS = [
     "final_filter_failed_price",
     "stale_candidate",
     "already_open_or_pending",
-    "dispatch_bug_or_missing_reason",
+    "post_signal_stale_or_backfill_skip",
+    "post_signal_already_open_skip",
+    "unexplained_after_signal_before_dispatch",
     "unknown_no_buy_after_signal",
 ]
 
@@ -290,6 +297,46 @@ def skip_reason_from_text(text: str, symbol: str) -> str:
     return ""
 
 
+def post_signal_terminal_evidence(text: str, symbol: str) -> dict[str, Any]:
+    stale_reason = ""
+    already_open_reason = ""
+    terminal_lines = []
+    for line in text.splitlines():
+        upper = line.upper()
+        if symbol_pattern(symbol).search(upper) or "STALE_OR_BACKFILL_READY_SKIPPED" in upper or "ALREADY_OPEN_POSITION" in upper:
+            terminal_lines.append(line)
+    for line in terminal_lines:
+        upper = line.upper()
+        kv = parse_key_values(line)
+        if "STALE_OR_BACKFILL_READY_SKIPPED" in upper:
+            stale_reason = kv.get("reason") or kv.get("stale_or_backfill_reason") or line[:240]
+        if "ALREADY_OPEN_POSITION" in upper or "ALREADY_OPEN" in upper:
+            already_open_reason = kv.get("reason") or "already_open_position"
+    if stale_reason:
+        return {
+            "post_signal_terminal_event": "STALE_OR_BACKFILL_READY_SKIPPED",
+            "post_signal_terminal_reason": stale_reason,
+            "stale_or_backfill_reason": stale_reason,
+            "already_open_after_signal": 0,
+            "post_signal_continue_detected": 1,
+        }
+    if already_open_reason:
+        return {
+            "post_signal_terminal_event": "already_open_position",
+            "post_signal_terminal_reason": already_open_reason,
+            "stale_or_backfill_reason": "",
+            "already_open_after_signal": 1,
+            "post_signal_continue_detected": 1,
+        }
+    return {
+        "post_signal_terminal_event": "",
+        "post_signal_terminal_reason": "",
+        "stale_or_backfill_reason": "",
+        "already_open_after_signal": 0,
+        "post_signal_continue_detected": 0,
+    }
+
+
 def heartbeat_entries_blocked_reason(state: dict[str, str]) -> str:
     reasons: list[str] = []
     for field in BLOCK_FIELDS:
@@ -307,8 +354,22 @@ def heartbeat_entries_blocked_reason(state: dict[str, str]) -> str:
 def classify_no_buy_reason(row: dict[str, Any]) -> str:
     failed = str(row.get("failed_final_entry_filter_reason") or "").lower()
     skip = str(row.get("order_dispatch_skip_reason") or "").lower()
+    terminal_event = str(row.get("post_signal_terminal_event") or "").upper()
+    terminal_reason = str(row.get("post_signal_terminal_reason") or "").lower()
+    if (
+        not truthy(row.get("order_dispatch_attempted"))
+        and terminal_event == "STALE_OR_BACKFILL_READY_SKIPPED"
+    ):
+        return "post_signal_stale_or_backfill_skip"
+    if (
+        not truthy(row.get("order_dispatch_attempted"))
+        and (terminal_event == "ALREADY_OPEN_POSITION" or truthy(row.get("already_open_after_signal")))
+    ):
+        return "post_signal_already_open_skip"
     if "already" in failed or "already" in skip or "pending" in failed or "pending" in skip:
         return "already_open_or_pending"
+    if "already_open_position" in terminal_reason:
+        return "post_signal_already_open_skip"
     if "stale" in failed or "stale" in skip or "signal_before_last_unblock" in skip or "candidate_age" in skip:
         return "stale_candidate"
     if "spread" in failed or "spread" in skip:
@@ -326,7 +387,7 @@ def classify_no_buy_reason(row: dict[str, Any]) -> str:
     if int(numeric(row.get("candidates_ahead_count")) or 0) > 0:
         return "lower_rank_candidate_not_selected"
     if not truthy(row.get("order_dispatch_attempted")) and row.get("signal_ready_time"):
-        return "dispatch_bug_or_missing_reason"
+        return "unexplained_after_signal_before_dispatch"
     return "unknown_no_buy_after_signal"
 
 
@@ -353,6 +414,8 @@ def lifecycle_stage_trace(
     entries_blocked: int,
     max_entries_reached: int,
     better: list[str],
+    post_signal_terminal_event: str = "",
+    post_signal_terminal_reason: str = "",
 ) -> dict[str, str]:
     # In v67, SIGNAL_READY is emitted inside ordered_entry_candidates after the
     # symbol has entered entry_candidates, survived candidate_rejection_reasons,
@@ -370,7 +433,10 @@ def lifecycle_stage_trace(
 
     final_stage = "passed_or_no_explicit_final_filter"
     disappeared = ""
-    if skip_reason:
+    if post_signal_terminal_event:
+        final_stage = f"direct_observed_post_SIGNAL_READY_continue:{post_signal_terminal_event}:{post_signal_terminal_reason}"
+        disappeared = "post_signal_terminal_continue"
+    elif skip_reason:
         final_stage = f"blocked_after_SIGNAL_READY:{skip_reason}"
         disappeared = "final_entry_filter"
     elif failed_reason:
@@ -387,9 +453,9 @@ def lifecycle_stage_trace(
         dispatch_stage = "dispatch_attempt_seen"
         ibkr_stage = "ibkr_placeOrder_or_BUY_ORDER_SENT_seen"
     elif signal_ready_seen and not disappeared:
-        dispatch_stage = "missing_after_SIGNAL_READY_before_BUY_ORDER_SENT"
+        dispatch_stage = "missing_after_SIGNAL_READY_before_ENTRY_ORDER_DISPATCH_ATTEMPT"
         ibkr_stage = "not_seen"
-        disappeared = "dispatch_queue_or_ibkr_placeOrder_gap"
+        disappeared = "unexplained_after_SIGNAL_READY_before_dispatch_attempt"
     elif better and not signal_ready_seen:
         dispatch_stage = "not_dispatched_lower_rank_candidates_ahead"
         ibkr_stage = "not_seen"
@@ -400,9 +466,9 @@ def lifecycle_stage_trace(
 
     ack_stage = "ack_seen" if ack else ("not_seen_after_dispatch" if dispatch else "not_applicable_no_dispatch")
     trace = [
-        f"ready_list={ready_stage}",
-        f"ranking={ranking_stage}",
-        f"selection={selection_stage}",
+        f"ready_list_inferred={ready_stage}",
+        f"ranking_inferred={ranking_stage}",
+        f"selection_observed_or_inferred={selection_stage}",
         f"final_filter={final_stage}",
         f"dispatch_queue={dispatch_stage}",
         f"ibkr_order_submission={ibkr_stage}",
@@ -449,6 +515,7 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
     timeline_text = event_text(timeline)
     symbol_window_lines = symbol_lines(evidence.journal_lines, symbol, signal_ready_ts, window_end)
     combined = "\n".join([timeline_text, journal_symbol, "\n".join(symbol_window_lines)])
+    terminal = post_signal_terminal_evidence("\n".join([timeline_text, "\n".join(symbol_window_lines)]), symbol)
     values = extract_symbol_values(combined, symbol)
     candidate_rank = values.get("candidate_rank_at_scan") or target.get("top100_rank")
     better = better_candidates_ahead(evidence.journal_lines, symbol, signal_ready_ts, candidate_rank)
@@ -472,6 +539,8 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
         entries_blocked=entries_blocked,
         max_entries_reached=max_entries_reached,
         better=better,
+        post_signal_terminal_event=terminal["post_signal_terminal_event"],
+        post_signal_terminal_reason=terminal["post_signal_terminal_reason"],
     )
     row = {
         "date": session_date,
@@ -503,6 +572,7 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
         "failed_final_entry_filter_reason": failed_reason,
         "order_dispatch_attempted": dispatch,
         "order_dispatch_skip_reason": skip_reason,
+        **terminal,
         **lifecycle,
     }
     row["final_no_buy_reason"] = classify_no_buy_reason(row)

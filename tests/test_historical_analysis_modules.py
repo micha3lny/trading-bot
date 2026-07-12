@@ -41,6 +41,7 @@ from src.live_trading.analysis.no_buy_after_signal_investigator import (
     build_parser as build_no_buy_after_signal_parser,
     classify_no_buy_reason,
     lifecycle_stage_trace,
+    post_signal_terminal_evidence,
     summary_for_cases as no_buy_after_signal_summary_for_cases,
 )
 from src.live_trading.analysis.overnight_hold_ranker import analyze_trade_overnight, ensure_overnight_columns, overnight_score, score_bucket
@@ -709,13 +710,13 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         self.assertIn("--max-cases", help_text)
         self.assertIn("--start-date", help_text)
         cases = pd.DataFrame([
-            {"final_no_buy_reason": "dispatch_bug_or_missing_reason"},
+            {"final_no_buy_reason": "unexplained_after_signal_before_dispatch"},
             {"final_no_buy_reason": "entries_blocked"},
             {"final_no_buy_reason": "lower_rank_candidate_not_selected"},
         ])
         summary = no_buy_after_signal_summary_for_cases(cases, "2026-06-26").iloc[0]
         self.assertEqual(int(summary["total_runtime_signal_ready_but_no_buy"]), 3)
-        self.assertEqual(int(summary["dispatch_bug_or_missing_reason"]), 1)
+        self.assertEqual(int(summary["unexplained_after_signal_before_dispatch"]), 1)
         self.assertEqual(int(summary["entries_blocked"]), 1)
         self.assertEqual(int(summary["lower_rank_candidate_not_selected"]), 1)
 
@@ -778,8 +779,93 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         self.assertEqual(trace["ready_list_stage"], "seen_in_entry_candidates_inferred_from_SIGNAL_READY")
         self.assertEqual(trace["ranking_stage"], "ranked_in_ordered_entry_candidates_inferred_from_SIGNAL_READY")
         self.assertEqual(trace["selection_stage"], "selected_for_entry_evaluation_SIGNAL_READY")
-        self.assertEqual(trace["candidate_disappeared_stage"], "dispatch_queue_or_ibkr_placeOrder_gap")
+        self.assertEqual(trace["candidate_disappeared_stage"], "unexplained_after_SIGNAL_READY_before_dispatch_attempt")
         self.assertIn("SIGNAL_READY", trace["candidate_lifecycle_trace"])
+
+    def test_no_buy_after_signal_detects_post_signal_stale_skip(self) -> None:
+        terminal = post_signal_terminal_evidence(
+            "2026-06-26T14:02:42+00:00 STALE_OR_BACKFILL_READY_SKIPPED symbol=AOUT reason=signal_before_last_unblock",
+            "AOUT",
+        )
+        self.assertEqual(terminal["post_signal_terminal_event"], "STALE_OR_BACKFILL_READY_SKIPPED")
+        self.assertEqual(terminal["stale_or_backfill_reason"], "signal_before_last_unblock")
+        self.assertEqual(terminal["post_signal_continue_detected"], 1)
+        self.assertEqual(
+            classify_no_buy_reason(
+                {
+                    **terminal,
+                    "order_dispatch_attempted": 0,
+                    "signal_ready_time": "2026-06-26T14:00:00Z",
+                    "entries_blocked_at_scan": 0,
+                    "failed_final_entry_filter_reason": "",
+                    "order_dispatch_skip_reason": "",
+                    "max_entries_per_scan_reached": 0,
+                    "candidates_ahead_count": 0,
+                }
+            ),
+            "post_signal_stale_or_backfill_skip",
+        )
+
+    def test_no_buy_after_signal_detects_post_signal_already_open_skip(self) -> None:
+        terminal = post_signal_terminal_evidence(
+            "2026-06-26T14:03:00+00:00 ENTRY_REJECTED symbol=OMER reason=already_open_position",
+            "OMER",
+        )
+        self.assertEqual(terminal["post_signal_terminal_event"], "already_open_position")
+        self.assertEqual(terminal["already_open_after_signal"], 1)
+        self.assertEqual(
+            classify_no_buy_reason(
+                {
+                    **terminal,
+                    "order_dispatch_attempted": 0,
+                    "signal_ready_time": "2026-06-26T14:00:00Z",
+                    "entries_blocked_at_scan": 0,
+                    "failed_final_entry_filter_reason": "",
+                    "order_dispatch_skip_reason": "",
+                    "max_entries_per_scan_reached": 0,
+                    "candidates_ahead_count": 0,
+                }
+            ),
+            "post_signal_already_open_skip",
+        )
+
+    def test_no_buy_after_signal_unexplained_only_after_known_paths_excluded(self) -> None:
+        self.assertEqual(
+            classify_no_buy_reason(
+                {
+                    "post_signal_terminal_event": "",
+                    "post_signal_terminal_reason": "",
+                    "already_open_after_signal": 0,
+                    "order_dispatch_attempted": 0,
+                    "signal_ready_time": "2026-06-26T14:00:00Z",
+                    "entries_blocked_at_scan": 0,
+                    "failed_final_entry_filter_reason": "",
+                    "order_dispatch_skip_reason": "",
+                    "max_entries_per_scan_reached": 0,
+                    "candidates_ahead_count": 0,
+                }
+            ),
+            "unexplained_after_signal_before_dispatch",
+        )
+
+    def test_no_buy_after_signal_dispatch_attempt_is_not_unexplained(self) -> None:
+        self.assertEqual(
+            classify_no_buy_reason(
+                {
+                    "post_signal_terminal_event": "",
+                    "post_signal_terminal_reason": "",
+                    "already_open_after_signal": 0,
+                    "order_dispatch_attempted": 1,
+                    "signal_ready_time": "2026-06-26T14:00:00Z",
+                    "entries_blocked_at_scan": 0,
+                    "failed_final_entry_filter_reason": "",
+                    "order_dispatch_skip_reason": "",
+                    "max_entries_per_scan_reached": 0,
+                    "candidates_ahead_count": 0,
+                }
+            ),
+            "unknown_no_buy_after_signal",
+        )
 
     def test_strategy_coverage_runner_rows_uses_default_signal_thresholds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
