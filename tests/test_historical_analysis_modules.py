@@ -734,6 +734,7 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
                     "candidates_ahead_count": 0,
                     "order_dispatch_attempted": 0,
                     "signal_ready_time": "2026-06-26T14:00:00Z",
+                    "signal_ready_event_observed": 1,
                 }
             ),
             "entries_blocked",
@@ -748,6 +749,7 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
                     "candidates_ahead_count": 0,
                     "order_dispatch_attempted": 0,
                     "signal_ready_time": "2026-06-26T14:00:00Z",
+                    "signal_ready_event_observed": 1,
                 }
             ),
             "final_filter_failed_spread",
@@ -762,6 +764,7 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
                     "candidates_ahead_count": 2,
                     "order_dispatch_attempted": 0,
                     "signal_ready_time": "2026-06-26T14:00:00Z",
+                    "signal_ready_event_observed": 1,
                 }
             ),
             "lower_rank_candidate_not_selected",
@@ -806,6 +809,7 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
                     "max_entries_per_scan_reached": 0,
                     "candidates_ahead_count": 0,
                     "same_attempt_match_confirmed": 1,
+                    "signal_ready_event_observed": 1,
                 }
             ),
             "post_signal_stale_or_backfill_skip",
@@ -830,6 +834,7 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
                     "max_entries_per_scan_reached": 0,
                     "candidates_ahead_count": 0,
                     "same_attempt_match_confirmed": 1,
+                    "signal_ready_event_observed": 1,
                 }
             ),
             "post_signal_already_open_skip",
@@ -850,6 +855,7 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
                     "max_entries_per_scan_reached": 0,
                     "candidates_ahead_count": 0,
                     "same_attempt_match_confirmed": 1,
+                    "signal_ready_event_observed": 1,
                 }
             ),
             "unexplained_after_signal_before_dispatch",
@@ -869,6 +875,7 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
                     "order_dispatch_skip_reason": "",
                     "max_entries_per_scan_reached": 0,
                     "candidates_ahead_count": 0,
+                    "signal_ready_event_observed": 1,
                 }
             ),
             "unknown_no_buy_after_signal",
@@ -879,7 +886,7 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
             {"time": "2026-07-09T14:00:00+00:00", "event": "SIGNAL_READY", "reason": "", "details": "symbol=ABCD", "symbol": "ABCD"},
             {"time": "2026-07-09T14:05:00+00:00", "event": "SIGNAL_READY", "reason": "", "details": "symbol=ABCD", "symbol": "ABCD"},
         ]
-        selected, candidates, reason = select_signal_ready_time(
+        selected, candidates, reason, event = select_signal_ready_time(
             timeline,
             [],
             "ABCD",
@@ -888,6 +895,7 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         self.assertEqual(str(selected), "2026-07-09 14:05:00+00:00")
         self.assertEqual(len(candidates), 2)
         self.assertEqual(reason, "first_signal_ready_at_or_after_target_time")
+        self.assertIsNotNone(event)
 
     def test_no_buy_after_signal_first_signal_blocked_second_dispatches(self) -> None:
         start = pd.Timestamp("2026-07-09T14:00:00Z")
@@ -909,12 +917,13 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
             {"time": "2026-07-09T14:00:00.123456+00:00", "event": "SIGNAL_READY", "reason": "", "details": "symbol=ABCD", "symbol": "ABCD"},
             {"time": "2026-07-09T14:00:00.123456+00:00", "event": "SIGNAL_READY", "reason": "", "details": "symbol=ABCD duplicate", "symbol": "ABCD"},
         ]
-        selected, candidates, _reason = select_signal_ready_time(
+        selected, candidates, _reason, event = select_signal_ready_time(
             timeline,
             [],
             "ABCD",
             pd.Timestamp("2026-07-09T14:00:00.123456Z"),
         )
+        self.assertIsNotNone(event)
         same_ts_count = sum(1 for ts in candidates if selected is not None and abs((ts - selected).total_seconds()) <= 0.001)
         self.assertEqual(same_ts_count, 1)
 
@@ -922,13 +931,14 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         timeline = [
             {"time": "2026-07-09T10:00:00.500000-04:00", "event": "SIGNAL_READY", "reason": "", "details": "symbol=ABCD", "symbol": "ABCD"},
         ]
-        selected, _candidates, _reason = select_signal_ready_time(
+        selected, _candidates, _reason, event = select_signal_ready_time(
             timeline,
             [],
             "ABCD",
             pd.Timestamp("2026-07-09T14:00:00.499999Z"),
         )
         self.assertEqual(str(selected), "2026-07-09 14:00:00.500000+00:00")
+        self.assertIsNotNone(event)
 
     def test_no_buy_after_signal_event_after_next_signal_not_matched_to_prior_attempt(self) -> None:
         first = pd.Timestamp("2026-07-09T14:00:00Z")
@@ -948,9 +958,33 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
                     "correlation_issue_reason": "missing_observed_signal_ready_event",
                     "order_dispatch_attempted": 0,
                     "signal_ready_time": "2026-07-09T14:00:00Z",
+                    "signal_ready_event_observed": 1,
                 }
             ),
             "ambiguous_event_correlation",
+        )
+
+    def test_no_buy_after_signal_offline_fallback_is_not_unexplained(self) -> None:
+        selected, candidates, reason, event = select_signal_ready_time(
+            [],
+            [],
+            "ABCD",
+            pd.Timestamp("2026-07-09T14:00:00Z"),
+        )
+        self.assertEqual(str(selected), "2026-07-09 14:00:00+00:00")
+        self.assertEqual(candidates, [])
+        self.assertEqual(reason, "fallback_target_time_no_signal_ready_event")
+        self.assertIsNone(event)
+        self.assertEqual(
+            classify_no_buy_reason(
+                {
+                    "signal_ready_event_observed": 0,
+                    "order_dispatch_attempted": 0,
+                    "signal_ready_time": "2026-07-09T14:00:00Z",
+                    "same_attempt_match_confirmed": 0,
+                }
+            ),
+            "offline_signal_expected_runtime_signal_not_observed",
         )
 
     def test_strategy_coverage_runner_rows_uses_default_signal_thresholds(self) -> None:

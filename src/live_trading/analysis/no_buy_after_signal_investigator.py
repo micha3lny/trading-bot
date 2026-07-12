@@ -43,6 +43,12 @@ CASE_COLUMNS = [
     "top100_score",
     "possible_signal_time",
     "signal_ready_event_timestamp",
+    "signal_ready_timestamp_source",
+    "signal_ready_event_observed",
+    "signal_ready_event_raw_timestamp",
+    "signal_ready_event_payload_signal_time",
+    "signal_ready_event_payload_ready_since",
+    "signal_ready_event_raw_source_row",
     "correlation_window_start",
     "correlation_window_end",
     "next_signal_ready_timestamp",
@@ -105,6 +111,7 @@ NO_BUY_CLASSIFICATIONS = [
     "post_signal_already_open_skip",
     "unexplained_after_signal_before_dispatch",
     "ambiguous_event_correlation",
+    "offline_signal_expected_runtime_signal_not_observed",
     "unknown_no_buy_after_signal",
 ]
 
@@ -188,15 +195,27 @@ def timeline_event_text(event: dict[str, Any]) -> str:
     return f"{event.get('event', '')} {event.get('reason', '')} {event.get('details', '')}".upper()
 
 
-def collect_signal_ready_times(timeline: list[dict[str, Any]], journal_lines: list[str], symbol: str) -> list[pd.Timestamp]:
-    candidates: list[pd.Timestamp] = []
+def collect_signal_ready_events(timeline: list[dict[str, Any]], journal_lines: list[str], symbol: str) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
     for event in timeline:
         text = timeline_event_text(event)
         if "SIGNAL_READY" not in text:
             continue
         ts = parse_dt(event.get("time"))
         if ts is not None:
-            candidates.append(ts)
+            raw_text = (
+                f"{event.get('time', '')} {event.get('source', '')} {event.get('event', '')} "
+                f"symbol={event.get('symbol', '')} reason={event.get('reason', '')} {event.get('details', '')}"
+            )
+            kv = parse_key_values(raw_text)
+            candidates.append({
+                "timestamp": ts,
+                "source": str(event.get("source") or "timeline"),
+                "raw_timestamp": str(event.get("time") or ""),
+                "payload_signal_time": kv.get("signal_time") or kv.get("signal_time_ts") or "",
+                "payload_ready_since": kv.get("ready_since") or kv.get("ready_since_ts") or "",
+                "raw_source_row": raw_text[:1000],
+            })
     pattern = symbol_pattern(symbol)
     for line in journal_lines:
         upper = line.upper()
@@ -204,8 +223,23 @@ def collect_signal_ready_times(timeline: list[dict[str, Any]], journal_lines: li
             continue
         ts = event_line_time(line)
         if ts is not None:
-            candidates.append(ts)
-    return sorted(set(candidates))
+            kv = parse_key_values(line)
+            candidates.append({
+                "timestamp": ts,
+                "source": "journal",
+                "raw_timestamp": str(line[:32]).strip(),
+                "payload_signal_time": kv.get("signal_time") or "",
+                "payload_ready_since": kv.get("ready_since") or "",
+                "raw_source_row": line[:1000],
+            })
+    deduped: dict[pd.Timestamp, dict[str, Any]] = {}
+    for candidate in candidates:
+        deduped.setdefault(candidate["timestamp"], candidate)
+    return [deduped[ts] for ts in sorted(deduped)]
+
+
+def collect_signal_ready_times(timeline: list[dict[str, Any]], journal_lines: list[str], symbol: str) -> list[pd.Timestamp]:
+    return [event["timestamp"] for event in collect_signal_ready_events(timeline, journal_lines, symbol)]
 
 
 def select_signal_ready_time(
@@ -213,16 +247,18 @@ def select_signal_ready_time(
     journal_lines: list[str],
     symbol: str,
     target_time: pd.Timestamp | None,
-) -> tuple[pd.Timestamp | None, list[pd.Timestamp], str]:
-    candidates = collect_signal_ready_times(timeline, journal_lines, symbol)
+) -> tuple[pd.Timestamp | None, list[pd.Timestamp], str, dict[str, Any] | None]:
+    events = collect_signal_ready_events(timeline, journal_lines, symbol)
+    candidates = [event["timestamp"] for event in events]
     if not candidates:
-        return target_time, [], "fallback_target_time_no_signal_ready_event"
+        return target_time, [], "fallback_target_time_no_signal_ready_event", None
     if target_time is None:
-        return candidates[0], candidates, "earliest_signal_ready_no_target_time"
+        return candidates[0], candidates, "earliest_signal_ready_no_target_time", events[0]
     after = [ts for ts in candidates if ts >= target_time]
     if after:
-        return after[0], candidates, "first_signal_ready_at_or_after_target_time"
-    return candidates[-1], candidates, "latest_signal_ready_before_target_time"
+        selected = after[0]
+        return selected, candidates, "first_signal_ready_at_or_after_target_time", next(event for event in events if event["timestamp"] == selected)
+    return candidates[-1], candidates, "latest_signal_ready_before_target_time", events[-1]
 
 
 def next_signal_ready_after(candidates: list[pd.Timestamp], signal_ready_ts: pd.Timestamp | None) -> pd.Timestamp | None:
@@ -304,7 +340,7 @@ def correlation_issue_reason(
     if signal_ready_ts is None:
         return "missing_signal_ready_event"
     if selection_reason.startswith("fallback"):
-        return "missing_observed_signal_ready_event"
+        return "offline_signal_expected_runtime_signal_not_observed"
     same_ts_count = sum(1 for ts in candidates if abs((ts - signal_ready_ts).total_seconds()) <= 0.001)
     if same_ts_count > 1:
         return ""
@@ -511,6 +547,8 @@ def classify_no_buy_reason(row: dict[str, Any]) -> str:
     skip = str(row.get("order_dispatch_skip_reason") or "").lower()
     terminal_event = str(row.get("post_signal_terminal_event") or "").upper()
     terminal_reason = str(row.get("post_signal_terminal_reason") or "").lower()
+    if not truthy(row.get("signal_ready_event_observed")):
+        return "offline_signal_expected_runtime_signal_not_observed"
     if str(row.get("correlation_issue_reason") or ""):
         return "ambiguous_event_correlation"
     if (
@@ -680,12 +718,13 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
         recorder_sources=recorder_sources,
         center=center,
     )
-    signal_ready_ts, signal_ready_candidates, signal_selection_reason = select_signal_ready_time(
+    signal_ready_ts, signal_ready_candidates, signal_selection_reason, signal_ready_event = select_signal_ready_time(
         timeline,
         evidence.journal_lines,
         symbol,
         target_time,
     )
+    signal_ready_observed = signal_ready_event is not None
     next_signal_ts = next_signal_ready_after(signal_ready_candidates, signal_ready_ts)
     fallback_window_end = signal_ready_ts + pd.Timedelta(minutes=2) if signal_ready_ts is not None else None
     correlation_end = min(
@@ -727,14 +766,14 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
     max_entries_reached = int("ENTRY_RATE_LIMIT_BLOCK" in attempt_text.upper() or "MAX_ENTRIES_PER" in attempt_text.upper())
     managed_open = heartbeat.get("managed_open", "")
     max_positions = heartbeat.get("max_positions") or heartbeat.get("max_open_positions") or ""
-    signal_ready_seen = signal_ready_ts is not None and signal_ready_candidates
+    signal_ready_seen = signal_ready_observed
     corr_issue = correlation_issue_reason(
         signal_ready_ts=signal_ready_ts,
         candidates=signal_ready_candidates,
         selection_reason=signal_selection_reason,
         target_time=target_time,
     )
-    same_attempt_confirmed = int(bool(signal_ready_seen) and not corr_issue)
+    same_attempt_confirmed = int(bool(signal_ready_observed) and not corr_issue)
     lifecycle = lifecycle_stage_trace(
         symbol=symbol,
         signal_ready_seen=signal_ready_seen,
@@ -757,6 +796,12 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
         "top100_score": target.get("top100_score"),
         "possible_signal_time": target.get("possible_signal_time"),
         "signal_ready_event_timestamp": iso_ts(signal_ready_ts),
+        "signal_ready_timestamp_source": signal_selection_reason if not signal_ready_event else str(signal_ready_event.get("source") or signal_selection_reason),
+        "signal_ready_event_observed": int(signal_ready_observed),
+        "signal_ready_event_raw_timestamp": "" if not signal_ready_event else signal_ready_event.get("raw_timestamp", ""),
+        "signal_ready_event_payload_signal_time": "" if not signal_ready_event else signal_ready_event.get("payload_signal_time", ""),
+        "signal_ready_event_payload_ready_since": "" if not signal_ready_event else signal_ready_event.get("payload_ready_since", ""),
+        "signal_ready_event_raw_source_row": "" if not signal_ready_event else signal_ready_event.get("raw_source_row", ""),
         "correlation_window_start": iso_ts(signal_ready_ts),
         "correlation_window_end": iso_ts(correlation_end),
         "next_signal_ready_timestamp": iso_ts(next_signal_ts),
@@ -764,7 +809,7 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
         "matched_terminal_event_timestamp": iso_ts(terminal_ts),
         "matched_buy_timestamp": iso_ts(buy_ts),
         "correlation_key_used": "symbol+selected_signal_ready_timestamp+until_next_signal_ready_or_2m",
-        "correlation_confidence": "high" if same_attempt_confirmed else "ambiguous",
+        "correlation_confidence": "high" if same_attempt_confirmed else ("offline_fallback" if not signal_ready_observed else "ambiguous"),
         "duplicate_signal_ready_count": sum(1 for ts in signal_ready_candidates if signal_ready_ts is not None and abs((ts - signal_ready_ts).total_seconds()) <= 0.001),
         "same_attempt_match_confirmed": same_attempt_confirmed,
         "correlation_issue_reason": corr_issue,
