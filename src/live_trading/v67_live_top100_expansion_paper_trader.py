@@ -841,6 +841,212 @@ def emit_symbol_pipeline_health(
         )
 
 
+def pre_signal_quantity(price: Any, position_usd: Any) -> tuple[int, str]:
+    numeric_price = safe_float(price)
+    if numeric_price is None or numeric_price <= 0:
+        return 0, "missing_or_invalid_price"
+    try:
+        return max(1, int(float(position_usd) // numeric_price)), "ok"
+    except Exception:
+        return 0, "quantity_calculation_error"
+
+
+def pre_signal_ready_block_reason(
+    *,
+    features: dict[str, Any],
+    state: SymbolState,
+    has_active_position: bool,
+    entry_symbol_allowed: bool,
+    symbol_ineligible: bool,
+    entries_blocked: bool,
+    stale_reason: str,
+    quantity: int,
+) -> str:
+    if not features.get("ready"):
+        return str(features.get("reason") or "features_not_ready")
+    if state.signal_sent:
+        return "signal_sent_already_true"
+    if has_active_position:
+        return "already_open"
+    if not entry_symbol_allowed:
+        return "not_in_entry_symbols"
+    if symbol_ineligible:
+        return "symbol_ineligible"
+    if entries_blocked:
+        return "entries_blocked"
+    if stale_reason:
+        return stale_reason
+    if quantity <= 0:
+        return "quantity_zero"
+    return "would_emit_SIGNAL_READY"
+
+
+def build_pre_signal_runtime_snapshot(
+    *,
+    symbol: str,
+    session_date: str,
+    scan_id: int,
+    contract: Any,
+    ticker_present: bool,
+    snap: dict[str, Any],
+    state: SymbolState,
+    features: dict[str, Any],
+    runtime_state: dict[str, Any],
+    ranking_position: int | None,
+    has_active_position: bool,
+    entry_symbol_allowed: bool,
+    symbol_ineligible: bool,
+    entries_blocked: bool,
+    entries_blocked_reason: str,
+    stale_reason: str,
+    position_usd: Any,
+    now_ts: float,
+) -> dict[str, Any]:
+    top100_meta = dict(_runtime_dict(runtime_state, "top100_entry_metadata_by_symbol").get(symbol, {}))
+    quantity, quantity_reason = pre_signal_quantity(features.get("entry_price"), position_usd)
+    candidate_age = ready_candidate_age_seconds(state, now_ts)
+    would_emit = (
+        bool(features.get("ready"))
+        and not state.signal_sent
+        and not has_active_position
+        and entry_symbol_allowed
+        and not symbol_ineligible
+        and not entries_blocked
+        and not stale_reason
+        and quantity > 0
+    )
+    signal_reason = pre_signal_ready_block_reason(
+        features=features,
+        state=state,
+        has_active_position=has_active_position,
+        entry_symbol_allowed=entry_symbol_allowed,
+        symbol_ineligible=symbol_ineligible,
+        entries_blocked=entries_blocked,
+        stale_reason=stale_reason,
+        quantity=quantity,
+    )
+    return {
+        "symbol": symbol,
+        "timestamp": now_utc(),
+        "session_date": session_date,
+        "scan_id": scan_id,
+        "ranking_position": ranking_position,
+        "candidate_age_seconds": None if candidate_age is None else round(candidate_age, 3),
+        "in_top100": int(symbol in _runtime_set(runtime_state, "entry_symbols")),
+        "top100_rank": top100_meta.get("top100_rank"),
+        "top100_score": top100_meta.get("top100_score"),
+        "contract_present": int(contract is not None),
+        "ticker_present": int(ticker_present),
+        "usable_price": int(snap.get("price") is not None),
+        "current_price": snap.get("price"),
+        "bid": snap.get("bid"),
+        "ask": snap.get("ask"),
+        "spread_bps": features.get("spread_bps") if features.get("spread_bps") is not None else snap.get("spread_bps"),
+        "state_present": 1,
+        "signal_sent": int(bool(state.signal_sent)),
+        "ready": int(bool(features.get("ready"))),
+        "ready_since": state.ready_since_utc,
+        "first_seen": state.first_seen_utc,
+        "last_live_update": state.last_live_update_utc,
+        "first_price_initialized": int(state.first_price is not None),
+        "first5_initialized": int(state.first_5m_high is not None),
+        "first15_initialized": int(state.first_15m_high is not None),
+        "first_5m_high_pct": features.get("first_5m_high_pct"),
+        "first_15m_high_pct": features.get("first_15m_high_pct"),
+        "or_range_pct": features.get("or_range_pct"),
+        "live_entry_score": features.get("score"),
+        "rejection_reason": features.get("reason"),
+        "entries_blocked": int(bool(entries_blocked)),
+        "entries_blocked_reason": entries_blocked_reason,
+        "stale_reason": stale_reason,
+        "already_open": int(bool(has_active_position)),
+        "quantity": quantity,
+        "quantity_reason": quantity_reason,
+        "would_emit_signal_ready": int(would_emit),
+        "signal_ready_reason": signal_reason,
+        "entry_symbol_allowed": int(bool(entry_symbol_allowed)),
+        "symbol_ineligible": int(bool(symbol_ineligible)),
+    }
+
+
+def emit_pre_signal_runtime_snapshot(
+    recorder: LiveDataRecorder,
+    runtime_state: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> None:
+    symbol = str(snapshot.get("symbol") or "")
+    scan_id = snapshot.get("scan_id")
+    key = f"{scan_id}:{symbol}"
+    emitted = runtime_state.setdefault("pre_signal_runtime_snapshot_emitted_keys", {})
+    if not isinstance(emitted, dict):
+        emitted = {}
+        runtime_state["pre_signal_runtime_snapshot_emitted_keys"] = emitted
+    if key in emitted:
+        return
+    emitted[key] = now_utc()
+    if len(emitted) > 1000:
+        runtime_state["pre_signal_runtime_snapshot_emitted_keys"] = {key: emitted[key]}
+    fields = " ".join(
+        f"{name}={snapshot.get(name) if snapshot.get(name) is not None else ''}"
+        for name in [
+            "symbol",
+            "session_date",
+            "scan_id",
+            "ranking_position",
+            "candidate_age_seconds",
+            "in_top100",
+            "top100_rank",
+            "top100_score",
+            "contract_present",
+            "ticker_present",
+            "usable_price",
+            "current_price",
+            "bid",
+            "ask",
+            "spread_bps",
+            "state_present",
+            "signal_sent",
+            "ready",
+            "ready_since",
+            "first_seen",
+            "last_live_update",
+            "first_price_initialized",
+            "first5_initialized",
+            "first15_initialized",
+            "first_5m_high_pct",
+            "first_15m_high_pct",
+            "or_range_pct",
+            "live_entry_score",
+            "rejection_reason",
+            "entries_blocked",
+            "entries_blocked_reason",
+            "stale_reason",
+            "already_open",
+            "quantity",
+            "quantity_reason",
+            "would_emit_signal_ready",
+            "signal_ready_reason",
+        ]
+    )
+    try:
+        print(f"{now_utc()} PRE_SIGNAL_RUNTIME_SNAPSHOT {fields}", flush=True)
+    except Exception as exc:
+        print(f"{now_utc()} PRE_SIGNAL_RUNTIME_SNAPSHOT_LOG_FAILED symbol={symbol} error={exc!r}", flush=True)
+    try:
+        record_lifecycle_with_formal(
+            recorder,
+            "PRE_SIGNAL_RUNTIME_SNAPSHOT",
+            symbol,
+            action="BUY",
+            quantity=snapshot.get("quantity"),
+            price=snapshot.get("current_price"),
+            reason=str(snapshot.get("signal_ready_reason") or ""),
+            raw_json=snapshot,
+        )
+    except Exception as exc:
+        print(f"{now_utc()} PRE_SIGNAL_RUNTIME_SNAPSHOT_RECORD_FAILED symbol={symbol} error={exc!r}", flush=True)
+
+
 def market_open_datetime_utc(args: argparse.Namespace, now: datetime | None = None) -> datetime:
     now = now or datetime.now(timezone.utc)
     hh, mm = [int(x) for x in str(args.market_open_utc).split(":", 1)]
@@ -6610,6 +6816,8 @@ def main() -> int:
                     time.sleep(float(args.reconnect_wait_seconds))
                 continue
             loop_now = time.time()
+            runtime_state["runtime_scan_id"] = int(safe_int(runtime_state.get("runtime_scan_id")) or 0) + 1
+            runtime_scan_id = int(runtime_state["runtime_scan_id"])
             observed_at = datetime.now(timezone.utc)
             if loop_now - float(runtime_state.get("disk_usage_last_check_ts") or 0.0) >= 60.0:
                 runtime_state["disk_usage_last_check_ts"] = loop_now
@@ -6697,6 +6905,7 @@ def main() -> int:
 
             mark_entry_block_state(runtime_state, entries_blocked, loop_now)
             entry_candidates: list[dict[str, Any]] = []
+            pre_signal_snapshots: list[dict[str, Any]] = []
             symbols_with_price: list[str] = []
             symbols_without_price: list[str] = []
 
@@ -6733,6 +6942,28 @@ def main() -> int:
                 entry_symbol_allowed = symbol in _runtime_set(runtime_state, "entry_symbols")
                 symbol_ineligible = symbol in _runtime_set(runtime_state, "ineligible_symbols")
                 if symbol_ineligible and features["ready"]:
+                    pre_signal_snapshots.append(
+                        build_pre_signal_runtime_snapshot(
+                            symbol=symbol,
+                            session_date=today_session.session_date.isoformat(),
+                            scan_id=runtime_scan_id,
+                            contract=q,
+                            ticker_present=ticker is not None,
+                            snap=snap,
+                            state=state,
+                            features=features,
+                            runtime_state=runtime_state,
+                            ranking_position=None,
+                            has_active_position=has_active_position,
+                            entry_symbol_allowed=entry_symbol_allowed,
+                            symbol_ineligible=symbol_ineligible,
+                            entries_blocked=entries_blocked,
+                            entries_blocked_reason=str(runtime_state.get("entries_blocked_reason") or ""),
+                            stale_reason="",
+                            position_usd=args.position_usd,
+                            now_ts=loop_now,
+                        )
+                    )
                     info = runtime_ineligible_info(runtime_state, symbol)
                     reason = str(info.get("reason") or "ineligible_no_trading_permission_kid")
                     rejection_counter[reason] += 1
@@ -6753,6 +6984,7 @@ def main() -> int:
                         )
                         state.stale_ready_logged = True
                     continue
+                stale_reason_for_snapshot = ""
                 if features["ready"] and not state.signal_sent and not has_active_position and entry_symbol_allowed:
                     if state.ready_since_ts is None:
                         state.ready_since_ts = loop_now
@@ -6760,6 +6992,12 @@ def main() -> int:
                         state.signal_source = state.last_update_source or "unknown"
                         state.stale_ready_logged = False
                     candidate_age = ready_candidate_age_seconds(state, loop_now)
+                    stale_reason_for_snapshot = ready_candidate_rejection_reason(
+                        state,
+                        runtime_state,
+                        max_age_seconds=float(args.max_entry_candidate_age_seconds),
+                        now_ts=loop_now,
+                    )
                     entry_candidates.append(
                         {
                             "symbol": symbol,
@@ -6770,6 +7008,28 @@ def main() -> int:
                             "candidate_age_seconds": candidate_age,
                         }
                     )
+                pre_signal_snapshots.append(
+                    build_pre_signal_runtime_snapshot(
+                        symbol=symbol,
+                        session_date=today_session.session_date.isoformat(),
+                        scan_id=runtime_scan_id,
+                        contract=q,
+                        ticker_present=ticker is not None,
+                        snap=snap,
+                        state=state,
+                        features=features,
+                        runtime_state=runtime_state,
+                        ranking_position=None,
+                        has_active_position=has_active_position,
+                        entry_symbol_allowed=entry_symbol_allowed,
+                        symbol_ineligible=symbol_ineligible,
+                        entries_blocked=entries_blocked,
+                        entries_blocked_reason=str(runtime_state.get("entries_blocked_reason") or ""),
+                        stale_reason=stale_reason_for_snapshot,
+                        position_usd=args.position_usd,
+                        now_ts=loop_now,
+                    )
+                )
                 if features["ready"] and not state.signal_sent and not has_active_position and entry_symbol_allowed and entries_blocked:
                     record_lifecycle_with_formal(
                         recorder,
@@ -6804,6 +7064,9 @@ def main() -> int:
             ranking_position_by_symbol = {
                 symbol: idx + 1 for idx, (symbol, _score, _features) in enumerate(sorted(ranked, key=lambda item: item[1], reverse=True))
             }
+            for snapshot in pre_signal_snapshots:
+                snapshot["ranking_position"] = ranking_position_by_symbol.get(str(snapshot.get("symbol") or ""))
+                emit_pre_signal_runtime_snapshot(recorder, runtime_state, snapshot)
             ready_candidates_total = len(entry_candidates)
             candidate_rejection_reasons = {
                 candidate["symbol"]: ready_candidate_rejection_reason(
