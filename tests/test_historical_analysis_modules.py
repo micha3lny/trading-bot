@@ -40,6 +40,7 @@ from src.live_trading.analysis.missed_runners_analyzer import add_multiday_ranks
 from src.live_trading.analysis.no_buy_after_signal_investigator import (
     build_parser as build_no_buy_after_signal_parser,
     classify_no_buy_reason,
+    collect_signal_ready_events,
     first_record_time,
     lifecycle_stage_trace,
     records_in_window,
@@ -986,6 +987,29 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
             ),
             "offline_signal_expected_runtime_signal_not_observed",
         )
+
+    def test_no_buy_after_signal_candle_signal_ready_is_not_runtime_signal_ready(self) -> None:
+        timeline = [
+            {
+                "time": "2026-07-09T13:45:00+00:00",
+                "source": "candle",
+                "event": "possible_signal",
+                "reason": "",
+                "details": "candle_signal_ready open_to_high_pct=12.3",
+                "symbol": "FBRX",
+            }
+        ]
+        self.assertEqual(collect_signal_ready_events(timeline, [], "FBRX"), [])
+        selected, candidates, reason, event = select_signal_ready_time(
+            timeline,
+            [],
+            "FBRX",
+            pd.Timestamp("2026-07-09T13:45:00Z"),
+        )
+        self.assertEqual(str(selected), "2026-07-09 13:45:00+00:00")
+        self.assertEqual(candidates, [])
+        self.assertEqual(reason, "fallback_target_time_no_signal_ready_event")
+        self.assertIsNone(event)
 
     def test_strategy_coverage_runner_rows_uses_default_signal_thresholds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -195,11 +195,18 @@ def timeline_event_text(event: dict[str, Any]) -> str:
     return f"{event.get('event', '')} {event.get('reason', '')} {event.get('details', '')}".upper()
 
 
+def is_runtime_signal_ready_event(event: dict[str, Any]) -> bool:
+    event_type = str(event.get("event") or "").strip().upper().replace(" ", "_")
+    source = str(event.get("source") or "").strip().lower()
+    if source == "candle":
+        return False
+    return event_type in {"SIGNAL_READY", "ENTRY_SIGNAL"}
+
+
 def collect_signal_ready_events(timeline: list[dict[str, Any]], journal_lines: list[str], symbol: str) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for event in timeline:
-        text = timeline_event_text(event)
-        if "SIGNAL_READY" not in text:
+        if not is_runtime_signal_ready_event(event):
             continue
         ts = parse_dt(event.get("time"))
         if ts is not None:
