@@ -48,6 +48,12 @@ from src.live_trading.analysis.no_buy_after_signal_investigator import (
     post_signal_terminal_evidence,
     summary_for_cases as no_buy_after_signal_summary_for_cases,
 )
+from src.live_trading.analysis.offline_runtime_pre_signal_analyzer import (
+    RuntimeSnapshot,
+    build_parser as build_pre_signal_parser,
+    divergence_for_row,
+    summary_for_cases as pre_signal_summary_for_cases,
+)
 from src.live_trading.analysis.overnight_hold_ranker import analyze_trade_overnight, ensure_overnight_columns, overnight_score, score_bucket
 from src.live_trading.analysis.signal_replay_analyzer import (
     build_parser as build_signal_replay_parser,
@@ -1010,6 +1016,161 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         self.assertEqual(candidates, [])
         self.assertEqual(reason, "fallback_target_time_no_signal_ready_event")
         self.assertIsNone(event)
+
+    def test_pre_signal_parser_supports_date(self) -> None:
+        parser = build_pre_signal_parser()
+        args = parser.parse_args(["--date", "2026-07-09"])
+        self.assertEqual(args.date, "2026-07-09")
+
+    def test_pre_signal_offline_ready_runtime_no_subscription(self) -> None:
+        result = divergence_for_row(
+            {"possible_signal_time": "2026-07-09T14:00:00Z"},
+            RuntimeSnapshot(
+                {
+                    "runtime_symbol_present_in_top100": 1,
+                    "runtime_contract_present": 0,
+                    "runtime_ticker_present": 0,
+                    "runtime_subscription_state": "contract_failed",
+                },
+                source="TOP100_RELOAD_CONTRACT_FAILED",
+                observed=True,
+            ),
+        )
+        self.assertEqual(result["first_divergence_stage"], "subscription")
+        self.assertEqual(result["restart_could_explain"], "yes")
+
+    def test_pre_signal_offline_ready_runtime_missing_usable_price(self) -> None:
+        result = divergence_for_row(
+            {"offline_current_price": 10.5},
+            RuntimeSnapshot(
+                {
+                    "runtime_symbol_present_in_top100": 1,
+                    "runtime_contract_present": 1,
+                    "runtime_ticker_present": 1,
+                    "runtime_usable_price_present": 0,
+                    "runtime_price": "",
+                    "runtime_price_eligibility": "no_usable_price",
+                },
+                source="NO_USABLE_TICKER_PRICE",
+                observed=True,
+            ),
+        )
+        self.assertEqual(result["first_divergence_stage"], "ticker/price")
+
+    def test_pre_signal_offline_ready_runtime_stale_state(self) -> None:
+        result = divergence_for_row(
+            {"possible_signal_time": "2026-07-09T14:00:00Z"},
+            RuntimeSnapshot(
+                {
+                    "runtime_symbol_present_in_top100": 1,
+                    "runtime_contract_present": 1,
+                    "runtime_ticker_present": 1,
+                    "runtime_usable_price_present": 1,
+                    "runtime_state_present": 1,
+                    "runtime_signal_sent": 0,
+                    "runtime_first_price_initialized": 1,
+                    "runtime_first5_initialized": 1,
+                    "runtime_first15_initialized": 1,
+                    "runtime_stale_or_backfill_status": "signal_before_last_unblock",
+                    "runtime_candidate_rejection_reason": "",
+                },
+                source="STALE_OR_BACKFILL_READY_SKIPPED",
+                observed=True,
+            ),
+        )
+        self.assertEqual(result["first_divergence_stage"], "stale state")
+
+    def test_pre_signal_offline_ready_runtime_signal_sent_carryover(self) -> None:
+        result = divergence_for_row(
+            {"possible_signal_time": "2026-07-09T14:00:00Z"},
+            RuntimeSnapshot(
+                {
+                    "runtime_symbol_present_in_top100": 1,
+                    "runtime_contract_present": 1,
+                    "runtime_ticker_present": 1,
+                    "runtime_usable_price_present": 1,
+                    "runtime_state_present": 1,
+                    "runtime_signal_sent": 1,
+                },
+                source="SYMBOL_PIPELINE_HEALTH",
+                observed=True,
+            ),
+        )
+        self.assertEqual(result["first_divergence_stage"], "signal_sent carryover")
+
+    def test_pre_signal_restart_can_mask_signal_sent_carryover(self) -> None:
+        result = divergence_for_row(
+            {"possible_signal_time": "2026-07-09T14:00:00Z"},
+            RuntimeSnapshot(
+                {
+                    "runtime_symbol_present_in_top100": 1,
+                    "runtime_contract_present": 1,
+                    "runtime_ticker_present": 1,
+                    "runtime_usable_price_present": 1,
+                    "runtime_state_present": 1,
+                    "runtime_signal_sent": 1,
+                },
+                source="SYMBOL_PIPELINE_HEALTH",
+                observed=True,
+            ),
+        )
+        self.assertEqual(result["first_divergence_stage"], "signal_sent carryover")
+        self.assertEqual(result["restart_could_explain"], "yes")
+        self.assertIn("clears", result["restart_mechanism"])
+
+    def test_pre_signal_offline_ready_runtime_first5_first15_not_initialized(self) -> None:
+        base = {
+            "runtime_symbol_present_in_top100": 1,
+            "runtime_contract_present": 1,
+            "runtime_ticker_present": 1,
+            "runtime_usable_price_present": 1,
+            "runtime_state_present": 1,
+            "runtime_signal_sent": 0,
+            "runtime_first_price_initialized": 1,
+        }
+        first5 = divergence_for_row(
+            {"offline_first_5m_high_pct": 2.0},
+            RuntimeSnapshot({**base, "runtime_first5_initialized": 0}, source="SYMBOL_PIPELINE_HEALTH", observed=True),
+        )
+        self.assertEqual(first5["first_divergence_stage"], "first5")
+        first15 = divergence_for_row(
+            {"offline_first_15m_high_pct": 3.0},
+            RuntimeSnapshot({**base, "runtime_first5_initialized": 1, "runtime_first15_initialized": 0}, source="SYMBOL_PIPELINE_HEALTH", observed=True),
+        )
+        self.assertEqual(first15["first_divergence_stage"], "first15")
+
+    def test_pre_signal_offline_ready_runtime_spread_rejection(self) -> None:
+        result = divergence_for_row(
+            {},
+            RuntimeSnapshot(
+                {
+                    "runtime_symbol_present_in_top100": 1,
+                    "runtime_contract_present": 1,
+                    "runtime_ticker_present": 1,
+                    "runtime_usable_price_present": 1,
+                    "runtime_state_present": 1,
+                    "runtime_signal_sent": 0,
+                    "runtime_first_price_initialized": 1,
+                    "runtime_first5_initialized": 1,
+                    "runtime_first15_initialized": 1,
+                    "runtime_candidate_rejection_reason": "spread_too_wide",
+                    "runtime_spread_bps": 250,
+                    "runtime_live_entry_score": 5,
+                },
+                source="LIVE_FEATURE_DEBUG",
+                observed=True,
+            ),
+        )
+        self.assertEqual(result["first_divergence_stage"], "spread")
+
+    def test_pre_signal_runtime_evidence_unavailable_summary(self) -> None:
+        result = divergence_for_row(
+            {"possible_signal_time": "2026-07-09T14:00:00Z"},
+            RuntimeSnapshot({}, source="", observed=False),
+        )
+        self.assertEqual(result["first_divergence_stage"], "runtime evidence missing")
+        summary = pre_signal_summary_for_cases(pd.DataFrame([result]), "2026-07-09")
+        self.assertEqual(int(summary.iloc[0]["runtime evidence missing"]), 1)
 
     def test_strategy_coverage_runner_rows_uses_default_signal_thresholds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
