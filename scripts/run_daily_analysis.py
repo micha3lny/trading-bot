@@ -126,6 +126,7 @@ def summarize_csv(path: Path) -> list[str]:
             "post_signal_stale_or_backfill_skip",
             "post_signal_already_open_skip",
             "unexplained_after_signal_before_dispatch",
+            "ambiguous_event_correlation",
             "unknown_no_buy_after_signal",
             "coverage_pct",
             "capture_pct",

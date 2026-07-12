@@ -42,6 +42,18 @@ CASE_COLUMNS = [
     "top100_rank",
     "top100_score",
     "possible_signal_time",
+    "signal_ready_event_timestamp",
+    "correlation_window_start",
+    "correlation_window_end",
+    "next_signal_ready_timestamp",
+    "matched_dispatch_attempt_timestamp",
+    "matched_terminal_event_timestamp",
+    "matched_buy_timestamp",
+    "correlation_key_used",
+    "correlation_confidence",
+    "duplicate_signal_ready_count",
+    "same_attempt_match_confirmed",
+    "correlation_issue_reason",
     "signal_ready_time",
     "next_entry_scan_time_after_signal",
     "candidate_present_in_ready_list_after_signal",
@@ -92,6 +104,7 @@ NO_BUY_CLASSIFICATIONS = [
     "post_signal_stale_or_backfill_skip",
     "post_signal_already_open_skip",
     "unexplained_after_signal_before_dispatch",
+    "ambiguous_event_correlation",
     "unknown_no_buy_after_signal",
 ]
 
@@ -163,10 +176,22 @@ def symbol_lines(lines: list[str], symbol: str, start: pd.Timestamp | None, end:
     return out
 
 
-def find_signal_ready_time(timeline: list[dict[str, Any]], journal_lines: list[str], symbol: str, fallback: pd.Timestamp | None) -> pd.Timestamp | None:
+def event_line_time(line: str) -> pd.Timestamp | None:
+    return line_time(line) or parse_dt(line[:32])
+
+
+def event_has_symbol(text: str, symbol: str) -> bool:
+    return bool(symbol_pattern(symbol).search(str(text or "").upper()))
+
+
+def timeline_event_text(event: dict[str, Any]) -> str:
+    return f"{event.get('event', '')} {event.get('reason', '')} {event.get('details', '')}".upper()
+
+
+def collect_signal_ready_times(timeline: list[dict[str, Any]], journal_lines: list[str], symbol: str) -> list[pd.Timestamp]:
     candidates: list[pd.Timestamp] = []
     for event in timeline:
-        text = f"{event.get('event', '')} {event.get('reason', '')} {event.get('details', '')}".upper()
+        text = timeline_event_text(event)
         if "SIGNAL_READY" not in text:
             continue
         ts = parse_dt(event.get("time"))
@@ -177,12 +202,115 @@ def find_signal_ready_time(timeline: list[dict[str, Any]], journal_lines: list[s
         upper = line.upper()
         if "SIGNAL_READY" not in upper or not pattern.search(upper):
             continue
-        ts = line_time(line)
+        ts = event_line_time(line)
         if ts is not None:
             candidates.append(ts)
-    if candidates:
-        return min(candidates)
-    return fallback
+    return sorted(set(candidates))
+
+
+def select_signal_ready_time(
+    timeline: list[dict[str, Any]],
+    journal_lines: list[str],
+    symbol: str,
+    target_time: pd.Timestamp | None,
+) -> tuple[pd.Timestamp | None, list[pd.Timestamp], str]:
+    candidates = collect_signal_ready_times(timeline, journal_lines, symbol)
+    if not candidates:
+        return target_time, [], "fallback_target_time_no_signal_ready_event"
+    if target_time is None:
+        return candidates[0], candidates, "earliest_signal_ready_no_target_time"
+    after = [ts for ts in candidates if ts >= target_time]
+    if after:
+        return after[0], candidates, "first_signal_ready_at_or_after_target_time"
+    return candidates[-1], candidates, "latest_signal_ready_before_target_time"
+
+
+def next_signal_ready_after(candidates: list[pd.Timestamp], signal_ready_ts: pd.Timestamp | None) -> pd.Timestamp | None:
+    if signal_ready_ts is None:
+        return None
+    for ts in candidates:
+        if ts > signal_ready_ts:
+            return ts
+    return None
+
+
+def timeline_records(timeline: list[dict[str, Any]], journal_lines: list[str], symbol: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for event in timeline:
+        text = (
+            f"{event.get('time', '')} {event.get('source', '')} {event.get('event', '')} "
+            f"symbol={event.get('symbol', '')} reason={event.get('reason', '')} {event.get('details', '')}"
+        )
+        if not event_has_symbol(text, symbol) and normalize_symbol(event.get("symbol")) != normalize_symbol(symbol):
+            continue
+        records.append({
+            "time": parse_dt(event.get("time")),
+            "text": text,
+            "source": event.get("source", ""),
+            "event": str(event.get("event", "")).upper(),
+        })
+    for line in journal_lines:
+        if not event_has_symbol(line, symbol):
+            continue
+        records.append({
+            "time": event_line_time(line),
+            "text": line,
+            "source": "journal",
+            "event": "",
+        })
+    return sorted(records, key=lambda item: item.get("time") or pd.Timestamp.max.tz_localize("UTC"))
+
+
+def records_in_window(
+    records: list[dict[str, Any]],
+    start: pd.Timestamp | None,
+    end: pd.Timestamp | None,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for record in records:
+        ts = record.get("time")
+        if ts is None:
+            continue
+        if start is not None and ts < start:
+            continue
+        if end is not None and ts >= end:
+            continue
+        out.append(record)
+    return out
+
+
+def records_text(records: list[dict[str, Any]]) -> str:
+    return "\n".join(str(record.get("text") or "") for record in records)
+
+
+def first_record_time(records: list[dict[str, Any]], symbol: str, tokens: list[str]) -> pd.Timestamp | None:
+    for record in records:
+        text = str(record.get("text") or "")
+        upper = text.upper()
+        if not event_has_symbol(upper, symbol):
+            continue
+        if any(token in upper for token in tokens):
+            return record.get("time")
+    return None
+
+
+def correlation_issue_reason(
+    *,
+    signal_ready_ts: pd.Timestamp | None,
+    candidates: list[pd.Timestamp],
+    selection_reason: str,
+    target_time: pd.Timestamp | None,
+) -> str:
+    if signal_ready_ts is None:
+        return "missing_signal_ready_event"
+    if selection_reason.startswith("fallback"):
+        return "missing_observed_signal_ready_event"
+    same_ts_count = sum(1 for ts in candidates if abs((ts - signal_ready_ts).total_seconds()) <= 0.001)
+    if same_ts_count > 1:
+        return ""
+    if target_time is not None and abs((signal_ready_ts - target_time).total_seconds()) > 900:
+        return "signal_ready_far_from_target_time"
+    return ""
 
 
 def extract_symbol_values(text: str, symbol: str) -> dict[str, Any]:
@@ -254,15 +382,42 @@ def better_candidates_ahead(lines: list[str], symbol: str, signal_time: pd.Times
     return out
 
 
-def order_dispatch_attempted(text: str, symbol: str) -> int:
-    pattern = symbol_pattern(symbol)
+def first_matching_line_time(text: str, symbol: str, tokens: list[str]) -> pd.Timestamp | None:
     for line in text.splitlines():
         upper = line.upper()
-        if not pattern.search(upper):
+        if not event_has_symbol(upper, symbol):
             continue
-        if any(token in upper for token in ["PAPER BUY SENT", "BUY_ORDER_SENT", "ORDER_SUBMITTED", "ENTRY_ORDER_PARTIAL"]):
-            return 1
-    return 0
+        if any(token in upper for token in tokens):
+            return event_line_time(line)
+    return None
+
+
+def order_dispatch_attempted(text: str, symbol: str) -> int:
+    return int(first_matching_line_time(text, symbol, ["ENTRY_ORDER_DISPATCH_ATTEMPT", "PAPER BUY SENT", "BUY_ORDER_SENT", "ORDER_SUBMITTED", "ENTRY_ORDER_PARTIAL"]) is not None)
+
+
+def order_dispatch_attempt_time(text: str, symbol: str) -> pd.Timestamp | None:
+    return first_matching_line_time(text, symbol, ["ENTRY_ORDER_DISPATCH_ATTEMPT", "ORDER_SUBMITTED", "ENTRY_ORDER_PARTIAL"])
+
+
+def buy_time_seen(text: str, symbol: str) -> pd.Timestamp | None:
+    return first_matching_line_time(text, symbol, ["PAPER BUY SENT", "BUY_ORDER_SENT"])
+
+
+def terminal_event_time(text: str, symbol: str) -> pd.Timestamp | None:
+    return first_matching_line_time(
+        text,
+        symbol,
+        [
+            "STALE_OR_BACKFILL_READY_SKIPPED",
+            "ALREADY_OPEN_POSITION",
+            "ENTRY_BLOCKED_LOW_SCORE",
+            "RISK_GUARD_BLOCK_ENTRY",
+            "BUY_BLOCKED",
+            "ENTRY_RATE_LIMIT_BLOCK",
+            "ENTRY_SYMBOL_INELIGIBLE_SKIPPED",
+        ],
+    )
 
 
 def order_ack_seen(text: str, symbol: str) -> int:
@@ -356,6 +511,8 @@ def classify_no_buy_reason(row: dict[str, Any]) -> str:
     skip = str(row.get("order_dispatch_skip_reason") or "").lower()
     terminal_event = str(row.get("post_signal_terminal_event") or "").upper()
     terminal_reason = str(row.get("post_signal_terminal_reason") or "").lower()
+    if str(row.get("correlation_issue_reason") or ""):
+        return "ambiguous_event_correlation"
     if (
         not truthy(row.get("order_dispatch_attempted"))
         and terminal_event == "STALE_OR_BACKFILL_READY_SKIPPED"
@@ -386,7 +543,11 @@ def classify_no_buy_reason(row: dict[str, Any]) -> str:
         return "per_scan_entry_limit_reached"
     if int(numeric(row.get("candidates_ahead_count")) or 0) > 0:
         return "lower_rank_candidate_not_selected"
-    if not truthy(row.get("order_dispatch_attempted")) and row.get("signal_ready_time"):
+    if (
+        not truthy(row.get("order_dispatch_attempted"))
+        and row.get("signal_ready_time")
+        and truthy(row.get("same_attempt_match_confirmed"))
+    ):
         return "unexplained_after_signal_before_dispatch"
     return "unknown_no_buy_after_signal"
 
@@ -416,6 +577,8 @@ def lifecycle_stage_trace(
     better: list[str],
     post_signal_terminal_event: str = "",
     post_signal_terminal_reason: str = "",
+    same_attempt_confirmed: int = 0,
+    correlation_issue_reason: str = "",
 ) -> dict[str, str]:
     # In v67, SIGNAL_READY is emitted inside ordered_entry_candidates after the
     # symbol has entered entry_candidates, survived candidate_rejection_reasons,
@@ -452,10 +615,18 @@ def lifecycle_stage_trace(
     if dispatch:
         dispatch_stage = "dispatch_attempt_seen"
         ibkr_stage = "ibkr_placeOrder_or_BUY_ORDER_SENT_seen"
-    elif signal_ready_seen and not disappeared:
+    elif correlation_issue_reason:
+        dispatch_stage = f"ambiguous_event_correlation:{correlation_issue_reason}"
+        ibkr_stage = "not_proven"
+        disappeared = "ambiguous_event_correlation"
+    elif signal_ready_seen and same_attempt_confirmed and not disappeared:
         dispatch_stage = "missing_after_SIGNAL_READY_before_ENTRY_ORDER_DISPATCH_ATTEMPT"
         ibkr_stage = "not_seen"
         disappeared = "unexplained_after_SIGNAL_READY_before_dispatch_attempt"
+    elif signal_ready_seen and not disappeared:
+        dispatch_stage = "not_proven_same_attempt"
+        ibkr_stage = "not_proven"
+        disappeared = "ambiguous_event_correlation"
     elif better and not signal_ready_seen:
         dispatch_stage = "not_dispatched_lower_rank_candidates_ahead"
         ibkr_stage = "not_seen"
@@ -494,12 +665,13 @@ def lifecycle_stage_trace(
 
 def investigate_case(target: dict[str, Any], session_date: str, evidence: EvidenceBundle) -> dict[str, Any]:
     symbol = normalize_symbol(target.get("symbol"))
-    center = parse_dt(
+    target_time = parse_dt(
         target.get("signal_ready_time")
         or target.get("possible_signal_time")
         or target.get("opening_range_break_time")
         or target.get("first_time_above_8pct")
     )
+    center = target_time
     sqlite_sources = sources_for_symbol(evidence.sqlite_by_symbol, symbol, center, window_minutes=90)
     recorder_sources = sources_for_symbol(evidence.recorder_by_symbol, symbol, center, window_minutes=90)
     timeline, _raw_counts = build_symbol_timeline(
@@ -508,27 +680,61 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
         recorder_sources=recorder_sources,
         center=center,
     )
-    signal_ready_ts = find_signal_ready_time(timeline, evidence.journal_lines, symbol, center)
+    signal_ready_ts, signal_ready_candidates, signal_selection_reason = select_signal_ready_time(
+        timeline,
+        evidence.journal_lines,
+        symbol,
+        target_time,
+    )
+    next_signal_ts = next_signal_ready_after(signal_ready_candidates, signal_ready_ts)
+    fallback_window_end = signal_ready_ts + pd.Timedelta(minutes=2) if signal_ready_ts is not None else None
+    correlation_end = min(
+        [ts for ts in [next_signal_ts, fallback_window_end] if ts is not None],
+        default=None,
+    )
+    all_records = timeline_records(timeline, evidence.journal_lines, symbol)
+    attempt_records = records_in_window(all_records, signal_ready_ts, correlation_end)
+    attempt_text = records_text(attempt_records)
     scan_ts, heartbeat = heartbeat_after_signal(evidence.heartbeat_states, signal_ready_ts)
-    window_end = scan_ts + pd.Timedelta(minutes=5) if scan_ts is not None else None
     journal_symbol = journal_text_for_symbol(evidence.journal_lines, symbol, signal_ready_ts or center, minutes=90)
     timeline_text = event_text(timeline)
-    symbol_window_lines = symbol_lines(evidence.journal_lines, symbol, signal_ready_ts, window_end)
-    combined = "\n".join([timeline_text, journal_symbol, "\n".join(symbol_window_lines)])
-    terminal = post_signal_terminal_evidence("\n".join([timeline_text, "\n".join(symbol_window_lines)]), symbol)
+    combined = "\n".join([attempt_text, timeline_text, journal_symbol])
+    terminal = post_signal_terminal_evidence(attempt_text, symbol)
     values = extract_symbol_values(combined, symbol)
     candidate_rank = values.get("candidate_rank_at_scan") or target.get("top100_rank")
     better = better_candidates_ahead(evidence.journal_lines, symbol, signal_ready_ts, candidate_rank)
     heartbeat_reason = heartbeat_entries_blocked_reason(heartbeat)
     entries_blocked = int(truthy(heartbeat.get("entries_blocked")) or bool(heartbeat_reason))
-    skip_reason = skip_reason_from_text(combined, symbol)
-    failed_reason = final_filter_reason(combined, symbol, heartbeat_reason)
-    dispatch = order_dispatch_attempted(combined, symbol)
-    ack = order_ack_seen(combined, symbol)
-    max_entries_reached = int("ENTRY_RATE_LIMIT_BLOCK" in combined.upper() or "MAX_ENTRIES_PER" in combined.upper())
+    skip_reason = skip_reason_from_text(attempt_text, symbol)
+    failed_reason = final_filter_reason(attempt_text, symbol, "")
+    dispatch_ts = first_record_time(attempt_records, symbol, ["ENTRY_ORDER_DISPATCH_ATTEMPT", "ORDER_SUBMITTED", "ENTRY_ORDER_PARTIAL"])
+    buy_ts = first_record_time(attempt_records, symbol, ["PAPER BUY SENT", "BUY_ORDER_SENT"])
+    terminal_ts = first_record_time(
+        attempt_records,
+        symbol,
+        [
+            "STALE_OR_BACKFILL_READY_SKIPPED",
+            "ALREADY_OPEN_POSITION",
+            "ENTRY_BLOCKED_LOW_SCORE",
+            "RISK_GUARD_BLOCK_ENTRY",
+            "BUY_BLOCKED",
+            "ENTRY_RATE_LIMIT_BLOCK",
+            "ENTRY_SYMBOL_INELIGIBLE_SKIPPED",
+        ],
+    )
+    dispatch = int(dispatch_ts is not None or buy_ts is not None)
+    ack = order_ack_seen(attempt_text, symbol)
+    max_entries_reached = int("ENTRY_RATE_LIMIT_BLOCK" in attempt_text.upper() or "MAX_ENTRIES_PER" in attempt_text.upper())
     managed_open = heartbeat.get("managed_open", "")
     max_positions = heartbeat.get("max_positions") or heartbeat.get("max_open_positions") or ""
-    signal_ready_seen = "SIGNAL_READY" in combined.upper()
+    signal_ready_seen = signal_ready_ts is not None and signal_ready_candidates
+    corr_issue = correlation_issue_reason(
+        signal_ready_ts=signal_ready_ts,
+        candidates=signal_ready_candidates,
+        selection_reason=signal_selection_reason,
+        target_time=target_time,
+    )
+    same_attempt_confirmed = int(bool(signal_ready_seen) and not corr_issue)
     lifecycle = lifecycle_stage_trace(
         symbol=symbol,
         signal_ready_seen=signal_ready_seen,
@@ -541,6 +747,8 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
         better=better,
         post_signal_terminal_event=terminal["post_signal_terminal_event"],
         post_signal_terminal_reason=terminal["post_signal_terminal_reason"],
+        same_attempt_confirmed=same_attempt_confirmed,
+        correlation_issue_reason=corr_issue,
     )
     row = {
         "date": session_date,
@@ -548,6 +756,18 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
         "top100_rank": target.get("top100_rank"),
         "top100_score": target.get("top100_score"),
         "possible_signal_time": target.get("possible_signal_time"),
+        "signal_ready_event_timestamp": iso_ts(signal_ready_ts),
+        "correlation_window_start": iso_ts(signal_ready_ts),
+        "correlation_window_end": iso_ts(correlation_end),
+        "next_signal_ready_timestamp": iso_ts(next_signal_ts),
+        "matched_dispatch_attempt_timestamp": iso_ts(dispatch_ts),
+        "matched_terminal_event_timestamp": iso_ts(terminal_ts),
+        "matched_buy_timestamp": iso_ts(buy_ts),
+        "correlation_key_used": "symbol+selected_signal_ready_timestamp+until_next_signal_ready_or_2m",
+        "correlation_confidence": "high" if same_attempt_confirmed else "ambiguous",
+        "duplicate_signal_ready_count": sum(1 for ts in signal_ready_candidates if signal_ready_ts is not None and abs((ts - signal_ready_ts).total_seconds()) <= 0.001),
+        "same_attempt_match_confirmed": same_attempt_confirmed,
+        "correlation_issue_reason": corr_issue,
         "signal_ready_time": iso_ts(signal_ready_ts),
         "next_entry_scan_time_after_signal": iso_ts(scan_ts),
         "candidate_present_in_ready_list_after_signal": int(
@@ -568,7 +788,7 @@ def investigate_case(target: dict[str, Any], session_date: str, evidence: Eviden
         "subscription_cap_state_at_scan": f"subscription_cap_block={heartbeat.get('subscription_cap_block', '')};subscriptions_active={heartbeat.get('subscriptions_active', '')};subscriptions_cap={heartbeat.get('subscriptions_cap', '')}",
         "spread_bps_at_scan": values.get("spread_bps_at_scan"),
         "price_at_scan": values.get("price_at_scan"),
-        "passed_final_entry_filters": int(not failed_reason and not entries_blocked and not max_entries_reached),
+        "passed_final_entry_filters": int(not failed_reason and not max_entries_reached and same_attempt_confirmed),
         "failed_final_entry_filter_reason": failed_reason,
         "order_dispatch_attempted": dispatch,
         "order_dispatch_skip_reason": skip_reason,
