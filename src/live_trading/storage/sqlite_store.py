@@ -669,6 +669,16 @@ class SQLiteRuntimeStore:
             CREATE INDEX IF NOT EXISTS idx_executions_trade_id ON executions(trade_id);
             CREATE INDEX IF NOT EXISTS idx_executions_order_id ON executions(order_id);
             CREATE INDEX IF NOT EXISTS idx_executions_perm_id ON executions(perm_id);
+            CREATE INDEX IF NOT EXISTS idx_executions_executed_at ON executions(executed_at);
+            CREATE INDEX IF NOT EXISTS idx_executions_recorded_at ON executions(recorded_at);
+            CREATE INDEX IF NOT EXISTS idx_executions_executed_recorded_id ON executions(executed_at DESC, recorded_at DESC, execution_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_executions_missing_executed_session_date
+                ON executions(session_date)
+                WHERE executed_at IS NULL OR executed_at = '';
+            CREATE INDEX IF NOT EXISTS idx_executions_missing_executed_recorded_at
+                ON executions(recorded_at)
+                WHERE (executed_at IS NULL OR executed_at = '')
+                  AND (session_date IS NULL OR session_date = '');
 
             CREATE TABLE IF NOT EXISTS positions (
                 position_key TEXT PRIMARY KEY,

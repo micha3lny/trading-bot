@@ -10,7 +10,17 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.dashboard.runtime_queries import DateWindow, aggregate_closed_positions, list_sessions, list_strategies, load_dashboard_snapshot, load_diagnostics, utc_today
+from src.dashboard.runtime_queries import (
+    DateWindow,
+    aggregate_closed_positions,
+    execution_window_predicate,
+    list_sessions,
+    list_strategies,
+    load_dashboard_snapshot,
+    load_diagnostics,
+    load_executions,
+    utc_today,
+)
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
 
@@ -42,6 +52,120 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             ),
         )
         store.conn.commit()
+
+    def test_execution_window_predicate_uses_timestamp_indexes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                for idx in range(5):
+                    self.insert_execution_direct(store, {
+                        "execution_id": f"E{idx}",
+                        "trade_id": f"T{idx}",
+                        "strategy_name": "v67",
+                        "session_date": "2026-07-02",
+                        "symbol": "IDX",
+                        "side": "BOT",
+                        "quantity": 1,
+                        "price": 10 + idx,
+                        "executed_at": f"2026-07-02T13:3{idx}:00+00:00",
+                        "recorded_at": f"2026-07-02T13:3{idx}:01+00:00",
+                        "commission": 0.1,
+                        "commission_currency": "USD",
+                        "commission_source": "ibkr",
+                    })
+                clause, params = execution_window_predicate("e", DateWindow("2026-07-02", "2026-07-02"))
+                plan_rows = store.conn.execute(
+                    f"""
+                    EXPLAIN QUERY PLAN
+                    SELECT e.execution_id
+                    FROM executions e
+                    WHERE {clause}
+                    ORDER BY e.executed_at DESC, e.recorded_at DESC, e.execution_id DESC
+                    LIMIT 50
+                    """,
+                    params,
+                ).fetchall()
+                plan = " | ".join(str(row[3]) for row in plan_rows)
+                self.assertIn("INDEX", plan.upper())
+                self.assertNotIn("SCAN EXECUTIONS", plan.upper())
+            finally:
+                store.close()
+
+    def test_load_executions_uses_indexable_date_fallbacks_and_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                self.insert_execution_direct(store, {
+                    "execution_id": "EXEC_TIME",
+                    "trade_id": "T1",
+                    "strategy_name": "v67",
+                    "session_date": "",
+                    "symbol": "AAA",
+                    "side": "BOT",
+                    "quantity": 1,
+                    "price": 10,
+                    "executed_at": "2026-07-02T13:31:00+00:00",
+                    "recorded_at": "2026-07-02T13:31:01+00:00",
+                    "commission": 0.1,
+                    "commission_currency": "USD",
+                    "commission_source": "ibkr",
+                    "raw_json": {"large": "payload"},
+                })
+                self.insert_execution_direct(store, {
+                    "execution_id": "SESSION_FALLBACK",
+                    "trade_id": "T2",
+                    "strategy_name": "v67",
+                    "session_date": "2026-07-02",
+                    "symbol": "BBB",
+                    "side": "SLD",
+                    "quantity": 1,
+                    "price": 11,
+                    "executed_at": "",
+                    "recorded_at": "",
+                    "commission": 0.1,
+                    "commission_currency": "USD",
+                    "commission_source": "ibkr",
+                })
+                self.insert_execution_direct(store, {
+                    "execution_id": "RECORDED_FALLBACK",
+                    "trade_id": "T3",
+                    "strategy_name": "v67",
+                    "session_date": "",
+                    "symbol": "CCC",
+                    "side": "BOT",
+                    "quantity": 1,
+                    "price": 12,
+                    "executed_at": "",
+                    "recorded_at": "2026-07-02 14:00:00+00:00",
+                    "commission": 0.1,
+                    "commission_currency": "USD",
+                    "commission_source": "ibkr",
+                })
+                self.insert_execution_direct(store, {
+                    "execution_id": "OLD",
+                    "trade_id": "T4",
+                    "strategy_name": "v67",
+                    "session_date": "2026-07-01",
+                    "symbol": "OLD",
+                    "side": "BOT",
+                    "quantity": 1,
+                    "price": 9,
+                    "executed_at": "2026-07-01T13:31:00+00:00",
+                    "recorded_at": "2026-07-01T13:31:01+00:00",
+                    "commission": 0.1,
+                    "commission_currency": "USD",
+                    "commission_source": "ibkr",
+                })
+                rows = load_executions(store.conn, DateWindow("2026-07-02", "2026-07-02"), "v67", limit=2)
+                self.assertEqual(len(rows), 2)
+                self.assertNotIn("OLD", rows["execution_id"].tolist())
+                self.assertEqual(rows["raw_json"].fillna("").astype(str).unique().tolist(), [""])
+                all_rows = load_executions(store.conn, DateWindow("2026-07-02", "2026-07-02"), "v67", limit=None)
+                self.assertEqual(set(all_rows["execution_id"].tolist()), {"EXEC_TIME", "SESSION_FALLBACK", "RECORDED_FALLBACK"})
+            finally:
+                store.close()
 
     def test_runtime_open_positions_use_sqlite_positions_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

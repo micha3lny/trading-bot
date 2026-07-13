@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +25,8 @@ OPEN_POSITION_STATUSES = {"OPEN", "EXIT_ORDER"}
 DEFAULT_RECORDER_ROOT = Path("data/live/recorder")
 DEFAULT_ORPHAN_STALE_DAYS = 7
 _MIGRATED_SQLITE_PATHS: set[str] = set()
+DEFAULT_EXECUTION_ROW_LIMIT = int(os.environ.get("TRADING_BOT_DASHBOARD_EXECUTION_ROW_LIMIT", "2000") or "2000")
+DEFAULT_EXECUTION_LOOKUP_DAYS = int(os.environ.get("TRADING_BOT_DASHBOARD_EXECUTION_LOOKUP_DAYS", "7") or "7")
 OPEN_POSITION_STATUS_SQL = """
 (
     UPPER(COALESCE(p.status, '')) IN ('OPEN', 'EXIT_ORDER')
@@ -49,6 +52,55 @@ def execution_day_sql(alias: str = "e") -> str:
         f"COALESCE(substr({prefix}recorded_at, 1, 10), '')"
         ")"
     )
+
+
+def date_window_bounds(window: DateWindow) -> tuple[str, str]:
+    end_exclusive = datetime.fromisoformat(window.end_date).date() + timedelta(days=1)
+    return window.start_date, end_exclusive.isoformat()
+
+
+def execution_window_predicate(alias: str, window: DateWindow) -> tuple[str, list[Any]]:
+    """Indexable execution date filter.
+
+    The old dashboard predicate used COALESCE(substr(executed_at...), session_date,
+    substr(recorded_at...)), which prevents SQLite from using simple timestamp
+    indexes and forces temp sorting on large execution ledgers. Prefer the real
+    execution timestamp, then fall back to session_date/recorded_at only for rows
+    where executed_at is genuinely missing.
+    """
+    start_ts, end_ts = date_window_bounds(window)
+    p = f"{alias}." if alias else ""
+    return (
+        f"""(
+            ({p}executed_at IS NOT NULL AND {p}executed_at != '' AND {p}executed_at >= ? AND {p}executed_at < ?)
+            OR (({p}executed_at IS NULL OR {p}executed_at = '') AND {p}session_date >= ? AND {p}session_date <= ?)
+            OR (
+                ({p}executed_at IS NULL OR {p}executed_at = '')
+                AND ({p}session_date IS NULL OR {p}session_date = '')
+                AND {p}recorded_at IS NOT NULL AND {p}recorded_at != ''
+                AND {p}recorded_at >= ? AND {p}recorded_at < ?
+            )
+        )""",
+        [start_ts, end_ts, window.start_date, window.end_date, start_ts, end_ts],
+    )
+
+
+def read_sql_timed(
+    conn: sqlite3.Connection,
+    sql: str,
+    params: list[Any] | tuple[Any, ...] = (),
+    *,
+    query_name: str,
+) -> pd.DataFrame:
+    started = time.perf_counter()
+    rows = read_sql(conn, sql, params)
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    print(
+        f"{datetime.now(timezone.utc).isoformat()} DASHBOARD_QUERY_TIMING "
+        f"query_name={query_name} duration_ms={duration_ms:.3f} rows_returned={len(rows)}",
+        flush=True,
+    )
+    return rows
 
 
 def utc_today() -> str:
@@ -194,7 +246,7 @@ def window_contains_date(window: DateWindow, value: Any) -> bool:
     return bool(day and window.start_date <= day <= window.end_date)
 
 
-def expanded_lookup_window(window: DateWindow, days_back: int = 45) -> DateWindow:
+def expanded_lookup_window(window: DateWindow, days_back: int = DEFAULT_EXECUTION_LOOKUP_DAYS) -> DateWindow:
     start = datetime.fromisoformat(window.start_date).date() - timedelta(days=days_back)
     return DateWindow(start.isoformat(), window.end_date)
 
@@ -378,48 +430,117 @@ def strategy_clause(alias: str, strategy: str | None) -> tuple[str, list[Any]]:
     return f" AND COALESCE({alias}.strategy_name, 'unknown') = ?", [strategy]
 
 
-def load_executions(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> pd.DataFrame:
+def load_executions(
+    conn: sqlite3.Connection,
+    window: DateWindow,
+    strategy: str | None,
+    *,
+    limit: int | None = DEFAULT_EXECUTION_ROW_LIMIT,
+    include_raw_json: bool = False,
+    query_name: str = "load_executions",
+) -> pd.DataFrame:
     if not strategy or strategy == "All":
         clause, params = "", []
     else:
         clause, params = " AND (COALESCE(e.strategy_name, 'unknown') = ? OR COALESCE(e.strategy_name, 'unknown') = 'unknown')", [strategy]
-    execution_day_expr = execution_day_sql("e")
-    rows = read_sql(
-        conn,
-        f"""
+    start_ts, end_ts = date_window_bounds(window)
+    raw_json_select = "e.raw_json" if include_raw_json else "'' AS raw_json"
+    partition_limit_clause = ""
+    partition_limit_params: list[Any] = []
+    if limit is not None and int(limit) > 0:
+        partition_limit_clause = " LIMIT ?"
+        partition_limit_params = [int(limit)]
+    select_sql = f"""
         SELECT
-            execution_id,
-            trade_id,
-            COALESCE(strategy_name, 'unknown') AS strategy,
-            COALESCE(strategy_name, 'unknown') AS strategy_name,
-            session_date,
-            symbol,
-            side,
-            side AS action,
-            quantity AS qty,
-            quantity,
-            price,
-            price AS fill_price,
-            quantity * price AS gross_value,
-            order_id,
-            perm_id,
-            exchange,
-            liquidity,
-            executed_at AS time,
-            executed_at,
-            recorded_at,
-            commission,
-            commission_currency,
-            realized_pnl,
-            commission_source,
-            exit_reason,
-            exit_reason_source,
-            raw_json
+            e.execution_id,
+            e.trade_id,
+            COALESCE(e.strategy_name, 'unknown') AS strategy,
+            COALESCE(e.strategy_name, 'unknown') AS strategy_name,
+            e.session_date,
+            e.symbol,
+            e.side,
+            e.side AS action,
+            e.quantity AS qty,
+            e.quantity,
+            e.price,
+            e.price AS fill_price,
+            e.quantity * e.price AS gross_value,
+            e.order_id,
+            e.perm_id,
+            e.exchange,
+            e.liquidity,
+            e.executed_at AS time,
+            e.executed_at,
+            e.recorded_at,
+            e.commission,
+            e.commission_currency,
+            e.realized_pnl,
+            e.commission_source,
+            e.exit_reason,
+            e.exit_reason_source,
+            {raw_json_select}
         FROM executions e
-        WHERE {execution_day_expr} BETWEEN ? AND ? {clause}
-        ORDER BY COALESCE(e.executed_at, e.recorded_at) DESC, e.execution_id DESC
-        """,
-        [window.start_date, window.end_date, *params],
+    """
+    query_specs = [
+        (
+            "executed_at",
+            f"""
+            {select_sql}
+            WHERE e.executed_at IS NOT NULL AND e.executed_at != ''
+              AND e.executed_at >= ? AND e.executed_at < ?
+              {clause}
+            ORDER BY e.executed_at DESC, e.recorded_at DESC, e.execution_id DESC
+            {partition_limit_clause}
+            """,
+            [start_ts, end_ts, *params, *partition_limit_params],
+        ),
+        (
+            "session_date_fallback",
+            f"""
+            {select_sql}
+            WHERE (e.executed_at IS NULL OR e.executed_at = '')
+              AND e.session_date >= ? AND e.session_date <= ?
+              {clause}
+            ORDER BY e.session_date DESC, e.recorded_at DESC, e.execution_id DESC
+            {partition_limit_clause}
+            """,
+            [window.start_date, window.end_date, *params, *partition_limit_params],
+        ),
+        (
+            "recorded_at_fallback",
+            f"""
+            {select_sql}
+            WHERE (e.executed_at IS NULL OR e.executed_at = '')
+              AND (e.session_date IS NULL OR e.session_date = '')
+              AND e.recorded_at IS NOT NULL AND e.recorded_at != ''
+              AND e.recorded_at >= ? AND e.recorded_at < ?
+              {clause}
+            ORDER BY e.recorded_at DESC, e.execution_id DESC
+            {partition_limit_clause}
+            """,
+            [start_ts, end_ts, *params, *partition_limit_params],
+        ),
+    ]
+    started = time.perf_counter()
+    parts: list[pd.DataFrame] = []
+    for suffix, sql, sql_params in query_specs:
+        part = read_sql(conn, sql, sql_params)
+        parts.append(part)
+        if suffix == "executed_at" and limit is not None and int(limit) > 0 and len(part) >= int(limit):
+            break
+    rows = pd.concat([part for part in parts if not part.empty], ignore_index=True, sort=False) if any(not part.empty for part in parts) else pd.DataFrame()
+    if not rows.empty:
+        sort_key = rows["executed_at"].fillna("").astype(str)
+        fallback_key = rows["recorded_at"].fillna("").astype(str)
+        rows["_dashboard_sort_time"] = sort_key.where(sort_key != "", fallback_key)
+        rows = rows.sort_values(["_dashboard_sort_time", "execution_id"], ascending=[False, False]).drop(columns=["_dashboard_sort_time"]).reset_index(drop=True)
+        if limit is not None and int(limit) > 0:
+            rows = rows.head(int(limit)).reset_index(drop=True)
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    print(
+        f"{datetime.now(timezone.utc).isoformat()} DASHBOARD_QUERY_TIMING "
+        f"query_name={query_name} duration_ms={duration_ms:.3f} rows_returned={len(rows)}",
+        flush=True,
     )
     if rows.empty:
         return rows
@@ -445,8 +566,8 @@ def load_execution_pnl_summary(conn: sqlite3.Connection, window: DateWindow, str
         clause, params = "", []
     else:
         clause, params = " AND (COALESCE(e.strategy_name, 'unknown') = ? OR COALESCE(e.strategy_name, 'unknown') = 'unknown')", [strategy]
-    execution_day_expr = execution_day_sql("e")
-    rows = read_sql(
+    window_clause, window_params = execution_window_predicate("e", window)
+    rows = read_sql_timed(
         conn,
         f"""
         SELECT
@@ -459,13 +580,15 @@ def load_execution_pnl_summary(conn: sqlite3.Connection, window: DateWindow, str
             END) AS sell_commissions,
             SUM(COALESCE(commission, 0)) AS all_commissions
         FROM executions e
-        WHERE {execution_day_expr} BETWEEN ? AND ?
+        WHERE {window_clause}
         {clause}
         """,
-        [window.start_date, window.end_date, *params],
+        [*window_params, *params],
+        query_name="load_execution_pnl_summary",
     )
     row = rows.iloc[0].to_dict() if not rows.empty else {}
-    closed_symbol_rows = read_sql(
+    closed_window_clause, closed_window_params = execution_window_predicate("e", window)
+    closed_symbol_rows = read_sql_timed(
         conn,
         f"""
         SELECT COUNT(*) AS closed_symbols
@@ -482,7 +605,7 @@ def load_execution_pnl_summary(conn: sqlite3.Connection, window: DateWindow, str
                     ELSE 0
                 END) AS sell_quantity
             FROM executions e
-            WHERE {execution_day_expr} BETWEEN ? AND ?
+            WHERE {closed_window_clause}
             {clause}
             GROUP BY UPPER(COALESCE(symbol, ''))
             HAVING symbol != ''
@@ -490,7 +613,8 @@ def load_execution_pnl_summary(conn: sqlite3.Connection, window: DateWindow, str
                AND sell_quantity > 0
         )
         """,
-        [window.start_date, window.end_date, *params],
+        [*closed_window_params, *params],
+        query_name="load_execution_closed_symbol_count",
     )
     closed_symbols = float((closed_symbol_rows.iloc[0].to_dict() if not closed_symbol_rows.empty else {}).get("closed_symbols") or 0)
     gross = float(row.get("gross_realized") or 0.0)
@@ -3713,9 +3837,16 @@ def load_dashboard_snapshot(
     conn = connect(path)
     try:
         conn.execute("BEGIN")
-        executions = load_executions(conn, window, strategy)
+        executions = load_executions(conn, window, strategy, query_name="load_executions_table")
         execution_pnl = load_execution_pnl_summary(conn, window, strategy)
-        execution_lookup = load_executions(conn, expanded_lookup_window(window), strategy)
+        execution_lookup = load_executions(
+            conn,
+            expanded_lookup_window(window),
+            strategy,
+            limit=None,
+            include_raw_json=True,
+            query_name="load_executions_lookup",
+        )
         raw_closed_rows = load_raw_closed_trade_rows(conn, window, strategy)
         closed, closed_diag = load_closed_positions(
             conn,
