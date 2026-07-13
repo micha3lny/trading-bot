@@ -7,10 +7,12 @@ import hashlib
 import json
 import math
 import os
+import resource
 import signal
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -1045,6 +1047,498 @@ def emit_pre_signal_runtime_snapshot(
         )
     except Exception as exc:
         print(f"{now_utc()} PRE_SIGNAL_RUNTIME_SNAPSHOT_RECORD_FAILED symbol={symbol} error={exc!r}", flush=True)
+
+
+def _len_safe(value: Any) -> int:
+    try:
+        if value is None:
+            return 0
+        return len(value)
+    except Exception:
+        return 0
+
+
+def _event_callback_count(event: Any) -> int:
+    if event is None:
+        return 0
+    for attr in ("handlers", "_handlers"):
+        try:
+            handlers = getattr(event, attr, None)
+            if handlers is not None:
+                return len(handlers)
+        except Exception:
+            pass
+    try:
+        return len(event)
+    except Exception:
+        return -1
+
+
+def _open_file_descriptor_count() -> int:
+    for path in ("/proc/self/fd", "/dev/fd"):
+        try:
+            return len(os.listdir(path))
+        except Exception:
+            continue
+    return -1
+
+
+def _process_rss_memory_mb() -> float:
+    try:
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return round(float(rss) / (1024.0 * 1024.0), 2)
+        return round(float(rss) / 1024.0, 2)
+    except Exception:
+        return 0.0
+
+
+def _process_cpu_percent() -> float | str:
+    try:
+        import psutil  # type: ignore
+        return round(float(psutil.Process(os.getpid()).cpu_percent(interval=None)), 3)
+    except Exception:
+        return ""
+
+
+def _runtime_counter_value(value: Any) -> int:
+    if isinstance(value, dict):
+        return len(value)
+    if isinstance(value, (set, list, tuple)):
+        return len(value)
+    return 0
+
+
+def _runtime_set_readonly(runtime_state: dict[str, Any], key: str) -> set[Any]:
+    value = runtime_state.get(key)
+    if isinstance(value, set):
+        return set(value)
+    if isinstance(value, (list, tuple)):
+        return set(value)
+    return set()
+
+
+def _runtime_dict_readonly(runtime_state: dict[str, Any], key: str) -> dict[Any, Any]:
+    value = runtime_state.get(key)
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def runtime_state_growth_current_metrics(
+    *,
+    ib: IB | None,
+    runtime_state: dict[str, Any],
+    states: dict[str, SymbolState],
+    contracts: list[tuple[str, Any]],
+    contract_by_symbol: dict[str, Any],
+    tickers: dict[str, Any],
+    managed_positions: dict[str, ManagedPosition],
+    seen_fills: set[str],
+    latest_snapshots: dict[str, dict[str, Any]],
+    args: argparse.Namespace,
+    current_session_date: str,
+    previous_session_date: str = "",
+    sqlite_store: Any | None = None,
+) -> dict[str, Any]:
+    desired = {str(symbol).upper() for symbol in _runtime_set_readonly(runtime_state, "entry_symbols")}
+    if not desired:
+        desired = {str(symbol).upper() for symbol in (runtime_state.get("top100_reload_symbols") or [])}
+    contract_symbols = {str(symbol).upper() for symbol, _contract in contracts} | {str(symbol).upper() for symbol in contract_by_symbol}
+    ticker_symbols = {str(symbol).upper() for symbol in tickers}
+    state_symbols = {str(symbol).upper() for symbol in states}
+    active_subscription_symbols = contract_symbols | ticker_symbols
+    removed_still_subscribed = sorted(active_subscription_symbols - desired)
+    desired_without_subscription = sorted(desired - active_subscription_symbols)
+    desired_without_ticker = sorted(desired - ticker_symbols)
+    desired_without_state = sorted(desired - state_symbols)
+    old_state_symbols = []
+    old_first_seen_symbols = []
+    old_last_live_symbols = []
+    old_first5_symbols = []
+    old_first15_symbols = []
+    old_open_symbols = []
+    for symbol, state in states.items():
+        first_seen_date = str(state.first_seen_utc or "")[:10]
+        last_live_date = str(state.last_live_update_utc or state.latest_seen_utc or "")[:10]
+        if first_seen_date and first_seen_date != current_session_date:
+            old_state_symbols.append(symbol)
+            if state.first_price is not None:
+                old_open_symbols.append(symbol)
+            if state.first_5m_high is not None:
+                old_first5_symbols.append(symbol)
+            if state.first_15m_high is not None:
+                old_first15_symbols.append(symbol)
+        if first_seen_date and first_seen_date != current_session_date:
+            old_first_seen_symbols.append(symbol)
+        if last_live_date and last_live_date != current_session_date:
+            old_last_live_symbols.append(symbol)
+    sqlite_status: dict[str, Any] = {}
+    try:
+        if sqlite_store is not None and hasattr(sqlite_store, "status"):
+            sqlite_status = sqlite_store.status()
+    except Exception:
+        sqlite_status = dict(runtime_state.get("sqlite_writer_status") or {})
+    if not sqlite_status:
+        sqlite_status = dict(runtime_state.get("sqlite_writer_status") or {})
+    pending_orders = []
+    try:
+        if ib is not None and ibkr_connection_alive(ib):
+            pending_orders = open_ibkr_order_trades(ib)
+    except Exception:
+        pending_orders = []
+    active_positions = [pos for pos in managed_positions.values() if getattr(pos, "active", False)]
+    inactive_positions = [pos for pos in managed_positions.values() if not getattr(pos, "active", False)]
+    entry_order_map = _runtime_dict_readonly(runtime_state, "entry_order_by_order_id")
+    pending_entry_orders = [
+        row for row in entry_order_map.values()
+        if isinstance(row, dict) and str(row.get("symbol") or "")
+    ]
+    total_cached_candles = sum(len(getattr(state, "bars", []) or []) for state in states.values())
+    callback_counts = {
+        "callback_count_pendingTickersEvent": _event_callback_count(getattr(ib, "pendingTickersEvent", None)) if ib is not None else 0,
+        "callback_count_orderStatusEvent": _event_callback_count(getattr(ib, "orderStatusEvent", None)) if ib is not None else 0,
+        "callback_count_execDetailsEvent": _event_callback_count(getattr(ib, "execDetailsEvent", None)) if ib is not None else 0,
+        "callback_count_commissionReportEvent": _event_callback_count(getattr(ib, "commissionReportEvent", None)) if ib is not None else 0,
+        "callback_count_errorEvent": _event_callback_count(getattr(ib, "errorEvent", None)) if ib is not None else 0,
+        "callback_count_disconnectedEvent": _event_callback_count(getattr(ib, "disconnectedEvent", None)) if ib is not None else 0,
+    }
+    req_total = int(runtime_state.get("reqMktData_total_count") or 0)
+    cancel_total = int(runtime_state.get("cancelMktData_total_count") or 0)
+    max_subscriptions = int(getattr(args, "max_market_data_subscriptions", 100) or 0)
+    active_subscription_count = len(active_subscription_symbols)
+    subscription_capacity_used_pct = (
+        round(active_subscription_count / max_subscriptions * 100.0, 2)
+        if max_subscriptions > 0 else 0.0
+    )
+    ack_timeouts_total = int(sqlite_status.get("ack_timeouts_total") or 0)
+    session_ack_start = int(runtime_state.get("session_start_sqlite_ack_timeouts_total") or 0)
+    process_start = float(runtime_state.get("process_start_monotonic") or time.monotonic())
+    metrics: dict[str, Any] = {
+        "process_uptime_seconds": round(time.monotonic() - process_start, 3),
+        "rss_memory_mb": _process_rss_memory_mb(),
+        "cpu_percent": _process_cpu_percent(),
+        "thread_count": threading.active_count(),
+        "open_file_descriptor_count": _open_file_descriptor_count(),
+        "pending_async_task_count": len(_runtime_list_like(runtime_state.get("history_collector_queue"))) + int(runtime_state.get("daily_top100_process") is not None) + int(runtime_state.get("history_collector_process") is not None),
+        "desired_top100_count": len(desired),
+        "active_contract_count": len(contract_symbols),
+        "active_ticker_count": len(ticker_symbols),
+        "active_subscription_count": active_subscription_count,
+        "reqMktData_total_count": req_total,
+        "cancelMktData_total_count": cancel_total,
+        "symbols_added_since_start": _runtime_counter_value(runtime_state.get("symbols_added_since_start")),
+        "symbols_removed_since_start": _runtime_counter_value(runtime_state.get("symbols_removed_since_start")),
+        "symbols_removed_from_top100_but_still_subscribed": len(removed_still_subscribed),
+        "symbols_in_top100_without_subscription": len(desired_without_subscription),
+        "symbols_in_top100_without_ticker": len(desired_without_ticker),
+        "symbols_in_top100_without_state": len(desired_without_state),
+        "subscription_capacity": max_subscriptions,
+        "subscription_capacity_used_pct": subscription_capacity_used_pct,
+        "total_state_count": len(states),
+        "states_for_current_top100_count": len(state_symbols & desired),
+        "states_not_in_current_top100_count": len(state_symbols - desired),
+        "ready_state_count": sum(1 for state in states.values() if state.ready_since_utc),
+        "signal_sent_count": sum(1 for state in states.values() if state.signal_sent),
+        "stale_ready_count": sum(1 for state in states.values() if state.ready_since_utc and (state.signal_source or state.last_update_source) != "live"),
+        "state_with_old_session_date_count": len(old_state_symbols),
+        "state_with_old_first_seen_count": len(old_first_seen_symbols),
+        "state_with_old_last_live_update_count": len(old_last_live_symbols),
+        "state_with_first5_from_previous_session_count": len(old_first5_symbols),
+        "state_with_first15_from_previous_session_count": len(old_first15_symbols),
+        "state_with_open_price_from_previous_session_count": len(old_open_symbols),
+        "managed_positions_count": len(managed_positions),
+        "active_managed_positions_count": len(active_positions),
+        "inactive_managed_positions_count": len(inactive_positions),
+        "runtime_entry_order_map_count": len(entry_order_map),
+        "runtime_exit_order_map_count": sum(1 for pos in managed_positions.values() if getattr(pos, "exit_order_id", None)),
+        "pending_orders_count": len(pending_orders),
+        "pending_entry_orders_count": len(pending_entry_orders),
+        "pending_exit_orders_count": sum(1 for pos in active_positions if getattr(pos, "exit_sent", False)),
+        "orders_with_no_recent_update_count": 0,
+        "fills_buffer_count": 0,
+        "executions_seen_cache_count": len(seen_fills),
+        "duplicate_execution_guard_count": _runtime_counter_value(runtime_state.get("fill_diagnostic_execution_ids")),
+        "traded_symbols_today_count": sum(1 for state in states.values() if state.signal_sent),
+        "sqlite_queue_depth": int(sqlite_status.get("queue_depth") or 0),
+        "sqlite_max_queue_depth": int(sqlite_status.get("max_queue_depth") or 0),
+        "sqlite_oldest_queued_age_seconds": sqlite_status.get("oldest_queued_age_seconds") or 0,
+        "sqlite_ack_timeouts_total": ack_timeouts_total,
+        "sqlite_ack_timeouts_delta_since_session_start": ack_timeouts_total - session_ack_start,
+        "sqlite_dropped_writes": int(sqlite_status.get("dropped_writes") or 0),
+        "sqlite_current_write_method": str(sqlite_status.get("current_write_method") or ""),
+        "sqlite_current_write_duration_seconds": sqlite_status.get("current_write_duration_seconds") or 0,
+        "pending_sqlite_requests_count": int(sqlite_status.get("queue_depth") or 0),
+        "rate_limit_state_count": len(_runtime_dict_readonly(runtime_state, "rate_limited_log_state")),
+        "log_throttle_key_count": sum(_len_safe(item.get("keys")) for item in _runtime_dict_readonly(runtime_state, "rate_limited_log_state").values() if isinstance(item, dict)),
+        "rejection_reason_cache_count": _runtime_counter_value(runtime_state.get("entry_rejection_processed")),
+        "candle_cache_symbol_count": sum(1 for state in states.values() if state.bars),
+        "total_cached_candles": total_cached_candles,
+        "live_feature_cache_count": len(latest_snapshots),
+        "current_session_date": current_session_date,
+        "previous_session_date": previous_session_date,
+        "session_reset_executed": int(bool(runtime_state.get("last_session_boundary_check_date") == current_session_date)),
+        "state_objects_reset_count": int(runtime_state.get("state_objects_reset_count") or 0),
+        "state_objects_preserved_count": len(states),
+        "preserved_state_reason_counts": json.dumps(runtime_state.get("preserved_state_reason_counts") or {}, sort_keys=True, separators=(",", ":")),
+        "last_restart_unblock_time": runtime_state.get("last_restart_unblock_utc") or "",
+        "last_session_boundary_time": runtime_state.get("last_session_boundary_time") or "",
+        "last_top100_reload_time": runtime_state.get("top100_reload_done_at") or "",
+        "reconnect_count_since_start": int(runtime_state.get("reconnect_attempts") or 0),
+        "removed_symbols_still_subscribed_sample": diagnostic_symbol_sample(removed_still_subscribed, limit=25),
+        "top100_without_subscription_sample": diagnostic_symbol_sample(desired_without_subscription, limit=25),
+        "top100_without_ticker_sample": diagnostic_symbol_sample(desired_without_ticker, limit=25),
+        "top100_without_state_sample": diagnostic_symbol_sample(desired_without_state, limit=25),
+        "callback_duplicate_registration_risk": int(any(value > 1 for value in callback_counts.values() if isinstance(value, int))),
+    }
+    metrics.update(callback_counts)
+    return metrics
+
+
+def _runtime_list_like(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return []
+
+
+def runtime_state_growth_numeric_baseline(metrics: dict[str, Any]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for key, value in metrics.items():
+        if isinstance(value, bool):
+            out[key] = float(int(value))
+        elif isinstance(value, int | float):
+            out[key] = float(value)
+    return out
+
+
+def runtime_state_growth_delta_json(
+    metrics: dict[str, Any],
+    startup: dict[str, float],
+    session: dict[str, float],
+) -> str:
+    interesting = [
+        "rss_memory_mb",
+        "thread_count",
+        "open_file_descriptor_count",
+        "active_subscription_count",
+        "reqMktData_total_count",
+        "cancelMktData_total_count",
+        "total_state_count",
+        "states_not_in_current_top100_count",
+        "ready_state_count",
+        "signal_sent_count",
+        "state_with_old_session_date_count",
+        "runtime_entry_order_map_count",
+        "runtime_exit_order_map_count",
+        "pending_orders_count",
+        "executions_seen_cache_count",
+        "sqlite_queue_depth",
+        "sqlite_ack_timeouts_total",
+        "rate_limit_state_count",
+        "log_throttle_key_count",
+        "total_cached_candles",
+        "live_feature_cache_count",
+        "callback_count_execDetailsEvent",
+        "callback_count_commissionReportEvent",
+        "callback_count_errorEvent",
+    ]
+    out: dict[str, dict[str, Any]] = {}
+    for key in interesting:
+        current = metrics.get(key)
+        if not isinstance(current, int | float):
+            continue
+        startup_value = startup.get(key, 0.0)
+        session_value = session.get(key, 0.0)
+        out[key] = {
+            "current": current,
+            "startup": startup_value,
+            "session_start": session_value,
+            "delta_startup": round(float(current) - float(startup_value), 3),
+            "delta_session": round(float(current) - float(session_value), 3),
+        }
+    return json.dumps(out, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def emit_runtime_state_session_diff(
+    *,
+    runtime_state: dict[str, Any],
+    metrics: dict[str, Any],
+    reason: str,
+) -> None:
+    session = dict(runtime_state.get("state_growth_baseline_session") or {})
+    if not session:
+        return
+    watched = [
+        "states_not_in_current_top100_count",
+        "active_subscription_count",
+        "symbols_removed_from_top100_but_still_subscribed",
+        "signal_sent_count",
+        "runtime_entry_order_map_count",
+        "pending_orders_count",
+        "callback_count_execDetailsEvent",
+        "sqlite_ack_timeouts_total",
+        "rate_limit_state_count",
+        "total_cached_candles",
+    ]
+    changes: list[str] = []
+    for key in watched:
+        current = metrics.get(key)
+        start = session.get(key)
+        if not isinstance(current, int | float) or start is None:
+            continue
+        if float(current) != float(start):
+            changes.append(f"{key}:{start}->{current}")
+    print(
+        f"{now_utc()} RUNTIME_STATE_SESSION_DIFF reason={reason} "
+        f"current_session_date={metrics.get('current_session_date') or ''} "
+        f"previous_session_date={metrics.get('previous_session_date') or ''} "
+        f"changed_count={len(changes)} changes={';'.join(changes[:60])}",
+        flush=True,
+    )
+
+
+def emit_runtime_state_growth_snapshot(
+    *,
+    ib: IB | None,
+    runtime_state: dict[str, Any],
+    states: dict[str, SymbolState],
+    contracts: list[tuple[str, Any]],
+    contract_by_symbol: dict[str, Any],
+    tickers: dict[str, Any],
+    managed_positions: dict[str, ManagedPosition],
+    seen_fills: set[str],
+    latest_snapshots: dict[str, dict[str, Any]],
+    args: argparse.Namespace,
+    reason: str,
+    current_session_date: str,
+    previous_session_date: str = "",
+    sqlite_store: Any | None = None,
+    reset_startup_baseline: bool = False,
+    reset_session_baseline: bool = False,
+    emit_session_diff: bool = False,
+) -> dict[str, Any]:
+    try:
+        metrics = runtime_state_growth_current_metrics(
+            ib=ib,
+            runtime_state=runtime_state,
+            states=states,
+            contracts=contracts,
+            contract_by_symbol=contract_by_symbol,
+            tickers=tickers,
+            managed_positions=managed_positions,
+            seen_fills=seen_fills,
+            latest_snapshots=latest_snapshots,
+            args=args,
+            current_session_date=current_session_date,
+            previous_session_date=previous_session_date,
+            sqlite_store=sqlite_store,
+        )
+        numeric = runtime_state_growth_numeric_baseline(metrics)
+        if emit_session_diff:
+            emit_runtime_state_session_diff(runtime_state=runtime_state, metrics=metrics, reason=reason)
+        if reset_startup_baseline or not runtime_state.get("state_growth_baseline_startup"):
+            runtime_state["state_growth_baseline_startup"] = dict(numeric)
+        if reset_session_baseline or not runtime_state.get("state_growth_baseline_session"):
+            runtime_state["state_growth_baseline_session"] = dict(numeric)
+            runtime_state["session_start_sqlite_ack_timeouts_total"] = int(metrics.get("sqlite_ack_timeouts_total") or 0)
+        startup = dict(runtime_state.get("state_growth_baseline_startup") or {})
+        session = dict(runtime_state.get("state_growth_baseline_session") or {})
+        delta_json = runtime_state_growth_delta_json(metrics, startup, session)
+        fields = [
+            "process_uptime_seconds",
+            "rss_memory_mb",
+            "cpu_percent",
+            "thread_count",
+            "open_file_descriptor_count",
+            "pending_async_task_count",
+            "desired_top100_count",
+            "active_contract_count",
+            "active_ticker_count",
+            "active_subscription_count",
+            "reqMktData_total_count",
+            "cancelMktData_total_count",
+            "symbols_added_since_start",
+            "symbols_removed_since_start",
+            "symbols_removed_from_top100_but_still_subscribed",
+            "symbols_in_top100_without_subscription",
+            "symbols_in_top100_without_ticker",
+            "symbols_in_top100_without_state",
+            "subscription_capacity",
+            "subscription_capacity_used_pct",
+            "total_state_count",
+            "states_for_current_top100_count",
+            "states_not_in_current_top100_count",
+            "ready_state_count",
+            "signal_sent_count",
+            "stale_ready_count",
+            "state_with_old_session_date_count",
+            "state_with_old_first_seen_count",
+            "state_with_old_last_live_update_count",
+            "state_with_first5_from_previous_session_count",
+            "state_with_first15_from_previous_session_count",
+            "state_with_open_price_from_previous_session_count",
+            "managed_positions_count",
+            "active_managed_positions_count",
+            "inactive_managed_positions_count",
+            "runtime_entry_order_map_count",
+            "runtime_exit_order_map_count",
+            "pending_orders_count",
+            "pending_entry_orders_count",
+            "pending_exit_orders_count",
+            "orders_with_no_recent_update_count",
+            "fills_buffer_count",
+            "executions_seen_cache_count",
+            "duplicate_execution_guard_count",
+            "traded_symbols_today_count",
+            "sqlite_queue_depth",
+            "sqlite_max_queue_depth",
+            "sqlite_oldest_queued_age_seconds",
+            "sqlite_ack_timeouts_total",
+            "sqlite_ack_timeouts_delta_since_session_start",
+            "sqlite_dropped_writes",
+            "sqlite_current_write_method",
+            "sqlite_current_write_duration_seconds",
+            "pending_sqlite_requests_count",
+            "rate_limit_state_count",
+            "log_throttle_key_count",
+            "rejection_reason_cache_count",
+            "candle_cache_symbol_count",
+            "total_cached_candles",
+            "live_feature_cache_count",
+            "callback_count_pendingTickersEvent",
+            "callback_count_orderStatusEvent",
+            "callback_count_execDetailsEvent",
+            "callback_count_commissionReportEvent",
+            "callback_count_errorEvent",
+            "callback_count_disconnectedEvent",
+            "callback_duplicate_registration_risk",
+            "current_session_date",
+            "previous_session_date",
+            "session_reset_executed",
+            "state_objects_reset_count",
+            "state_objects_preserved_count",
+            "preserved_state_reason_counts",
+            "last_restart_unblock_time",
+            "last_session_boundary_time",
+            "last_top100_reload_time",
+            "reconnect_count_since_start",
+            "removed_symbols_still_subscribed_sample",
+            "top100_without_subscription_sample",
+            "top100_without_ticker_sample",
+            "top100_without_state_sample",
+        ]
+        line_fields = " ".join(f"{key}={str(metrics.get(key, '')).replace(' ', '_')}" for key in fields)
+        print(
+            f"{now_utc()} RUNTIME_STATE_GROWTH_SNAPSHOT reason={reason} {line_fields} "
+            f"delta_json={delta_json}",
+            flush=True,
+        )
+        return metrics
+    except Exception as exc:
+        print(f"{now_utc()} RUNTIME_STATE_GROWTH_SNAPSHOT_FAILED reason={reason} error={exc!r}", flush=True)
+        return {}
 
 
 def market_open_datetime_utc(args: argparse.Namespace, now: datetime | None = None) -> datetime:
@@ -4863,6 +5357,7 @@ def reload_top100_universe_if_requested(
     managed_positions: dict[str, ManagedPosition],
     runtime_state: dict[str, Any],
     args: argparse.Namespace,
+    seen_fills: set[str] | None = None,
 ) -> bool:
     if not bool(runtime_state.get("top100_reload_requested", False)):
         return False
@@ -4870,6 +5365,23 @@ def reload_top100_universe_if_requested(
     reload_path = str(runtime_state.get("top100_reload_path") or getattr(args, "daily_top100_latest_output", args.alpha_rank_csv))
     ranking_date = runtime_state.get("top100_reload_ranking_date")
     print(f"{now_utc()} TOP100_RELOAD_START ranking_date={ranking_date} path={reload_path}", flush=True)
+    today_session = get_us_equity_session(datetime.now(timezone.utc).date())
+    emit_runtime_state_growth_snapshot(
+        ib=ib,
+        runtime_state=runtime_state,
+        states=states,
+        contracts=contracts,
+        contract_by_symbol=contract_by_symbol,
+        tickers=tickers,
+        managed_positions=managed_positions,
+        seen_fills=seen_fills or set(),
+        latest_snapshots=latest_snapshots,
+        args=args,
+        reason="before_top100_reload",
+        current_session_date=today_session.session_date.isoformat(),
+        previous_session_date=previous_us_equity_trading_day(today_session.session_date).isoformat(),
+        sqlite_store=getattr(recorder, "sqlite_store", None),
+    )
     runtime_state["entries_blocked"] = True
     runtime_state["entries_blocked_reason"] = "top100_reload"
 
@@ -4946,6 +5458,7 @@ def reload_top100_universe_if_requested(
                 unsubscribed_symbols.append(symbol)
                 try:
                     ib.cancelMktData(contract)
+                    runtime_state["cancelMktData_total_count"] = int(runtime_state.get("cancelMktData_total_count") or 0) + 1
                 except Exception as exc:
                     print(f"{now_utc()} TOP100_RELOAD_CANCEL_MKTDATA_FAILED symbol={symbol} error={exc!r}", flush=True)
             latest_snapshots.pop(symbol, None)
@@ -4996,6 +5509,7 @@ def reload_top100_universe_if_requested(
                 print(f"{now_utc()} TOP100_RELOAD_REQUESTED symbol={symbol} conId={getattr(contract, 'conId', '')}", flush=True)
                 try:
                     tickers[symbol] = ib.reqMktData(contract, "", False, False)
+                    runtime_state["reqMktData_total_count"] = int(runtime_state.get("reqMktData_total_count") or 0) + 1
                     _runtime_dict(runtime_state, "subscription_started_monotonic_by_symbol")[symbol] = time.monotonic()
                     subscribed += 1
                     subscribed_symbols.append(symbol)
@@ -5038,6 +5552,8 @@ def reload_top100_universe_if_requested(
             active_after_count=len(tickers),
         )
         runtime_state["entry_symbols"] = set(entry_symbols)
+        _runtime_set(runtime_state, "symbols_added_since_start").update(subscription_symbol_set - previous_symbol_set)
+        _runtime_set(runtime_state, "symbols_removed_since_start").update(previous_symbol_set - subscription_symbol_set)
         runtime_state["top100_reload_requested"] = False
         runtime_state["top100_reload_done_at"] = now_utc()
         runtime_state["top100_reload_last_error"] = ""
@@ -5076,6 +5592,22 @@ def reload_top100_universe_if_requested(
             managed_positions=managed_positions,
             top100_symbols=entry_symbols,
             reason="top100_reload",
+        )
+        emit_runtime_state_growth_snapshot(
+            ib=ib,
+            runtime_state=runtime_state,
+            states=states,
+            contracts=contracts,
+            contract_by_symbol=contract_by_symbol,
+            tickers=tickers,
+            managed_positions=managed_positions,
+            seen_fills=seen_fills or set(),
+            latest_snapshots=latest_snapshots,
+            args=args,
+            reason="after_top100_reload",
+            current_session_date=today_session.session_date.isoformat(),
+            previous_session_date=previous_us_equity_trading_day(today_session.session_date).isoformat(),
+            sqlite_store=getattr(recorder, "sqlite_store", None),
         )
 
         print(
@@ -6205,6 +6737,7 @@ def handle_ibkr_disconnect_and_recover(
         print(f"{now_utc()} RECONNECT_SUPERVISOR_CONNECTED attempt={attempt}", flush=True)
 
         tickers = resubscribe_impl(ib, contracts)
+        runtime_state["reqMktData_total_count"] = int(runtime_state.get("reqMktData_total_count") or 0) + len(tickers)
         print(f"{now_utc()} RECONNECT_SUPERVISOR_RESUBSCRIBED symbols={len(tickers)}", flush=True)
 
         try:
@@ -6501,7 +7034,12 @@ def main() -> int:
         "top100_freshness": {},
         "top100_entry_metadata_by_symbol": dict(top100_entry_metadata_by_symbol),
         "subscription_started_monotonic_by_symbol": {},
+        "reqMktData_total_count": 0,
+        "cancelMktData_total_count": 0,
+        "symbols_added_since_start": set(),
+        "symbols_removed_since_start": set(),
         "symbol_pipeline_health_last_ts": 0.0,
+        "runtime_state_growth_last_periodic_ts": 0.0,
         "sqlite_writer_status": {},
         "market_closed_logged_dates": set(),
         "risk_guard_last_status": {
@@ -6538,6 +7076,25 @@ def main() -> int:
     last_portfolio_record = 0.0
     adopted_once = False
     normal_exit = False
+    initial_session = get_us_equity_session(datetime.now(timezone.utc).date())
+    emit_runtime_state_growth_snapshot(
+        ib=ib,
+        runtime_state=runtime_state,
+        states=states,
+        contracts=contracts,
+        contract_by_symbol=contract_by_symbol,
+        tickers=tickers,
+        managed_positions=managed_positions,
+        seen_fills=seen_fills,
+        latest_snapshots=latest_snapshots,
+        args=args,
+        reason="startup_after_initialization",
+        current_session_date=initial_session.session_date.isoformat(),
+        previous_session_date=previous_us_equity_trading_day(initial_session.session_date).isoformat(),
+        sqlite_store=sqlite_store,
+        reset_startup_baseline=True,
+        reset_session_baseline=True,
+    )
 
     try:
         startup_subscribed_symbols: list[str] = []
@@ -6568,6 +7125,7 @@ def main() -> int:
             contracts.append((symbol, q))
             contract_by_symbol[symbol] = q
             tickers[symbol] = ib.reqMktData(q, "", False, False)
+            runtime_state["reqMktData_total_count"] = int(runtime_state.get("reqMktData_total_count") or 0) + 1
             _runtime_dict(runtime_state, "subscription_started_monotonic_by_symbol")[symbol] = time.monotonic()
             startup_subscribed_symbols.append(symbol)
             print(f"Subscribed {symbol} conId={q.conId}", flush=True)
@@ -6698,6 +7256,22 @@ def main() -> int:
             f"result={json.dumps(sqlite_rebuild_result or {}, sort_keys=True, default=str)}",
             flush=True,
         )
+        emit_runtime_state_growth_snapshot(
+            ib=ib,
+            runtime_state=runtime_state,
+            states=states,
+            contracts=contracts,
+            contract_by_symbol=contract_by_symbol,
+            tickers=tickers,
+            managed_positions=managed_positions,
+            seen_fills=seen_fills,
+            latest_snapshots=latest_snapshots,
+            args=args,
+            reason="startup_reconciliation_complete",
+            current_session_date=today_session.session_date.isoformat(),
+            previous_session_date=previous_us_equity_trading_day(today_session.session_date).isoformat(),
+            sqlite_store=sqlite_store,
+        )
         emit_runtime_state_session_boundary_check(
             runtime_state=runtime_state,
             states=states,
@@ -6771,6 +7345,7 @@ def main() -> int:
                     managed_positions,
                     runtime_state,
                     args,
+                    seen_fills=seen_fills,
                 )
 
                 process_control_api_commands(
@@ -6829,13 +7404,33 @@ def main() -> int:
             if today_session.is_trading_day:
                 boundary_key = today_session.session_date.isoformat()
                 if runtime_state.get("last_session_boundary_check_date") != boundary_key:
+                    previous_boundary = str(runtime_state.get("last_session_boundary_check_date") or "")
                     runtime_state["last_session_boundary_check_date"] = boundary_key
+                    runtime_state["last_session_boundary_time"] = now_utc()
                     emit_runtime_state_session_boundary_check(
                         runtime_state=runtime_state,
                         states=states,
                         managed_positions=managed_positions,
                         top100_symbols=runtime_state.get("top100_reload_symbols") or runtime_state.get("entry_symbols") or [],
                         reason="session_start",
+                    )
+                    emit_runtime_state_growth_snapshot(
+                        ib=ib,
+                        runtime_state=runtime_state,
+                        states=states,
+                        contracts=contracts,
+                        contract_by_symbol=contract_by_symbol,
+                        tickers=tickers,
+                        managed_positions=managed_positions,
+                        seen_fills=seen_fills,
+                        latest_snapshots=latest_snapshots,
+                        args=args,
+                        reason="session_boundary",
+                        current_session_date=boundary_key,
+                        previous_session_date=previous_boundary or previous_us_equity_trading_day(today_session.session_date).isoformat(),
+                        sqlite_store=sqlite_store,
+                        emit_session_diff=True,
+                        reset_session_baseline=True,
                     )
             if market_closed_today:
                 runtime_state["entries_blocked_reason"] = "market_closed_holiday"
@@ -7771,6 +8366,28 @@ def main() -> int:
                 f"{portfolio_part}"
             )
             emit_heartbeat(heartbeat_line, runtime_state, log_dir)
+            if (
+                today_session.is_trading_day
+                and not market_closed_today
+                and loop_now - float(runtime_state.get("runtime_state_growth_last_periodic_ts") or 0.0) >= 900.0
+            ):
+                runtime_state["runtime_state_growth_last_periodic_ts"] = loop_now
+                emit_runtime_state_growth_snapshot(
+                    ib=ib,
+                    runtime_state=runtime_state,
+                    states=states,
+                    contracts=contracts,
+                    contract_by_symbol=contract_by_symbol,
+                    tickers=tickers,
+                    managed_positions=managed_positions,
+                    seen_fills=seen_fills,
+                    latest_snapshots=latest_snapshots,
+                    args=args,
+                    reason="periodic_15m",
+                    current_session_date=today_session.session_date.isoformat(),
+                    previous_session_date=previous_us_equity_trading_day(today_session.session_date).isoformat(),
+                    sqlite_store=sqlite_store,
+                )
         normal_exit = True
         shutdown.log_main_loop_exit(reason="duration_elapsed", exit_code=0)
 
@@ -7788,6 +8405,24 @@ def main() -> int:
     finally:
         if not normal_exit and shutdown.reason == "unknown":
             shutdown.set_reason("main_loop_interrupted")
+        final_session = get_us_equity_session(datetime.now(timezone.utc).date())
+        emit_runtime_state_growth_snapshot(
+            ib=ib,
+            runtime_state=runtime_state,
+            states=states,
+            contracts=contracts,
+            contract_by_symbol=contract_by_symbol,
+            tickers=tickers,
+            managed_positions=managed_positions,
+            seen_fills=seen_fills,
+            latest_snapshots=latest_snapshots,
+            args=args,
+            reason="session_end",
+            current_session_date=final_session.session_date.isoformat(),
+            previous_session_date=previous_us_equity_trading_day(final_session.session_date).isoformat(),
+            sqlite_store=sqlite_store,
+            emit_session_diff=True,
+        )
         persist_managed_positions(recorder, managed_positions)
         if sqlite_store is not None:
             sqlite_store.close()
