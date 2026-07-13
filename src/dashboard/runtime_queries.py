@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import resource
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -27,6 +29,7 @@ DEFAULT_ORPHAN_STALE_DAYS = 7
 _MIGRATED_SQLITE_PATHS: set[str] = set()
 DEFAULT_EXECUTION_ROW_LIMIT = int(os.environ.get("TRADING_BOT_DASHBOARD_EXECUTION_ROW_LIMIT", "2000") or "2000")
 DEFAULT_EXECUTION_LOOKUP_DAYS = int(os.environ.get("TRADING_BOT_DASHBOARD_EXECUTION_LOOKUP_DAYS", "7") or "7")
+DEFAULT_MEMORY_DIAGNOSTICS_TOP_N = int(os.environ.get("TRADING_BOT_DASHBOARD_MEMORY_DIAGNOSTICS_TOP_N", "8") or "8")
 OPEN_POSITION_STATUS_SQL = """
 (
     UPPER(COALESCE(p.status, '')) IN ('OPEN', 'EXIT_ORDER')
@@ -101,6 +104,80 @@ def read_sql_timed(
         flush=True,
     )
     return rows
+
+
+def process_rss_mb() -> float | None:
+    try:
+        statm = Path("/proc/self/statm")
+        if statm.exists():
+            pages = int((statm.read_text().split() or ["0"])[1])
+            return (pages * os.sysconf("SC_PAGE_SIZE")) / (1024.0 * 1024.0)
+    except Exception:
+        pass
+    try:
+        rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        if sys.platform == "darwin":
+            return rss / (1024.0 * 1024.0)
+        return rss / 1024.0
+    except Exception:
+        return None
+
+
+def dataframe_memory_mb(df: pd.DataFrame | None) -> float:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return 0.0
+    try:
+        return float(df.memory_usage(index=True, deep=True).sum()) / (1024.0 * 1024.0)
+    except Exception:
+        try:
+            return float(df.memory_usage(index=True).sum()) / (1024.0 * 1024.0)
+        except Exception:
+            return 0.0
+
+
+def log_dashboard_dataframe_memory(name: str, df: pd.DataFrame | None) -> dict[str, Any]:
+    rows = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+    cols = int(len(df.columns)) if isinstance(df, pd.DataFrame) else 0
+    memory_mb = dataframe_memory_mb(df)
+    rss = process_rss_mb()
+    rss_text = f"{rss:.3f}" if rss is not None else ""
+    print(
+        f"{datetime.now(timezone.utc).isoformat()} DASHBOARD_DATAFRAME_MEMORY "
+        f"dataframe_name={name} rows={rows} cols={cols} memory_mb={memory_mb:.3f} process_rss_mb={rss_text}",
+        flush=True,
+    )
+    return {"name": name, "rows": rows, "cols": cols, "memory_mb": memory_mb}
+
+
+def log_dashboard_snapshot_memory(
+    *,
+    window: DateWindow,
+    strategy: str | None,
+    include_reconstructed: bool,
+    frames: list[dict[str, Any]],
+) -> dict[str, Any]:
+    sorted_frames = sorted(frames, key=lambda row: float(row.get("memory_mb") or 0.0), reverse=True)
+    total_mb = sum(float(row.get("memory_mb") or 0.0) for row in sorted_frames)
+    top_n = max(1, DEFAULT_MEMORY_DIAGNOSTICS_TOP_N)
+    top_frames = sorted_frames[:top_n]
+    top_text = ",".join(
+        f"{row.get('name')}:{float(row.get('memory_mb') or 0.0):.3f}MB:{int(row.get('rows') or 0)}r"
+        for row in top_frames
+    )
+    rss = process_rss_mb()
+    rss_text = f"{rss:.3f}" if rss is not None else ""
+    print(
+        f"{datetime.now(timezone.utc).isoformat()} DASHBOARD_SNAPSHOT_MEMORY "
+        f"start_date={window.start_date} end_date={window.end_date} strategy={strategy or 'All'} "
+        f"include_reconstructed={int(bool(include_reconstructed))} total_dataframe_memory_mb={total_mb:.3f} "
+        f"process_rss_mb={rss_text} top_frames={top_text}",
+        flush=True,
+    )
+    return {
+        "dashboard_dataframe_memory_total_mb": total_mb,
+        "dashboard_largest_dataframes": top_text,
+        "dashboard_process_rss_mb": rss,
+    }
 
 
 def utc_today() -> str:
@@ -557,6 +634,7 @@ def load_executions(
         else:
             data_quality.append("OK")
     rows["data_quality"] = data_quality
+    log_dashboard_dataframe_memory(query_name, rows)
     return rows
 
 
@@ -3837,7 +3915,10 @@ def load_dashboard_snapshot(
     conn = connect(path)
     try:
         conn.execute("BEGIN")
+        snapshot_started = time.perf_counter()
+        memory_frames: list[dict[str, Any]] = []
         executions = load_executions(conn, window, strategy, query_name="load_executions_table")
+        memory_frames.append(log_dashboard_dataframe_memory("snapshot.executions", executions))
         execution_pnl = load_execution_pnl_summary(conn, window, strategy)
         execution_lookup = load_executions(
             conn,
@@ -3847,7 +3928,9 @@ def load_dashboard_snapshot(
             include_raw_json=True,
             query_name="load_executions_lookup",
         )
+        memory_frames.append(log_dashboard_dataframe_memory("snapshot.execution_lookup", execution_lookup))
         raw_closed_rows = load_raw_closed_trade_rows(conn, window, strategy)
+        memory_frames.append(log_dashboard_dataframe_memory("snapshot.raw_closed_rows", raw_closed_rows))
         closed, closed_diag = load_closed_positions(
             conn,
             window,
@@ -3856,12 +3939,19 @@ def load_dashboard_snapshot(
             include_reconstructed=include_reconstructed,
             current_executions=executions,
         )
+        memory_frames.append(log_dashboard_dataframe_memory("snapshot.closed_positions", closed))
         open_positions = load_open_positions(conn, window, strategy, executions, execution_lookup, broker_portfolio)
+        memory_frames.append(log_dashboard_dataframe_memory("snapshot.open_positions", open_positions))
         pending_trades = load_pending_trades(conn, window, strategy)
+        memory_frames.append(log_dashboard_dataframe_memory("snapshot.pending_trades", pending_trades))
         raw_active_positions = load_raw_active_positions(conn, strategy)
+        memory_frames.append(log_dashboard_dataframe_memory("snapshot.raw_active_positions", raw_active_positions))
         orphan_stale_positions = load_orphan_stale_positions(conn, window, strategy)
+        memory_frames.append(log_dashboard_dataframe_memory("snapshot.orphan_stale_positions", orphan_stale_positions))
         excluded_open_positions = load_excluded_open_positions(conn, window, strategy, open_positions, orphan_stale_positions)
+        memory_frames.append(log_dashboard_dataframe_memory("snapshot.excluded_open_positions", excluded_open_positions))
         rejected_entries = load_rejected_entries(conn, window, strategy)
+        memory_frames.append(log_dashboard_dataframe_memory("snapshot.rejected_entries", rejected_entries))
         diagnostics = load_diagnostics(conn, window, strategy)
         diagnostics.update(closed_diag)
         diagnostics.update(load_position_row_diagnostics(conn, window, strategy, len(open_positions)))
@@ -4009,6 +4099,16 @@ def load_dashboard_snapshot(
             f"reconstructed={diagnostics.get('reconstructed_trades_count', 0)};"
             f"last_reducer={diagnostics.get('last_reducer_run_at', '')}"
         )
+        exit_sim = exit_simulation(closed)
+        memory_frames.append(log_dashboard_dataframe_memory("snapshot.exit_simulation", exit_sim))
+        memory_diagnostics = log_dashboard_snapshot_memory(
+            window=window,
+            strategy=strategy,
+            include_reconstructed=include_reconstructed,
+            frames=memory_frames,
+        )
+        diagnostics.update(memory_diagnostics)
+        diagnostics["dashboard_snapshot_build_duration_ms"] = (time.perf_counter() - snapshot_started) * 1000.0
         snapshot = {
             "summary": build_summary(open_positions, closed, execution_pnl),
             "data_quality_summary": build_data_quality_summary(closed),
@@ -4019,7 +4119,7 @@ def load_dashboard_snapshot(
             "rejected_entries": rejected_entries,
             "closed_positions": closed,
             "pending_trades": pending_trades,
-            "exit_simulation": exit_simulation(closed),
+            "exit_simulation": exit_sim,
             "diagnostics": diagnostics,
             "executions": executions,
             "loaded_at": datetime.now(timezone.utc).isoformat(),

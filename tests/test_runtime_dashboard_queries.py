@@ -13,12 +13,14 @@ import pandas as pd
 from src.dashboard.runtime_queries import (
     DateWindow,
     aggregate_closed_positions,
+    dataframe_memory_mb,
     execution_window_predicate,
     list_sessions,
     list_strategies,
     load_dashboard_snapshot,
     load_diagnostics,
     load_executions,
+    log_dashboard_snapshot_memory,
     utc_today,
 )
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
@@ -219,6 +221,10 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(row["source"], "live_buy")
             self.assertEqual(row["exit_sent"], 1)
             self.assertEqual(row["execution_ids"], "B1, B2")
+            diagnostics = snapshot["diagnostics"]
+            self.assertIn("dashboard_dataframe_memory_total_mb", diagnostics)
+            self.assertIn("dashboard_largest_dataframes", diagnostics)
+            self.assertIn("dashboard_snapshot_build_duration_ms", diagnostics)
 
     def test_runtime_open_positions_include_entry_score_columns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -253,6 +259,22 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(row["live_entry_rank"], 2)
             self.assertEqual(row["entry_order_id"], "7010")
             self.assertEqual(row["entry_perm_id"], "9010")
+
+    def test_dashboard_memory_diagnostics_rank_largest_frames(self) -> None:
+        small = pd.DataFrame({"a": [1]})
+        large = pd.DataFrame({"payload": ["x" * 1000 for _ in range(10)]})
+        self.assertGreater(dataframe_memory_mb(large), dataframe_memory_mb(small))
+        diagnostics = log_dashboard_snapshot_memory(
+            window=DateWindow("2026-07-02", "2026-07-02"),
+            strategy="All",
+            include_reconstructed=False,
+            frames=[
+                {"name": "small", "rows": len(small), "cols": len(small.columns), "memory_mb": dataframe_memory_mb(small)},
+                {"name": "large", "rows": len(large), "cols": len(large.columns), "memory_mb": dataframe_memory_mb(large)},
+            ],
+        )
+        self.assertGreater(diagnostics["dashboard_dataframe_memory_total_mb"], 0)
+        self.assertTrue(str(diagnostics["dashboard_largest_dataframes"]).startswith("large:"))
 
     def test_closed_trade_excursion_columns_and_missing_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1300,6 +1300,13 @@ def render_diagnostics(diag: dict) -> None:
     ]
     for col, (label, key) in zip(fifo_cols, fifo_labels):
         col.metric(label, int(diag.get(key, 0) or 0))
+    memory_cols = st.columns(4)
+    memory_cols[0].metric("Dashboard DF MB", display_number_or_missing(diag.get("dashboard_dataframe_memory_total_mb"), decimals=2))
+    memory_cols[1].metric("Dashboard RSS MB", display_number_or_missing(diag.get("dashboard_process_rss_mb"), decimals=2))
+    memory_cols[2].metric("Snapshot Build ms", display_number_or_missing(diag.get("dashboard_snapshot_build_duration_ms"), decimals=1))
+    memory_cols[3].metric("Execution Rows", int(diag.get("execution_pnl_rows", 0) or 0))
+    if diag.get("dashboard_largest_dataframes"):
+        st.caption(f"largest_dashboard_frames={diag.get('dashboard_largest_dataframes')}")
     reducer_cols = st.columns(4)
     reducer_cols[0].metric("SQLite Closed Trades", int(diag.get("closed_trades_count", 0) or 0))
     reducer_cols[1].metric("Broker Closed Trades", str(diag.get("broker_closed_trades_count", "N/A")))
@@ -2080,14 +2087,18 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
             ],
         )
     with row3[1]:
+        ops_diag = ops_snapshot.get("diagnostics", {}) if isinstance(ops_snapshot.get("diagnostics", {}), dict) else {}
         render_readiness_card(
             "Orphan stale positions",
             orphan_stale_count,
             "OK" if orphan_stale_count == 0 else "FAILED",
             [
-                f"oldest={ops_snapshot.get('diagnostics', {}).get('oldest_orphan_stale_position', '')}",
-                f"age_days={ops_snapshot.get('diagnostics', {}).get('oldest_orphan_stale_position_age_days', 0.0)}",
-                f"recommendation={ops_snapshot.get('diagnostics', {}).get('cleanup_recommendation', '')}",
+                f"oldest={ops_diag.get('oldest_orphan_stale_position', '')}",
+                f"age_days={ops_diag.get('oldest_orphan_stale_position_age_days', 0.0)}",
+                f"recommendation={ops_diag.get('cleanup_recommendation', '')}",
+                f"dashboard_dataframe_memory_total_mb={display_number_or_missing(ops_diag.get('dashboard_dataframe_memory_total_mb'), decimals=2)}",
+                f"dashboard_process_rss_mb={display_number_or_missing(ops_diag.get('dashboard_process_rss_mb'), decimals=2)}",
+                f"largest_dashboard_frames={ops_diag.get('dashboard_largest_dataframes', '')}",
             ],
         )
 
@@ -2127,6 +2138,12 @@ def render_operational_readiness_tab(sqlite_path: str, selected_session_date: st
                 "top100": top100,
                 "top100_diagnostics": top100_diag,
                 "eod": eod,
+                "dashboard_snapshot_memory": {
+                    "dashboard_dataframe_memory_total_mb": ops_diag.get("dashboard_dataframe_memory_total_mb"),
+                    "dashboard_process_rss_mb": ops_diag.get("dashboard_process_rss_mb"),
+                    "dashboard_snapshot_build_duration_ms": ops_diag.get("dashboard_snapshot_build_duration_ms"),
+                    "dashboard_largest_dataframes": ops_diag.get("dashboard_largest_dataframes"),
+                },
                 "orphan_stale_position_count": orphan_stale_count,
                 "orphan_stale_positions": orphan_stale_positions.to_dict("records") if isinstance(orphan_stale_positions, pd.DataFrame) else [],
                 "health_code": health_code,
