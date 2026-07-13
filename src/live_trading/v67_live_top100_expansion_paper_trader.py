@@ -975,19 +975,42 @@ def emit_pre_signal_runtime_snapshot(
     recorder: LiveDataRecorder,
     runtime_state: dict[str, Any],
     snapshot: dict[str, Any],
+    *,
+    now_ts: float | None = None,
+    unchanged_interval_seconds: float = 900.0,
 ) -> None:
     symbol = str(snapshot.get("symbol") or "")
-    scan_id = snapshot.get("scan_id")
-    key = f"{scan_id}:{symbol}"
-    emitted = runtime_state.setdefault("pre_signal_runtime_snapshot_emitted_keys", {})
-    if not isinstance(emitted, dict):
-        emitted = {}
-        runtime_state["pre_signal_runtime_snapshot_emitted_keys"] = emitted
-    if key in emitted:
+    now_ts = time.monotonic() if now_ts is None else float(now_ts)
+    state_key = (
+        int(bool(snapshot.get("would_emit_signal_ready"))),
+        str(snapshot.get("signal_ready_reason") or ""),
+        int(bool(snapshot.get("signal_sent"))),
+        int(bool(snapshot.get("entries_blocked"))),
+        str(snapshot.get("entries_blocked_reason") or ""),
+        str(snapshot.get("stale_reason") or ""),
+        int(bool(snapshot.get("ticker_present"))),
+        int(bool(snapshot.get("usable_price"))),
+    )
+    last_by_symbol = runtime_state.setdefault("pre_signal_runtime_snapshot_last_state", {})
+    last_emit_by_symbol = runtime_state.setdefault("pre_signal_runtime_snapshot_last_emit_ts", {})
+    if not isinstance(last_by_symbol, dict):
+        last_by_symbol = {}
+        runtime_state["pre_signal_runtime_snapshot_last_state"] = last_by_symbol
+    if not isinstance(last_emit_by_symbol, dict):
+        last_emit_by_symbol = {}
+        runtime_state["pre_signal_runtime_snapshot_last_emit_ts"] = last_emit_by_symbol
+    previous_state = last_by_symbol.get(symbol)
+    previous_emit_ts = float(last_emit_by_symbol.get(symbol) or 0.0)
+    changed = previous_state != state_key
+    would_emit_ready = bool(snapshot.get("would_emit_signal_ready"))
+    due_for_periodic = previous_emit_ts <= 0.0 or (now_ts - previous_emit_ts) >= float(unchanged_interval_seconds)
+    if not would_emit_ready and not changed and not due_for_periodic:
+        runtime_state["pre_signal_snapshots_suppressed_total"] = int(runtime_state.get("pre_signal_snapshots_suppressed_total") or 0) + 1
         return
-    emitted[key] = now_utc()
-    if len(emitted) > 1000:
-        runtime_state["pre_signal_runtime_snapshot_emitted_keys"] = {key: emitted[key]}
+    last_by_symbol[symbol] = state_key
+    last_emit_by_symbol[symbol] = now_ts
+    runtime_state["pre_signal_snapshot_last_emit_monotonic"] = now_ts
+    runtime_state["pre_signal_snapshots_emitted_total"] = int(runtime_state.get("pre_signal_snapshots_emitted_total") or 0) + 1
     fields = " ".join(
         f"{name}={snapshot.get(name) if snapshot.get(name) is not None else ''}"
         for name in [
@@ -1028,6 +1051,8 @@ def emit_pre_signal_runtime_snapshot(
             "quantity_reason",
             "would_emit_signal_ready",
             "signal_ready_reason",
+            "entry_symbol_allowed",
+            "symbol_ineligible",
         ]
     )
     try:
@@ -1214,6 +1239,9 @@ def runtime_state_growth_current_metrics(
     ack_timeouts_total = int(sqlite_status.get("ack_timeouts_total") or 0)
     session_ack_start = int(runtime_state.get("session_start_sqlite_ack_timeouts_total") or 0)
     process_start = float(runtime_state.get("process_start_monotonic") or time.monotonic())
+    pre_signal_last_emit = float(runtime_state.get("pre_signal_snapshot_last_emit_monotonic") or 0.0)
+    pre_signal_last_emit_age = round(time.monotonic() - pre_signal_last_emit, 3) if pre_signal_last_emit > 0 else 0.0
+    write_count_by_method = dict(sqlite_status.get("write_count_by_method") or {})
     metrics: dict[str, Any] = {
         "process_uptime_seconds": round(time.monotonic() - process_start, 3),
         "rss_memory_mb": _process_rss_memory_mb(),
@@ -1260,6 +1288,10 @@ def runtime_state_growth_current_metrics(
         "executions_seen_cache_count": len(seen_fills),
         "duplicate_execution_guard_count": _runtime_counter_value(runtime_state.get("fill_diagnostic_execution_ids")),
         "traded_symbols_today_count": sum(1 for state in states.values() if state.signal_sent),
+        "pre_signal_snapshots_emitted_total": int(runtime_state.get("pre_signal_snapshots_emitted_total") or 0),
+        "pre_signal_snapshots_suppressed_total": int(runtime_state.get("pre_signal_snapshots_suppressed_total") or 0),
+        "pre_signal_snapshot_last_emit_age_seconds": pre_signal_last_emit_age,
+        "runtime_event_writes_total": int(write_count_by_method.get("record_runtime_event", 0) or 0),
         "sqlite_queue_depth": int(sqlite_status.get("queue_depth") or 0),
         "sqlite_max_queue_depth": int(sqlite_status.get("max_queue_depth") or 0),
         "sqlite_oldest_queued_age_seconds": sqlite_status.get("oldest_queued_age_seconds") or 0,
@@ -1336,6 +1368,9 @@ def runtime_state_growth_delta_json(
         "executions_seen_cache_count",
         "sqlite_queue_depth",
         "sqlite_ack_timeouts_total",
+        "pre_signal_snapshots_emitted_total",
+        "pre_signal_snapshots_suppressed_total",
+        "runtime_event_writes_total",
         "rate_limit_state_count",
         "log_throttle_key_count",
         "total_cached_candles",
@@ -1492,6 +1527,10 @@ def emit_runtime_state_growth_snapshot(
             "executions_seen_cache_count",
             "duplicate_execution_guard_count",
             "traded_symbols_today_count",
+            "pre_signal_snapshots_emitted_total",
+            "pre_signal_snapshots_suppressed_total",
+            "pre_signal_snapshot_last_emit_age_seconds",
+            "runtime_event_writes_total",
             "sqlite_queue_depth",
             "sqlite_max_queue_depth",
             "sqlite_oldest_queued_age_seconds",
@@ -1852,6 +1891,16 @@ def record_lifecycle(recorder: LiveDataRecorder, event: str, symbol: str, **kwar
     if raw and not isinstance(raw, str):
         row["raw_json"] = json.dumps(raw, ensure_ascii=False, default=str)
     append_dict_csv(recorder.path("trade_lifecycle.csv"), row, fields)
+    if event == "SIGNAL_READY":
+        print(
+            f"{now_utc()} SIGNAL_READY symbol={symbol} action={kwargs.get('action') or ''} "
+            f"quantity={kwargs.get('quantity') if kwargs.get('quantity') is not None else ''} "
+            f"price={kwargs.get('price') if kwargs.get('price') is not None else ''} "
+            f"reason={kwargs.get('reason') or ''}",
+            flush=True,
+        )
+    if event == "PRE_SIGNAL_RUNTIME_SNAPSHOT":
+        return
     safe_sqlite_call(
         getattr(recorder, "sqlite_store", None),
         "record_runtime_event",
@@ -7661,7 +7710,7 @@ def main() -> int:
             }
             for snapshot in pre_signal_snapshots:
                 snapshot["ranking_position"] = ranking_position_by_symbol.get(str(snapshot.get("symbol") or ""))
-                emit_pre_signal_runtime_snapshot(recorder, runtime_state, snapshot)
+                emit_pre_signal_runtime_snapshot(recorder, runtime_state, snapshot, now_ts=loop_now)
             ready_candidates_total = len(entry_candidates)
             candidate_rejection_reasons = {
                 candidate["symbol"]: ready_candidate_rejection_reason(

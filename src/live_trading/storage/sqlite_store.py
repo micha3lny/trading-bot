@@ -3256,6 +3256,7 @@ class SQLiteWriteQueue:
             "last_ack_timeout_method": "",
             "last_ack_timeout_at": "",
             "write_count": 0,
+            "write_count_by_method": {},
             "failed_writes": 0,
             "last_write_latency_ms": None,
             "last_write_method": "",
@@ -3356,6 +3357,9 @@ class SQLiteWriteQueue:
                     with self._status_lock:
                         if request.exception is None:
                             self._status["write_count"] = int(self._status.get("write_count", 0) or 0) + 1
+                            by_method = dict(self._status.get("write_count_by_method") or {})
+                            by_method[request.method] = int(by_method.get(request.method, 0) or 0) + 1
+                            self._status["write_count_by_method"] = by_method
                             self._status["last_write_error"] = ""
                         else:
                             self._status["failed_writes"] = int(self._status.get("failed_writes", 0) or 0) + 1

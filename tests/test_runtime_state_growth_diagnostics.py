@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from src.live_trading.v67_live_top100_expansion_paper_trader import (
     ManagedPosition,
     SymbolState,
+    emit_pre_signal_runtime_snapshot,
     runtime_state_growth_current_metrics,
     runtime_state_growth_delta_json,
     runtime_state_growth_numeric_baseline,
@@ -98,6 +101,9 @@ class RuntimeStateGrowthDiagnosticsTests(unittest.TestCase):
     def test_signal_sent_pending_maps_and_callbacks_are_counted(self) -> None:
         runtime_state = self.base_runtime_state()
         runtime_state["entry_order_by_order_id"] = {"123": {"symbol": "AAA"}}
+        runtime_state["pre_signal_snapshots_emitted_total"] = 7
+        runtime_state["pre_signal_snapshots_suppressed_total"] = 11
+        runtime_state["sqlite_writer_status"] = {"ack_timeouts_total": 0, "write_count_by_method": {"record_runtime_event": 13}}
         states = {"AAA": SymbolState(symbol="AAA", signal_sent=True)}
         managed = {
             "AAA": ManagedPosition(symbol="AAA", contract=object(), quantity=1, entry_price=10.0, entry_time="", peak_price=10.0, active=True, exit_sent=True, exit_order_id=456)
@@ -121,6 +127,9 @@ class RuntimeStateGrowthDiagnosticsTests(unittest.TestCase):
         self.assertEqual(metrics["pending_exit_orders_count"], 1)
         self.assertEqual(metrics["executions_seen_cache_count"], 2)
         self.assertEqual(metrics["callback_count_execDetailsEvent"], 1)
+        self.assertEqual(metrics["pre_signal_snapshots_emitted_total"], 7)
+        self.assertEqual(metrics["pre_signal_snapshots_suppressed_total"], 11)
+        self.assertEqual(metrics["runtime_event_writes_total"], 13)
 
     def test_state_growth_snapshot_deltas_are_reported(self) -> None:
         metrics = {"total_state_count": 5, "sqlite_ack_timeouts_total": 3, "rss_memory_mb": 100.0}
@@ -131,6 +140,123 @@ class RuntimeStateGrowthDiagnosticsTests(unittest.TestCase):
         self.assertEqual(parsed["total_state_count"]["delta_startup"], 3.0)
         self.assertEqual(parsed["total_state_count"]["delta_session"], 1.0)
         self.assertEqual(parsed["sqlite_ack_timeouts_total"]["delta_session"], 1.0)
+
+    def snapshot_recorder(self, tmpdir: str):
+        class Recorder:
+            session_date = "2026-07-13"
+            sqlite_store = None
+
+            def __init__(self, root: str) -> None:
+                self.root = Path(root)
+
+            def path(self, name: str) -> Path:
+                return self.root / name
+
+        return Recorder(tmpdir)
+
+    def base_pre_signal_snapshot(self, **overrides) -> dict:
+        snapshot = {
+            "symbol": "AAA",
+            "session_date": "2026-07-13",
+            "scan_id": 1,
+            "ranking_position": 1,
+            "candidate_age_seconds": None,
+            "in_top100": 1,
+            "top100_rank": 1,
+            "top100_score": 90.0,
+            "contract_present": 1,
+            "ticker_present": 1,
+            "usable_price": 1,
+            "current_price": 10.0,
+            "bid": 9.99,
+            "ask": 10.01,
+            "spread_bps": 20.0,
+            "state_present": 1,
+            "signal_sent": 0,
+            "ready": 0,
+            "ready_since": "",
+            "first_seen": "2026-07-13T13:30:00+00:00",
+            "last_live_update": "2026-07-13T13:31:00+00:00",
+            "first_price_initialized": 1,
+            "first5_initialized": 1,
+            "first15_initialized": 1,
+            "first_5m_high_pct": 0.1,
+            "first_15m_high_pct": 0.2,
+            "or_range_pct": 0.3,
+            "live_entry_score": 42.0,
+            "rejection_reason": "first_5m_high_too_low",
+            "entries_blocked": 0,
+            "entries_blocked_reason": "",
+            "stale_reason": "",
+            "already_open": 0,
+            "quantity": 100,
+            "quantity_reason": "ok",
+            "would_emit_signal_ready": 0,
+            "signal_ready_reason": "not_ready:first_5m_high_too_low",
+            "entry_symbol_allowed": 1,
+            "symbol_ineligible": 0,
+        }
+        snapshot.update(overrides)
+        return snapshot
+
+    def lifecycle_rows(self, tmpdir: str) -> list[str]:
+        path = Path(tmpdir) / "trade_lifecycle.csv"
+        if not path.exists():
+            return []
+        return [line for line in path.read_text(encoding="utf-8").splitlines() if "PRE_SIGNAL_RUNTIME_SNAPSHOT" in line]
+
+    def test_pre_signal_first_decision_snapshot_is_emitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_state: dict = {}
+            emit_pre_signal_runtime_snapshot(
+                self.snapshot_recorder(tmpdir),
+                runtime_state,
+                self.base_pre_signal_snapshot(),
+                now_ts=100.0,
+            )
+            self.assertEqual(len(self.lifecycle_rows(tmpdir)), 1)
+            self.assertEqual(runtime_state["pre_signal_snapshots_emitted_total"], 1)
+            self.assertEqual(runtime_state.get("pre_signal_snapshots_suppressed_total", 0), 0)
+
+    def test_pre_signal_unchanged_non_ready_snapshot_is_suppressed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_state: dict = {}
+            recorder = self.snapshot_recorder(tmpdir)
+            snapshot = self.base_pre_signal_snapshot()
+            emit_pre_signal_runtime_snapshot(recorder, runtime_state, snapshot, now_ts=100.0)
+            emit_pre_signal_runtime_snapshot(recorder, runtime_state, snapshot, now_ts=120.0)
+            self.assertEqual(len(self.lifecycle_rows(tmpdir)), 1)
+            self.assertEqual(runtime_state["pre_signal_snapshots_emitted_total"], 1)
+            self.assertEqual(runtime_state["pre_signal_snapshots_suppressed_total"], 1)
+
+    def test_pre_signal_changed_reason_emits_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_state: dict = {}
+            recorder = self.snapshot_recorder(tmpdir)
+            emit_pre_signal_runtime_snapshot(recorder, runtime_state, self.base_pre_signal_snapshot(), now_ts=100.0)
+            emit_pre_signal_runtime_snapshot(
+                recorder,
+                runtime_state,
+                self.base_pre_signal_snapshot(signal_ready_reason="not_ready:or_range_too_low"),
+                now_ts=120.0,
+            )
+            self.assertEqual(len(self.lifecycle_rows(tmpdir)), 2)
+            self.assertEqual(runtime_state["pre_signal_snapshots_emitted_total"], 2)
+
+    def test_pre_signal_would_emit_ready_is_always_emitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_state: dict = {}
+            recorder = self.snapshot_recorder(tmpdir)
+            snapshot = self.base_pre_signal_snapshot(
+                ready=1,
+                rejection_reason="live_safe_expansion_ready",
+                would_emit_signal_ready=1,
+                signal_ready_reason="would_emit_signal_ready",
+            )
+            emit_pre_signal_runtime_snapshot(recorder, runtime_state, snapshot, now_ts=100.0)
+            emit_pre_signal_runtime_snapshot(recorder, runtime_state, snapshot, now_ts=101.0)
+            self.assertEqual(len(self.lifecycle_rows(tmpdir)), 2)
+            self.assertEqual(runtime_state["pre_signal_snapshots_emitted_total"], 2)
 
 
 if __name__ == "__main__":
