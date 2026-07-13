@@ -71,6 +71,7 @@ DEFAULT_HISTORY_DIR = "data/history/universe_1m"
 DEFAULT_RECORDER_DIR = "data/live/recorder"
 STRATEGY_NAME = "v67_top100_live_safe_expansion_v46_wide_trail"
 _ACTIVE_SHUTDOWN_DIAGNOSTICS: "ShutdownDiagnostics | None" = None
+SYMBOL_STATE_MAX_BARS = int(os.environ.get("TRADING_BOT_SYMBOL_STATE_MAX_BARS", "60") or "60")
 
 
 @dataclass
@@ -98,6 +99,7 @@ class SymbolState:
     last_live_update_utc: str | None = None
     stale_ready_logged: bool = False
     bars: list[dict[str, Any]] = field(default_factory=list)
+    last_bar_bucket: str | None = None
 
 
 @dataclass
@@ -1219,7 +1221,10 @@ def runtime_state_growth_current_metrics(
         row for row in entry_order_map.values()
         if isinstance(row, dict) and str(row.get("symbol") or "")
     ]
-    total_cached_candles = sum(len(getattr(state, "bars", []) or []) for state in states.values())
+    bar_counts = [len(getattr(state, "bars", []) or []) for state in states.values()]
+    total_cached_candles = sum(bar_counts)
+    max_cached_bars = max(bar_counts) if bar_counts else 0
+    avg_cached_bars = round(total_cached_candles / len(bar_counts), 3) if bar_counts else 0.0
     callback_counts = {
         "callback_count_pendingTickersEvent": _event_callback_count(getattr(ib, "pendingTickersEvent", None)) if ib is not None else 0,
         "callback_count_orderStatusEvent": _event_callback_count(getattr(ib, "orderStatusEvent", None)) if ib is not None else 0,
@@ -1306,6 +1311,13 @@ def runtime_state_growth_current_metrics(
         "rejection_reason_cache_count": _runtime_counter_value(runtime_state.get("entry_rejection_processed")),
         "candle_cache_symbol_count": sum(1 for state in states.values() if state.bars),
         "total_cached_candles": total_cached_candles,
+        "max_cached_bars_per_symbol": max_cached_bars,
+        "avg_cached_bars_per_symbol": avg_cached_bars,
+        "symbol_state_max_bars": SYMBOL_STATE_MAX_BARS,
+        "symbol_state_duplicate_bar_suppressed_total": int(runtime_state.get("symbol_state_duplicate_bar_suppressed_total") or 0),
+        "symbol_state_bars_trimmed_total": int(runtime_state.get("symbol_state_bars_trimmed_total") or 0),
+        "symbol_state_session_reset_count": int(runtime_state.get("symbol_state_session_reset_count") or 0),
+        "symbol_state_bars_cleared_total": int(runtime_state.get("symbol_state_bars_cleared_total") or 0),
         "live_feature_cache_count": len(latest_snapshots),
         "current_session_date": current_session_date,
         "previous_session_date": previous_session_date,
@@ -1374,6 +1386,10 @@ def runtime_state_growth_delta_json(
         "rate_limit_state_count",
         "log_throttle_key_count",
         "total_cached_candles",
+        "max_cached_bars_per_symbol",
+        "symbol_state_duplicate_bar_suppressed_total",
+        "symbol_state_bars_trimmed_total",
+        "symbol_state_session_reset_count",
         "live_feature_cache_count",
         "callback_count_execDetailsEvent",
         "callback_count_commissionReportEvent",
@@ -1545,6 +1561,13 @@ def emit_runtime_state_growth_snapshot(
             "rejection_reason_cache_count",
             "candle_cache_symbol_count",
             "total_cached_candles",
+            "max_cached_bars_per_symbol",
+            "avg_cached_bars_per_symbol",
+            "symbol_state_max_bars",
+            "symbol_state_duplicate_bar_suppressed_total",
+            "symbol_state_bars_trimmed_total",
+            "symbol_state_session_reset_count",
+            "symbol_state_bars_cleared_total",
             "live_feature_cache_count",
             "callback_count_pendingTickersEvent",
             "callback_count_orderStatusEvent",
@@ -1586,6 +1609,114 @@ def market_open_datetime_utc(args: argparse.Namespace, now: datetime | None = No
     return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
 
 
+def append_symbol_state_bar(
+    state: SymbolState,
+    *,
+    observed_at: datetime,
+    price: float,
+    session_elapsed: float,
+    source: str,
+    runtime_state: dict[str, Any] | None = None,
+    open_price: float | None = None,
+    high: float | None = None,
+    low: float | None = None,
+    close: float | None = None,
+    volume: float | None = None,
+    max_bars: int = SYMBOL_STATE_MAX_BARS,
+) -> None:
+    if max_bars <= 0:
+        state.bars.clear()
+        state.last_bar_bucket = None
+        return
+    bucket = observed_at.replace(second=0, microsecond=0).isoformat()
+    high_value = high if high is not None else price
+    low_value = low if low is not None else price
+    close_value = close if close is not None else price
+    if state.bars and state.last_bar_bucket == bucket:
+        bar = state.bars[-1]
+        bar["high"] = max(safe_float(bar.get("high")) or high_value, high_value)
+        bar["low"] = min(safe_float(bar.get("low")) or low_value, low_value)
+        bar["close"] = close_value
+        bar["price"] = close_value
+        bar["bar_time_utc"] = observed_at.isoformat()
+        bar["session_elapsed_seconds"] = round(float(session_elapsed), 3)
+        if volume is not None:
+            bar["volume"] = volume
+        bar["samples"] = int(safe_int(bar.get("samples")) or 1) + 1
+        if runtime_state is not None:
+            runtime_state["symbol_state_duplicate_bar_suppressed_total"] = int(runtime_state.get("symbol_state_duplicate_bar_suppressed_total") or 0) + 1
+        return
+    state.bars.append(
+        {
+            "bar_time_utc": observed_at.isoformat(),
+            "bucket_utc": bucket,
+            "open": open_price if open_price is not None else price,
+            "high": high_value,
+            "low": low_value,
+            "close": close_value,
+            "price": close_value,
+            "volume": volume,
+            "session_elapsed_seconds": round(float(session_elapsed), 3),
+            "source": source,
+            "samples": 1,
+        }
+    )
+    state.last_bar_bucket = bucket
+    if len(state.bars) > max_bars:
+        removed = len(state.bars) - max_bars
+        del state.bars[:-max_bars]
+        if runtime_state is not None:
+            runtime_state["symbol_state_bars_trimmed_total"] = int(runtime_state.get("symbol_state_bars_trimmed_total") or 0) + removed
+
+
+def reset_symbol_session_state(state: SymbolState) -> None:
+    state.open_price = None
+    state.first_price = None
+    state.high = None
+    state.low = None
+    state.last_price = None
+    state.first_5m_high = None
+    state.first_15m_high = None
+    state.or_high = None
+    state.or_low = None
+    state.first_seen_ts = None
+    state.first_seen_utc = None
+    state.latest_seen_utc = None
+    state.latest_volume = None
+    state.ready_since_ts = None
+    state.ready_since_utc = None
+    state.signal_source = ""
+    state.last_update_source = ""
+    state.last_live_update_ts = None
+    state.last_live_update_utc = None
+    state.stale_ready_logged = False
+    state.bars.clear()
+    state.last_bar_bucket = None
+
+
+def reset_session_candle_state(
+    states: dict[str, SymbolState],
+    runtime_state: dict[str, Any],
+    *,
+    previous_session_date: str,
+    current_session_date: str,
+) -> None:
+    reset_count = 0
+    bars_cleared = 0
+    for state in states.values():
+        bars_cleared += len(state.bars)
+        reset_symbol_session_state(state)
+        reset_count += 1
+    runtime_state["state_objects_reset_count"] = int(runtime_state.get("state_objects_reset_count") or 0) + reset_count
+    runtime_state["symbol_state_session_reset_count"] = int(runtime_state.get("symbol_state_session_reset_count") or 0) + reset_count
+    runtime_state["symbol_state_bars_cleared_total"] = int(runtime_state.get("symbol_state_bars_cleared_total") or 0) + bars_cleared
+    print(
+        f"{now_utc()} SYMBOL_STATE_SESSION_RESET previous_session_date={previous_session_date} "
+        f"current_session_date={current_session_date} states_reset={reset_count} bars_cleared={bars_cleared}",
+        flush=True,
+    )
+
+
 def update_state(
     state: SymbolState,
     snap: dict[str, Any],
@@ -1594,6 +1725,7 @@ def update_state(
     *,
     observed_at: datetime | None = None,
     source: str = "live",
+    runtime_state: dict[str, Any] | None = None,
 ) -> None:
     price = safe_float(snap.get("price"))
     if price is None or price <= 0:
@@ -1608,16 +1740,14 @@ def update_state(
     if source == "live":
         state.last_live_update_ts = now_ts
         state.last_live_update_utc = observed_iso
-    state.bars.append(
-        {
-            "bar_time_utc": observed_iso,
-            "price": price,
-            "session_elapsed_seconds": round(float(session_elapsed), 3),
-            "source": "live_ticker_snapshot" if source == "live" else source,
-        }
+    append_symbol_state_bar(
+        state,
+        observed_at=observed_at,
+        price=price,
+        session_elapsed=session_elapsed,
+        source="live_ticker_snapshot" if source == "live" else source,
+        runtime_state=runtime_state,
     )
-    if len(state.bars) > 500:
-        del state.bars[:-500]
 
     if session_elapsed < 0:
         return
@@ -5627,7 +5757,7 @@ def reload_top100_universe_if_requested(
             for symbol in traded_symbols_today:
                 if symbol in states:
                     states[symbol].signal_sent = True
-        rebuilt = rebuild_symbol_states_from_1m_candles(recorder, states, args)
+        rebuilt = rebuild_symbol_states_from_1m_candles(recorder, states, args, runtime_state)
         emit_top100_subscription_reconcile(
             desired_symbols=entry_symbols,
             contract_by_symbol=contract_by_symbol,
@@ -6588,6 +6718,7 @@ def rebuild_symbol_states_from_1m_candles(
     recorder: LiveDataRecorder,
     states: dict[str, SymbolState],
     args: argparse.Namespace,
+    runtime_state: dict[str, Any] | None = None,
 ) -> int:
     path = recorder.path("candles_1m.csv")
     if not path.exists() or path.stat().st_size == 0:
@@ -6628,13 +6759,9 @@ def rebuild_symbol_states_from_1m_candles(
             continue
 
         st = states[symbol]
+        reset_symbol_session_state(st)
         st.signal_source = "reconstructed"
         st.last_update_source = "reconstructed"
-        st.last_live_update_ts = None
-        st.last_live_update_utc = None
-        st.ready_since_ts = None
-        st.ready_since_utc = None
-        st.stale_ready_logged = False
         st.first_seen_ts = time.time()
         first_ts = _parse_bar_time_utc(rows[0].get("bar_time", ""))
         st.first_seen_utc = first_ts.isoformat() if first_ts is not None else None
@@ -6643,11 +6770,6 @@ def rebuild_symbol_states_from_1m_candles(
         st.open_price = first
         st.high = first
         st.low = first
-        st.first_5m_high = None
-        st.first_15m_high = None
-        st.or_high = None
-        st.or_low = None
-        st.bars = []
 
         for row in rows:
             ts = _parse_bar_time_utc(row.get("bar_time", ""))
@@ -6669,16 +6791,18 @@ def rebuild_symbol_states_from_1m_candles(
             st.last_price = close or st.last_price
             st.latest_volume = vol or st.latest_volume
             st.latest_seen_utc = ts.isoformat()
-            st.bars.append(
-                {
-                    "bar_time_utc": ts.isoformat(),
-                    "open": safe_float(row.get("open")),
-                    "high": high,
-                    "low": low,
-                    "close": close,
-                    "session_elapsed_seconds": round(minutes * 60.0, 3),
-                    "source": "candles_1m_rebuild",
-                }
+            append_symbol_state_bar(
+                st,
+                observed_at=ts,
+                price=close or high,
+                session_elapsed=minutes * 60.0,
+                source="candles_1m_rebuild",
+                runtime_state=runtime_state,
+                open_price=safe_float(row.get("open")),
+                high=high,
+                low=low,
+                close=close,
+                volume=vol,
             )
 
             if 0 <= minutes < 5:
@@ -7222,7 +7346,7 @@ def main() -> int:
             print(f"{now_utc()} restored_managed_positions={len(restored)}", flush=True)
 
         backfilled_rows = backfill_recent_1m(ib, recorder, contracts, args)
-        state_rebuild_count = rebuild_symbol_states_from_1m_candles(recorder, states, args)
+        state_rebuild_count = rebuild_symbol_states_from_1m_candles(recorder, states, args, runtime_state)
         current_session_backfilled_rows = 0
         today_session = get_us_equity_session(datetime.now(timezone.utc).date())
         if not today_session.is_trading_day:
@@ -7235,7 +7359,7 @@ def main() -> int:
         if today_session.is_trading_day and state_rebuild_count == 0 and current_session_candle_count(recorder, args) == 0:
             current_session_backfilled_rows = backfill_current_session_1m(ib, recorder, contracts, args)
             if current_session_backfilled_rows:
-                state_rebuild_count = rebuild_symbol_states_from_1m_candles(recorder, states, args)
+                state_rebuild_count = rebuild_symbol_states_from_1m_candles(recorder, states, args, runtime_state)
         traded_symbols_today = load_traded_symbols_today(recorder)
         if traded_symbols_today:
             for symbol in traded_symbols_today:
@@ -7456,6 +7580,13 @@ def main() -> int:
                     previous_boundary = str(runtime_state.get("last_session_boundary_check_date") or "")
                     runtime_state["last_session_boundary_check_date"] = boundary_key
                     runtime_state["last_session_boundary_time"] = now_utc()
+                    if previous_boundary and previous_boundary != boundary_key:
+                        reset_session_candle_state(
+                            states,
+                            runtime_state,
+                            previous_session_date=previous_boundary,
+                            current_session_date=boundary_key,
+                        )
                     emit_runtime_state_session_boundary_check(
                         runtime_state=runtime_state,
                         states=states,
@@ -7564,7 +7695,7 @@ def main() -> int:
                 latest_snapshots[symbol] = snap
                 data_count += 1
                 state = states[symbol]
-                update_state(state, snap, session_elapsed, args.opening_range_seconds, observed_at=observed_at)
+                update_state(state, snap, session_elapsed, args.opening_range_seconds, observed_at=observed_at, runtime_state=runtime_state)
                 features = compute_live_safe_features(state, snap, args)
                 if features_are_all_zeroish(features):
                     zeroish_feature_count += 1

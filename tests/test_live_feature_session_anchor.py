@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src.live_trading.v67_live_top100_expansion_paper_trader import (
     SymbolState,
     compute_live_safe_features,
+    reset_session_candle_state,
     update_state,
 )
 
@@ -51,6 +52,80 @@ class LiveFeatureSessionAnchorTests(unittest.TestCase):
         self.assertAlmostEqual(features["first_5m_high_pct"], 8.0)
         self.assertAlmostEqual(features["first_15m_high_pct"], 8.0)
         self.assertGreater(features["or_range_pct"], 0.0)
+
+    def test_duplicate_minute_snapshots_update_compact_bar_without_changing_features(self) -> None:
+        state = SymbolState("AAA")
+        runtime_state: dict = {}
+        args = argparse.Namespace(
+            min_first_5m_high_pct=0.5,
+            min_first_15m_high_pct=1.0,
+            min_or_range_pct=0.5,
+            min_price=5.0,
+            max_spread_bps=50.0,
+        )
+        update_state(
+            state,
+            {"price": 10.0},
+            session_elapsed=0.0,
+            opening_range_seconds=15 * 60,
+            observed_at=datetime(2026, 7, 13, 13, 30, 1, tzinfo=timezone.utc),
+            runtime_state=runtime_state,
+        )
+        update_state(
+            state,
+            {"price": 10.8},
+            session_elapsed=20.0,
+            opening_range_seconds=15 * 60,
+            observed_at=datetime(2026, 7, 13, 13, 30, 20, tzinfo=timezone.utc),
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(len(state.bars), 1)
+        self.assertEqual(runtime_state["symbol_state_duplicate_bar_suppressed_total"], 1)
+        self.assertAlmostEqual(state.bars[0]["high"], 10.8)
+        features = compute_live_safe_features(state, {"price": 10.8}, args)
+        self.assertAlmostEqual(features["first_5m_high_pct"], 8.0)
+        self.assertAlmostEqual(features["first_15m_high_pct"], 8.0)
+
+    def test_symbol_bars_are_bounded_without_changing_feature_scalars(self) -> None:
+        state = SymbolState("AAA")
+        runtime_state: dict = {}
+        start = datetime(2026, 7, 13, 13, 30, tzinfo=timezone.utc)
+        for minute in range(65):
+            update_state(
+                state,
+                {"price": 10.0 + minute},
+                session_elapsed=float(minute * 60),
+                opening_range_seconds=15 * 60,
+                observed_at=start + timedelta(minutes=minute),
+                runtime_state=runtime_state,
+            )
+        self.assertEqual(len(state.bars), 60)
+        self.assertEqual(runtime_state["symbol_state_bars_trimmed_total"], 5)
+        self.assertAlmostEqual(state.first_5m_high, 14.0)
+
+    def test_session_reset_clears_candle_state_only(self) -> None:
+        state = SymbolState("AAA", signal_sent=True)
+        runtime_state: dict = {}
+        update_state(
+            state,
+            {"price": 10.0},
+            session_elapsed=0.0,
+            opening_range_seconds=15 * 60,
+            observed_at=datetime(2026, 7, 13, 13, 30, tzinfo=timezone.utc),
+            runtime_state=runtime_state,
+        )
+        reset_session_candle_state(
+            {"AAA": state},
+            runtime_state,
+            previous_session_date="2026-07-13",
+            current_session_date="2026-07-14",
+        )
+        self.assertEqual(state.bars, [])
+        self.assertIsNone(state.first_price)
+        self.assertIsNone(state.first_5m_high)
+        self.assertTrue(state.signal_sent)
+        self.assertEqual(runtime_state["symbol_state_session_reset_count"], 1)
+        self.assertEqual(runtime_state["symbol_state_bars_cleared_total"], 1)
 
 
 if __name__ == "__main__":
