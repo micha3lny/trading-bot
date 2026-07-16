@@ -123,6 +123,22 @@ def first_col(columns: Iterable[str], candidates: Iterable[str]) -> str | None:
     return None
 
 
+def first_nonempty_col(df: pd.DataFrame, candidates: Iterable[str]) -> str | None:
+    by_lower = {str(col).strip().lower(): col for col in df.columns}
+    fallback: str | None = None
+    for candidate in candidates:
+        key = candidate.strip().lower()
+        if key not in by_lower:
+            continue
+        col = by_lower[key]
+        if fallback is None:
+            fallback = col
+        values = df[col].dropna().astype(str).str.strip()
+        if bool((values != "").any()):
+            return col
+    return fallback
+
+
 def holding_minutes(start: Any, end: Any) -> float | None:
     start_dt = parse_dt(start)
     end_dt = parse_dt(end)
@@ -171,6 +187,7 @@ def read_flex_xml(path: Path) -> pd.DataFrame:
                 "quantity": item.get("quantity"),
                 "tradePrice": item.get("tradePrice") or item.get("price"),
                 "tradeDate": item.get("tradeDate") or item.get("tradeTime") or item.get("reportDate"),
+                "tradeTime": item.get("tradeTime") or item.get("dateTime"),
                 "tradeID": item.get("tradeID") or item.get("ibExecID") or item.get("execID"),
                 "fifoPnlRealized": item.get("fifoPnlRealized"),
                 "ibCommission": item.get("ibCommission"),
@@ -207,7 +224,7 @@ def flex_metadata(df: pd.DataFrame, *, source: str, statements_count: int, raw_t
         }
     cols = list(df.columns)
     symbol_col = first_col(cols, ["symbol", "underlying", "contract", "ticker", "underlyingSymbol"])
-    time_col = first_col(cols, ["executed_at", "execution_time", "datetime", "date/time", "date_time", "time", "trade_time", "tradeDate", "reportDate"])
+    time_col = first_nonempty_col(df, ["executed_at", "execution_time", "datetime", "date/time", "date_time", "time", "trade_time", "tradeTime", "tradeDate", "reportDate"])
     symbols = sorted({norm_symbol(x) for x in df[symbol_col].tolist() if norm_symbol(x)}) if symbol_col else []
     dates = []
     if time_col:
@@ -231,7 +248,7 @@ def normalize_execution_frame(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
     side_col = first_col(cols, ["side", "action", "buySell", "buy/sell", "transactiontype", "transaction_type"])
     qty_col = first_col(cols, ["quantity", "qty", "shares", "totalquantity"])
     price_col = first_col(cols, ["price", "fill_price", "tradeprice", "tradePrice", "trade_price", "avgprice"])
-    time_col = first_col(cols, ["executed_at", "execution_time", "datetime", "date/time", "date_time", "time", "trade_time", "tradeDate", "reportDate"])
+    time_col = first_nonempty_col(df, ["executed_at", "execution_time", "datetime", "date/time", "date_time", "time", "trade_time", "tradeTime", "tradeDate", "reportDate"])
     exec_col = first_col(cols, ["execution_id", "execid", "exec_id", "ibexecid", "tradeID", "trade_id"])
     order_col = first_col(cols, ["order_id", "orderid", "order"])
     pnl_col = first_col(cols, ["realized_pnl", "realizedpnl", "fifoPnlRealized", "realized p/l", "realized p&l", "realizedpl"])
@@ -418,6 +435,24 @@ def sqlite_executions_for_symbols(conn: sqlite3.Connection, symbols: list[str]) 
         ORDER BY symbol, COALESCE(executed_at, recorded_at), execution_id
         """,
         symbols,
+    )
+
+
+def sqlite_all_executions_range(conn: sqlite3.Connection, start_date: str, end_date: str) -> pd.DataFrame:
+    if not table_exists(conn, "executions"):
+        return pd.DataFrame()
+    return read_sql_df(
+        conn,
+        """
+        SELECT execution_id, trade_id, order_key, order_id, perm_id, strategy_name,
+               session_date, symbol, side, quantity, price, executed_at, recorded_at,
+               commission, realized_pnl, commission_source, raw_json
+        FROM executions
+        WHERE session_date BETWEEN ? AND ?
+           OR substr(COALESCE(executed_at, recorded_at), 1, 10) BETWEEN ? AND ?
+        ORDER BY symbol, COALESCE(executed_at, recorded_at), execution_id
+        """,
+        [start_date, end_date, start_date, end_date],
     )
 
 
@@ -1085,6 +1120,140 @@ def sell_level_status(row: dict[str, Any]) -> str:
     return "OK"
 
 
+def nearest_sqlite_execution(flex_row: dict[str, Any], sqlite_rows: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, str]:
+    flex_symbol = norm_symbol(flex_row.get("symbol"))
+    flex_side = norm_side(flex_row.get("side"))
+    flex_time = parse_dt(flex_row.get("time"))
+    flex_qty = fnum(flex_row.get("quantity"))
+    flex_price = fnum(flex_row.get("price"))
+    flex_id = str(flex_row.get("execution_id") or "")
+    by_id = [row for row in sqlite_rows if str(row.get("execution_id") or "") == flex_id]
+    if by_id:
+        row = by_id[0]
+        reasons = []
+        if norm_symbol(row.get("symbol")) != flex_symbol:
+            reasons.append("symbol mismatch")
+        if norm_side(row.get("side")) != flex_side:
+            reasons.append("buySell mismatch")
+        if flex_qty is not None and not close_enough(abs(fnum(row.get("quantity")) or 0.0), abs(flex_qty), QTY_TOLERANCE):
+            reasons.append("quantity mismatch")
+        if flex_price is not None and not close_enough(fnum(row.get("price")), flex_price, PRICE_TOLERANCE):
+            reasons.append("price mismatch")
+        return row, "; ".join(reasons) or "exact execution_id matched"
+    candidates = sqlite_rows
+    if flex_symbol:
+        same_symbol = [row for row in candidates if norm_symbol(row.get("symbol")) == flex_symbol]
+        if same_symbol:
+            candidates = same_symbol
+    if flex_side:
+        same_side = [row for row in candidates if norm_side(row.get("side")) == flex_side]
+        if same_side:
+            candidates = same_side
+    def score(row: dict[str, Any]) -> float:
+        value = 0.0
+        if norm_symbol(row.get("symbol")) != flex_symbol:
+            value += 1_000_000.0
+        if norm_side(row.get("side")) != flex_side:
+            value += 100_000.0
+        if flex_time is not None:
+            row_time = parse_dt(execution_time(row))
+            value += abs((row_time - flex_time).total_seconds()) if row_time is not None else 50_000.0
+        if flex_qty is not None:
+            value += abs(abs(fnum(row.get("quantity")) or 0.0) - abs(flex_qty)) * 100.0
+        if flex_price is not None and fnum(row.get("price")) is not None:
+            value += abs((fnum(row.get("price")) or 0.0) - flex_price) * 10.0
+        return value
+    if not candidates:
+        return None, "no sqlite executions loaded"
+    nearest = min(candidates, key=score)
+    reasons = ["execution_id mismatch", "tradeID mismatch"]
+    if norm_symbol(nearest.get("symbol")) != flex_symbol:
+        reasons.append("symbol mismatch")
+    if norm_side(nearest.get("side")) != flex_side:
+        reasons.append("buySell mismatch")
+    nearest_time = parse_dt(execution_time(nearest))
+    if flex_time is None or nearest_time is None:
+        reasons.append("timestamp mismatch")
+    else:
+        delta = abs((nearest_time - flex_time).total_seconds())
+        if delta > 300:
+            reasons.append("timestamp mismatch")
+        elif delta > 0:
+            reasons.append("timezone mismatch" if delta in (3600, 7200, 14400, 18000) else "timestamp mismatch")
+    if flex_qty is not None and not close_enough(abs(fnum(nearest.get("quantity")) or 0.0), abs(flex_qty), QTY_TOLERANCE):
+        reasons.append("quantity mismatch")
+    if flex_price is not None and not close_enough(fnum(nearest.get("price")), flex_price, PRICE_TOLERANCE):
+        reasons.append("price mismatch")
+    return nearest, "; ".join(dict.fromkeys(reasons))
+
+
+def build_flex_match_diagnostics(
+    *,
+    flex_file: Path | None,
+    sqlite_executions_df: pd.DataFrame,
+    start_date: str,
+    end_date: str,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    flex_raw = read_flex_file(flex_file) if flex_file else pd.DataFrame()
+    flex_meta = getattr(flex_raw, "attrs", {}).get("flex_meta", {})
+    flex = normalize_execution_frame(flex_raw, source="ibkr_flex") if flex_file else pd.DataFrame()
+    raw_by_trade_id: dict[str, dict[str, Any]] = {}
+    if not flex_raw.empty:
+        raw_id_col = first_col(flex_raw.columns, ["tradeID", "execution_id", "execid", "exec_id", "ibexecid"])
+        if raw_id_col:
+            for raw_row in flex_raw.to_dict("records"):
+                raw_id = str(raw_row.get(raw_id_col) or "")
+                if raw_id:
+                    raw_by_trade_id[raw_id] = raw_row
+    if not flex.empty:
+        flex["_date"] = flex["time"].map(date_part)
+        flex = flex[(flex["_date"] >= start_date) & (flex["_date"] <= end_date)].drop(columns=["_date"])
+    sqlite_rows = sqlite_executions_df.to_dict("records") if not sqlite_executions_df.empty else []
+    sqlite_ids = {str(row.get("execution_id") or "") for row in sqlite_rows if str(row.get("execution_id") or "")}
+    rows: list[dict[str, Any]] = []
+    matched_buy = 0
+    matched_sell = 0
+    for flex_row in flex.to_dict("records"):
+        flex_id = str(flex_row.get("execution_id") or "")
+        matched = bool(flex_id and flex_id in sqlite_ids)
+        side = norm_side(flex_row.get("side"))
+        if matched and side == "BUY":
+            matched_buy += 1
+        if matched and side == "SELL":
+            matched_sell += 1
+        nearest, reason = nearest_sqlite_execution(flex_row, sqlite_rows)
+        if matched:
+            continue
+        raw = raw_by_trade_id.get(flex_id, {})
+        rows.append(
+            {
+                "symbol": norm_symbol(flex_row.get("symbol")),
+                "buySell": side,
+                "tradeDate": raw.get("tradeDate") or raw.get("reportDate") or date_part(flex_row.get("time")),
+                "tradeTime": raw.get("tradeTime") or raw.get("dateTime") or "",
+                "quantity": flex_row.get("quantity"),
+                "price": flex_row.get("price"),
+                "tradeID": flex_id,
+                "match_failure_reason": reason,
+                "nearest_sqlite_execution_id": str(nearest.get("execution_id") or "") if nearest else "",
+                "nearest_sqlite_symbol": norm_symbol(nearest.get("symbol")) if nearest else "",
+                "nearest_sqlite_side": norm_side(nearest.get("side")) if nearest else "",
+                "nearest_sqlite_time": execution_time(nearest) if nearest else "",
+                "nearest_sqlite_quantity": nearest.get("quantity") if nearest else None,
+                "nearest_sqlite_price": nearest.get("price") if nearest else None,
+            }
+        )
+    summary = {
+        "flex_source": flex_meta.get("source", ""),
+        "flex_trades_loaded": int(len(flex)),
+        "sqlite_executions_loaded": int(len(sqlite_rows)),
+        "flex_buy_matched": int(matched_buy),
+        "flex_sell_matched": int(matched_sell),
+        "flex_unmatched": int(len(rows)),
+    }
+    return pd.DataFrame(rows), summary
+
+
 def markdown_table(df: pd.DataFrame) -> str:
     if df.empty:
         return "_No rows._"
@@ -1208,7 +1377,7 @@ def audit(
     history_dir: Path | None,
     output_dir: Path,
     include_dashboard_reconstructed: bool,
-) -> tuple[pd.DataFrame, Path, Path]:
+) -> tuple[pd.DataFrame, Path, Path, Path | None]:
     flex_raw = read_flex_file(flex_file) if flex_file else pd.DataFrame()
     flex_meta = getattr(flex_raw, "attrs", {}).get("flex_meta", {"source": "not_provided", "statements_count": 0, "trade_rows": 0, "symbols": 0, "date_min": "", "date_max": ""})
     broker_df = normalize_execution_frame(flex_raw, source="ibkr_flex") if flex_file else pd.DataFrame()
@@ -1221,8 +1390,23 @@ def audit(
     recon_trades: list[AuditTrade] = []
     dashboard_trades: list[AuditTrade] = []
     detailed_df = pd.DataFrame()
+    flex_diag_df = pd.DataFrame()
+    flex_diag_summary = {
+        "flex_trades_loaded": 0,
+        "sqlite_executions_loaded": 0,
+        "flex_buy_matched": 0,
+        "flex_sell_matched": 0,
+        "flex_unmatched": 0,
+    }
     if sqlite_path.exists():
         with connect_sqlite(sqlite_path) as conn:
+            sqlite_range = sqlite_all_executions_range(conn, start_date, end_date)
+            flex_diag_df, flex_diag_summary = build_flex_match_diagnostics(
+                flex_file=flex_file,
+                sqlite_executions_df=sqlite_range,
+                start_date=start_date,
+                end_date=end_date,
+            )
             detailed_df = build_sell_level_audit(
                 conn=conn,
                 sqlite_path=sqlite_path,
@@ -1311,18 +1495,36 @@ def audit(
     suffix = start_date if start_date == end_date else f"{start_date}_{end_date}"
     csv_path = output_dir / f"trade_reconstruction_audit_{suffix}.csv"
     summary_path = output_dir / f"trade_reconstruction_summary_{suffix}.md"
+    flex_diag_path = output_dir / f"trade_reconstruction_flex_match_diagnostics_{suffix}.csv"
     df.to_csv(csv_path, index=False)
-    write_summary(summary_path, df, start_date=start_date, end_date=end_date, flex_file=flex_file, sqlite_path=sqlite_path, flex_meta=flex_meta)
+    if not flex_diag_df.empty:
+        flex_diag_df.to_csv(flex_diag_path, index=False)
+    else:
+        flex_diag_path = None
+    write_summary(summary_path, df, start_date=start_date, end_date=end_date, flex_file=flex_file, sqlite_path=sqlite_path, flex_meta=flex_meta, flex_diag_summary=flex_diag_summary, flex_diag_df=flex_diag_df)
     generic_csv_path = output_dir / "trade_reconstruction_audit.csv"
     generic_summary_path = output_dir / "trade_reconstruction_summary.md"
     if generic_csv_path != csv_path:
         df.to_csv(generic_csv_path, index=False)
     if generic_summary_path != summary_path:
-        write_summary(generic_summary_path, df, start_date=start_date, end_date=end_date, flex_file=flex_file, sqlite_path=sqlite_path, flex_meta=flex_meta)
-    return df, csv_path, summary_path
+        write_summary(generic_summary_path, df, start_date=start_date, end_date=end_date, flex_file=flex_file, sqlite_path=sqlite_path, flex_meta=flex_meta, flex_diag_summary=flex_diag_summary, flex_diag_df=flex_diag_df)
+    if not flex_diag_df.empty:
+        flex_diag_df.to_csv(output_dir / "trade_reconstruction_flex_match_diagnostics.csv", index=False)
+    return df, csv_path, summary_path, flex_diag_path
 
 
-def write_summary(path: Path, df: pd.DataFrame, *, start_date: str, end_date: str, flex_file: Path | None, sqlite_path: Path, flex_meta: dict[str, Any] | None = None) -> None:
+def write_summary(
+    path: Path,
+    df: pd.DataFrame,
+    *,
+    start_date: str,
+    end_date: str,
+    flex_file: Path | None,
+    sqlite_path: Path,
+    flex_meta: dict[str, Any] | None = None,
+    flex_diag_summary: dict[str, Any] | None = None,
+    flex_diag_df: pd.DataFrame | None = None,
+) -> None:
     status_counts = df["status"].value_counts().to_dict() if not df.empty and "status" in df.columns else {}
     top = df.sort_values("mismatch_score", ascending=False).head(100) if not df.empty else pd.DataFrame()
     code_locations = [
@@ -1346,9 +1548,42 @@ def write_summary(path: Path, df: pd.DataFrame, *, start_date: str, end_date: st
         f"- flex_date_range: {(flex_meta or {}).get('date_min', '')}..{(flex_meta or {}).get('date_max', '')}",
         f"- flex_symbols: {(flex_meta or {}).get('symbols', 0)}",
         "",
-        "## Status Counts",
+        "## Flex / SQLite Matching Diagnostics",
+        "",
+        f"- Flex trades loaded: {(flex_diag_summary or {}).get('flex_trades_loaded', 0)}",
+        f"- SQLite executions loaded: {(flex_diag_summary or {}).get('sqlite_executions_loaded', 0)}",
+        f"- Flex BUY matched: {(flex_diag_summary or {}).get('flex_buy_matched', 0)}",
+        f"- Flex SELL matched: {(flex_diag_summary or {}).get('flex_sell_matched', 0)}",
+        f"- Flex unmatched: {(flex_diag_summary or {}).get('flex_unmatched', 0)}",
+        "",
+        "### First 20 Flex Unmatched",
         "",
     ]
+    if flex_diag_df is not None and not flex_diag_df.empty:
+        first_unmatched_cols = [
+            "symbol",
+            "buySell",
+            "tradeDate",
+            "tradeTime",
+            "quantity",
+            "price",
+            "tradeID",
+            "match_failure_reason",
+            "nearest_sqlite_execution_id",
+            "nearest_sqlite_symbol",
+            "nearest_sqlite_side",
+            "nearest_sqlite_time",
+            "nearest_sqlite_quantity",
+            "nearest_sqlite_price",
+        ]
+        lines.append(markdown_table(flex_diag_df.head(20)[[col for col in first_unmatched_cols if col in flex_diag_df.columns]]))
+    else:
+        lines.append("_No unmatched Flex rows._")
+    lines.extend([
+        "",
+        "## Status Counts",
+        "",
+    ])
     if status_counts:
         for status, count in sorted(status_counts.items(), key=lambda item: STATUS_ORDER.index(item[0]) if item[0] in STATUS_ORDER else 99):
             lines.append(f"- {status}: {count}")
@@ -1414,7 +1649,7 @@ def main() -> int:
         if not flex_covers_requested_range(flex_meta, start_date, end_date):
             print_flex_date_range_mismatch(start_date, end_date, flex_meta)
             return 2
-    df, csv_path, summary_path = audit(
+    df, csv_path, summary_path, flex_diag_path = audit(
         start_date=start_date,
         end_date=end_date,
         sqlite_path=Path(args.sqlite_path),
@@ -1427,6 +1662,8 @@ def main() -> int:
         f"TRADE_RECONSTRUCTION_AUDIT_DONE rows={len(df)} output={csv_path} summary={summary_path}",
         flush=True,
     )
+    if flex_diag_path:
+        print(f"FLEX_MATCH_DIAGNOSTICS output={flex_diag_path}", flush=True)
     if not df.empty and "status" in df.columns:
         print("status_counts=" + json.dumps(df["status"].value_counts().to_dict(), sort_keys=True), flush=True)
     return 0
