@@ -1103,6 +1103,29 @@ def markdown_table(df: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
+def flex_file_metadata(path: Path | None) -> dict[str, Any]:
+    return getattr(read_flex_file(path), "attrs", {}).get(
+        "flex_meta",
+        {"source": "missing", "statements_count": 0, "trade_rows": 0, "symbols": 0, "date_min": "", "date_max": ""},
+    )
+
+
+def flex_covers_requested_range(meta: dict[str, Any], start_date: str, end_date: str) -> bool:
+    flex_start = str(meta.get("date_min") or "")
+    flex_end = str(meta.get("date_max") or "")
+    if not flex_start or not flex_end:
+        return False
+    return flex_start <= start_date and flex_end >= end_date
+
+
+def print_flex_date_range_mismatch(start_date: str, end_date: str, meta: dict[str, Any]) -> None:
+    print("FLEX_DATE_RANGE_MISMATCH", flush=True)
+    print(f"requested_start={start_date}", flush=True)
+    print(f"requested_end={end_date}", flush=True)
+    print(f"flex_start={meta.get('date_min') or ''}", flush=True)
+    print(f"flex_end={meta.get('date_max') or ''}", flush=True)
+
+
 def group_by_symbol_sell_date(trades: list[AuditTrade]) -> dict[tuple[str, str], list[AuditTrade]]:
     out: dict[tuple[str, str], list[AuditTrade]] = {}
     for trade in trades:
@@ -1386,6 +1409,11 @@ def main() -> int:
     if not start_date or not end_date:
         parser.error("provide --date or --start-date/--end-date")
     flex_file = args.ibkr_flex_file or args.ibkr_flex_csv
+    if flex_file:
+        flex_meta = flex_file_metadata(Path(flex_file))
+        if not flex_covers_requested_range(flex_meta, start_date, end_date):
+            print_flex_date_range_mismatch(start_date, end_date, flex_meta)
+            return 2
     df, csv_path, summary_path = audit(
         start_date=start_date,
         end_date=end_date,
