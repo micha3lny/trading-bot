@@ -250,6 +250,268 @@ def read_sql_df(conn: sqlite3.Connection, sql: str, params: list[Any]) -> pd.Dat
         return pd.DataFrame()
 
 
+def qmarks(values: Iterable[Any]) -> str:
+    return ",".join("?" for _ in values)
+
+
+def execution_time(row: dict[str, Any]) -> str:
+    return iso(row.get("executed_at") or row.get("time") or row.get("recorded_at"))
+
+
+def execution_date(row: dict[str, Any]) -> str:
+    return str(row.get("session_date") or "")[:10] or date_part(execution_time(row))
+
+
+def weighted_avg(rows: list[dict[str, Any]], qty_key: str = "quantity", price_key: str = "price") -> float | None:
+    total_qty = 0.0
+    total_value = 0.0
+    for row in rows:
+        qty = abs(fnum(row.get(qty_key)) or 0.0)
+        price = fnum(row.get(price_key))
+        if qty <= 0 or price is None:
+            continue
+        total_qty += qty
+        total_value += qty * price
+    if total_qty <= QTY_TOLERANCE:
+        return None
+    return total_value / total_qty
+
+
+def sum_qty(rows: list[dict[str, Any]]) -> float | None:
+    total = 0.0
+    seen = False
+    for row in rows:
+        qty = fnum(row.get("quantity"))
+        if qty is None:
+            continue
+        total += abs(qty)
+        seen = True
+    return total if seen else None
+
+
+def join_ids(rows: list[dict[str, Any]], key: str = "execution_id") -> str:
+    seen: list[str] = []
+    for row in rows:
+        value = str(row.get(key) or "").strip()
+        if value and value not in seen:
+            seen.append(value)
+    return ",".join(seen)
+
+
+def sqlite_selected_sell_executions(conn: sqlite3.Connection, start_date: str, end_date: str) -> pd.DataFrame:
+    if not table_exists(conn, "executions"):
+        return pd.DataFrame()
+    return read_sql_df(
+        conn,
+        """
+        SELECT execution_id, trade_id, order_key, order_id, perm_id, strategy_name,
+               session_date, symbol, side, quantity, price, executed_at, recorded_at,
+               commission, realized_pnl, commission_source, raw_json
+        FROM executions
+        WHERE upper(side) IN ('SLD', 'SELL', 'SOLD', 'S')
+          AND (
+            session_date BETWEEN ? AND ?
+            OR substr(COALESCE(executed_at, recorded_at), 1, 10) BETWEEN ? AND ?
+          )
+        ORDER BY symbol, COALESCE(executed_at, recorded_at), execution_id
+        """,
+        [start_date, end_date, start_date, end_date],
+    )
+
+
+def sqlite_executions_for_symbols(conn: sqlite3.Connection, symbols: list[str]) -> pd.DataFrame:
+    if not symbols or not table_exists(conn, "executions"):
+        return pd.DataFrame()
+    placeholders = qmarks(symbols)
+    return read_sql_df(
+        conn,
+        f"""
+        SELECT execution_id, trade_id, order_key, order_id, perm_id, strategy_name,
+               session_date, symbol, side, quantity, price, executed_at, recorded_at,
+               commission, realized_pnl, commission_source, raw_json
+        FROM executions
+        WHERE upper(symbol) IN ({placeholders})
+        ORDER BY symbol, COALESCE(executed_at, recorded_at), execution_id
+        """,
+        symbols,
+    )
+
+
+def sqlite_trades_for_symbols(conn: sqlite3.Connection, symbols: list[str]) -> pd.DataFrame:
+    if not symbols or not table_exists(conn, "trades"):
+        return pd.DataFrame()
+    placeholders = qmarks(symbols)
+    return read_sql_df(
+        conn,
+        f"""
+        SELECT *
+        FROM trades
+        WHERE upper(symbol) IN ({placeholders})
+        ORDER BY symbol, COALESCE(exit_fill_time, closed_at, entry_fill_time), trade_id
+        """,
+        symbols,
+    )
+
+
+def sqlite_positions_for_symbols(conn: sqlite3.Connection, symbols: list[str]) -> pd.DataFrame:
+    if not symbols or not table_exists(conn, "positions"):
+        return pd.DataFrame()
+    placeholders = qmarks(symbols)
+    return read_sql_df(
+        conn,
+        f"""
+        SELECT position_key, strategy_name, session_date, symbol, status, quantity,
+               avg_price, updated_at, raw_json
+        FROM positions
+        WHERE upper(symbol) IN ({placeholders})
+        ORDER BY symbol, session_date, updated_at, position_key
+        """,
+        symbols,
+    )
+
+
+def same_session_fifo_candidates(executions: pd.DataFrame, selected_sell_ids: set[str]) -> dict[str, dict[str, Any]]:
+    if executions.empty:
+        return {}
+    rows = executions.to_dict("records")
+    for row in rows:
+        row["_symbol_norm"] = norm_symbol(row.get("symbol"))
+        row["_side_norm"] = norm_side(row.get("side"))
+        row["_time_norm"] = execution_time(row)
+        row["_session_norm"] = execution_date(row)
+    out: dict[str, dict[str, Any]] = {}
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault((row["_symbol_norm"], row["_session_norm"]), []).append(row)
+    for group_rows in grouped.values():
+        open_lots: list[dict[str, Any]] = []
+        for row in sorted(group_rows, key=lambda item: (item.get("_time_norm") or "", str(item.get("execution_id") or ""))):
+            side = row.get("_side_norm")
+            qty = abs(fnum(row.get("quantity")) or 0.0)
+            price = fnum(row.get("price"))
+            if qty <= 0 or price is None:
+                continue
+            if side == "BUY":
+                lot = dict(row)
+                lot["remaining_qty"] = qty
+                open_lots.append(lot)
+                continue
+            if side != "SELL":
+                continue
+            remaining = qty
+            portions: list[dict[str, Any]] = []
+            lots_before = len([lot for lot in open_lots if (fnum(lot.get("remaining_qty")) or 0.0) > QTY_TOLERANCE])
+            while remaining > QTY_TOLERANCE and open_lots:
+                lot = open_lots[0]
+                lot_remaining = fnum(lot.get("remaining_qty")) or 0.0
+                if lot_remaining <= QTY_TOLERANCE:
+                    open_lots.pop(0)
+                    continue
+                matched = min(remaining, lot_remaining)
+                portion = dict(lot)
+                portion["quantity"] = matched
+                portions.append(portion)
+                lot["remaining_qty"] = lot_remaining - matched
+                remaining -= matched
+                if (fnum(lot.get("remaining_qty")) or 0.0) <= QTY_TOLERANCE:
+                    open_lots.pop(0)
+            sell_id = str(row.get("execution_id") or "")
+            if sell_id in selected_sell_ids:
+                out[sell_id] = {
+                    "candidate_entry_execution_id": join_ids(portions),
+                    "candidate_entry_time": ",".join(x for x in [execution_time(p) for p in portions] if x),
+                    "candidate_entry_quantity": sum_qty(portions),
+                    "candidate_entry_price": weighted_avg(portions),
+                    "candidate_entry_count": len(portions),
+                    "candidate_ambiguous": int(len(portions) > 1 or lots_before > 1),
+                    "candidate_unmatched_qty": max(remaining, 0.0),
+                    "candidate_holding_minutes": holding_minutes(portions[0].get("_time_norm") if portions else None, row.get("_time_norm")),
+                }
+    return out
+
+
+def trade_rows_by_id(trades: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    if trades.empty or "trade_id" not in trades.columns:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for row in trades.to_dict("records"):
+        trade_id = str(row.get("trade_id") or "")
+        if trade_id and trade_id not in out:
+            out[trade_id] = row
+    return out
+
+
+def parse_trade_id_entry_ids(trade_id: str) -> list[str]:
+    if not trade_id:
+        return []
+    parts = trade_id.split(":")
+    if len(parts) >= 6 and parts[0] == "reconstructed":
+        return [parts[-2]]
+    return []
+
+
+def current_trade_entry(
+    sell: dict[str, Any],
+    executions: pd.DataFrame,
+    trades_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    trade_id = str(sell.get("trade_id") or "")
+    if not trade_id:
+        return {}
+    all_rows = executions.to_dict("records") if not executions.empty else []
+    sell_time = execution_time(sell)
+    buy_rows = [
+        row for row in all_rows
+        if str(row.get("trade_id") or "") == trade_id
+        and norm_side(row.get("side")) == "BUY"
+        and norm_symbol(row.get("symbol")) == norm_symbol(sell.get("symbol"))
+        and (not sell_time or execution_time(row) <= sell_time)
+    ]
+    if not buy_rows:
+        entry_ids = parse_trade_id_entry_ids(trade_id)
+        trade_row = trades_by_id.get(trade_id) or {}
+        raw = parse_json(trade_row.get("raw_json"))
+        raw_ids = raw.get("buy_execution_ids") or raw.get("entry_execution_ids") or []
+        if isinstance(raw_ids, str):
+            raw_ids = [raw_ids]
+        entry_ids.extend(str(x) for x in raw_ids if x)
+        entry_ids = [x for x in dict.fromkeys(entry_ids) if x]
+        if entry_ids:
+            buy_rows = [row for row in all_rows if str(row.get("execution_id") or "") in entry_ids]
+    if not buy_rows:
+        trade_row = trades_by_id.get(trade_id) or {}
+        if trade_row:
+            return {
+                "entry_execution_id": "",
+                "entry_time": iso(trade_row.get("entry_fill_time")),
+                "entry_quantity": fnum(trade_row.get("quantity")),
+                "entry_price": fnum(trade_row.get("entry_price")),
+            }
+        return {}
+    buy_rows = sorted(buy_rows, key=lambda row: (execution_time(row), str(row.get("execution_id") or "")))
+    return {
+        "entry_execution_id": join_ids(buy_rows),
+        "entry_time": ",".join(x for x in [execution_time(row) for row in buy_rows] if x),
+        "entry_quantity": sum_qty(buy_rows),
+        "entry_price": weighted_avg(buy_rows),
+    }
+
+
+def broker_trade_by_sell_execution(flex_csv: Path | None, start_date: str, end_date: str) -> dict[str, AuditTrade]:
+    broker_df = normalize_execution_frame(read_csv_flexible(flex_csv), source="ibkr_flex") if flex_csv else pd.DataFrame()
+    if broker_df.empty:
+        return {}
+    broker_df["_date"] = broker_df["time"].map(date_part)
+    broker_df = broker_df[(broker_df["_date"] >= start_date) & (broker_df["_date"] <= end_date)].drop(columns=["_date"])
+    out: dict[str, AuditTrade] = {}
+    for trade in fifo_from_executions(broker_df, selected_start=start_date, selected_end=end_date, source="ibkr_flex"):
+        for sell_id in str(trade.sell_execution_ids or "").split(","):
+            sell_id = sell_id.strip()
+            if sell_id and sell_id not in out:
+                out[sell_id] = trade
+    return out
+
+
 def sqlite_executions(conn: sqlite3.Connection, start_date: str, end_date: str) -> pd.DataFrame:
     if not table_exists(conn, "executions"):
         return pd.DataFrame()
@@ -330,7 +592,10 @@ def reconstructed_trades(conn: sqlite3.Connection, start_date: str, end_date: st
 
 
 def dashboard_closed_positions(sqlite_path: Path, start_date: str, end_date: str, include_reconstructed: bool) -> list[AuditTrade]:
-    snapshot = load_dashboard_snapshot(sqlite_path, DateWindow(start_date, end_date), "All", include_reconstructed=include_reconstructed)
+    try:
+        snapshot = load_dashboard_snapshot(sqlite_path, DateWindow(start_date, end_date), "All", include_reconstructed=include_reconstructed)
+    except Exception:
+        return []
     closed = snapshot.get("closed_positions", pd.DataFrame())
     if not isinstance(closed, pd.DataFrame) or closed.empty:
         return []
@@ -351,6 +616,407 @@ def dashboard_closed_positions(sqlite_path: Path, start_date: str, end_date: str
             )
         )
     return out
+
+
+def dashboard_closed_rows(sqlite_path: Path, start_date: str, end_date: str, include_reconstructed: bool) -> list[dict[str, Any]]:
+    try:
+        snapshot = load_dashboard_snapshot(sqlite_path, DateWindow(start_date, end_date), "All", include_reconstructed=include_reconstructed)
+    except Exception:
+        return []
+    closed = snapshot.get("closed_positions", pd.DataFrame())
+    if not isinstance(closed, pd.DataFrame) or closed.empty:
+        return []
+    return closed.to_dict("records")
+
+
+def dashboard_closed_rows_from_trades(trades: pd.DataFrame, start_date: str, end_date: str) -> list[dict[str, Any]]:
+    if trades.empty:
+        return []
+    out: list[dict[str, Any]] = []
+    for row in trades.to_dict("records"):
+        exit_time = row.get("exit_fill_time") or row.get("closed_at")
+        exit_date = date_part(exit_time)
+        if exit_date < start_date or exit_date > end_date:
+            continue
+        raw = parse_json(row.get("raw_json"))
+        data_quality = raw.get("data_quality") or raw.get("quality") or ""
+        if str(row.get("trade_id") or "").startswith("reconstructed:") and "RECONSTRUCTED" not in str(data_quality).upper():
+            data_quality = f"{data_quality}; RECONSTRUCTED_CLOSED_METADATA".strip("; ")
+        out.append(
+            {
+                "symbol": row.get("symbol"),
+                "entry_time": row.get("entry_fill_time"),
+                "exit_time": exit_time,
+                "qty": row.get("quantity"),
+                "buy": row.get("entry_price"),
+                "sell": row.get("exit_price"),
+                "net_actual": row.get("net_pnl"),
+                "gross": row.get("gross_pnl"),
+                "exit_reason": row.get("exit_reason") or raw.get("exit_reason"),
+                "trade_id": row.get("trade_id"),
+                "data_quality": data_quality,
+                "source": "trades",
+            }
+        )
+    return out
+
+
+def infer_dashboard_closed_source(row: dict[str, Any] | None) -> str:
+    if not row:
+        return ""
+    haystack = " ".join(str(row.get(key) or "") for key in ("data_quality", "source", "trade_id", "raw_json")).upper()
+    if "UNATTRIBUTED_EXECUTION_CLOSED" in haystack or "EXECUTION" in haystack and "RECONSTRUCTED" not in haystack:
+        return "executions.realized_pnl"
+    if "RECONSTRUCTED" in haystack or str(row.get("trade_id") or "").startswith("reconstructed:"):
+        return "reconstructed FIFO"
+    if row.get("trade_id"):
+        return "table trades"
+    if "POSITION" in haystack or "RAW_JSON" in haystack or row.get("position_key"):
+        return "positions/raw_json"
+    return "unknown"
+
+
+def match_dashboard_row(sell: dict[str, Any], dashboard_rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    symbol = norm_symbol(sell.get("symbol"))
+    sell_time = parse_dt(execution_time(sell))
+    sell_qty = abs(fnum(sell.get("quantity")) or 0.0)
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    for row in dashboard_rows:
+        if norm_symbol(row.get("symbol")) != symbol:
+            continue
+        row_exit = parse_dt(row.get("exit_time") or row.get("closed_at"))
+        if sell_time is not None and row_exit is not None and sell_time.date() != row_exit.date():
+            continue
+        row_qty = abs(fnum(row.get("qty") or row.get("quantity")) or 0.0)
+        qty_penalty = abs(row_qty - sell_qty) if row_qty and sell_qty else 0.0
+        time_penalty = abs((row_exit - sell_time).total_seconds()) / 60.0 if row_exit is not None and sell_time is not None else 999999.0
+        candidates.append((time_penalty + qty_penalty, row))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
+
+
+def load_symbol_candles(history_dir: Path | None, symbol: str, session_date: str) -> pd.DataFrame:
+    if history_dir is None:
+        return pd.DataFrame()
+    day = parse_dt(session_date)
+    if day is None:
+        return pd.DataFrame()
+    path = (
+        history_dir
+        / "session_type=RTH"
+        / f"symbol={norm_symbol(symbol)}"
+        / f"year={day.year:04d}"
+        / f"month={day.month:02d}"
+        / f"day={day.day:02d}.parquet"
+    )
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_parquet(path, columns=["timestamp", "high"])
+    except Exception:
+        try:
+            df = pd.read_parquet(path)
+        except Exception:
+            return pd.DataFrame()
+    time_col = first_col(df.columns, ["timestamp", "bar_time", "time", "datetime"])
+    high_col = first_col(df.columns, ["high", "High"])
+    if not time_col or not high_col:
+        return pd.DataFrame()
+    out = pd.DataFrame()
+    out["timestamp"] = pd.to_datetime(df[time_col], errors="coerce", utc=True)
+    out["high"] = pd.to_numeric(df[high_col], errors="coerce")
+    return out.dropna(subset=["timestamp", "high"]).sort_values("timestamp")
+
+
+def candle_peak(
+    history_dir: Path | None,
+    symbol: str,
+    entry_time: Any,
+    sell_time: Any,
+    entry_price: float | None,
+) -> dict[str, Any]:
+    if history_dir is None or entry_price is None or entry_price <= 0:
+        return {}
+    entry_dt = parse_dt(entry_time)
+    sell_dt = parse_dt(sell_time)
+    if entry_dt is None or sell_dt is None:
+        return {}
+    candles = load_symbol_candles(history_dir, symbol, entry_dt.date().isoformat())
+    if candles.empty:
+        return {}
+    window = candles[(candles["timestamp"] >= entry_dt) & (candles["timestamp"] <= sell_dt)]
+    if window.empty:
+        return {}
+    idx = window["high"].idxmax()
+    peak_price = fnum(window.loc[idx, "high"])
+    if peak_price is None:
+        return {}
+    return {
+        "peak_price": peak_price,
+        "peak_pct": (peak_price / entry_price - 1.0) * 100.0,
+        "peak_source": "reconstructed_from_candles",
+        "peak_position_key": "",
+        "peak_match_status": "symbol_session_match",
+    }
+
+
+def position_peak(
+    positions: pd.DataFrame,
+    *,
+    symbol: str,
+    session_date: str,
+    entry_execution_ids: str,
+) -> dict[str, Any]:
+    if positions.empty:
+        return {}
+    rows = [
+        row for row in positions.to_dict("records")
+        if norm_symbol(row.get("symbol")) == norm_symbol(symbol)
+        and (str(row.get("session_date") or "")[:10] == session_date or not row.get("session_date"))
+    ]
+    if not rows:
+        return {}
+    entry_ids = [x.strip() for x in str(entry_execution_ids or "").split(",") if x.strip()]
+    exact: list[dict[str, Any]] = []
+    for row in rows:
+        raw_text = str(row.get("raw_json") or "")
+        if entry_ids and any(entry_id in raw_text for entry_id in entry_ids):
+            exact.append(row)
+    if len(exact) == 1:
+        raw = parse_json(exact[0].get("raw_json"))
+        peak_price = fnum(raw.get("peak_price"))
+        peak_pct = fnum(raw.get("peak_pct") or raw.get("peak_unrealized_pct"))
+        return {
+            "peak_price": peak_price,
+            "peak_pct": peak_pct,
+            "peak_source": "live_position_json" if peak_price is not None or peak_pct is not None else "unavailable",
+            "peak_position_key": str(exact[0].get("position_key") or ""),
+            "peak_match_status": "exact_trade_match" if peak_price is not None or peak_pct is not None else "unavailable",
+        }
+    peak_rows: list[dict[str, Any]] = []
+    for row in rows:
+        raw = parse_json(row.get("raw_json"))
+        if fnum(raw.get("peak_price")) is not None or fnum(raw.get("peak_pct") or raw.get("peak_unrealized_pct")) is not None:
+            peak_rows.append(row)
+    if len(peak_rows) == 1 and not entry_ids:
+        raw = parse_json(peak_rows[0].get("raw_json"))
+        return {
+            "peak_price": fnum(raw.get("peak_price")),
+            "peak_pct": fnum(raw.get("peak_pct") or raw.get("peak_unrealized_pct")),
+            "peak_source": "live_position_json",
+            "peak_position_key": str(peak_rows[0].get("position_key") or ""),
+            "peak_match_status": "symbol_session_match",
+        }
+    if peak_rows:
+        return {
+            "peak_price": None,
+            "peak_pct": None,
+            "peak_source": "unavailable",
+            "peak_position_key": ",".join(str(row.get("position_key") or "") for row in peak_rows[:5]),
+            "peak_match_status": "ambiguous",
+        }
+    return {}
+
+
+def classify_sell_problem(
+    sell: dict[str, Any],
+    current_entry: dict[str, Any],
+    candidate: dict[str, Any],
+) -> str:
+    problems: list[str] = []
+    trade_id = str(sell.get("trade_id") or "")
+    sell_qty = abs(fnum(sell.get("quantity")) or 0.0)
+    sell_date = date_part(execution_time(sell))
+    current_entry_date = date_part(current_entry.get("entry_time"))
+    current_qty = fnum(current_entry.get("entry_quantity"))
+    candidate_ids = str(candidate.get("candidate_entry_execution_id") or "")
+    if not trade_id:
+        problems.append("missing_trade_id")
+    if not candidate_ids:
+        problems.append("unmatched_sell")
+    if current_entry_date and sell_date and current_entry_date != sell_date:
+        problems.append("cross_session_trade_id")
+    if current_qty is not None and sell_qty and not close_enough(current_qty, sell_qty, QTY_TOLERANCE):
+        problems.append("wrong_entry_quantity")
+    if candidate_ids:
+        current_ids = str(current_entry.get("entry_execution_id") or "")
+        if not current_ids or current_ids != candidate_ids or "cross_session_trade_id" in problems:
+            problems.append("same_session_candidate_exists")
+    if int(candidate.get("candidate_ambiguous") or 0):
+        problems.append("ambiguous_match")
+    return ";".join(dict.fromkeys(problems)) or "OK"
+
+
+def build_sell_level_audit(
+    *,
+    conn: sqlite3.Connection,
+    sqlite_path: Path,
+    start_date: str,
+    end_date: str,
+    flex_csv: Path | None,
+    history_dir: Path | None,
+    include_dashboard_reconstructed: bool,
+) -> pd.DataFrame:
+    selected_sells = sqlite_selected_sell_executions(conn, start_date, end_date)
+    if selected_sells.empty:
+        return pd.DataFrame()
+    selected_sells["symbol"] = selected_sells["symbol"].map(norm_symbol)
+    symbols = sorted({norm_symbol(x) for x in selected_sells["symbol"].tolist() if norm_symbol(x)})
+    all_execs = sqlite_executions_for_symbols(conn, symbols)
+    trades = sqlite_trades_for_symbols(conn, symbols)
+    positions = sqlite_positions_for_symbols(conn, symbols)
+    trades_by_id = trade_rows_by_id(trades)
+    selected_sell_ids = {str(x) for x in selected_sells["execution_id"].fillna("").astype(str).tolist() if str(x)}
+    candidates = same_session_fifo_candidates(all_execs, selected_sell_ids)
+    broker_by_sell = broker_trade_by_sell_execution(flex_csv, start_date, end_date)
+    dashboard_rows = dashboard_closed_rows_from_trades(trades, start_date, end_date)
+    rows: list[dict[str, Any]] = []
+    for sell in selected_sells.to_dict("records"):
+        sell_id = str(sell.get("execution_id") or "")
+        symbol = norm_symbol(sell.get("symbol"))
+        sell_time = execution_time(sell)
+        sell_qty = abs(fnum(sell.get("quantity")) or 0.0)
+        sell_price = fnum(sell.get("price"))
+        current_entry = current_trade_entry(sell, all_execs, trades_by_id)
+        candidate = candidates.get(sell_id, {})
+        broker = broker_by_sell.get(sell_id)
+        dash = match_dashboard_row(sell, dashboard_rows)
+        problem = classify_sell_problem(sell, current_entry, candidate)
+        peak_entry_ids = str(current_entry.get("entry_execution_id") or "")
+        if any(flag in problem for flag in ("cross_session_trade_id", "wrong_entry_quantity", "same_session_candidate_exists")):
+            peak_entry_ids = str(candidate.get("candidate_entry_execution_id") or "")
+        peak = position_peak(
+            positions,
+            symbol=symbol,
+            session_date=date_part(sell_time),
+            entry_execution_ids=peak_entry_ids,
+        )
+        if not peak or peak.get("peak_source") == "unavailable":
+            candle = candle_peak(
+                history_dir,
+                symbol,
+                current_entry.get("entry_time") or candidate.get("candidate_entry_time"),
+                sell_time,
+                fnum(current_entry.get("entry_price")) or fnum(candidate.get("candidate_entry_price")),
+            )
+            if candle:
+                peak = candle
+        if not peak:
+            peak = {
+                "peak_price": None,
+                "peak_pct": None,
+                "peak_source": "unavailable",
+                "peak_position_key": "",
+                "peak_match_status": "unavailable",
+            }
+        broker_qty = broker.qty if broker else None
+        broker_entry = broker.avg_buy if broker else None
+        broker_exit = broker.avg_sell if broker else None
+        broker_pnl = broker.realized_pnl if broker else None
+        sqlite_pnl = fnum(sell.get("realized_pnl"))
+        row = {
+            "sell_execution_id": sell_id,
+            "symbol": symbol,
+            "sell_time": sell_time,
+            "sell_quantity": sell_qty,
+            "sell_price": sell_price,
+            "current_executions_trade_id": str(sell.get("trade_id") or ""),
+            "entry_execution_id": current_entry.get("entry_execution_id", ""),
+            "entry_time": current_entry.get("entry_time", ""),
+            "entry_quantity": current_entry.get("entry_quantity"),
+            "entry_price": current_entry.get("entry_price"),
+            "candidate_entry_execution_id": candidate.get("candidate_entry_execution_id", ""),
+            "candidate_entry_time": candidate.get("candidate_entry_time", ""),
+            "candidate_entry_quantity": candidate.get("candidate_entry_quantity"),
+            "candidate_entry_price": candidate.get("candidate_entry_price"),
+            "candidate_entry_count": candidate.get("candidate_entry_count"),
+            "candidate_unmatched_qty": candidate.get("candidate_unmatched_qty"),
+            "problem_classification": problem,
+            "holding_minutes_current_assignment": holding_minutes(current_entry.get("entry_time"), sell_time),
+            "holding_minutes_same_session_candidate": candidate.get("candidate_holding_minutes"),
+            "ibkr_flex_quantity": broker_qty,
+            "sqlite_ibkr_quantity_diff": (sell_qty - broker_qty) if broker_qty is not None else None,
+            "ibkr_flex_entry_price": broker_entry,
+            "sqlite_ibkr_entry_price_diff": (fnum(current_entry.get("entry_price")) - broker_entry) if broker_entry is not None and fnum(current_entry.get("entry_price")) is not None else None,
+            "ibkr_flex_exit_price": broker_exit,
+            "sqlite_ibkr_exit_price_diff": (sell_price - broker_exit) if broker_exit is not None and sell_price is not None else None,
+            "sqlite_realized_pnl": sqlite_pnl,
+            "ibkr_flex_realized_pnl": broker_pnl,
+            "sqlite_ibkr_realized_pnl_diff": (sqlite_pnl - broker_pnl) if sqlite_pnl is not None and broker_pnl is not None else None,
+            "dashboard_closed_source": infer_dashboard_closed_source(dash),
+            "dashboard_entry_time": iso(dash.get("entry_time")) if dash else "",
+            "dashboard_exit_time": iso(dash.get("exit_time")) if dash else "",
+            "dashboard_entry_price": fnum(dash.get("buy")) if dash else None,
+            "dashboard_exit_price": fnum(dash.get("sell")) if dash else None,
+            "dashboard_realized_pnl": fnum(dash.get("net_actual") or dash.get("gross")) if dash else None,
+            "dashboard_data_quality": str(dash.get("data_quality") or "") if dash else "",
+            "peak_price": peak.get("peak_price"),
+            "peak_pct": peak.get("peak_pct"),
+            "peak_source": peak.get("peak_source", "unavailable"),
+            "peak_position_key": peak.get("peak_position_key", ""),
+            "peak_match_status": peak.get("peak_match_status", "unavailable"),
+        }
+        row["status"] = sell_level_status(row)
+        row["mismatch_score"] = mismatch_score(
+            {
+                "broker_avg_buy": broker_entry,
+                "dashboard_entry_price": row["dashboard_entry_price"],
+                "broker_avg_sell": broker_exit,
+                "dashboard_exit_price": row["dashboard_exit_price"],
+                "broker_realized_pnl": broker_pnl,
+                "dashboard_realized_pnl": row["dashboard_realized_pnl"],
+                "holding_minutes_broker": holding_minutes(broker.buy_time, broker.sell_time) if broker else None,
+                "holding_minutes_dashboard": holding_minutes(row["dashboard_entry_time"], row["dashboard_exit_time"]),
+            }
+        )
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["status", "mismatch_score", "symbol", "sell_time"], ascending=[True, False, True, True]).reset_index(drop=True)
+    return df
+
+
+def sell_level_status(row: dict[str, Any]) -> str:
+    problem = str(row.get("problem_classification") or "")
+    if "cross_session_trade_id" in problem or "wrong_entry_quantity" in problem or "same_session_candidate_exists" in problem:
+        return "SQLITE_FIFO_MISMATCH"
+    if row.get("dashboard_entry_time") and row.get("entry_time") and date_part(row["dashboard_entry_time"]) != date_part(row["entry_time"]):
+        return "FIFO_DASHBOARD_MISMATCH"
+    current_hold = fnum(row.get("holding_minutes_current_assignment"))
+    dashboard_hold = holding_minutes(row.get("dashboard_entry_time"), row.get("dashboard_exit_time"))
+    if current_hold is not None and dashboard_hold is not None and abs(current_hold - dashboard_hold) > HOLDING_TIME_TOLERANCE_MINUTES:
+        return "DASHBOARD_HOLDING_TIME_MISMATCH"
+    if row.get("sqlite_ibkr_quantity_diff") not in (None, "") and abs(fnum(row.get("sqlite_ibkr_quantity_diff")) or 0.0) > QTY_TOLERANCE:
+        return "BROKER_SQLITE_MISMATCH"
+    if row.get("sqlite_ibkr_entry_price_diff") not in (None, "") and abs(fnum(row.get("sqlite_ibkr_entry_price_diff")) or 0.0) > PRICE_TOLERANCE:
+        return "ENTRY_PRICE_MISMATCH"
+    if row.get("sqlite_ibkr_exit_price_diff") not in (None, "") and abs(fnum(row.get("sqlite_ibkr_exit_price_diff")) or 0.0) > PRICE_TOLERANCE:
+        return "EXIT_PRICE_MISMATCH"
+    if row.get("sqlite_ibkr_realized_pnl_diff") not in (None, "") and abs(fnum(row.get("sqlite_ibkr_realized_pnl_diff")) or 0.0) > PNL_TOLERANCE:
+        return "PNL_MISMATCH"
+    if "missing_trade_id" in problem or "unmatched_sell" in problem or "ambiguous_match" in problem:
+        return "UNKNOWN"
+    return "OK"
+
+
+def markdown_table(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "_No rows._"
+    cols = list(df.columns)
+    lines = [
+        "| " + " | ".join(cols) + " |",
+        "| " + " | ".join("---" for _ in cols) + " |",
+    ]
+    for row in df.to_dict("records"):
+        values = []
+        for col in cols:
+            value = row.get(col)
+            text = "" if value is None or (isinstance(value, float) and math.isnan(value)) else str(value)
+            values.append(text.replace("|", "\\|").replace("\n", " "))
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines)
 
 
 def group_by_symbol_sell_date(trades: list[AuditTrade]) -> dict[tuple[str, str], list[AuditTrade]]:
@@ -432,6 +1098,7 @@ def audit(
     end_date: str,
     sqlite_path: Path,
     flex_csv: Path | None,
+    history_dir: Path | None,
     output_dir: Path,
     include_dashboard_reconstructed: bool,
 ) -> tuple[pd.DataFrame, Path, Path]:
@@ -444,12 +1111,23 @@ def audit(
     fill_trades: list[AuditTrade] = []
     recon_trades: list[AuditTrade] = []
     dashboard_trades: list[AuditTrade] = []
+    detailed_df = pd.DataFrame()
     if sqlite_path.exists():
         with connect_sqlite(sqlite_path) as conn:
+            detailed_df = build_sell_level_audit(
+                conn=conn,
+                sqlite_path=sqlite_path,
+                start_date=start_date,
+                end_date=end_date,
+                flex_csv=flex_csv,
+                history_dir=history_dir,
+                include_dashboard_reconstructed=include_dashboard_reconstructed,
+            )
             sqlite_trades = fifo_from_executions(sqlite_executions(conn, start_date, end_date), selected_start=start_date, selected_end=end_date, source="sqlite_executions")
             fill_trades = fifo_from_executions(sqlite_fills(conn, start_date, end_date), selected_start=start_date, selected_end=end_date, source="sqlite_fills")
             recon_trades = reconstructed_trades(conn, start_date, end_date)
-        dashboard_trades = dashboard_closed_positions(sqlite_path, start_date, end_date, include_dashboard_reconstructed)
+        if detailed_df.empty:
+            dashboard_trades = dashboard_closed_positions(sqlite_path, start_date, end_date, include_dashboard_reconstructed)
     sources = {
         "broker": group_by_symbol_sell_date(broker_trades),
         "sqlite": group_by_symbol_sell_date(sqlite_trades),
@@ -515,7 +1193,7 @@ def audit(
             row["status"] = classify(row)
             row["mismatch_score"] = mismatch_score(row)
             rows.append(row)
-    df = pd.DataFrame(rows)
+    df = detailed_df if not detailed_df.empty else pd.DataFrame(rows)
     if not df.empty:
         status_rank = {status: idx for idx, status in enumerate(STATUS_ORDER)}
         df["_status_rank"] = df["status"].map(lambda value: status_rank.get(str(value), 99))
@@ -567,9 +1245,23 @@ def write_summary(path: Path, df: pd.DataFrame, *, start_date: str, end_date: st
         lines.append("_No rows._")
     else:
         display_cols = [
+            "sell_execution_id",
             "symbol",
             "status",
+            "problem_classification",
             "mismatch_score",
+            "sell_time",
+            "sell_quantity",
+            "current_executions_trade_id",
+            "entry_execution_id",
+            "entry_time",
+            "candidate_entry_execution_id",
+            "candidate_entry_time",
+            "holding_minutes_current_assignment",
+            "holding_minutes_same_session_candidate",
+            "dashboard_closed_source",
+            "peak_source",
+            "peak_match_status",
             "broker_buy_time",
             "broker_sell_time",
             "dashboard_entry_time",
@@ -579,7 +1271,7 @@ def write_summary(path: Path, df: pd.DataFrame, *, start_date: str, end_date: st
             "broker_realized_pnl",
             "dashboard_realized_pnl",
         ]
-        lines.append(top[[col for col in display_cols if col in top.columns]].to_markdown(index=False))
+        lines.append(markdown_table(top[[col for col in display_cols if col in top.columns]]))
     lines.extend(["", "## Code Locations Responsible For Reconstruction / Closed Positions", ""])
     for item in code_locations:
         lines.append(f"- {item}")
@@ -593,6 +1285,7 @@ def main() -> int:
     parser.add_argument("--end-date")
     parser.add_argument("--ibkr-flex-csv", help="Optional IBKR Flex/Activity execution CSV for the same period.")
     parser.add_argument("--sqlite-path", default=str(DEFAULT_SQLITE_PATH))
+    parser.add_argument("--history-dir", default="data/history/universe_1m", help="Optional parquet history dir for candle-reconstructed peak diagnostics.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--include-dashboard-reconstructed", action="store_true", help="Ask dashboard snapshot to include execution-reconstructed rows.")
     args = parser.parse_args()
@@ -605,6 +1298,7 @@ def main() -> int:
         end_date=end_date,
         sqlite_path=Path(args.sqlite_path),
         flex_csv=Path(args.ibkr_flex_csv) if args.ibkr_flex_csv else None,
+        history_dir=Path(args.history_dir) if args.history_dir else None,
         output_dir=Path(args.output_dir),
         include_dashboard_reconstructed=bool(args.include_dashboard_reconstructed),
     )
