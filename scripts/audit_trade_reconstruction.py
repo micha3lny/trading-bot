@@ -616,18 +616,94 @@ def current_trade_entry(
     }
 
 
-def broker_trade_by_sell_execution(flex_file: Path | None, start_date: str, end_date: str) -> dict[str, AuditTrade]:
+def copy_trade_for_sqlite_sell(trade: AuditTrade, sqlite_sell: dict[str, Any], flex_sell_qty: float | None) -> AuditTrade:
+    sqlite_qty = abs(fnum(sqlite_sell.get("quantity")) or 0.0)
+    fraction = sqlite_qty / flex_sell_qty if flex_sell_qty and flex_sell_qty > QTY_TOLERANCE else 1.0
+    return AuditTrade(
+        source=trade.source,
+        symbol=trade.symbol,
+        buy_time=trade.buy_time,
+        sell_time=execution_time(sqlite_sell) or trade.sell_time,
+        qty=sqlite_qty or trade.qty,
+        avg_buy=trade.avg_buy,
+        avg_sell=fnum(sqlite_sell.get("price")) or trade.avg_sell,
+        realized_pnl=(trade.realized_pnl * fraction) if trade.realized_pnl is not None else None,
+        exit_reason=trade.exit_reason,
+        trade_id=trade.trade_id,
+        buy_execution_ids=trade.buy_execution_ids,
+        sell_execution_ids=trade.sell_execution_ids,
+    )
+
+
+def combine_audit_trades(trades: list[AuditTrade], sqlite_sell: dict[str, Any]) -> AuditTrade | None:
+    if not trades:
+        return None
+    qty_total = sum(abs(fnum(t.qty) or 0.0) for t in trades)
+    if qty_total <= QTY_TOLERANCE:
+        qty_total = abs(fnum(sqlite_sell.get("quantity")) or 0.0)
+    avg_buy = sum((abs(fnum(t.qty) or 0.0) * (fnum(t.avg_buy) or 0.0)) for t in trades) / qty_total if qty_total > QTY_TOLERANCE else None
+    avg_sell = sum((abs(fnum(t.qty) or 0.0) * (fnum(t.avg_sell) or 0.0)) for t in trades) / qty_total if qty_total > QTY_TOLERANCE else None
+    pnl_values = [fnum(t.realized_pnl) for t in trades if fnum(t.realized_pnl) is not None]
+    return AuditTrade(
+        source="ibkr_flex",
+        symbol=trades[0].symbol,
+        buy_time=trades[0].buy_time,
+        sell_time=execution_time(sqlite_sell) or trades[-1].sell_time,
+        qty=qty_total,
+        avg_buy=avg_buy,
+        avg_sell=avg_sell,
+        realized_pnl=sum(pnl_values) if pnl_values else None,
+        trade_id=";".join(t.trade_id for t in trades if t.trade_id),
+        buy_execution_ids=",".join(x for t in trades for x in str(t.buy_execution_ids or "").split(",") if x),
+        sell_execution_ids=",".join(x for t in trades for x in str(t.sell_execution_ids or "").split(",") if x),
+    )
+
+
+def broker_trade_by_sell_execution(
+    flex_file: Path | None,
+    start_date: str,
+    end_date: str,
+    sqlite_matches: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, AuditTrade]:
     broker_df = normalize_execution_frame(read_flex_file(flex_file), source="ibkr_flex") if flex_file else pd.DataFrame()
     if broker_df.empty:
         return {}
+    flex_to_sqlite: dict[str, list[dict[str, Any]]] = {}
+    if sqlite_matches:
+        for _sqlite_id, flex_rows in sqlite_matches.items():
+            for flex_row in flex_rows:
+                flex_id = str(flex_row.get("flex_trade_id") or flex_row.get("execution_id") or "")
+                sqlite_row = flex_row.get("_sqlite_row")
+                if flex_id and isinstance(sqlite_row, dict):
+                    flex_to_sqlite.setdefault(flex_id, []).append(sqlite_row)
     broker_df["_date"] = broker_df["time"].map(date_part)
     broker_df = broker_df[(broker_df["_date"] >= start_date) & (broker_df["_date"] <= end_date)].drop(columns=["_date"])
     out: dict[str, AuditTrade] = {}
     for trade in fifo_from_executions(broker_df, selected_start=start_date, selected_end=end_date, source="ibkr_flex"):
         for sell_id in str(trade.sell_execution_ids or "").split(","):
             sell_id = sell_id.strip()
-            if sell_id and sell_id not in out:
+            matched_sqlite = flex_to_sqlite.get(sell_id, [])
+            if matched_sqlite:
+                flex_sell_qty = trade.qty
+                for sqlite_sell in matched_sqlite:
+                    sqlite_id = str(sqlite_sell.get("execution_id") or "")
+                    if sqlite_id:
+                        out.setdefault(sqlite_id, copy_trade_for_sqlite_sell(trade, sqlite_sell, flex_sell_qty))
+            elif sell_id and sell_id not in out:
                 out[sell_id] = trade
+    if sqlite_matches:
+        for sqlite_id, flex_rows in sqlite_matches.items():
+            if sqlite_id in out:
+                continue
+            flex_ids = {str(row.get("flex_trade_id") or row.get("execution_id") or "") for row in flex_rows}
+            portions = []
+            sqlite_sell = flex_rows[0].get("_sqlite_row") if flex_rows and isinstance(flex_rows[0].get("_sqlite_row"), dict) else {}
+            for trade in fifo_from_executions(broker_df, selected_start=start_date, selected_end=end_date, source="ibkr_flex"):
+                if any(x in flex_ids for x in str(trade.sell_execution_ids or "").split(",")):
+                    portions.append(copy_trade_for_sqlite_sell(trade, sqlite_sell, trade.qty))
+            combined = combine_audit_trades(portions, sqlite_sell)
+            if combined is not None:
+                out[sqlite_id] = combined
     return out
 
 
@@ -975,6 +1051,7 @@ def build_sell_level_audit(
     start_date: str,
     end_date: str,
     flex_file: Path | None,
+    sqlite_flex_matches: dict[str, list[dict[str, Any]]] | None,
     history_dir: Path | None,
     include_dashboard_reconstructed: bool,
 ) -> pd.DataFrame:
@@ -989,7 +1066,7 @@ def build_sell_level_audit(
     trades_by_id = trade_rows_by_id(trades)
     selected_sell_ids = {str(x) for x in selected_sells["execution_id"].fillna("").astype(str).tolist() if str(x)}
     candidates = same_session_fifo_candidates(all_execs, selected_sell_ids)
-    broker_by_sell = broker_trade_by_sell_execution(flex_file, start_date, end_date)
+    broker_by_sell = broker_trade_by_sell_execution(flex_file, start_date, end_date, sqlite_flex_matches)
     dashboard_rows = dashboard_closed_rows_from_trades(trades, start_date, end_date)
     rows: list[dict[str, Any]] = []
     for sell in selected_sells.to_dict("records"):
@@ -1187,13 +1264,179 @@ def nearest_sqlite_execution(flex_row: dict[str, Any], sqlite_rows: list[dict[st
     return nearest, "; ".join(dict.fromkeys(reasons))
 
 
+def sqlite_row_identity(row: dict[str, Any]) -> str:
+    return str(row.get("execution_id") or "")
+
+
+def flex_row_identity(row: dict[str, Any], fallback: int) -> str:
+    value = str(row.get("execution_id") or "").strip()
+    return value or f"flex_row_{fallback}"
+
+
+def flex_sqlite_candidates(flex_row: dict[str, Any], sqlite_rows: list[dict[str, Any]], used_sqlite: set[str]) -> list[dict[str, Any]]:
+    symbol = norm_symbol(flex_row.get("symbol"))
+    side = norm_side(flex_row.get("side"))
+    date = date_part(flex_row.get("time"))
+    price = fnum(flex_row.get("price"))
+    out = []
+    for row in sqlite_rows:
+        sqlite_id = sqlite_row_identity(row)
+        if sqlite_id in used_sqlite:
+            continue
+        if norm_symbol(row.get("symbol")) != symbol:
+            continue
+        if norm_side(row.get("side")) != side:
+            continue
+        if execution_date(row) != date:
+            continue
+        if price is not None and not close_enough(fnum(row.get("price")), price, PRICE_TOLERANCE):
+            continue
+        out.append(row)
+    return out
+
+
+def assign_match(
+    *,
+    assignments: dict[int, list[dict[str, Any]]],
+    sqlite_to_flex: dict[str, list[dict[str, Any]]],
+    statuses: dict[int, str],
+    flex_index: int,
+    flex_row: dict[str, Any],
+    sqlite_rows: list[dict[str, Any]],
+    status: str,
+    used_sqlite: set[str],
+) -> None:
+    enriched_rows = []
+    for sqlite_row in sqlite_rows:
+        enriched = dict(flex_row)
+        enriched["flex_trade_id"] = flex_row_identity(flex_row, flex_index)
+        enriched["_sqlite_row"] = sqlite_row
+        enriched_rows.append(enriched)
+        sqlite_id = sqlite_row_identity(sqlite_row)
+        if sqlite_id:
+            sqlite_to_flex.setdefault(sqlite_id, []).append(enriched)
+            used_sqlite.add(sqlite_id)
+    assignments[flex_index] = sqlite_rows
+    statuses[flex_index] = status
+
+
+def match_flex_rows_to_sqlite(
+    flex: pd.DataFrame,
+    sqlite_executions_df: pd.DataFrame,
+) -> tuple[dict[int, list[dict[str, Any]]], dict[str, list[dict[str, Any]]], dict[int, str]]:
+    sqlite_rows = sqlite_executions_df.to_dict("records") if not sqlite_executions_df.empty else []
+    sqlite_by_id = {sqlite_row_identity(row): row for row in sqlite_rows if sqlite_row_identity(row)}
+    flex_rows = flex.to_dict("records")
+    assignments: dict[int, list[dict[str, Any]]] = {}
+    sqlite_to_flex: dict[str, list[dict[str, Any]]] = {}
+    statuses: dict[int, str] = {}
+    used_sqlite: set[str] = set()
+    for idx, flex_row in enumerate(flex_rows):
+        flex_id = str(flex_row.get("execution_id") or "")
+        sqlite_row = sqlite_by_id.get(flex_id)
+        if not sqlite_row or sqlite_row_identity(sqlite_row) in used_sqlite:
+            continue
+        if norm_symbol(sqlite_row.get("symbol")) != norm_symbol(flex_row.get("symbol")):
+            continue
+        if norm_side(sqlite_row.get("side")) != norm_side(flex_row.get("side")):
+            continue
+        if execution_date(sqlite_row) != date_part(flex_row.get("time")):
+            continue
+        if not close_enough(abs(fnum(sqlite_row.get("quantity")) or 0.0), abs(fnum(flex_row.get("quantity")) or 0.0), QTY_TOLERANCE):
+            continue
+        if not close_enough(fnum(sqlite_row.get("price")), fnum(flex_row.get("price")), PRICE_TOLERANCE):
+            continue
+        assign_match(
+            assignments=assignments,
+            sqlite_to_flex=sqlite_to_flex,
+            statuses=statuses,
+            flex_index=idx,
+            flex_row=flex_row,
+            sqlite_rows=[sqlite_row],
+            status="exact_match",
+            used_sqlite=used_sqlite,
+        )
+    for idx, flex_row in enumerate(flex_rows):
+        if idx in assignments:
+            continue
+        candidates = flex_sqlite_candidates(flex_row, sqlite_rows, used_sqlite)
+        flex_qty = abs(fnum(flex_row.get("quantity")) or 0.0)
+        exact_qty = [row for row in candidates if close_enough(abs(fnum(row.get("quantity")) or 0.0), flex_qty, QTY_TOLERANCE)]
+        if len(exact_qty) == 1:
+            assign_match(
+                assignments=assignments,
+                sqlite_to_flex=sqlite_to_flex,
+                statuses=statuses,
+                flex_index=idx,
+                flex_row=flex_row,
+                sqlite_rows=[exact_qty[0]],
+                status="exact_match",
+                used_sqlite=used_sqlite,
+            )
+        elif len(exact_qty) > 1:
+            statuses[idx] = "ambiguous_match"
+    for idx, flex_row in enumerate(flex_rows):
+        if idx in assignments or statuses.get(idx) == "ambiguous_match":
+            continue
+        candidates = flex_sqlite_candidates(flex_row, sqlite_rows, used_sqlite)
+        flex_qty = abs(fnum(flex_row.get("quantity")) or 0.0)
+        candidate_qty = sum(abs(fnum(row.get("quantity")) or 0.0) for row in candidates)
+        if candidates and close_enough(candidate_qty, flex_qty, QTY_TOLERANCE):
+            assign_match(
+                assignments=assignments,
+                sqlite_to_flex=sqlite_to_flex,
+                statuses=statuses,
+                flex_index=idx,
+                flex_row=flex_row,
+                sqlite_rows=candidates,
+                status="aggregate_match",
+                used_sqlite=used_sqlite,
+            )
+    grouped: dict[tuple[str, str, str, str], list[int]] = {}
+    for idx, flex_row in enumerate(flex_rows):
+        if idx in assignments or statuses.get(idx) == "ambiguous_match":
+            continue
+        key = (
+            norm_symbol(flex_row.get("symbol")),
+            date_part(flex_row.get("time")),
+            norm_side(flex_row.get("side")),
+            f"{fnum(flex_row.get('price')) or 0.0:.4f}",
+        )
+        grouped.setdefault(key, []).append(idx)
+    for indexes in grouped.values():
+        if len(indexes) < 2:
+            continue
+        sample = flex_rows[indexes[0]]
+        candidates = flex_sqlite_candidates(sample, sqlite_rows, used_sqlite)
+        if len(candidates) != 1:
+            continue
+        total_flex_qty = sum(abs(fnum(flex_rows[idx].get("quantity")) or 0.0) for idx in indexes)
+        sqlite_qty = abs(fnum(candidates[0].get("quantity")) or 0.0)
+        if not close_enough(total_flex_qty, sqlite_qty, QTY_TOLERANCE):
+            continue
+        for idx in indexes:
+            assign_match(
+                assignments=assignments,
+                sqlite_to_flex=sqlite_to_flex,
+                statuses=statuses,
+                flex_index=idx,
+                flex_row=flex_rows[idx],
+                sqlite_rows=candidates,
+                status="aggregate_match",
+                used_sqlite=used_sqlite,
+            )
+    for idx in range(len(flex_rows)):
+        statuses.setdefault(idx, "unmatched")
+    return assignments, sqlite_to_flex, statuses
+
+
 def build_flex_match_diagnostics(
     *,
     flex_file: Path | None,
     sqlite_executions_df: pd.DataFrame,
     start_date: str,
     end_date: str,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
+) -> tuple[pd.DataFrame, dict[str, Any], dict[str, list[dict[str, Any]]]]:
     flex_raw = read_flex_file(flex_file) if flex_file else pd.DataFrame()
     flex_meta = getattr(flex_raw, "attrs", {}).get("flex_meta", {})
     flex = normalize_execution_frame(flex_raw, source="ibkr_flex") if flex_file else pd.DataFrame()
@@ -1209,14 +1452,27 @@ def build_flex_match_diagnostics(
         flex["_date"] = flex["time"].map(date_part)
         flex = flex[(flex["_date"] >= start_date) & (flex["_date"] <= end_date)].drop(columns=["_date"])
     sqlite_rows = sqlite_executions_df.to_dict("records") if not sqlite_executions_df.empty else []
-    sqlite_ids = {str(row.get("execution_id") or "") for row in sqlite_rows if str(row.get("execution_id") or "")}
+    assignments, sqlite_to_flex, statuses = match_flex_rows_to_sqlite(flex, sqlite_executions_df)
     rows: list[dict[str, Any]] = []
+    matched_exact = 0
+    matched_aggregate = 0
+    ambiguous = 0
+    unmatched = 0
     matched_buy = 0
     matched_sell = 0
-    for flex_row in flex.to_dict("records"):
+    for idx, flex_row in enumerate(flex.to_dict("records")):
         flex_id = str(flex_row.get("execution_id") or "")
-        matched = bool(flex_id and flex_id in sqlite_ids)
         side = norm_side(flex_row.get("side"))
+        status = statuses.get(idx, "unmatched")
+        matched = status in {"exact_match", "aggregate_match"}
+        if status == "exact_match":
+            matched_exact += 1
+        elif status == "aggregate_match":
+            matched_aggregate += 1
+        elif status == "ambiguous_match":
+            ambiguous += 1
+        elif status == "unmatched":
+            unmatched += 1
         if matched and side == "BUY":
             matched_buy += 1
         if matched and side == "SELL":
@@ -1234,6 +1490,7 @@ def build_flex_match_diagnostics(
                 "quantity": flex_row.get("quantity"),
                 "price": flex_row.get("price"),
                 "tradeID": flex_id,
+                "match_status": status,
                 "match_failure_reason": reason,
                 "nearest_sqlite_execution_id": str(nearest.get("execution_id") or "") if nearest else "",
                 "nearest_sqlite_symbol": norm_symbol(nearest.get("symbol")) if nearest else "",
@@ -1249,9 +1506,13 @@ def build_flex_match_diagnostics(
         "sqlite_executions_loaded": int(len(sqlite_rows)),
         "flex_buy_matched": int(matched_buy),
         "flex_sell_matched": int(matched_sell),
-        "flex_unmatched": int(len(rows)),
+        "flex_rows_matched_exact": int(matched_exact),
+        "flex_rows_matched_aggregate": int(matched_aggregate),
+        "flex_rows_ambiguous": int(ambiguous),
+        "flex_rows_unmatched": int(unmatched),
+        "flex_unmatched": int(unmatched),
     }
-    return pd.DataFrame(rows), summary
+    return pd.DataFrame(rows), summary, sqlite_to_flex
 
 
 def markdown_table(df: pd.DataFrame) -> str:
@@ -1396,12 +1657,16 @@ def audit(
         "sqlite_executions_loaded": 0,
         "flex_buy_matched": 0,
         "flex_sell_matched": 0,
+        "flex_rows_matched_exact": 0,
+        "flex_rows_matched_aggregate": 0,
+        "flex_rows_ambiguous": 0,
+        "flex_rows_unmatched": 0,
         "flex_unmatched": 0,
     }
     if sqlite_path.exists():
         with connect_sqlite(sqlite_path) as conn:
             sqlite_range = sqlite_all_executions_range(conn, start_date, end_date)
-            flex_diag_df, flex_diag_summary = build_flex_match_diagnostics(
+            flex_diag_df, flex_diag_summary, sqlite_flex_matches = build_flex_match_diagnostics(
                 flex_file=flex_file,
                 sqlite_executions_df=sqlite_range,
                 start_date=start_date,
@@ -1413,6 +1678,7 @@ def audit(
                 start_date=start_date,
                 end_date=end_date,
                 flex_file=flex_file,
+                sqlite_flex_matches=sqlite_flex_matches,
                 history_dir=history_dir,
                 include_dashboard_reconstructed=include_dashboard_reconstructed,
             )
@@ -1554,6 +1820,10 @@ def write_summary(
         f"- SQLite executions loaded: {(flex_diag_summary or {}).get('sqlite_executions_loaded', 0)}",
         f"- Flex BUY matched: {(flex_diag_summary or {}).get('flex_buy_matched', 0)}",
         f"- Flex SELL matched: {(flex_diag_summary or {}).get('flex_sell_matched', 0)}",
+        f"- Flex rows matched exact: {(flex_diag_summary or {}).get('flex_rows_matched_exact', 0)}",
+        f"- Flex rows matched aggregate: {(flex_diag_summary or {}).get('flex_rows_matched_aggregate', 0)}",
+        f"- Flex rows ambiguous: {(flex_diag_summary or {}).get('flex_rows_ambiguous', 0)}",
+        f"- Flex rows unmatched: {(flex_diag_summary or {}).get('flex_rows_unmatched', 0)}",
         f"- Flex unmatched: {(flex_diag_summary or {}).get('flex_unmatched', 0)}",
         "",
         "### First 20 Flex Unmatched",
