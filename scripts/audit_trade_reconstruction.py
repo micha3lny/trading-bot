@@ -6,6 +6,7 @@ import json
 import math
 import sqlite3
 import sys
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -139,23 +140,106 @@ def read_csv_flexible(path: Path | None) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def looks_like_xml(path: Path) -> bool:
+    if path.suffix.lower() == ".xml":
+        return True
+    try:
+        with path.open("rb") as handle:
+            prefix = handle.read(256).lstrip()
+        return prefix.startswith(b"<")
+    except Exception:
+        return False
+
+
+def read_flex_xml(path: Path) -> pd.DataFrame:
+    try:
+        root = ET.parse(path).getroot()
+    except Exception:
+        return pd.DataFrame()
+    statements = [elem for elem in root.iter() if xml_local_name(elem.tag) == "FlexStatement"]
+    trades = [elem.attrib for elem in root.iter() if xml_local_name(elem.tag) == "Trade"]
+    rows: list[dict[str, Any]] = []
+    for item in trades:
+        rows.append(
+            {
+                "symbol": item.get("symbol") or item.get("underlyingSymbol"),
+                "buySell": item.get("buySell") or item.get("side"),
+                "quantity": item.get("quantity"),
+                "tradePrice": item.get("tradePrice") or item.get("price"),
+                "tradeDate": item.get("tradeDate") or item.get("tradeTime") or item.get("reportDate"),
+                "tradeID": item.get("tradeID") or item.get("ibExecID") or item.get("execID"),
+                "fifoPnlRealized": item.get("fifoPnlRealized"),
+                "ibCommission": item.get("ibCommission"),
+                "reportDate": item.get("reportDate"),
+                "raw_json": json.dumps(item, sort_keys=True),
+            }
+        )
+    df = pd.DataFrame(rows)
+    df.attrs["flex_meta"] = flex_metadata(df, source="xml", statements_count=len(statements), raw_trade_rows=len(trades))
+    return df
+
+
+def read_flex_file(path: Path | None) -> pd.DataFrame:
+    if path is None or not path.exists():
+        df = pd.DataFrame()
+        df.attrs["flex_meta"] = {"source": "missing", "statements_count": 0, "trade_rows": 0, "symbols": 0, "date_min": "", "date_max": ""}
+        return df
+    if looks_like_xml(path):
+        return read_flex_xml(path)
+    df = read_csv_flexible(path)
+    df.attrs["flex_meta"] = flex_metadata(df, source="csv", statements_count=0, raw_trade_rows=len(df))
+    return df
+
+
+def flex_metadata(df: pd.DataFrame, *, source: str, statements_count: int, raw_trade_rows: int) -> dict[str, Any]:
+    if df.empty:
+        return {
+            "source": source,
+            "statements_count": statements_count,
+            "trade_rows": 0,
+            "symbols": 0,
+            "date_min": "",
+            "date_max": "",
+        }
+    cols = list(df.columns)
+    symbol_col = first_col(cols, ["symbol", "underlying", "contract", "ticker", "underlyingSymbol"])
+    time_col = first_col(cols, ["executed_at", "execution_time", "datetime", "date/time", "date_time", "time", "trade_time", "tradeDate", "reportDate"])
+    symbols = sorted({norm_symbol(x) for x in df[symbol_col].tolist() if norm_symbol(x)}) if symbol_col else []
+    dates = []
+    if time_col:
+        dates = [date_part(x) for x in df[time_col].tolist()]
+        dates = [x for x in dates if x]
+    return {
+        "source": source,
+        "statements_count": statements_count,
+        "trade_rows": raw_trade_rows,
+        "symbols": len(symbols),
+        "date_min": min(dates) if dates else "",
+        "date_max": max(dates) if dates else "",
+    }
+
+
 def normalize_execution_frame(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["symbol", "side", "quantity", "price", "time", "execution_id", "order_id", "realized_pnl", "commission", "raw_source"])
     cols = list(df.columns)
     symbol_col = first_col(cols, ["symbol", "underlying", "contract", "ticker"])
-    side_col = first_col(cols, ["side", "action", "buy/sell", "transactiontype", "transaction_type"])
+    side_col = first_col(cols, ["side", "action", "buySell", "buy/sell", "transactiontype", "transaction_type"])
     qty_col = first_col(cols, ["quantity", "qty", "shares", "totalquantity"])
-    price_col = first_col(cols, ["price", "fill_price", "tradeprice", "trade_price", "avgprice"])
-    time_col = first_col(cols, ["executed_at", "execution_time", "datetime", "date/time", "date_time", "time", "trade_time"])
-    exec_col = first_col(cols, ["execution_id", "execid", "exec_id", "ibexecid"])
+    price_col = first_col(cols, ["price", "fill_price", "tradeprice", "tradePrice", "trade_price", "avgprice"])
+    time_col = first_col(cols, ["executed_at", "execution_time", "datetime", "date/time", "date_time", "time", "trade_time", "tradeDate", "reportDate"])
+    exec_col = first_col(cols, ["execution_id", "execid", "exec_id", "ibexecid", "tradeID", "trade_id"])
     order_col = first_col(cols, ["order_id", "orderid", "order"])
-    pnl_col = first_col(cols, ["realized_pnl", "realizedpnl", "realized p/l", "realized p&l", "realizedpl"])
-    comm_col = first_col(cols, ["commission", "commissions"])
+    pnl_col = first_col(cols, ["realized_pnl", "realizedpnl", "fifoPnlRealized", "realized p/l", "realized p&l", "realizedpl"])
+    comm_col = first_col(cols, ["commission", "commissions", "ibCommission"])
     out = pd.DataFrame()
     out["symbol"] = df[symbol_col].map(norm_symbol) if symbol_col else ""
     out["side"] = df[side_col].map(norm_side) if side_col else ""
-    out["quantity"] = pd.to_numeric(df[qty_col], errors="coerce") if qty_col else pd.NA
+    out["quantity"] = pd.to_numeric(df[qty_col], errors="coerce").abs() if qty_col else pd.NA
     out["price"] = pd.to_numeric(df[price_col], errors="coerce") if price_col else pd.NA
     out["time"] = df[time_col].map(iso) if time_col else ""
     out["execution_id"] = df[exec_col].fillna("").astype(str) if exec_col else ""
@@ -497,8 +581,8 @@ def current_trade_entry(
     }
 
 
-def broker_trade_by_sell_execution(flex_csv: Path | None, start_date: str, end_date: str) -> dict[str, AuditTrade]:
-    broker_df = normalize_execution_frame(read_csv_flexible(flex_csv), source="ibkr_flex") if flex_csv else pd.DataFrame()
+def broker_trade_by_sell_execution(flex_file: Path | None, start_date: str, end_date: str) -> dict[str, AuditTrade]:
+    broker_df = normalize_execution_frame(read_flex_file(flex_file), source="ibkr_flex") if flex_file else pd.DataFrame()
     if broker_df.empty:
         return {}
     broker_df["_date"] = broker_df["time"].map(date_part)
@@ -855,7 +939,7 @@ def build_sell_level_audit(
     sqlite_path: Path,
     start_date: str,
     end_date: str,
-    flex_csv: Path | None,
+    flex_file: Path | None,
     history_dir: Path | None,
     include_dashboard_reconstructed: bool,
 ) -> pd.DataFrame:
@@ -870,7 +954,7 @@ def build_sell_level_audit(
     trades_by_id = trade_rows_by_id(trades)
     selected_sell_ids = {str(x) for x in selected_sells["execution_id"].fillna("").astype(str).tolist() if str(x)}
     candidates = same_session_fifo_candidates(all_execs, selected_sell_ids)
-    broker_by_sell = broker_trade_by_sell_execution(flex_csv, start_date, end_date)
+    broker_by_sell = broker_trade_by_sell_execution(flex_file, start_date, end_date)
     dashboard_rows = dashboard_closed_rows_from_trades(trades, start_date, end_date)
     rows: list[dict[str, Any]] = []
     for sell in selected_sells.to_dict("records"):
@@ -1097,12 +1181,14 @@ def audit(
     start_date: str,
     end_date: str,
     sqlite_path: Path,
-    flex_csv: Path | None,
+    flex_file: Path | None,
     history_dir: Path | None,
     output_dir: Path,
     include_dashboard_reconstructed: bool,
 ) -> tuple[pd.DataFrame, Path, Path]:
-    broker_df = normalize_execution_frame(read_csv_flexible(flex_csv), source="ibkr_flex") if flex_csv else pd.DataFrame()
+    flex_raw = read_flex_file(flex_file) if flex_file else pd.DataFrame()
+    flex_meta = getattr(flex_raw, "attrs", {}).get("flex_meta", {"source": "not_provided", "statements_count": 0, "trade_rows": 0, "symbols": 0, "date_min": "", "date_max": ""})
+    broker_df = normalize_execution_frame(flex_raw, source="ibkr_flex") if flex_file else pd.DataFrame()
     if not broker_df.empty:
         broker_df["_date"] = broker_df["time"].map(date_part)
         broker_df = broker_df[(broker_df["_date"] >= start_date) & (broker_df["_date"] <= end_date)].drop(columns=["_date"])
@@ -1119,7 +1205,7 @@ def audit(
                 sqlite_path=sqlite_path,
                 start_date=start_date,
                 end_date=end_date,
-                flex_csv=flex_csv,
+                flex_file=flex_file,
                 history_dir=history_dir,
                 include_dashboard_reconstructed=include_dashboard_reconstructed,
             )
@@ -1203,17 +1289,17 @@ def audit(
     csv_path = output_dir / f"trade_reconstruction_audit_{suffix}.csv"
     summary_path = output_dir / f"trade_reconstruction_summary_{suffix}.md"
     df.to_csv(csv_path, index=False)
-    write_summary(summary_path, df, start_date=start_date, end_date=end_date, flex_csv=flex_csv, sqlite_path=sqlite_path)
+    write_summary(summary_path, df, start_date=start_date, end_date=end_date, flex_file=flex_file, sqlite_path=sqlite_path, flex_meta=flex_meta)
     generic_csv_path = output_dir / "trade_reconstruction_audit.csv"
     generic_summary_path = output_dir / "trade_reconstruction_summary.md"
     if generic_csv_path != csv_path:
         df.to_csv(generic_csv_path, index=False)
     if generic_summary_path != summary_path:
-        write_summary(generic_summary_path, df, start_date=start_date, end_date=end_date, flex_csv=flex_csv, sqlite_path=sqlite_path)
+        write_summary(generic_summary_path, df, start_date=start_date, end_date=end_date, flex_file=flex_file, sqlite_path=sqlite_path, flex_meta=flex_meta)
     return df, csv_path, summary_path
 
 
-def write_summary(path: Path, df: pd.DataFrame, *, start_date: str, end_date: str, flex_csv: Path | None, sqlite_path: Path) -> None:
+def write_summary(path: Path, df: pd.DataFrame, *, start_date: str, end_date: str, flex_file: Path | None, sqlite_path: Path, flex_meta: dict[str, Any] | None = None) -> None:
     status_counts = df["status"].value_counts().to_dict() if not df.empty and "status" in df.columns else {}
     top = df.sort_values("mismatch_score", ascending=False).head(100) if not df.empty else pd.DataFrame()
     code_locations = [
@@ -1229,8 +1315,13 @@ def write_summary(path: Path, df: pd.DataFrame, *, start_date: str, end_date: st
         f"- start_date: {start_date}",
         f"- end_date: {end_date}",
         f"- sqlite_path: `{sqlite_path}`",
-        f"- ibkr_flex_csv: `{flex_csv}`" if flex_csv else "- ibkr_flex_csv: not provided",
+        f"- ibkr_flex_file: `{flex_file}`" if flex_file else "- ibkr_flex_file: not provided",
         f"- rows: {len(df)}",
+        f"- flex_source: {(flex_meta or {}).get('source', '')}",
+        f"- flex_statements: {(flex_meta or {}).get('statements_count', 0)}",
+        f"- flex_trade_rows: {(flex_meta or {}).get('trade_rows', 0)}",
+        f"- flex_date_range: {(flex_meta or {}).get('date_min', '')}..{(flex_meta or {}).get('date_max', '')}",
+        f"- flex_symbols: {(flex_meta or {}).get('symbols', 0)}",
         "",
         "## Status Counts",
         "",
@@ -1283,7 +1374,8 @@ def main() -> int:
     parser.add_argument("--date", help="Single selected session date.")
     parser.add_argument("--start-date")
     parser.add_argument("--end-date")
-    parser.add_argument("--ibkr-flex-csv", help="Optional IBKR Flex/Activity execution CSV for the same period.")
+    parser.add_argument("--ibkr-flex-file", help="Optional IBKR Flex Query XML or Activity/Flex CSV for the same period.")
+    parser.add_argument("--ibkr-flex-csv", help="Backward-compatible alias for --ibkr-flex-file.")
     parser.add_argument("--sqlite-path", default=str(DEFAULT_SQLITE_PATH))
     parser.add_argument("--history-dir", default="data/history/universe_1m", help="Optional parquet history dir for candle-reconstructed peak diagnostics.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
@@ -1293,11 +1385,12 @@ def main() -> int:
     end_date = args.end_date or args.date
     if not start_date or not end_date:
         parser.error("provide --date or --start-date/--end-date")
+    flex_file = args.ibkr_flex_file or args.ibkr_flex_csv
     df, csv_path, summary_path = audit(
         start_date=start_date,
         end_date=end_date,
         sqlite_path=Path(args.sqlite_path),
-        flex_csv=Path(args.ibkr_flex_csv) if args.ibkr_flex_csv else None,
+        flex_file=Path(flex_file) if flex_file else None,
         history_dir=Path(args.history_dir) if args.history_dir else None,
         output_dir=Path(args.output_dir),
         include_dashboard_reconstructed=bool(args.include_dashboard_reconstructed),
