@@ -86,6 +86,27 @@ def trader_process_running() -> bool:
     return result.returncode == 0 and bool(result.stdout.strip())
 
 
+def production_db_path() -> Path:
+    return REPO_ROOT / DEFAULT_DB
+
+
+def resolved_path(path: Path) -> Path:
+    return path.expanduser().resolve()
+
+
+def is_production_db_path(sqlite_path: Path) -> bool:
+    return resolved_path(sqlite_path) == resolved_path(production_db_path())
+
+
+def enforce_apply_guard(sqlite_path: Path) -> None:
+    absolute_path = resolved_path(sqlite_path)
+    if is_production_db_path(sqlite_path):
+        if trader_process_running():
+            raise RuntimeError("v67 trader process appears active on production DB; refusing --apply")
+        return
+    print(f"NON_PRODUCTION_DATABASE_APPLY sqlite_path={absolute_path}", flush=True)
+
+
 def build_plan(sqlite_path: Path, *, date: str | None, symbol: str | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     with connect_sqlite(sqlite_path, read_only=True) as conn:
         symbols = selected_symbols(conn, date, symbol)
@@ -164,8 +185,7 @@ def write_reports(rows: list[dict[str, Any]], summary: dict[str, Any], output_di
 
 
 def apply_repair(sqlite_path: Path, *, date: str | None, symbol: str | None) -> dict[str, Any]:
-    if trader_process_running():
-        raise RuntimeError("v67 trader process appears active; refusing --apply")
+    enforce_apply_guard(sqlite_path)
     backup_path = sqlite_path.with_suffix(sqlite_path.suffix + f".backup_{utc_stamp()}")
     shutil.copy2(sqlite_path, backup_path)
     store = SQLiteRuntimeStore(sqlite_path)
