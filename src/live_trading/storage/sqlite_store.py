@@ -2333,6 +2333,7 @@ class SQLiteRuntimeStore:
             "unmatched_sell_count": len(rebuild.unmatched_sells),
             "trade_components": len(rebuild.components),
             "conservation": conservation,
+            "timestamp_diagnostics": rebuild.timestamp_diagnostics,
         }
 
     def _delete_duplicate_reconstructed_execution_pair(self, trade_id: str, symbol: str, raw_json: Any, quantity: float | None) -> int:

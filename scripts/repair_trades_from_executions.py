@@ -118,10 +118,14 @@ def build_plan(sqlite_path: Path, *, date: str | None, symbol: str | None) -> tu
             "planned_components": 0,
             "unmatched_sell_count": 0,
             "unmatched_sell_quantity": 0.0,
+            "mixed_timestamp_format_symbols": 0,
+            "timestamp_parse_failures": 0,
+            "raw_string_order_diff_symbols": 0,
         }
         for sym in symbols:
             executions = execution_rows(conn, sym)
             rebuild = build_canonical_fifo(executions, symbol=sym)
+            ts_diag = rebuild.timestamp_diagnostics
             matching_trades = [
                 trade for trade in rebuild.trades
                 if not date or trade.session_date == date or str(trade.exit_time).startswith(date)
@@ -138,6 +142,9 @@ def build_plan(sqlite_path: Path, *, date: str | None, symbol: str | None) -> tu
             summary["planned_components"] += len(matching_components)
             summary["unmatched_sell_count"] += len(unmatched)
             summary["unmatched_sell_quantity"] += sum(float(item.get("unmatched_sell_quantity") or 0.0) for item in unmatched)
+            summary["mixed_timestamp_format_symbols"] += int(bool(ts_diag.get("mixed_timestamp_formats")))
+            summary["timestamp_parse_failures"] += int(ts_diag.get("timestamp_parse_failures") or 0)
+            summary["raw_string_order_diff_symbols"] += int(bool(ts_diag.get("raw_string_order_differs_from_parsed")))
             rows.append(
                 {
                     "symbol": sym,
@@ -148,6 +155,9 @@ def build_plan(sqlite_path: Path, *, date: str | None, symbol: str | None) -> tu
                     "unmatched_sell_count": len(unmatched),
                     "unmatched_sell_quantity": sum(float(item.get("unmatched_sell_quantity") or 0.0) for item in unmatched),
                     "unmatched_sell_execution_ids": ",".join(str(item.get("execution_id") or "") for item in unmatched),
+                    "mixed_timestamp_formats": int(bool(ts_diag.get("mixed_timestamp_formats"))),
+                    "timestamp_parse_failures": int(ts_diag.get("timestamp_parse_failures") or 0),
+                    "raw_string_order_differs_from_parsed": int(bool(ts_diag.get("raw_string_order_differs_from_parsed"))),
                 }
             )
     return rows, summary

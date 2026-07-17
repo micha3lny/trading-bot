@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.live_trading.storage.canonical_fifo import build_canonical_fifo  # noqa: E402
+from src.live_trading.storage.canonical_fifo import build_canonical_fifo, sort_execution_rows  # noqa: E402
 from src.live_trading.storage.sqlite_store import connect_sqlite  # noqa: E402
 
 
@@ -187,6 +187,7 @@ def classify_cycle(
 def build_inventory_events(conn: sqlite3.Connection, symbol: str) -> tuple[list[InventoryEvent], dict[str, Any]]:
     executions = execution_rows(conn, symbol)
     rebuild = build_canonical_fifo(executions, symbol=symbol)
+    executions = sort_execution_rows(executions)
     latest_qty, latest_position_raw = latest_position_quantity(conn, symbol)
     running = 0.0
     events: list[InventoryEvent] = []
@@ -245,6 +246,7 @@ def build_inventory_events(conn: sqlite3.Connection, symbol: str) -> tuple[list[
         "unmatched_sell_count": len(rebuild.unmatched_sells),
         "unmatched_sell_quantity": sum(float(row.get("unmatched_sell_quantity") or 0.0) for row in rebuild.unmatched_sells),
         "transition_count": len(events),
+        **rebuild.timestamp_diagnostics,
     }
     return events, summary
 
@@ -333,4 +335,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from src.live_trading.storage.canonical_fifo import build_canonical_fifo
+from src.live_trading.storage.canonical_fifo import build_canonical_fifo, sort_execution_rows, timestamp_diagnostics
 
 
 def ex(execution_id: str, side: str, qty: float, price: float, ts: str, **extra):
@@ -134,7 +134,62 @@ class CanonicalFifoBuilderTests(unittest.TestCase):
         self.assertEqual(len(rebuild.trades), 2)
         self.assertNotEqual(rebuild.trades[0].trade_id, rebuild.trades[1].trade_id)
 
+    def test_space_separator_sell_sorts_after_t_separator_buy(self) -> None:
+        rebuild = build_canonical_fifo(
+            [
+                ex("S_SPACE", "SLD", 10, 11, "2026-07-02 17:46:15+00:00", realized_pnl=10),
+                ex("B_T", "BOT", 10, 10, "2026-07-02T16:49:16+00:00"),
+            ],
+            symbol="FIFO",
+        )
+
+        self.assertEqual(len(rebuild.trades), 1)
+        self.assertEqual(rebuild.components[0].buy_execution_id, "B_T")
+        self.assertEqual(rebuild.components[0].sell_execution_id, "S_SPACE")
+        self.assertAlmostEqual(rebuild.open_quantity, 0)
+
+    def test_mixed_timestamp_formats_close_normal_trade(self) -> None:
+        rebuild = build_canonical_fifo(
+            [
+                ex("S_SPACE", "SLD", 5, 22, "2026-07-15 17:45:23+00:00", realized_pnl=10),
+                ex("B_T", "BOT", 5, 20, "2026-07-15T13:38:23+00:00"),
+            ],
+            symbol="FIFO",
+        )
+
+        self.assertEqual(len(rebuild.trades), 1)
+        self.assertEqual(rebuild.unmatched_sells, [])
+        self.assertTrue(rebuild.timestamp_diagnostics["mixed_timestamp_formats"])
+        self.assertTrue(rebuild.timestamp_diagnostics["raw_string_order_differs_from_parsed"])
+
+    def test_timestamp_sort_handles_space_t_microseconds_z_and_tie_break(self) -> None:
+        rows = [
+            ex("D", "BOT", 1, 10, "2026-07-15T13:30:00.000001+00:00"),
+            ex("B", "BOT", 1, 10, "2026-07-15 13:30:00+00:00", recorded_at="2026-07-15T13:30:00.000002Z"),
+            ex("A", "BOT", 1, 10, "2026-07-15T13:30:00+00:00", recorded_at="2026-07-15T13:30:00.000001Z"),
+            ex("C", "BOT", 1, 10, "2026-07-15T13:30:00Z", recorded_at="2026-07-15T13:30:00.000002Z"),
+        ]
+
+        ordered = sort_execution_rows(rows)
+        diagnostics = timestamp_diagnostics(rows)
+
+        self.assertEqual([row["execution_id"] for row in ordered], ["A", "B", "C", "D"])
+        self.assertIn("space_separator", diagnostics["timestamp_formats"])
+        self.assertIn("t_separator", diagnostics["timestamp_formats"])
+        self.assertIn("z_suffix", diagnostics["timestamp_formats"])
+        self.assertEqual(diagnostics["timestamp_parse_failures"], 0)
+
+    def test_naive_timestamp_is_assumed_utc_and_reported(self) -> None:
+        diagnostics = timestamp_diagnostics(
+            [
+                ex("B_NAIVE", "BOT", 1, 10, "2026-07-15T13:30:00", recorded_at="2026-07-15T13:30:00+00:00"),
+                ex("S_Z", "SLD", 1, 11, "2026-07-15T13:31:00Z"),
+            ]
+        )
+
+        self.assertEqual(diagnostics["naive_timestamp_assumed_utc_count"], 1)
+        self.assertEqual(diagnostics["timestamp_parse_failures"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
-

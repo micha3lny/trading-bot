@@ -7,6 +7,7 @@ from typing import Any
 
 
 QTY_TOLERANCE = 1e-9
+MAX_SORT_DATETIME = datetime.max.replace(tzinfo=timezone.utc)
 
 
 def _safe_float(value: Any) -> float | None:
@@ -33,6 +34,29 @@ def _parse_dt(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _timestamp_format(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "missing"
+    if text.endswith("Z"):
+        return "z_suffix"
+    if "T" in text:
+        return "t_separator"
+    if " " in text:
+        return "space_separator"
+    return "other"
+
+
+def _timestamp_is_naive(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    parsed = _parse_dt(text)
+    if parsed is None:
+        return False
+    return not (text.endswith("Z") or "+" in text[10:] or "-" in text[10:])
+
+
 def _iso(value: Any) -> str:
     parsed = _parse_dt(value)
     return parsed.isoformat() if parsed else str(value or "")
@@ -54,12 +78,63 @@ def _side(value: Any) -> str:
     return text
 
 
-def _sort_key(row: dict[str, Any]) -> tuple[str, str, str]:
+def _primary_sort_dt(row: dict[str, Any]) -> datetime:
+    return _parse_dt(row.get("executed_at")) or _parse_dt(row.get("recorded_at")) or MAX_SORT_DATETIME
+
+
+def _recorded_sort_dt(row: dict[str, Any]) -> datetime:
+    return _parse_dt(row.get("recorded_at")) or MAX_SORT_DATETIME
+
+
+def _sort_key(row: dict[str, Any]) -> tuple[datetime, datetime, str]:
     return (
-        _iso(row.get("executed_at") or row.get("recorded_at")),
-        _iso(row.get("recorded_at")),
+        _primary_sort_dt(row),
+        _recorded_sort_dt(row),
         str(row.get("execution_id") or ""),
     )
+
+
+def sort_execution_rows(executions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted((dict(row) for row in executions), key=_sort_key)
+
+
+def timestamp_diagnostics(executions: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = [dict(row) for row in executions]
+    format_values: set[str] = set()
+    parse_failures = 0
+    naive_count = 0
+    for row in rows:
+        for field in ("executed_at", "recorded_at"):
+            value = row.get(field)
+            if value in (None, ""):
+                continue
+            format_values.add(_timestamp_format(value))
+            if _parse_dt(value) is None:
+                parse_failures += 1
+            if _timestamp_is_naive(value):
+                naive_count += 1
+    raw_sorted_ids = [
+        str(row.get("execution_id") or "")
+        for row in sorted(
+            rows,
+            key=lambda item: (
+                str(item.get("executed_at") or item.get("recorded_at") or ""),
+                str(item.get("recorded_at") or ""),
+                str(item.get("execution_id") or ""),
+            ),
+        )
+    ]
+    parsed_sorted_ids = [str(row.get("execution_id") or "") for row in sort_execution_rows(rows)]
+    raw_diff_count = sum(1 for left, right in zip(raw_sorted_ids, parsed_sorted_ids) if left != right)
+    return {
+        "mixed_timestamp_formats": len(format_values) > 1,
+        "timestamp_format_count": len(format_values),
+        "timestamp_formats": sorted(format_values),
+        "timestamp_parse_failures": parse_failures,
+        "naive_timestamp_assumed_utc_count": naive_count,
+        "raw_string_order_differs_from_parsed": raw_sorted_ids != parsed_sorted_ids,
+        "raw_string_order_diff_count": raw_diff_count,
+    }
 
 
 def _raw(row: dict[str, Any]) -> dict[str, Any]:
@@ -146,6 +221,7 @@ class CanonicalRebuild:
     buy_consumed: dict[str, float]
     sell_matched: dict[str, float]
     sell_unmatched: dict[str, float]
+    timestamp_diagnostics: dict[str, Any] = field(default_factory=dict)
 
     @property
     def open_quantity(self) -> float:
@@ -172,8 +248,8 @@ def _metadata_trade_id(symbol: str, cycle_index: int, row: dict[str, Any]) -> st
 
 
 def build_canonical_fifo(executions: list[dict[str, Any]], *, symbol: str | None = None) -> CanonicalRebuild:
-    rows = [dict(row) for row in executions]
-    rows.sort(key=_sort_key)
+    rows = sort_execution_rows(executions)
+    ts_diagnostics = timestamp_diagnostics(executions)
     inferred_symbol = str(symbol or (rows[0].get("symbol") if rows else "") or "").upper().strip()
     open_lots: list[CanonicalLot] = []
     active_trade_id: str | None = None
@@ -338,4 +414,5 @@ def build_canonical_fifo(executions: list[dict[str, Any]], *, symbol: str | None
         buy_consumed=buy_consumed,
         sell_matched=sell_matched,
         sell_unmatched=sell_unmatched,
+        timestamp_diagnostics=ts_diagnostics,
     )
