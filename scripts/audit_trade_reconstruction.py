@@ -23,14 +23,21 @@ from src.dashboard.runtime_queries import DateWindow, load_dashboard_snapshot  #
 DEFAULT_SQLITE_PATH = Path("data/runtime/trading_runtime.sqlite")
 DEFAULT_OUTPUT_DIR = Path("data/analysis")
 STATUS_ORDER = [
+    "COMPONENT_BUY_OVERUSE",
+    "COMPONENT_SELL_OVERUSE",
+    "COMPONENT_QUANTITY_MISMATCH",
+    "MISSING_COMPONENTS",
     "BROKER_SQLITE_MISMATCH",
     "SQLITE_FIFO_MISMATCH",
+    "STALE_EXECUTIONS_TRADE_ID",
     "FIFO_DASHBOARD_MISMATCH",
     "DASHBOARD_HOLDING_TIME_MISMATCH",
     "ENTRY_PRICE_MISMATCH",
     "EXIT_PRICE_MISMATCH",
     "PNL_MISMATCH",
     "UNKNOWN",
+    "OK_COMPONENT_AGGREGATE",
+    "OK_COMPONENT_EXACT",
     "OK",
 ]
 PRICE_TOLERANCE = 0.02
@@ -487,6 +494,61 @@ def sqlite_positions_for_symbols(conn: sqlite3.Connection, symbols: list[str]) -
         """,
         symbols,
     )
+
+
+def sqlite_trade_components_for_sell_ids(conn: sqlite3.Connection, sell_ids: set[str]) -> pd.DataFrame:
+    if not sell_ids or not table_exists(conn, "trade_components"):
+        return pd.DataFrame()
+    ids = sorted(str(value) for value in sell_ids if str(value or "").strip())
+    if not ids:
+        return pd.DataFrame()
+    placeholders = qmarks(ids)
+    return read_sql_df(
+        conn,
+        f"""
+        SELECT component_id, trade_id, symbol, session_date,
+               buy_execution_id, sell_execution_id, matched_qty,
+               buy_price, sell_price, entry_time, exit_time,
+               buy_commission_alloc, sell_commission_alloc,
+               realized_pnl_alloc, gross_pnl, net_pnl, raw_json, updated_at
+        FROM trade_components
+        WHERE sell_execution_id IN ({placeholders})
+        ORDER BY sell_execution_id, entry_time, buy_execution_id, component_id
+        """,
+        ids,
+    )
+
+
+def component_summaries_by_sell(components: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    if components.empty:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for sell_id, group in components.groupby("sell_execution_id", dropna=False):
+        records = group.to_dict("records")
+        matched_qty = sum(abs(fnum(row.get("matched_qty")) or 0.0) for row in records)
+        trade_ids = [str(row.get("trade_id") or "") for row in records if str(row.get("trade_id") or "")]
+        buy_ids = [str(row.get("buy_execution_id") or "") for row in records if str(row.get("buy_execution_id") or "")]
+        buy_times = [iso(row.get("entry_time")) for row in records if iso(row.get("entry_time"))]
+        buy_qty_values = [str(fnum(row.get("matched_qty")) or 0.0) for row in records]
+        entry_price = weighted_avg(
+            [{"quantity": row.get("matched_qty"), "price": row.get("buy_price")} for row in records]
+        )
+        exit_price = weighted_avg(
+            [{"quantity": row.get("matched_qty"), "price": row.get("sell_price")} for row in records]
+        )
+        out[str(sell_id or "")] = {
+            "canonical_trade_id": ",".join(dict.fromkeys(trade_ids)),
+            "component_count": len(records),
+            "component_buy_execution_ids": ",".join(dict.fromkeys(buy_ids)),
+            "component_buy_times": ",".join(dict.fromkeys(buy_times)),
+            "component_matched_qty": ",".join(buy_qty_values),
+            "component_total_matched_qty": matched_qty,
+            "canonical_entry_quantity": matched_qty,
+            "canonical_exit_quantity": matched_qty,
+            "canonical_entry_price": entry_price,
+            "canonical_exit_price": exit_price,
+        }
+    return out
 
 
 def same_session_fifo_candidates(executions: pd.DataFrame, selected_sell_ids: set[str]) -> dict[str, dict[str, Any]]:
@@ -1066,6 +1128,7 @@ def build_sell_level_audit(
     trades_by_id = trade_rows_by_id(trades)
     selected_sell_ids = {str(x) for x in selected_sells["execution_id"].fillna("").astype(str).tolist() if str(x)}
     candidates = same_session_fifo_candidates(all_execs, selected_sell_ids)
+    component_summaries = component_summaries_by_sell(sqlite_trade_components_for_sell_ids(conn, selected_sell_ids))
     broker_by_sell = broker_trade_by_sell_execution(flex_file, start_date, end_date, sqlite_flex_matches)
     dashboard_rows = dashboard_closed_rows_from_trades(trades, start_date, end_date)
     rows: list[dict[str, Any]] = []
@@ -1077,6 +1140,7 @@ def build_sell_level_audit(
         sell_price = fnum(sell.get("price"))
         current_entry = current_trade_entry(sell, all_execs, trades_by_id)
         candidate = candidates.get(sell_id, {})
+        component = component_summaries.get(sell_id, {})
         broker = broker_by_sell.get(sell_id)
         dash = match_dashboard_row(sell, dashboard_rows)
         problem = classify_sell_problem(sell, current_entry, candidate)
@@ -1130,6 +1194,21 @@ def build_sell_level_audit(
             "candidate_entry_count": candidate.get("candidate_entry_count"),
             "candidate_unmatched_qty": candidate.get("candidate_unmatched_qty"),
             "problem_classification": problem,
+            "canonical_trade_id": component.get("canonical_trade_id", ""),
+            "component_count": component.get("component_count", 0),
+            "component_buy_execution_ids": component.get("component_buy_execution_ids", ""),
+            "component_buy_times": component.get("component_buy_times", ""),
+            "component_matched_qty": component.get("component_matched_qty", ""),
+            "component_total_matched_qty": component.get("component_total_matched_qty"),
+            "sell_quantity_conservation_diff": (
+                sell_qty - fnum(component.get("component_total_matched_qty"))
+                if fnum(component.get("component_total_matched_qty")) is not None
+                else None
+            ),
+            "canonical_entry_quantity": component.get("canonical_entry_quantity"),
+            "canonical_exit_quantity": component.get("canonical_exit_quantity"),
+            "canonical_entry_price": component.get("canonical_entry_price"),
+            "canonical_exit_price": component.get("canonical_exit_price"),
             "holding_minutes_current_assignment": holding_minutes(current_entry.get("entry_time"), sell_time),
             "holding_minutes_same_session_candidate": candidate.get("candidate_holding_minutes"),
             "ibkr_flex_quantity": broker_qty,
@@ -1175,6 +1254,14 @@ def build_sell_level_audit(
 
 
 def sell_level_status(row: dict[str, Any]) -> str:
+    component_count = int(fnum(row.get("component_count")) or 0)
+    component_diff = fnum(row.get("sell_quantity_conservation_diff"))
+    if component_count > 0:
+        if component_diff is not None and abs(component_diff) > QTY_TOLERANCE:
+            return "COMPONENT_QUANTITY_MISMATCH"
+        if component_count == 1:
+            return "OK_COMPONENT_EXACT"
+        return "OK_COMPONENT_AGGREGATE"
     problem = str(row.get("problem_classification") or "")
     if "cross_session_trade_id" in problem or "wrong_entry_quantity" in problem or "same_session_candidate_exists" in problem:
         return "SQLITE_FIFO_MISMATCH"
@@ -1871,6 +1958,13 @@ def write_summary(
             "mismatch_score",
             "sell_time",
             "sell_quantity",
+            "canonical_trade_id",
+            "component_count",
+            "component_buy_execution_ids",
+            "component_buy_times",
+            "component_matched_qty",
+            "component_total_matched_qty",
+            "sell_quantity_conservation_diff",
             "current_executions_trade_id",
             "entry_execution_id",
             "entry_time",
@@ -1891,6 +1985,26 @@ def write_summary(
             "dashboard_realized_pnl",
         ]
         lines.append(markdown_table(top[[col for col in display_cols if col in top.columns]]))
+    cross_symbols = {"MXL", "NBIS", "WDAY", "AMPG", "CARL", "PENG", "POET"}
+    lines.extend(["", "## Cross-Session Component Details", ""])
+    if df.empty or "symbol" not in df.columns:
+        lines.append("_No rows._")
+    else:
+        component_cols = [
+            "symbol",
+            "sell_execution_id",
+            "sell_time",
+            "sell_quantity",
+            "canonical_trade_id",
+            "component_count",
+            "component_buy_execution_ids",
+            "component_buy_times",
+            "component_matched_qty",
+            "component_total_matched_qty",
+            "status",
+        ]
+        cross = df[df["symbol"].isin(cross_symbols)][[col for col in component_cols if col in df.columns]]
+        lines.append(markdown_table(cross) if not cross.empty else "_No cross-session target rows._")
     lines.extend(["", "## Code Locations Responsible For Reconstruction / Closed Positions", ""])
     for item in code_locations:
         lines.append(f"- {item}")
