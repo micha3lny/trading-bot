@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from src.live_trading.storage.canonical_fifo import build_canonical_fifo
 from src.live_trading.unified_logger import append_unified_log, unified_logger_installed
 
 
@@ -609,6 +610,31 @@ class SQLiteRuntimeStore:
             CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
             CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
             CREATE INDEX IF NOT EXISTS idx_trades_strategy_name ON trades(strategy_name);
+
+            CREATE TABLE IF NOT EXISTS trade_components (
+                component_id TEXT PRIMARY KEY,
+                trade_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                session_date TEXT,
+                buy_execution_id TEXT,
+                sell_execution_id TEXT,
+                matched_qty REAL NOT NULL,
+                buy_price REAL,
+                sell_price REAL,
+                entry_time TEXT,
+                exit_time TEXT,
+                buy_commission_alloc REAL,
+                sell_commission_alloc REAL,
+                realized_pnl_alloc REAL,
+                gross_pnl REAL,
+                net_pnl REAL,
+                raw_json TEXT,
+                updated_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_trade_components_trade_id ON trade_components(trade_id);
+            CREATE INDEX IF NOT EXISTS idx_trade_components_buy_execution_id ON trade_components(buy_execution_id);
+            CREATE INDEX IF NOT EXISTS idx_trade_components_sell_execution_id ON trade_components(sell_execution_id);
+            CREATE INDEX IF NOT EXISTS idx_trade_components_symbol_session ON trade_components(symbol, session_date);
 
             CREATE TABLE IF NOT EXISTS orders (
                 order_key TEXT PRIMARY KEY,
@@ -1797,6 +1823,518 @@ class SQLiteRuntimeStore:
         self.execute(f"DELETE FROM trades WHERE trade_id IN ({placeholders})", trade_ids)
         return len(trade_ids)
 
+    def _clear_reducer_trades_for_symbol(self, symbol: str) -> int:
+        symbol = str(symbol or "").upper().strip()
+        if not symbol:
+            return 0
+        rows = self.query(
+            """
+            SELECT trade_id
+            FROM trades
+            WHERE UPPER(symbol) = ?
+              AND (
+                trade_id LIKE 'reconstructed:%'
+                OR trade_id LIKE 'canonical:%'
+                OR raw_json LIKE '%sqlite_execution_reducer%'
+                OR raw_json LIKE '%canonical_fifo_execution_reducer%'
+                OR raw_json LIKE '%executions_pair_repair%'
+              )
+            """,
+            [symbol],
+        )
+        trade_ids = [str(row.get("trade_id") or "") for row in rows if row.get("trade_id")]
+        self.execute("DELETE FROM trade_components WHERE UPPER(symbol) = ?", [symbol])
+        if not trade_ids:
+            return 0
+        placeholders = ",".join("?" for _ in trade_ids)
+        self.execute(f"UPDATE executions SET trade_id = NULL WHERE trade_id IN ({placeholders})", trade_ids)
+        self.execute(f"DELETE FROM trades WHERE trade_id IN ({placeholders})", trade_ids)
+        return len(trade_ids)
+
+    def _insert_trade_component(self, component: Any, *, updated_at: str) -> None:
+        row = {
+            "component_id": component.component_id,
+            "trade_id": component.trade_id,
+            "symbol": component.symbol,
+            "session_date": component.session_date,
+            "buy_execution_id": component.buy_execution_id,
+            "sell_execution_id": component.sell_execution_id,
+            "matched_qty": component.matched_qty,
+            "buy_price": component.buy_price,
+            "sell_price": component.sell_price,
+            "entry_time": component.entry_time,
+            "exit_time": component.exit_time,
+            "buy_commission_alloc": component.buy_commission_alloc,
+            "sell_commission_alloc": component.sell_commission_alloc,
+            "realized_pnl_alloc": component.realized_pnl_alloc,
+            "gross_pnl": component.gross_pnl,
+            "net_pnl": component.net_pnl,
+            "raw_json": component.raw_json,
+            "updated_at": updated_at,
+        }
+        columns = list(row.keys())
+        self._upsert("trade_components", row, ["component_id"], columns)
+
+    def _trade_component_conservation_summary(self, symbol: str) -> dict[str, Any]:
+        symbol = str(symbol or "").upper().strip()
+        if not symbol:
+            return {}
+        buy_rows = self.query(
+            """
+            SELECT e.execution_id, e.quantity, COALESCE(SUM(c.matched_qty), 0) AS matched_qty
+            FROM executions e
+            LEFT JOIN trade_components c ON c.buy_execution_id = e.execution_id
+            WHERE UPPER(e.symbol) = ?
+              AND UPPER(e.side) IN ('BOT', 'BUY', 'BOUGHT', 'B')
+            GROUP BY e.execution_id, e.quantity
+            """,
+            [symbol],
+        )
+        sell_rows = self.query(
+            """
+            SELECT e.execution_id, e.quantity, COALESCE(SUM(c.matched_qty), 0) AS matched_qty
+            FROM executions e
+            LEFT JOIN trade_components c ON c.sell_execution_id = e.execution_id
+            WHERE UPPER(e.symbol) = ?
+              AND UPPER(e.side) IN ('SLD', 'SELL', 'SOLD', 'S')
+            GROUP BY e.execution_id, e.quantity
+            """,
+            [symbol],
+        )
+        buy_overused = [
+            row.get("execution_id")
+            for row in buy_rows
+            if (safe_float(row.get("matched_qty")) or 0.0) > (safe_float(row.get("quantity")) or 0.0) + 1e-6
+        ]
+        sell_overused = [
+            row.get("execution_id")
+            for row in sell_rows
+            if (safe_float(row.get("matched_qty")) or 0.0) > (safe_float(row.get("quantity")) or 0.0) + 1e-6
+        ]
+        sell_unmatched_qty = sum(
+            max((safe_float(row.get("quantity")) or 0.0) - (safe_float(row.get("matched_qty")) or 0.0), 0.0)
+            for row in sell_rows
+        )
+        return {
+            "buy_execution_count": len(buy_rows),
+            "sell_execution_count": len(sell_rows),
+            "buy_overused_count": len(buy_overused),
+            "sell_overused_count": len(sell_overused),
+            "buy_overused_execution_ids": [str(value) for value in buy_overused if value],
+            "sell_overused_execution_ids": [str(value) for value in sell_overused if value],
+            "sell_unmatched_quantity": sell_unmatched_qty,
+        }
+
+    def _execution_rows_for_symbol(self, symbol: str, strategy_name: str | None = None) -> list[dict[str, Any]]:
+        strategy_clause = ""
+        params: list[Any] = [str(symbol or "").upper().strip()]
+        if strategy_name:
+            strategy_clause = "AND COALESCE(strategy_name, 'unknown') = ?"
+            params.append(strategy_name)
+        return self.query(
+            f"""
+            SELECT execution_id, trade_id, order_key, order_id, perm_id,
+                   COALESCE(strategy_name, 'unknown') AS strategy_name,
+                   session_date, symbol, side, quantity, price, exchange, liquidity,
+                   executed_at, recorded_at, commission, commission_currency,
+                   realized_pnl, commission_source, exit_reason, exit_reason_source, raw_json
+            FROM executions
+            WHERE UPPER(symbol) = ? {strategy_clause}
+            ORDER BY COALESCE(executed_at, recorded_at, ''), COALESCE(recorded_at, ''), execution_id
+            """,
+            params,
+        )
+
+    def _entry_metadata_for_canonical_trade(self, trade: Any, rows_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        for execution_id in trade.buy_execution_ids:
+            row = rows_by_id.get(str(execution_id))
+            if not row:
+                continue
+            metadata = self._entry_metadata_for_execution(row, parse_jsonish(row.get("raw_json")))
+            if metadata:
+                return metadata
+        return {}
+
+    def _canonical_persist_trade_id(self, trade: Any, rows_by_id: dict[str, dict[str, Any]]) -> str:
+        first_buy = rows_by_id.get(str((trade.buy_execution_ids or [""])[0])) or {}
+        raw = parse_jsonish(first_buy.get("raw_json"))
+        order_id = normalized_identifier(first_buy.get("order_id") or raw.get("entry_order_id") or raw.get("order_id"))
+        if order_id:
+            return f"entry:{trade.session_date}:{trade.symbol}:{order_id}"
+        return str(trade.trade_id)
+
+    def _canonical_trade_status_and_exit_reason(
+        self,
+        trade: Any,
+        rows_by_id: dict[str, dict[str, Any]],
+        *,
+        broker_net_positions: dict[str, float] | None,
+    ) -> tuple[str, str, dict[str, Any]]:
+        pending_commission = 0
+        pending_realized = 0
+        exit_reason = ""
+        status_raw: dict[str, Any] = {
+            "pending_commission_count": 0,
+            "pending_realized_pnl_count": 0,
+            "buy_commission_fallback_source": "",
+            "buy_commission_unavailable_after_eod": False,
+        }
+        for execution_id in trade.buy_execution_ids:
+            row = rows_by_id.get(str(execution_id)) or {}
+            source = str(row.get("commission_source") or "").lower()
+            if source == "missing":
+                sell_ready = all(
+                    safe_float((rows_by_id.get(str(sell_id)) or {}).get("realized_pnl")) is not None
+                    for sell_id in trade.sell_execution_ids
+                )
+                sell_commission_ready = all(
+                    str((rows_by_id.get(str(sell_id)) or {}).get("commission_source") or "").lower() == "ibkr"
+                    for sell_id in trade.sell_execution_ids
+                )
+                if sell_ready and sell_commission_ready and self._broker_flat_for_symbol(trade.symbol, broker_net_positions):
+                    self._mark_buy_commission_unavailable_after_eod(execution_id)
+                    row["commission"] = 0.0
+                    row["commission_source"] = FALLBACK_BUY_COMMISSION_SOURCE
+                    status_raw["buy_commission_fallback_source"] = FALLBACK_BUY_COMMISSION_SOURCE
+                    status_raw["buy_commission_unavailable_after_eod"] = True
+                    continue
+                pending_commission += 1
+        for execution_id in trade.sell_execution_ids:
+            row = rows_by_id.get(str(execution_id)) or {}
+            raw = parse_jsonish(row.get("raw_json"))
+            if not exit_reason:
+                exit_reason = row.get("exit_reason") or raw.get("exit_reason") or ""
+            source = str(row.get("commission_source") or "").lower()
+            if source == "missing":
+                pending_commission += 1
+        status_raw["pending_commission_count"] = pending_commission
+        status_raw["pending_realized_pnl_count"] = pending_realized
+        if pending_commission:
+            return "COMMISSION_PENDING", exit_reason, status_raw
+        if pending_realized:
+            return "PNL_PENDING", exit_reason, status_raw
+        return "CLOSED", exit_reason, status_raw
+
+    def _rebuild_symbol_trade_state_canonical(
+        self,
+        symbol: str,
+        strategy_name: str | None = None,
+        *,
+        allow_historical_open_lots: bool = False,
+        broker_net_positions: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        rows = self._execution_rows_for_symbol(symbol, strategy_name)
+        reducer_started_at = utc_now_iso()
+        self._clear_reducer_trades_for_symbol(symbol)
+        rebuild = build_canonical_fifo(rows, symbol=symbol)
+        rows_by_id = {str(row.get("execution_id") or ""): row for row in rows if row.get("execution_id")}
+        latest_strategy = strategy_name or "unknown"
+        latest_session = session_date_utc()
+        latest_price: float | None = None
+        last_event_time = utc_now_iso()
+        if rows:
+            last_row = rows[-1]
+            latest_strategy = str(last_row.get("strategy_name") or latest_strategy or "unknown")
+            last_event_time = execution_sort_time(last_row) or last_event_time
+            latest_session = str(last_row.get("session_date") or "") or iso_date_part(last_event_time) or latest_session
+            latest_price = safe_float(last_row.get("price"))
+
+        execution_trade_ids: dict[str, set[str]] = {}
+        for trade in rebuild.trades:
+            entry_metadata = self._entry_metadata_for_canonical_trade(trade, rows_by_id)
+            persist_trade_id = self._canonical_persist_trade_id(trade, rows_by_id)
+            trade_status, exit_reason, status_raw = self._canonical_trade_status_and_exit_reason(
+                trade,
+                rows_by_id,
+                broker_net_positions=broker_net_positions,
+            )
+            raw = dict(trade.raw_json)
+            raw.update(
+                {
+                    "closed_trade_finalized_time": reducer_started_at,
+                    "conservation_checked": True,
+                    "peak_rebuild_status": "needs_rebuild",
+                    "canonical_trade_id": trade.trade_id,
+                    "buy_execution_ids": trade.buy_execution_ids,
+                    "sell_execution_ids": trade.sell_execution_ids,
+                    "exit_reason": exit_reason,
+                    **status_raw,
+                }
+            )
+            self.upsert_trade(
+                {
+                    "trade_id": persist_trade_id,
+                    "strategy_name": entry_metadata.get("strategy_name") or trade.strategy_name or latest_strategy,
+                    "session_date": trade.session_date,
+                    "symbol": trade.symbol,
+                    "status": trade_status,
+                    "entry_fill_time": trade.entry_time,
+                    "exit_fill_time": trade.exit_time,
+                    "closed_at": trade.exit_time,
+                    "entry_price": trade.entry_price,
+                    "exit_price": trade.exit_price,
+                    "quantity": trade.quantity,
+                    "remaining_quantity": 0,
+                    "gross_pnl": trade.gross_pnl,
+                    "commission": trade.commission,
+                    "net_pnl": trade.net_pnl,
+                    "mfe_pct": None,
+                    "mae_pct": None,
+                    "peak_price": None,
+                    "low_price": None,
+                    "peak_unrealized_pnl": None,
+                    "max_adverse_unrealized_pnl": None,
+                    "giveback_from_peak": None,
+                    "exit_reason": exit_reason,
+                    "ibkr_entry_confirmed": True,
+                    "ibkr_exit_confirmed": True,
+                    "ibkr_position_flat_confirmed": True,
+                    "ibkr_position_flat_confirmed_at": trade.exit_time,
+                    "updated_at": reducer_started_at,
+                    "raw_json": raw,
+                }
+            )
+            for component_index, component in enumerate(trade.components, start=1):
+                component.trade_id = persist_trade_id
+                component.component_id = (
+                    f"component:{persist_trade_id}:"
+                    f"{component.buy_execution_id}:{component.sell_execution_id}:{component_index:06d}"
+                )
+                self._insert_trade_component(component, updated_at=reducer_started_at)
+                if component.buy_execution_id:
+                    execution_trade_ids.setdefault(component.buy_execution_id, set()).add(component.trade_id)
+                if component.sell_execution_id:
+                    execution_trade_ids.setdefault(component.sell_execution_id, set()).add(component.trade_id)
+        for execution_id, trade_ids in execution_trade_ids.items():
+            if len(trade_ids) == 1:
+                self.execute("UPDATE executions SET trade_id = ? WHERE execution_id = ?", [next(iter(trade_ids)), execution_id])
+            else:
+                rows_for_exec = self.query("SELECT raw_json FROM executions WHERE execution_id = ?", [execution_id])
+                raw = parse_jsonish(rows_for_exec[0].get("raw_json")) if rows_for_exec else {}
+                raw["multi_trade_component"] = True
+                raw["trade_component_trade_ids"] = sorted(trade_ids)
+                self.execute("UPDATE executions SET trade_id = NULL, raw_json = ? WHERE execution_id = ?", [safe_json(raw), execution_id])
+
+        today = session_date_utc()
+        open_lots = [
+            {
+                **lot.row,
+                "remaining_qty": lot.remaining_qty,
+                "original_qty": lot.original_qty,
+                "canonical_trade_id": lot.trade_id,
+            }
+            for lot in rebuild.open_lots
+            if lot.remaining_qty > 1e-9
+        ]
+        suppressed_historical_lots: list[dict[str, Any]] = []
+        if not allow_historical_open_lots:
+            current_open_lots: list[dict[str, Any]] = []
+            for lot in open_lots:
+                entry_time = execution_sort_time(lot)
+                entry_date = str(lot.get("session_date") or "") or iso_date_part(entry_time) or latest_session
+                if entry_date and entry_date < today:
+                    suppressed_historical_lots.append(lot)
+                else:
+                    current_open_lots.append(lot)
+            open_lots = current_open_lots
+
+        open_qty = sum(safe_float(lot.get("remaining_qty")) or 0.0 for lot in open_lots)
+        broker_target_qty: float | None = None
+        broker_suppressed_lots: list[dict[str, Any]] = []
+        if broker_net_positions is not None:
+            broker_target_qty = max(safe_float(broker_net_positions.get(symbol, 0.0)) or 0.0, 0.0)
+            if broker_target_qty <= 1e-9:
+                broker_suppressed_lots = open_lots
+                open_lots = []
+                open_qty = 0.0
+            elif open_qty > broker_target_qty + 1e-9:
+                qty_to_keep = broker_target_qty
+                kept_reversed: list[dict[str, Any]] = []
+                suppressed_reversed: list[dict[str, Any]] = []
+                for lot in reversed(open_lots):
+                    lot_qty = safe_float(lot.get("remaining_qty")) or 0.0
+                    if lot_qty <= 1e-9:
+                        continue
+                    if qty_to_keep <= 1e-9:
+                        suppressed_reversed.append(lot)
+                        continue
+                    take_qty = min(lot_qty, qty_to_keep)
+                    if take_qty < lot_qty - 1e-9:
+                        kept = dict(lot)
+                        kept["remaining_qty"] = take_qty
+                        kept_reversed.append(kept)
+                        suppressed = dict(lot)
+                        suppressed["remaining_qty"] = lot_qty - take_qty
+                        suppressed_reversed.append(suppressed)
+                    else:
+                        kept_reversed.append(lot)
+                    qty_to_keep -= take_qty
+                open_lots = list(reversed(kept_reversed))
+                broker_suppressed_lots = list(reversed(suppressed_reversed))
+                open_qty = sum(safe_float(lot.get("remaining_qty")) or 0.0 for lot in open_lots)
+
+        suppressed_qty = sum(safe_float(lot.get("remaining_qty")) or 0.0 for lot in suppressed_historical_lots)
+        broker_suppressed_qty = sum(safe_float(lot.get("remaining_qty")) or 0.0 for lot in broker_suppressed_lots)
+        if suppressed_qty > 1e-9:
+            stale_cost = sum((safe_float(lot.get("remaining_qty")) or 0.0) * (safe_float(lot.get("price")) or 0.0) for lot in suppressed_historical_lots)
+            stale_avg_price = stale_cost / suppressed_qty if suppressed_qty else None
+            stale_first = suppressed_historical_lots[0]
+            stale_entry_time = execution_sort_time(stale_first)
+            stale_entry_date = str(stale_first.get("session_date") or "") or iso_date_part(stale_entry_time) or latest_session
+            stale_strategy = str(stale_first.get("strategy_name") or latest_strategy or "unknown")
+            self.upsert_position(
+                {
+                    "position_key": f"{stale_strategy}:{stale_entry_date}:{symbol}:stale_open_lot",
+                    "strategy_name": stale_strategy,
+                    "session_date": stale_entry_date,
+                    "symbol": symbol,
+                    "status": "STALE_CARRY_OPEN",
+                    "quantity": suppressed_qty,
+                    "avg_price": stale_avg_price,
+                    "source": "canonical_fifo_execution_reducer",
+                    "ibkr_quantity": None,
+                    "active": 0,
+                    "exit_sent": 0,
+                    "updated_at": last_event_time,
+                    "raw_json": {
+                        "active": False,
+                        "entry_fill_verified": True,
+                        "entry_time": stale_entry_time,
+                        "entry_price": stale_avg_price,
+                        "stale_open_lot_suppressed": True,
+                        "requires_ibkr_confirmation": True,
+                        "open_lot_execution_ids": [lot.get("execution_id") for lot in suppressed_historical_lots],
+                    },
+                }
+            )
+        if broker_suppressed_qty > 1e-9:
+            broker_suppressed_cost = sum((safe_float(lot.get("remaining_qty")) or 0.0) * (safe_float(lot.get("price")) or 0.0) for lot in broker_suppressed_lots)
+            broker_suppressed_avg = broker_suppressed_cost / broker_suppressed_qty if broker_suppressed_qty else None
+            broker_suppressed_first = broker_suppressed_lots[0]
+            broker_suppressed_entry_time = execution_sort_time(broker_suppressed_first)
+            broker_suppressed_entry_date = str(broker_suppressed_first.get("session_date") or "") or iso_date_part(broker_suppressed_entry_time) or latest_session
+            broker_suppressed_strategy = str(broker_suppressed_first.get("strategy_name") or latest_strategy or "unknown")
+            self.upsert_position(
+                {
+                    "position_key": f"{broker_suppressed_strategy}:{broker_suppressed_entry_date}:{symbol}:broker_unconfirmed_open_lot",
+                    "strategy_name": broker_suppressed_strategy,
+                    "session_date": broker_suppressed_entry_date,
+                    "symbol": symbol,
+                    "status": "BROKER_UNCONFIRMED_OPEN_LOT",
+                    "quantity": broker_suppressed_qty,
+                    "avg_price": broker_suppressed_avg,
+                    "source": "canonical_fifo_execution_reducer",
+                    "ibkr_quantity": broker_target_qty,
+                    "active": 0,
+                    "exit_sent": 0,
+                    "updated_at": last_event_time,
+                    "raw_json": {
+                        "active": False,
+                        "entry_fill_verified": True,
+                        "entry_time": broker_suppressed_entry_time,
+                        "entry_price": broker_suppressed_avg,
+                        "broker_position_reducer_suppressed": True,
+                        "broker_target_quantity": broker_target_qty,
+                        "suppressed_quantity": broker_suppressed_qty,
+                        "open_lot_execution_ids": [lot.get("execution_id") for lot in broker_suppressed_lots],
+                    },
+                }
+            )
+        if open_qty > 1e-9:
+            weighted_cost = sum((safe_float(lot.get("remaining_qty")) or 0.0) * (safe_float(lot.get("price")) or 0.0) for lot in open_lots)
+            avg_price = weighted_cost / open_qty if open_qty else None
+            first_lot = open_lots[0]
+            entry_time = execution_sort_time(first_lot)
+            entry_date = str(first_lot.get("session_date") or "") or iso_date_part(entry_time) or latest_session
+            first_lot_raw = parse_jsonish(first_lot.get("raw_json"))
+            entry_metadata = self._entry_metadata_for_execution(first_lot, first_lot_raw)
+            strategy = str(entry_metadata.get("strategy_name") or first_lot.get("strategy_name") or latest_strategy or "unknown")
+            self.mark_position_flat(symbol=symbol, reason="canonical_fifo_reducer_superseded_open_lot", status="CLOSED")
+            self.upsert_position(
+                {
+                    "position_key": f"{strategy}:{entry_date}:{symbol}",
+                    "strategy_name": strategy,
+                    "session_date": entry_date,
+                    "symbol": symbol,
+                    "status": "OPEN",
+                    "quantity": open_qty,
+                    "avg_price": avg_price,
+                    "source": "canonical_fifo_execution_reducer",
+                    "ibkr_quantity": open_qty,
+                    "active": 1,
+                    "exit_sent": 0,
+                    "top100_rank": safe_int(entry_metadata.get("top100_rank")),
+                    "top100_score": safe_float(entry_metadata.get("top100_score")),
+                    "top100_source_date": entry_metadata.get("top100_source_date"),
+                    "top100_features_json": entry_metadata.get("top100_features_json"),
+                    "live_entry_score": safe_float(entry_metadata.get("live_entry_score")),
+                    "live_entry_rank": safe_int(entry_metadata.get("live_entry_rank")),
+                    "live_entry_features_json": entry_metadata.get("live_entry_features_json"),
+                    "signal_source": entry_metadata.get("signal_source"),
+                    "signal_time": entry_metadata.get("signal_time"),
+                    "ready_since": entry_metadata.get("ready_since"),
+                    "entry_order_id": entry_metadata.get("entry_order_id"),
+                    "entry_perm_id": entry_metadata.get("entry_perm_id"),
+                    "updated_at": last_event_time,
+                    "raw_json": self._merge_entry_metadata_into_raw(
+                        {
+                            "active": True,
+                            "entry_fill_verified": True,
+                            "entry_time": entry_time,
+                            "entry_price": avg_price,
+                            "market_price": latest_price,
+                            "market_price_at": last_event_time,
+                            "market_price_source": "canonical_fifo_execution_reducer",
+                            "broker_target_quantity": broker_target_qty,
+                            "open_lot_execution_ids": [lot.get("execution_id") for lot in open_lots],
+                        },
+                        entry_metadata,
+                    ),
+                }
+            )
+        else:
+            self.mark_position_flat(symbol=symbol, strategy_name=strategy_name, reason="canonical_fifo_reducer_flat", status="CLOSED", updated_at=last_event_time)
+            if rows:
+                self.upsert_position(
+                    {
+                        "position_key": f"{latest_strategy}:{latest_session}:{symbol}",
+                        "strategy_name": latest_strategy,
+                        "session_date": latest_session,
+                        "symbol": symbol,
+                        "status": "CLOSED",
+                        "quantity": 0,
+                        "avg_price": latest_price,
+                        "source": "canonical_fifo_execution_reducer",
+                        "ibkr_quantity": 0,
+                        "active": 0,
+                        "exit_sent": 0,
+                        "updated_at": last_event_time,
+                        "raw_json": {
+                            "active": False,
+                            "ibkr_position_flat_confirmed": True,
+                            "flat_confirmed_reason": "canonical_fifo_reducer_flat",
+                            "flat_confirmed_at": last_event_time,
+                            "market_price": latest_price,
+                            "market_price_at": last_event_time,
+                            "market_price_source": "canonical_fifo_execution_reducer",
+                        },
+                    }
+                )
+        conservation = self._trade_component_conservation_summary(symbol)
+        return {
+            "symbol": symbol,
+            "closed_trades": len(rebuild.trades),
+            "open_quantity": open_qty,
+            "suppressed_historical_open_quantity": suppressed_qty,
+            "broker_target_quantity": broker_target_qty,
+            "broker_suppressed_open_quantity": broker_suppressed_qty,
+            "open_lot_suppressed": suppressed_qty > 1e-9 or broker_suppressed_qty > 1e-9,
+            "unmatched_sell_quantity": sum(safe_float(row.get("unmatched_sell_quantity")) or 0.0 for row in rebuild.unmatched_sells),
+            "unmatched_sell_count": len(rebuild.unmatched_sells),
+            "trade_components": len(rebuild.components),
+            "conservation": conservation,
+        }
+
     def _delete_duplicate_reconstructed_execution_pair(self, trade_id: str, symbol: str, raw_json: Any, quantity: float | None) -> int:
         raw = parse_jsonish(raw_json)
         buy_exec = str(raw.get("buy_execution_id") or "")
@@ -1982,6 +2520,12 @@ class SQLiteRuntimeStore:
         symbol = str(symbol or "").upper().strip()
         if not symbol:
             return {"symbol": symbol, "closed_trades": 0, "open_quantity": 0.0}
+        return self._rebuild_symbol_trade_state_canonical(
+            symbol,
+            strategy_name,
+            allow_historical_open_lots=allow_historical_open_lots,
+            broker_net_positions=broker_net_positions,
+        )
         strategy_clause = ""
         params: list[Any] = [symbol]
         if strategy_name:
