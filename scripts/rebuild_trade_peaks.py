@@ -456,6 +456,7 @@ def update_trade_peak(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
         {
             "peak_rebuild_status": "rebuilt_from_candles" if row["peak_data_quality"] in VALID_PEAK_QUALITIES else "needs_rebuild",
             "peak_rebuild_version": PEAK_REBUILD_VERSION,
+            "peak_version": PEAK_REBUILD_VERSION,
             "peak_data_quality": row["peak_data_quality"],
             "peak_source": "canonical_trade_candles_1m" if row["peak_data_quality"] in VALID_PEAK_QUALITIES else "unavailable",
             "peak_time": row["peak_time"],
@@ -464,6 +465,7 @@ def update_trade_peak(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
             "peak_validation_status": row["validation_status"],
             "peak_validation_reason": row["validation_reason"],
             "stale_peak_position_key_ignored": True,
+            "peak_calculated_at": datetime.now(timezone.utc).isoformat(),
             "peak_rebuilt_at": datetime.now(timezone.utc).isoformat(),
         }
     )
@@ -550,6 +552,7 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--history-dir", default=str(DEFAULT_HISTORY_DIR))
     parser.add_argument("--session-type", default="RTH")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument("--dry-run", action="store_true", help="Explicit no-op alias; dry-run is the default.")
     parser.add_argument("--apply", action="store_true", help="Apply changes to SQLite. Default is dry-run.")
     return parser
 

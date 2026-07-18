@@ -3409,6 +3409,11 @@ def write_eod_final_status(
             status="FLAT_CONFIRMED",
             updated_at=summary["recorded_at"],
         )
+        safe_sqlite_call(
+            getattr(recorder, "sqlite_store", None),
+            "repair_trade_peaks_needing_rebuild",
+            session_date=getattr(recorder, "session_date", None),
+        )
     safe_sqlite_call(
         getattr(recorder, "sqlite_store", None),
         "record_runtime_event",

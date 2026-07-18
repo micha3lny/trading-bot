@@ -4,7 +4,7 @@ import unittest
 
 import pandas as pd
 
-from scripts.rebuild_trade_peaks import calculate_peak
+from src.live_trading.storage.trade_peak_rebuilder import calculate_peak
 
 
 def candle_rows(rows: list[tuple[str, float, float]]) -> pd.DataFrame:

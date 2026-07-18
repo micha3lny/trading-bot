@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from src.live_trading.storage.canonical_fifo import build_canonical_fifo
+from src.live_trading.storage.trade_peak_rebuilder import (
+    DEFAULT_HISTORY_DIR as DEFAULT_TRADE_PEAK_HISTORY_DIR,
+    DEFAULT_SESSION_TYPE as DEFAULT_TRADE_PEAK_SESSION_TYPE,
+    calculate_and_store_trade_peak as calculate_and_store_trade_peak_on_connection,
+)
 from src.live_trading.unified_logger import append_unified_log, unified_logger_installed
 
 
@@ -28,6 +33,8 @@ SQLITE_WRITER_BEST_EFFORT_TIMEOUT_SECONDS = float(os.environ.get("TRADING_BOT_SQ
 SQLITE_WRITER_JOIN_TIMEOUT_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRITER_JOIN_TIMEOUT_SECONDS", "5.0"))
 SQLITE_WRITER_TIMEOUT_LOG_INTERVAL_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRITER_TIMEOUT_LOG_INTERVAL_SECONDS", "30.0"))
 SQLITE_WRITER_SLOW_WRITE_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRITER_SLOW_WRITE_SECONDS", "5.0"))
+TRADE_PEAK_ASYNC_CALCULATION_ENABLED = os.environ.get("TRADING_BOT_TRADE_PEAK_ASYNC_CALCULATION", "1").strip().lower() not in {"0", "false", "no", "off"}
+TRADE_PEAK_BACKGROUND_DELAY_SECONDS = float(os.environ.get("TRADING_BOT_TRADE_PEAK_BACKGROUND_DELAY_SECONDS", "0.25"))
 SQLITE_WRITER_METHOD_ACK_TIMEOUT_SECONDS = {
     "set_broker_net_positions": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_BROKER_POSITIONS", "8.0")),
     "reconcile_active_positions_to_broker_snapshot": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_RECONCILE", "12.0")),
@@ -415,6 +422,138 @@ class SQLiteRuntimeStore:
 
     def close(self) -> None:
         self.conn.close()
+
+    def calculate_and_store_trade_peak(self, trade_id: str) -> dict[str, Any]:
+        result = calculate_and_store_trade_peak_on_connection(
+            self.conn,
+            trade_id,
+            history_dir=DEFAULT_TRADE_PEAK_HISTORY_DIR,
+            session_type=DEFAULT_TRADE_PEAK_SESSION_TYPE,
+        )
+        return {
+            "trade_id": trade_id,
+            "peak_data_quality": result.peak_data_quality,
+            "validation_status": result.validation_status,
+            "validation_reason": result.validation_reason,
+            "peak_price": result.peak_price,
+            "peak_pct": result.peak_pct,
+        }
+
+    def _calculate_and_store_trade_peak_background(self, trade_id: str) -> None:
+        if TRADE_PEAK_BACKGROUND_DELAY_SECONDS > 0:
+            time.sleep(TRADE_PEAK_BACKGROUND_DELAY_SECONDS)
+        store: SQLiteRuntimeStore | None = None
+        try:
+            store = SQLiteRuntimeStore(self.path, init=False)
+            with store.transaction():
+                result = store.calculate_and_store_trade_peak(trade_id)
+            log_sqlite_line(
+                f"{utc_now_iso()} TRADE_PEAK_CALCULATED trade_id={trade_id} "
+                f"peak_data_quality={result.get('peak_data_quality')} "
+                f"validation_status={result.get('validation_status')}"
+            )
+        except Exception as exc:
+            log_sqlite_line(f"{utc_now_iso()} TRADE_PEAK_CALCULATION_FAILED trade_id={trade_id} error={exc!r}")
+            try:
+                if store is None:
+                    store = SQLiteRuntimeStore(self.path, init=False)
+                with store.transaction():
+                    rows = store.query("SELECT raw_json FROM trades WHERE trade_id = ?", [trade_id])
+                    raw = parse_jsonish(rows[0].get("raw_json")) if rows else {}
+                    raw.update(
+                        {
+                            "peak_rebuild_status": "needs_rebuild",
+                            "peak_data_quality": "NEEDS_REBUILD",
+                            "peak_source": "unavailable",
+                            "peak_version": 2,
+                            "peak_calculated_at": utc_now_iso(),
+                            "peak_error": repr(exc),
+                        }
+                    )
+                    store.execute(
+                        """
+                        UPDATE trades
+                        SET mfe_pct = NULL,
+                            mae_pct = NULL,
+                            peak_price = NULL,
+                            low_price = NULL,
+                            peak_unrealized_pnl = NULL,
+                            max_adverse_unrealized_pnl = NULL,
+                            giveback_from_peak = NULL,
+                            raw_json = ?,
+                            updated_at = ?
+                        WHERE trade_id = ?
+                        """,
+                        [safe_json(raw), utc_now_iso(), trade_id],
+                    )
+            except Exception as mark_exc:
+                log_sqlite_line(f"{utc_now_iso()} TRADE_PEAK_MARK_NEEDS_REBUILD_FAILED trade_id={trade_id} error={mark_exc!r}")
+        finally:
+            if store is not None:
+                store.close()
+
+    def schedule_trade_peak_calculation(self, trade_id: str) -> None:
+        if not TRADE_PEAK_ASYNC_CALCULATION_ENABLED or not trade_id:
+            return
+        thread = threading.Thread(
+            target=self._calculate_and_store_trade_peak_background,
+            args=(trade_id,),
+            name=f"trade-peak-{str(trade_id)[:32]}",
+            daemon=True,
+        )
+        thread.start()
+
+    def repair_trade_peaks_needing_rebuild(self, session_date: str | None = None, *, limit: int | None = None) -> dict[str, Any]:
+        clauses = [
+            "UPPER(COALESCE(status, '')) IN ('CLOSED', 'COMMISSION_PENDING', 'PNL_PENDING')",
+            "entry_fill_time IS NOT NULL",
+            "exit_fill_time IS NOT NULL",
+            "entry_price IS NOT NULL",
+            "exit_price IS NOT NULL",
+            """
+            (
+                raw_json IS NULL
+                OR raw_json NOT LIKE '%"peak_data_quality": "EXACT"%'
+                OR raw_json LIKE '%"peak_data_quality": "PARTIAL"%'
+                OR raw_json LIKE '%"peak_data_quality": "MISSING_CANDLES"%'
+                OR raw_json LIKE '%"peak_data_quality": "OUTSIDE_CANDLE_RANGE"%'
+                OR raw_json LIKE '%"peak_data_quality": "NEEDS_REBUILD"%'
+            )
+            """,
+        ]
+        params: list[Any] = []
+        if session_date:
+            clauses.append("(session_date = ? OR substr(COALESCE(exit_fill_time, closed_at, ''), 1, 10) = ?)")
+            params.extend([session_date, session_date])
+        sql = f"SELECT trade_id FROM trades WHERE {' AND '.join(clauses)} ORDER BY exit_fill_time, trade_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        rows = self.query(sql, params)
+        summary = {"scanned": len(rows), "exact": 0, "partial": 0, "missing": 0, "needs_rebuild": 0, "errors": 0}
+        for row in rows:
+            trade_id = str(row.get("trade_id") or "")
+            if not trade_id:
+                continue
+            try:
+                result = self.calculate_and_store_trade_peak(trade_id)
+                quality = str(result.get("peak_data_quality") or "")
+                if quality == "EXACT":
+                    summary["exact"] += 1
+                elif quality == "PARTIAL":
+                    summary["partial"] += 1
+                elif quality in {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE"}:
+                    summary["missing"] += 1
+                else:
+                    summary["needs_rebuild"] += 1
+            except Exception:
+                summary["errors"] += 1
+        log_sqlite_line(
+            f"{utc_now_iso()} TRADE_PEAK_EOD_REPAIR_DONE session_date={session_date or ''} "
+            f"scanned={summary['scanned']} exact={summary['exact']} partial={summary['partial']} "
+            f"missing={summary['missing']} needs_rebuild={summary['needs_rebuild']} errors={summary['errors']}"
+        )
+        return summary
 
     def set_broker_net_positions(self, positions: dict[str, float] | None) -> None:
         if positions is None:
@@ -2040,6 +2179,7 @@ class SQLiteRuntimeStore:
             latest_price = safe_float(last_row.get("price"))
 
         execution_trade_ids: dict[str, set[str]] = {}
+        peak_trade_ids_to_schedule: list[str] = []
         for trade in rebuild.trades:
             entry_metadata = self._entry_metadata_for_canonical_trade(trade, rows_by_id)
             persist_trade_id = self._canonical_persist_trade_id(trade, rows_by_id)
@@ -2105,6 +2245,8 @@ class SQLiteRuntimeStore:
                     execution_trade_ids.setdefault(component.buy_execution_id, set()).add(component.trade_id)
                 if component.sell_execution_id:
                     execution_trade_ids.setdefault(component.sell_execution_id, set()).add(component.trade_id)
+            if trade_status in {"CLOSED", "COMMISSION_PENDING", "PNL_PENDING"}:
+                peak_trade_ids_to_schedule.append(persist_trade_id)
         for execution_id, trade_ids in execution_trade_ids.items():
             if len(trade_ids) == 1:
                 self.execute("UPDATE executions SET trade_id = ? WHERE execution_id = ?", [next(iter(trade_ids)), execution_id])
@@ -2114,6 +2256,8 @@ class SQLiteRuntimeStore:
                 raw["multi_trade_component"] = True
                 raw["trade_component_trade_ids"] = sorted(trade_ids)
                 self.execute("UPDATE executions SET trade_id = NULL, raw_json = ? WHERE execution_id = ?", [safe_json(raw), execution_id])
+        for peak_trade_id in peak_trade_ids_to_schedule:
+            self.schedule_trade_peak_calculation(peak_trade_id)
 
         today = session_date_utc()
         open_lots = [
