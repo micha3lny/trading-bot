@@ -912,7 +912,7 @@ def closed_normal_mask(df: pd.DataFrame) -> pd.Series:
 def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     cols = [
         "symbol", "entry_date", "exit_date", "qty", "ibkr_commission", "commission_status", "buy", "sell", "gross", "net_actual", "net_pct", "peak_pct",
-        "mae_pct", "peak_price", "low_price", "peak_unrealized_pnl", "max_adverse_unrealized_pnl",
+        "mae_pct", "peak_price", "peak_data_quality", "low_price", "peak_unrealized_pnl", "max_adverse_unrealized_pnl",
         "giveback_from_peak", "drop_from_peak_pct", "top100_rank", "top100_score",
         "live_entry_score", "live_entry_rank", "entry_order_id", "entry_perm_id",
         "metadata_attribution_source", "metadata_attribution_confidence", "metadata_attribution_warning",
@@ -959,6 +959,7 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
             "peak_pct": "Peak %",
             "mae_pct": "MAE %",
             "peak_price": "Peak Price",
+            "peak_data_quality": "Peak Quality",
             "low_price": "Low Price",
             "peak_unrealized_pnl": "Peak UPNL",
             "max_adverse_unrealized_pnl": "Max Adverse UPNL",
@@ -988,7 +989,7 @@ def format_closed_positions(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     )
     display_cols = [
         "Symbol", "Quantity", "IBKR Comm", "Commission Status", "Buy", "Sell", "Gross", "Net", "Net %",
-        "Peak %", "Drop from Peak %", "Top100 Rank", "Top100 Score",
+        "Peak %", "Peak Quality", "Drop from Peak %", "Top100 Rank", "Top100 Score",
         "Live Entry Score", "Live Entry Rank", "Entry Order ID", "Entry Perm ID",
         "Metadata Attribution Source", "Metadata Attribution Confidence", "Metadata Attribution Warning",
         "Min", "Exit Reason", "Exit Reason Source",

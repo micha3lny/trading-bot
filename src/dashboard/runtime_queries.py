@@ -397,6 +397,7 @@ def aggregate_closed_positions(df: pd.DataFrame) -> pd.DataFrame:
         hold = hold_minutes(min(entry_times) if entry_times else None, max(exit_times) if exit_times else None)
         first = records[0]
         qualities = sorted({str(x) for x in group.get("data_quality", pd.Series(dtype=str)).dropna().tolist() if str(x)})
+        peak_qualities = sorted({str(x) for x in group.get("peak_data_quality", pd.Series(dtype=str)).dropna().tolist() if str(x)})
         statuses = sorted({str(x) for x in group.get("commission_status", pd.Series(dtype=str)).dropna().tolist() if str(x)})
         rows.append(
             {
@@ -417,6 +418,7 @@ def aggregate_closed_positions(df: pd.DataFrame) -> pd.DataFrame:
                 "max_adverse_unrealized_pnl": max_adverse_upnl if pd.notna(max_adverse_upnl) else None,
                 "giveback_from_peak": giveback if pd.notna(giveback) else None,
                 "drop_from_peak_pct": drop if pd.notna(drop) else None,
+                "peak_data_quality": "; ".join(peak_qualities) if peak_qualities else first.get("peak_data_quality"),
                 "hold_minutes": hold,
                 "entry_time": min(entry_times) if entry_times else first.get("entry_time"),
                 "exit_time": max(exit_times) if exit_times else first.get("exit_time"),
@@ -1981,6 +1983,7 @@ def closed_from_trades(
     peak_values: list[float | None] = []
     peak_sources: list[str] = []
     peak_match_qualities: list[str] = []
+    peak_data_qualities: list[str] = []
     drop_values: list[float | None] = []
     entry_execution_counts: list[int] = []
     exit_execution_counts: list[int] = []
@@ -2123,8 +2126,16 @@ def closed_from_trades(
             commission_status = "OK"
         else:
             commission_status = "MISSING"
+        peak_quality = str(raw.get("peak_data_quality") or "").upper()
+        canonical_peak_source = str(raw.get("peak_source") or "").lower() == "canonical_trade_candles_1m" or raw.get("peak_rebuild_version") is not None
         peak_pct, peak_source = peak_from_sources(enriched_row, runtime_peak_map, lifecycle_peak_map, candle_rows)
-        if peak_pct is None:
+        if canonical_peak_source and peak_quality not in {"EXACT", "PARTIAL"}:
+            peak_pct = None
+            peak_source = "canonical_peak_unavailable"
+        if peak_quality in {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"}:
+            peak_pct = None
+            peak_source = "canonical_peak_unavailable"
+        if peak_pct is None and not canonical_peak_source and peak_quality not in {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"}:
             peak_fallback = trade_raw_peak_by_symbol_session.get(
                 (
                     str(row.get("session_date") or ""),
@@ -2135,8 +2146,12 @@ def closed_from_trades(
             if peak_fallback is not None:
                 peak_pct, peak_source = peak_fallback
         drop_from_peak = to_float(raw.get("drop_from_peak_pct"), None)
+        if peak_pct is None or peak_quality in {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"}:
+            drop_from_peak = None
         if drop_from_peak is None:
             drop_from_peak = to_float(raw.get("giveback_pct"), None)
+        if peak_pct is None or peak_quality in {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"}:
+            drop_from_peak = None
         commissions.append(commission)
         commission_statuses.append(commission_status)
         data_quality.append(quality_label(flags, commission_status))
@@ -2144,7 +2159,8 @@ def closed_from_trades(
         exit_times.append(exit_time)
         peak_values.append(peak_pct)
         peak_sources.append(peak_source)
-        peak_match_qualities.append("exact_trade_id" if peak_source != "missing" else "missing")
+        peak_match_qualities.append("exact_trade_id" if peak_source not in {"missing", "canonical_peak_unavailable"} else "missing")
+        peak_data_qualities.append(peak_quality or ("EXACT" if peak_pct is not None else "NEEDS_REBUILD"))
         drop_values.append(drop_from_peak)
         entry_execution_counts.append(int(raw.get("entry_execution_count") or raw.get("buy_execution_count") or 0))
         exit_execution_counts.append(int(raw.get("exit_execution_count") or raw.get("sell_execution_count") or 0))
@@ -2208,6 +2224,7 @@ def closed_from_trades(
             out[excursion_col] = pd.to_numeric(out[excursion_col], errors="coerce")
     out["peak_source"] = peak_sources
     out["peak_match_quality"] = peak_match_qualities
+    out["peak_data_quality"] = peak_data_qualities
     out["drop_from_peak_pct"] = drop_values
     out["entry_execution_count"] = entry_execution_counts
     out["exit_execution_count"] = exit_execution_counts
@@ -2241,6 +2258,10 @@ def closed_from_trades(
     out["sell"] = pd.to_numeric(out["sell"], errors="coerce").fillna(0.0)
     out["qty"] = pd.to_numeric(out["qty"], errors="coerce").fillna(0.0)
     out["peak_pct"] = pd.to_numeric(out["peak_pct"], errors="coerce")
+    peak_quality_series = out["peak_data_quality"].fillna("").astype(str).str.upper()
+    invalid_peak_mask = peak_quality_series.isin({"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"})
+    if invalid_peak_mask.any():
+        out.loc[invalid_peak_mask, ["peak_pct", "peak_price", "low_price", "peak_unrealized_pnl", "max_adverse_unrealized_pnl", "giveback_from_peak", "drop_from_peak_pct"]] = pd.NA
     persisted_net = pd.to_numeric(out.get("persisted_net_pnl"), errors="coerce")
     out["net_actual"] = persisted_net.fillna(out["gross"] - out["ibkr_commission"])
     untrusted_mask = ~pd.Series(out["runtime_pnl_trusted"]).fillna(True).astype(bool)
@@ -2254,6 +2275,8 @@ def closed_from_trades(
     out["pnl_pct"] = out["net_pct"]
     fallback_drop = out["net_pct"].fillna(0.0) - out["peak_pct"]
     out["drop_from_peak_pct"] = pd.to_numeric(out["drop_from_peak_pct"], errors="coerce").fillna(fallback_drop)
+    if invalid_peak_mask.any():
+        out.loc[invalid_peak_mask, "drop_from_peak_pct"] = pd.NA
     out["hold_minutes"] = [hold_minutes(a, b or c) for a, b, c in zip(out["entry_time"], out["exit_time"], out["closed_at"])]
     reconstructed_mask = (
         out["trade_id"].fillna("").astype(str).str.startswith("reconstructed:")
@@ -2296,7 +2319,7 @@ def closed_from_trades(
             "entry_date", "exit_date", "carried_closed_today",
             "runtime_pnl_trusted", "runtime_pnl_untrusted_reason",
             "entry_execution_count", "exit_execution_count", "confirmed_commission_execution_count",
-            "expected_commission_execution_count", "peak_source", "peak_match_quality", "commission_source_detail",
+            "expected_commission_execution_count", "peak_source", "peak_match_quality", "peak_data_quality", "commission_source_detail",
             "entry_execution_id", "exit_execution_id", "exit_reason_source", "matched_event_type",
             "matched_event_time", "matched_order_id", "source", "closed_source",
             "metadata_attribution_source", "metadata_attribution_confidence", "metadata_attribution_warning",
@@ -2447,6 +2470,7 @@ def closed_from_execution_realized_pnl(
                 "exit_execution_id": ", ".join(str(x) for x in group.loc[sell_mask, "execution_id"].dropna().tolist() if str(x)),
                 "peak_source": metadata.get("peak_source") or "missing",
                 "peak_match_quality": metadata.get("peak_match_quality") or "missing",
+                "peak_data_quality": metadata.get("peak_data_quality") or "NEEDS_REBUILD",
             }
         )
     if not rows:

@@ -1305,6 +1305,57 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(closed["peak_source"], "missing")
             self.assertEqual(snapshot["data_quality_summary"]["peak_missing"], 1)
 
+    def test_canonical_peak_needs_rebuild_does_not_display_zero_as_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            store.upsert_trade({
+                "trade_id": "canonical:ZEROPEAK",
+                "session_date": "2026-05-27",
+                "strategy_name": "v67",
+                "symbol": "ZEROPEAK",
+                "status": "CLOSED",
+                "entry_fill_time": "2026-05-27T13:30:00+00:00",
+                "exit_fill_time": "2026-05-27T13:40:00+00:00",
+                "entry_price": 10,
+                "exit_price": 11,
+                "quantity": 1,
+                "gross_pnl": 1,
+                "mfe_pct": 0,
+                "peak_price": 0,
+                "raw_json": {
+                    "peak_rebuild_status": "needs_rebuild",
+                    "peak_data_quality": "NEEDS_REBUILD",
+                    "peak_source": "unavailable",
+                },
+            })
+            for execution_id, side, price, ts in [
+                ("B_ZEROPEAK", "BOT", 10, "2026-05-27T13:30:00+00:00"),
+                ("S_ZEROPEAK", "SLD", 11, "2026-05-27T13:40:00+00:00"),
+            ]:
+                self.insert_execution_direct(store, {
+                    "execution_id": execution_id,
+                    "trade_id": "canonical:ZEROPEAK",
+                    "session_date": "2026-05-27",
+                    "strategy_name": "v67",
+                    "symbol": "ZEROPEAK",
+                    "side": side,
+                    "quantity": 1,
+                    "price": price,
+                    "commission": 0.1,
+                    "commission_source": "ibkr",
+                    "recorded_at": ts,
+                })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-05-27", "2026-05-27"), "v67")
+            closed = snapshot["closed_positions"].iloc[0]
+
+            self.assertTrue(closed["peak_pct"] != closed["peak_pct"])
+            self.assertTrue(closed["drop_from_peak_pct"] != closed["drop_from_peak_pct"])
+            self.assertEqual(closed["peak_source"], "canonical_peak_unavailable")
+            self.assertEqual(closed["peak_data_quality"], "NEEDS_REBUILD")
+
     def test_missing_entry_time_does_not_reuse_exit_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "runtime.sqlite"
