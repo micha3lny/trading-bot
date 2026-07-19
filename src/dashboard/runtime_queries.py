@@ -441,6 +441,7 @@ def aggregate_closed_positions(df: pd.DataFrame) -> pd.DataFrame:
 
 INVALID_CANONICAL_PEAK_QUALITIES = {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"}
 VALID_CANONICAL_PEAK_QUALITIES = {"EXACT", "PARTIAL"}
+PEAK_ALGEBRA_TOLERANCE_PCT = 0.05
 
 
 def mask_untrusted_peak_values(closed: pd.DataFrame) -> pd.DataFrame:
@@ -477,6 +478,37 @@ def mask_untrusted_peak_values(closed: pd.DataFrame) -> pd.DataFrame:
             out.loc[profitable_peak_invalid, "peak_source"] = "canonical_peak_validation_failed"
             out.loc[profitable_peak_invalid, "peak_match_quality"] = "missing"
             out.loc[profitable_peak_invalid, available_peak_cols] = pd.NA
+    if {"buy", "sell", "peak_price", "peak_pct", "drop_from_peak_pct"}.issubset(out.columns):
+        buy = pd.to_numeric(out["buy"], errors="coerce")
+        sell = pd.to_numeric(out["sell"], errors="coerce")
+        peak_price = pd.to_numeric(out["peak_price"], errors="coerce")
+        peak_pct = pd.to_numeric(out["peak_pct"], errors="coerce")
+        drop_pct = pd.to_numeric(out["drop_from_peak_pct"], errors="coerce")
+        gross_return_pct = ((sell / buy) - 1.0) * 100.0
+        calculated_peak_pct = ((peak_price / buy) - 1.0) * 100.0
+        calculated_drop_pct = ((sell / peak_price) - 1.0) * 100.0
+        valid_quality = peak_quality.isin(VALID_CANONICAL_PEAK_QUALITIES)
+        algebra_invalid = (
+            valid_quality
+            & buy.gt(0)
+            & peak_price.gt(0)
+            & peak_pct.notna()
+            & drop_pct.notna()
+            & (
+                (peak_pct - calculated_peak_pct).abs().gt(PEAK_ALGEBRA_TOLERANCE_PCT)
+                | (drop_pct - calculated_drop_pct).abs().gt(PEAK_ALGEBRA_TOLERANCE_PCT)
+                | (
+                    peak_pct.abs().le(PEAK_ALGEBRA_TOLERANCE_PCT)
+                    & gross_return_pct.notna()
+                    & (drop_pct - gross_return_pct).abs().gt(PEAK_ALGEBRA_TOLERANCE_PCT)
+                )
+            )
+        )
+        if algebra_invalid.any():
+            out.loc[algebra_invalid, "peak_data_quality"] = "NEEDS_REBUILD"
+            out.loc[algebra_invalid, "peak_source"] = "canonical_peak_validation_failed"
+            out.loc[algebra_invalid, "peak_match_quality"] = "missing"
+            out.loc[algebra_invalid, available_peak_cols] = pd.NA
     return out
 
 

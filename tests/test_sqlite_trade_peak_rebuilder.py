@@ -112,6 +112,50 @@ class SQLiteTradePeakRebuilderTests(unittest.TestCase):
                 sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED = previous_async
                 sqlite_store_module.DEFAULT_TRADE_PEAK_HISTORY_DIR = previous_history
 
+    def test_canonical_peak_rebuild_removes_stale_raw_peak_fields(self) -> None:
+        previous_async = sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED
+        previous_history = sqlite_store_module.DEFAULT_TRADE_PEAK_HISTORY_DIR
+        sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED = False
+        with tempfile.TemporaryDirectory() as tmp:
+            history_dir = Path(tmp) / "history"
+            sqlite_store_module.DEFAULT_TRADE_PEAK_HISTORY_DIR = history_dir
+            write_history(
+                history_dir,
+                "RAWPEAK",
+                "2026-07-16",
+                [
+                    ("2026-07-16T13:30:00+00:00", 10.0, 9.8),
+                    ("2026-07-16T13:31:00+00:00", 10.0, 9.6),
+                ],
+            )
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                add_execution(store, "B1", "BOT", 10, 10, "2026-07-16T13:30:00+00:00", symbol="RAWPEAK")
+                add_execution(store, "S1", "SLD", 10, 9.9, "2026-07-16T13:31:00+00:00", symbol="RAWPEAK", realized_pnl=-1)
+                trade = store.query("SELECT trade_id FROM trades WHERE symbol = 'RAWPEAK' AND status = 'CLOSED'")[0]
+                store.execute(
+                    "UPDATE trades SET raw_json = ? WHERE trade_id = ?",
+                    [
+                        json.dumps({"peak_gain_pct": 0.0, "drop_from_peak_pct": -29.0, "giveback_pct": -29.0, "peak_position_key": "stale"}),
+                        trade["trade_id"],
+                    ],
+                )
+
+                store.calculate_and_store_trade_peak(trade["trade_id"])
+                row = store.query("SELECT mfe_pct, peak_price, giveback_from_peak, raw_json FROM trades WHERE trade_id = ?", [trade["trade_id"]])[0]
+                raw = json.loads(row["raw_json"])
+
+                self.assertAlmostEqual(row["mfe_pct"], 0.0)
+                self.assertAlmostEqual(row["peak_price"], 10.0)
+                self.assertAlmostEqual(raw["drop_from_peak_pct"], -1.0)
+                self.assertNotIn("giveback_pct", raw)
+                self.assertNotIn("peak_gain_pct", raw)
+                self.assertNotIn("peak_position_key", raw)
+            finally:
+                store.close()
+                sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED = previous_async
+                sqlite_store_module.DEFAULT_TRADE_PEAK_HISTORY_DIR = previous_history
+
 
 if __name__ == "__main__":
     unittest.main()

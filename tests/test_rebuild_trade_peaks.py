@@ -43,7 +43,7 @@ class RebuildTradePeaksTests(unittest.TestCase):
         )
 
         self.assertEqual(result.peak_data_quality, "EXACT")
-        self.assertEqual(result.validation_status, "OK")
+        self.assertEqual(result.validation_status, "VALID")
         self.assertAlmostEqual(result.peak_price or 0, 10.8)
         self.assertGreaterEqual(result.peak_pct or 0, 6.1986)
         self.assertAlmostEqual(result.giveback_usd or 0, (10.8 - 10.61986) * 100)
@@ -60,11 +60,11 @@ class RebuildTradePeaksTests(unittest.TestCase):
             trade=trade("FBYD", "2026-07-16T14:00:00+00:00", "2026-07-16T14:02:00+00:00", 20.0, 19.4, qty=10),
         )
 
-        self.assertEqual(result.validation_status, "OK")
+        self.assertEqual(result.validation_status, "VALID")
         self.assertGreater(result.peak_pct or 0, 0)
         self.assertLess(result.drop_from_peak_pct or 0, 0)
 
-    def test_losing_trade_that_never_crossed_entry_can_have_negative_peak_pct(self) -> None:
+    def test_losing_trade_that_never_crossed_entry_has_zero_peak_and_drop_equals_gross_return(self) -> None:
         result = calculate_peak(
             candle_rows(
                 [
@@ -75,8 +75,30 @@ class RebuildTradePeaksTests(unittest.TestCase):
             trade=trade("VELO", "2026-07-16T15:00:00+00:00", "2026-07-16T15:01:00+00:00", 10.0, 9.7),
         )
 
-        self.assertEqual(result.validation_status, "OK")
-        self.assertLess(result.peak_pct or 0, 0)
+        self.assertEqual(result.validation_status, "VALID")
+        self.assertAlmostEqual(result.peak_price or 0, 10.0)
+        self.assertIsNotNone(result.peak_pct)
+        self.assertAlmostEqual(result.peak_pct, 0.0)
+        self.assertAlmostEqual(result.drop_from_peak_pct or 0, -3.0)
+
+    def test_zero_peak_losing_trade_examples_have_consistent_drop(self) -> None:
+        for symbol, exit_price in [("VELO", 9.969), ("FBYD", 9.837), ("WDC", 9.422), ("STX", 9.35)]:
+            with self.subTest(symbol=symbol):
+                result = calculate_peak(
+                    candle_rows(
+                        [
+                            ("2026-07-16T15:00:00+00:00", 9.99, 9.70),
+                            ("2026-07-16T15:01:00+00:00", 9.98, 9.30),
+                        ]
+                    ),
+                    trade=trade(symbol, "2026-07-16T15:00:00+00:00", "2026-07-16T15:01:00+00:00", 10.0, exit_price),
+                )
+
+                expected_gross_return = (exit_price / 10.0 - 1.0) * 100.0
+                self.assertEqual(result.validation_status, "VALID")
+                self.assertIsNotNone(result.peak_pct)
+                self.assertAlmostEqual(result.peak_pct, 0.0)
+                self.assertAlmostEqual(result.drop_from_peak_pct or 0, expected_gross_return)
 
     def test_partial_exit_trade_uses_canonical_quantity_for_giveback(self) -> None:
         result = calculate_peak(
@@ -90,7 +112,7 @@ class RebuildTradePeaksTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(result.giveback_usd or 0, (7.10 - 6.85) * 156)
-        self.assertEqual(result.validation_status, "OK")
+        self.assertEqual(result.validation_status, "VALID")
 
     def test_multiple_trades_same_symbol_same_day_have_separate_windows(self) -> None:
         candles = candle_rows(
@@ -132,7 +154,7 @@ class RebuildTradePeaksTests(unittest.TestCase):
         )
 
         self.assertEqual(result.peak_data_quality, "EXACT")
-        self.assertEqual(result.validation_status, "OK")
+        self.assertEqual(result.validation_status, "VALID")
 
     def test_grrr_drop_from_peak_uses_same_window_peak(self) -> None:
         result = calculate_peak(
@@ -148,7 +170,27 @@ class RebuildTradePeaksTests(unittest.TestCase):
 
         self.assertAlmostEqual(result.peak_price or 0, 17.8)
         self.assertLess(result.drop_from_peak_pct or 0, -40.0)
-        self.assertEqual(result.validation_status, "OK")
+        self.assertEqual(result.validation_status, "VALID")
+
+    def test_algebra_mismatch_marks_peak_invalid(self) -> None:
+        from src.live_trading.storage.trade_peak_rebuilder import validate_peak
+
+        status, reason = validate_peak(
+            entry_time=pd.Timestamp("2026-07-16T13:30:00Z"),
+            exit_time=pd.Timestamp("2026-07-16T13:32:00Z"),
+            entry_price=10.0,
+            exit_price=9.9,
+            peak_price=10.0,
+            peak_time=pd.Timestamp("2026-07-16T13:30:00Z"),
+            peak_pct=0.0,
+            drop_from_peak_pct=-29.0,
+            giveback_usd=10.0,
+            gross_return_pct=-1.0,
+        )
+
+        self.assertEqual(status, "INVALID")
+        self.assertIn("PEAK_DROP_ALGEBRA_MISMATCH", reason)
+        self.assertIn("PEAK_ZERO_DROP_INCONSISTENT", reason)
 
 
 if __name__ == "__main__":

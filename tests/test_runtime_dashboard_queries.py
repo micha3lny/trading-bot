@@ -1380,6 +1380,32 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
         self.assertTrue(out.iloc[0]["drop_from_peak_pct"] != out.iloc[0]["drop_from_peak_pct"])
         self.assertEqual(out.iloc[0]["peak_data_quality"], "NEEDS_REBUILD")
 
+    def test_exact_peak_with_zero_peak_and_stale_drop_is_masked(self) -> None:
+        closed = pd.DataFrame([
+            {
+                "symbol": "VELO",
+                "session_date": "2026-07-16",
+                "strategy": "v67",
+                "buy": 10.0,
+                "sell": 9.97,
+                "net_pct": -0.31,
+                "peak_price": 10.0,
+                "peak_pct": 0.0,
+                "drop_from_peak_pct": -29.03,
+                "peak_data_quality": "EXACT",
+                "peak_source": "canonical_trade_candles_1m",
+                "peak_match_quality": "exact_trade_id",
+            }
+        ])
+
+        from src.dashboard.runtime_queries import mask_untrusted_peak_values
+
+        out = mask_untrusted_peak_values(closed)
+
+        self.assertEqual(out.iloc[0]["peak_data_quality"], "NEEDS_REBUILD")
+        self.assertTrue(out.iloc[0]["peak_pct"] != out.iloc[0]["peak_pct"])
+        self.assertTrue(out.iloc[0]["drop_from_peak_pct"] != out.iloc[0]["drop_from_peak_pct"])
+
     def test_aggregate_closed_positions_masks_invalid_peak_quality(self) -> None:
         closed = pd.DataFrame([
             {

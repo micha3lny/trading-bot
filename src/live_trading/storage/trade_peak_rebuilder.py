@@ -15,6 +15,7 @@ DEFAULT_SESSION_TYPE = os.environ.get("TRADING_BOT_TRADE_PEAK_SESSION_TYPE", "RT
 PEAK_VERSION = 2
 VALID_PEAK_QUALITIES = {"EXACT", "PARTIAL"}
 MISSING_PEAK_QUALITIES = {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"}
+PEAK_VALIDATION_TOLERANCE_PCT = 0.05
 
 
 @dataclass(frozen=True)
@@ -156,7 +157,7 @@ def validate_peak(
     if peak_price is None:
         if peak_pct is not None or drop_from_peak_pct is not None or giveback_usd is not None:
             reasons.append("null_peak_has_non_null_derived_values")
-        return ("OK" if not reasons else "FAIL", ";".join(reasons))
+        return ("VALID" if not reasons else "INVALID", ";".join(reasons))
     if peak_time is None:
         reasons.append("missing_peak_time")
     else:
@@ -164,14 +165,35 @@ def validate_peak(
             reasons.append("peak_time_before_entry")
         if peak_time > exit_time:
             reasons.append("peak_time_after_exit")
+    expected_peak_pct = pct(peak_price, entry_price)
+    expected_drop_from_peak_pct = pct(exit_price, peak_price)
+    if peak_pct is None or expected_peak_pct is None or abs(float(peak_pct) - float(expected_peak_pct)) > PEAK_VALIDATION_TOLERANCE_PCT:
+        reasons.append("PEAK_DROP_ALGEBRA_MISMATCH")
+    if (
+        drop_from_peak_pct is None
+        or expected_drop_from_peak_pct is None
+        or abs(float(drop_from_peak_pct) - float(expected_drop_from_peak_pct)) > PEAK_VALIDATION_TOLERANCE_PCT
+    ):
+        reasons.append("PEAK_DROP_ALGEBRA_MISMATCH")
+    if (
+        peak_pct is not None
+        and gross_return_pct is not None
+        and abs(float(peak_pct)) <= PEAK_VALIDATION_TOLERANCE_PCT
+        and drop_from_peak_pct is not None
+        and abs(float(drop_from_peak_pct) - float(gross_return_pct)) > PEAK_VALIDATION_TOLERANCE_PCT
+    ):
+        reasons.append("PEAK_ZERO_DROP_INCONSISTENT")
     if gross_return_pct is not None and gross_return_pct > 0:
         if peak_pct is None or peak_pct + 0.01 < gross_return_pct:
             reasons.append("profitable_long_peak_pct_below_gross_return")
         if peak_price + 1e-9 < entry_price:
             reasons.append("profitable_long_peak_price_below_entry")
+    if peak_price + 1e-9 < entry_price:
+        reasons.append("long_peak_price_below_entry_floor")
     if peak_price == 0:
         reasons.append("zero_peak_price_is_not_missing_data")
-    return ("OK" if not reasons else "FAIL", ";".join(reasons))
+    unique_reasons = sorted(set(reasons))
+    return ("VALID" if not unique_reasons else "INVALID", ";".join(unique_reasons))
 
 
 def calculate_peak(candles: pd.DataFrame, *, trade: dict[str, Any]) -> PeakResult:
@@ -202,10 +224,19 @@ def calculate_peak(candles: pd.DataFrame, *, trade: dict[str, Any]) -> PeakResul
     quality = "EXACT" if min_ts <= entry_time and max_ts >= exit_time and len(window) >= expected else "PARTIAL"
     peak_idx = pd.to_numeric(window["high"], errors="coerce").idxmax()
     low_idx = pd.to_numeric(window["low"], errors="coerce").idxmin()
-    peak_price = fnum(window.loc[peak_idx, "high"])
+    raw_peak_price = fnum(window.loc[peak_idx, "high"])
     low_price = fnum(window.loc[low_idx, "low"])
-    peak_time = parse_dt(window.loc[peak_idx, "timestamp"])
+    raw_peak_time = parse_dt(window.loc[peak_idx, "timestamp"])
     low_time = parse_dt(window.loc[low_idx, "timestamp"])
+    if raw_peak_price is None:
+        peak_price = None
+        peak_time = None
+    elif raw_peak_price < entry_price:
+        peak_price = entry_price
+        peak_time = entry_time
+    else:
+        peak_price = raw_peak_price
+        peak_time = raw_peak_time
     peak_pct = pct(peak_price, entry_price)
     mae_pct = pct(low_price, entry_price)
     drop_from_peak = pct(exit_price, peak_price)
@@ -224,6 +255,8 @@ def calculate_peak(candles: pd.DataFrame, *, trade: dict[str, Any]) -> PeakResul
         giveback_usd=giveback_usd,
         gross_return_pct=gross_return_pct,
     )
+    if validation_status != "VALID":
+        quality = "NEEDS_REBUILD"
     return PeakResult(
         peak_price=peak_price,
         peak_time=iso_ts(peak_time),
@@ -255,17 +288,21 @@ def calculate_peak_for_trade(trade: dict[str, Any], *, history_dir: Path = DEFAU
 
 
 def peak_raw_payload(result: PeakResult) -> dict[str, Any]:
+    peak_ok = result.peak_data_quality in VALID_PEAK_QUALITIES and result.validation_status == "VALID"
     return {
         "peak_rebuild_status": "rebuilt_from_candles" if result.peak_data_quality in VALID_PEAK_QUALITIES else "needs_rebuild",
         "peak_data_quality": result.peak_data_quality,
-        "peak_source": "canonical_trade_candles_1m" if result.peak_data_quality in VALID_PEAK_QUALITIES else "unavailable",
+        "peak_source": "canonical_trade_candles_1m" if peak_ok else "unavailable",
         "peak_version": PEAK_VERSION,
         "peak_rebuild_version": PEAK_VERSION,
         "peak_calculated_at": datetime.now(timezone.utc).isoformat(),
-        "peak_time": result.peak_time,
-        "low_time": result.low_time,
-        "drop_from_peak_pct": result.drop_from_peak_pct,
-        "giveback_usd": result.giveback_usd,
+        "peak_time": result.peak_time if peak_ok else "",
+        "low_time": result.low_time if peak_ok else "",
+        "peak_pct": result.peak_pct if peak_ok else None,
+        "mfe_pct": result.peak_pct if peak_ok else None,
+        "mae_pct": result.mae_pct if peak_ok else None,
+        "drop_from_peak_pct": result.drop_from_peak_pct if peak_ok else None,
+        "giveback_usd": result.giveback_usd if peak_ok else None,
         "peak_validation_status": result.validation_status,
         "peak_validation_reason": result.validation_reason,
         "stale_peak_position_key_ignored": True,
@@ -275,8 +312,17 @@ def peak_raw_payload(result: PeakResult) -> dict[str, Any]:
 def update_trade_peak(conn: sqlite3.Connection, trade_id: str, result: PeakResult) -> None:
     row = conn.execute("SELECT raw_json FROM trades WHERE trade_id = ?", (trade_id,)).fetchone()
     raw = parse_raw_json(row["raw_json"] if row else None)
+    for key in (
+        "peak_gain_pct",
+        "max_gain_pct",
+        "peak_unrealized_pct",
+        "giveback_pct",
+        "peak_position_key",
+        "position_key",
+    ):
+        raw.pop(key, None)
     raw.update(peak_raw_payload(result))
-    peak_ok = result.peak_data_quality in VALID_PEAK_QUALITIES
+    peak_ok = result.peak_data_quality in VALID_PEAK_QUALITIES and result.validation_status == "VALID"
     conn.execute(
         """
         UPDATE trades
@@ -309,6 +355,20 @@ def update_trade_peak(conn: sqlite3.Connection, trade_id: str, result: PeakResul
 def mark_trade_peak_needs_rebuild(conn: sqlite3.Connection, trade_id: str, reason: str) -> None:
     row = conn.execute("SELECT raw_json FROM trades WHERE trade_id = ?", (trade_id,)).fetchone()
     raw = parse_raw_json(row["raw_json"] if row else None)
+    for key in (
+        "peak_gain_pct",
+        "max_gain_pct",
+        "peak_unrealized_pct",
+        "giveback_pct",
+        "peak_position_key",
+        "position_key",
+        "peak_pct",
+        "mfe_pct",
+        "mae_pct",
+        "drop_from_peak_pct",
+        "giveback_usd",
+    ):
+        raw.pop(key, None)
     raw.update(
         {
             "peak_rebuild_status": "needs_rebuild",
