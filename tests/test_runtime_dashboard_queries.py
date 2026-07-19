@@ -3419,5 +3419,61 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertEqual(snapshot["diagnostics"]["runtime_closed_source"], "executions_realized_pnl")
 
 
+    def test_closed_positions_include_only_finalized_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            for symbol, status, raw_json in [
+                ("CLOSEDOK", "CLOSED", {"peak_data_quality": "EXACT", "peak_source": "canonical_trade_candles_1m", "drop_from_peak_pct": -1.0}),
+                ("COMMPEND", "COMMISSION_PENDING", {"peak_data_quality": "EXACT", "peak_source": "canonical_trade_candles_1m", "drop_from_peak_pct": -1.0}),
+                ("PNLPEND", "PNL_PENDING", {"peak_data_quality": "EXACT", "peak_source": "canonical_trade_candles_1m", "drop_from_peak_pct": -1.0}),
+                ("REBUILD", "CLOSED", {"peak_data_quality": "NEEDS_REBUILD", "peak_source": "unavailable"}),
+            ]:
+                store.upsert_trade({
+                    "trade_id": f"T_{symbol}",
+                    "session_date": "2026-07-16",
+                    "strategy_name": "v67",
+                    "symbol": symbol,
+                    "status": status,
+                    "entry_fill_time": "2026-07-16T13:30:00+00:00",
+                    "exit_fill_time": "2026-07-16T13:40:00+00:00",
+                    "entry_price": 10,
+                    "exit_price": 9.9,
+                    "quantity": 1,
+                    "gross_pnl": -0.1,
+                    "commission": 0.01,
+                    "net_pnl": -0.11,
+                    "mfe_pct": 0,
+                    "peak_price": 10,
+                    "giveback_from_peak": 0.1,
+                    "raw_json": raw_json,
+                })
+            store.upsert_trade({
+                "trade_id": "T_ENTRY_PENDING_PLACEHOLDER",
+                "session_date": "2026-07-16",
+                "strategy_name": "v67",
+                "symbol": "ENTRYPEND",
+                "status": "ENTRY_PENDING",
+                "entry_price": 10,
+                "quantity": 1,
+                "mfe_pct": 0,
+                "raw_json": {},
+            })
+            store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow("2026-07-16", "2026-07-16"), "v67")
+            closed = snapshot["closed_positions"].sort_values("symbol").reset_index(drop=True)
+
+            self.assertEqual(set(closed["symbol"].tolist()), {"CLOSEDOK", "COMMPEND", "PNLPEND", "REBUILD"})
+            self.assertNotIn("ENTRYPEND", closed["symbol"].tolist())
+            rebuild = closed[closed["symbol"] == "REBUILD"].iloc[0]
+            self.assertEqual(rebuild["peak_data_quality"], "NEEDS_REBUILD")
+            self.assertTrue(rebuild["peak_pct"] != rebuild["peak_pct"])
+            self.assertTrue(rebuild["drop_from_peak_pct"] != rebuild["drop_from_peak_pct"])
+            exported = aggregate_closed_positions(closed)
+            self.assertEqual(snapshot["diagnostics"]["closed_trades_count"], len(closed))
+            self.assertEqual(snapshot["diagnostics"]["exported_closed_rows_count"], len(exported))
+
+
 if __name__ == "__main__":
     unittest.main()

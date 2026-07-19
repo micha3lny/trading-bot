@@ -20,7 +20,7 @@ from src.live_trading.analytics.v67_daily_report import (
 from src.live_trading.storage.sqlite_store import DEFAULT_SQLITE_PATH, connect_sqlite, migrate_runtime_schema, resolve_sqlite_path
 
 
-CLOSED_STATUSES = {"CLOSED"}
+CLOSED_STATUSES = {"CLOSED", "COMMISSION_PENDING", "PNL_PENDING"}
 PENDING_TRADE_STATUSES = {"COMMISSION_PENDING", "PNL_PENDING"}
 TERMINAL_POSITION_STATUSES = {"CLOSED", "FLAT", "FLAT_CONFIRMED", "ENTRY_REJECTED", "ENTRY_NOT_FILLED", "STALE_DUPLICATE_SUPPRESSED", "ORPHAN_STALE_POSITION"}
 OPEN_POSITION_STATUSES = {"OPEN", "EXIT_ORDER"}
@@ -30,6 +30,12 @@ _MIGRATED_SQLITE_PATHS: set[str] = set()
 DEFAULT_EXECUTION_ROW_LIMIT = int(os.environ.get("TRADING_BOT_DASHBOARD_EXECUTION_ROW_LIMIT", "2000") or "2000")
 DEFAULT_EXECUTION_LOOKUP_DAYS = int(os.environ.get("TRADING_BOT_DASHBOARD_EXECUTION_LOOKUP_DAYS", "7") or "7")
 DEFAULT_MEMORY_DIAGNOSTICS_TOP_N = int(os.environ.get("TRADING_BOT_DASHBOARD_MEMORY_DIAGNOSTICS_TOP_N", "8") or "8")
+FINALIZED_CLOSED_TRADE_SQL = """
+AND NULLIF(t.entry_fill_time, '') IS NOT NULL
+AND NULLIF(t.exit_fill_time, '') IS NOT NULL
+AND t.entry_price IS NOT NULL
+AND t.exit_price IS NOT NULL
+"""
 OPEN_POSITION_STATUS_SQL = """
 (
     UPPER(COALESCE(p.status, '')) IN ('OPEN', 'EXIT_ORDER')
@@ -2040,15 +2046,12 @@ def closed_from_trades(
         WHERE (
             substr(t.exit_fill_time, 1, 10) BETWEEN ? AND ?
             OR substr(t.closed_at, 1, 10) BETWEEN ? AND ?
-            OR (
-                COALESCE(t.exit_fill_time, t.closed_at) IS NULL
-                AND t.session_date BETWEEN ? AND ?
-            )
         ) {clause}
           AND UPPER(COALESCE(t.status, '')) IN ({",".join("?" for _ in CLOSED_STATUSES)})
+          {FINALIZED_CLOSED_TRADE_SQL}
         ORDER BY COALESCE(t.closed_at, t.exit_fill_time), t.symbol
         """,
-        [window.start_date, window.end_date, window.start_date, window.end_date, window.start_date, window.end_date, *params, *sorted(CLOSED_STATUSES)],
+        [window.start_date, window.end_date, window.start_date, window.end_date, *params, *sorted(CLOSED_STATUSES)],
     )
     if rows.empty:
         return rows
@@ -3308,15 +3311,12 @@ def load_raw_closed_trade_rows(conn: sqlite3.Connection, window: DateWindow, str
         WHERE (
             substr(t.exit_fill_time, 1, 10) BETWEEN ? AND ?
             OR substr(t.closed_at, 1, 10) BETWEEN ? AND ?
-            OR (
-                COALESCE(t.exit_fill_time, t.closed_at) IS NULL
-                AND t.session_date BETWEEN ? AND ?
-            )
         ) {clause}
           AND UPPER(COALESCE(t.status, '')) IN ({",".join("?" for _ in CLOSED_STATUSES)})
+          {FINALIZED_CLOSED_TRADE_SQL}
         ORDER BY COALESCE(t.closed_at, t.exit_fill_time), t.symbol, t.trade_id
         """,
-        [window.start_date, window.end_date, window.start_date, window.end_date, window.start_date, window.end_date, *params, *sorted(CLOSED_STATUSES)],
+        [window.start_date, window.end_date, window.start_date, window.end_date, *params, *sorted(CLOSED_STATUSES)],
     )
 
 
