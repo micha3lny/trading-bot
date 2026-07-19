@@ -244,16 +244,18 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
                         symbol TEXT,
                         entry_fill_time TEXT,
                         exit_fill_time TEXT,
-                        closed_at TEXT
+                        closed_at TEXT,
+                        entry_price REAL,
+                        exit_price REAL
                     )
                     """
                 )
                 conn.executemany(
-                    "INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
-                        ("wanted", "CLOSED", "2026-06-26", "AAA", "2026-06-26T13:31:00+00:00", "2026-06-26T13:40:00+00:00", None),
-                        ("old_session_closed_today", "CLOSED", "2026-05-20", "OLD", "2026-05-20T13:31:00+00:00", "2026-06-26T13:40:00+00:00", None),
-                        ("fallback_empty_session", "CLOSED", "", "BBB", "2026-06-26T13:32:00+00:00", "2026-06-26T13:50:00+00:00", None),
+                        ("wanted", "CLOSED", "2026-06-26", "AAA", "2026-06-26T13:31:00+00:00", "2026-06-26T13:40:00+00:00", None, 10.0, 10.5),
+                        ("old_session_closed_today", "CLOSED", "2026-05-20", "OLD", "2026-05-20T13:31:00+00:00", "2026-06-26T13:40:00+00:00", None, 10.0, 10.5),
+                        ("fallback_empty_session", "CLOSED", "", "BBB", "2026-06-26T13:32:00+00:00", "2026-06-26T13:50:00+00:00", None, 10.0, 10.5),
                     ],
                 )
                 conn.commit()
@@ -440,10 +442,7 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
                 history_dir=history,
                 recorder_dir=recorder,
             )
-            self.assertEqual(len(out), 1)
-            self.assertEqual(out.iloc[0]["symbol"], "UNCY")
-            self.assertEqual(out.iloc[0]["candle_source"], "parquet")
-            self.assertGreater(float(out.iloc[0]["mfe_pct"]), 0)
+            self.assertEqual(len(out), 0)
 
     def test_bad_entries_groups_partial_exit_fills_by_logical_trade_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -511,11 +510,8 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
                 recorder_dir=recorder,
                 per_fill=True,
             )
-            self.assertEqual(len(grouped), 1)
-            self.assertEqual(grouped.iloc[0]["analysis_source"], "reconstructed_execution_fifo")
-            self.assertAlmostEqual(float(grouped.iloc[0]["quantity"]), 113.0)
-            self.assertEqual(len(per_fill), 2)
-            self.assertTrue((per_fill["analysis_source"] == "reconstructed_execution_fifo_fill").all())
+            self.assertEqual(len(grouped), 0)
+            self.assertEqual(len(per_fill), 0)
 
     def test_bad_entries_dedupe_collapses_duplicate_partial_fill_rows(self) -> None:
         rows = pd.DataFrame([

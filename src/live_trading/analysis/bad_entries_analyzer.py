@@ -25,11 +25,35 @@ from src.live_trading.analysis.common import (
     simulate_tp_sl,
 )
 from src.live_trading.market_calendar import get_us_equity_session
+from src.live_trading.analysis.trade_loader import load_finalized_canonical_trades
 
 
 DEFAULT_SQLITE_PATH = Path("data/runtime/trading_runtime.sqlite")
 DEFAULT_HISTORY_DIR = Path("data/history/universe_1m")
 DEFAULT_RECORDER_DIR = Path("data/live/recorder")
+PREMARKET_FEATURES = [
+    "premarket_range_pct",
+    "premarket_change_pct",
+    "premarket_volume",
+    "premarket_vwap",
+    "distance_from_premarket_high_pct",
+    "distance_from_premarket_low_pct",
+    "distance_from_premarket_vwap_pct",
+    "gap_from_previous_close_pct",
+]
+DYNAMIC_FEATURES = [
+    "spread_bps_at_entry",
+    "top100_rank",
+    "top100_score",
+    "live_entry_score",
+    "live_entry_rank",
+    "first_5m_high_pct",
+    "first_15m_high_pct",
+    "or_range_pct",
+    "distance_from_open_pct",
+    "distance_from_or_high_pct",
+    *PREMARKET_FEATURES,
+]
 
 OUTPUT_COLUMNS = [
     "date",
@@ -88,6 +112,17 @@ OUTPUT_COLUMNS = [
     "top100_score",
     "live_entry_score",
     "live_entry_rank",
+    "first_5m_high_pct",
+    "first_15m_high_pct",
+    "first_5m_complete",
+    "first_15m_complete",
+    "or_range_pct",
+    "distance_from_open_pct",
+    "distance_from_or_high_pct",
+    *PREMARKET_FEATURES,
+    "premarket_feature_coverage",
+    "bad_entry_label",
+    "bad_entry_reason",
     "tp2_sl1_5_exit_reason",
     "tp2_sl1_5_pnl_pct",
     "tp3_sl2_exit_reason",
@@ -98,20 +133,7 @@ OUTPUT_COLUMNS = [
 
 
 def load_closed_trades(sqlite_path: str | Path, start_date: str, end_date: str) -> pd.DataFrame:
-    trades = read_sql_table(
-        sqlite_path,
-        "trades",
-        where=(
-            "UPPER(COALESCE(status, '')) = 'CLOSED' "
-            "AND ("
-            "(COALESCE(session_date, '') != '' AND session_date BETWEEN ? AND ?) "
-            "OR (COALESCE(session_date, '') = '' AND substr(entry_fill_time, 1, 10) BETWEEN ? AND ?)"
-            ")"
-        ),
-        params=[start_date, end_date, start_date, end_date],
-        order_by="COALESCE(exit_fill_time, closed_at), symbol, trade_id",
-    )
-    return trades
+    return load_finalized_canonical_trades(sqlite_path, start_date, end_date)
 
 
 def load_executions(sqlite_path: str | Path, start_date: str, end_date: str) -> pd.DataFrame:
@@ -839,6 +861,85 @@ def row_value(row: dict[str, Any], raw: dict[str, Any], names: list[str]) -> Any
     return None
 
 
+
+
+def session_first_bars(candles: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    if candles.empty or "timestamp" not in candles.columns:
+        return pd.DataFrame()
+    first_ts = candles["timestamp"].min()
+    return candles[candles["timestamp"] < first_ts + pd.Timedelta(minutes=minutes)]
+
+
+def opening_range_features(candles_full: pd.DataFrame, entry_price: float | None) -> dict[str, Any]:
+    if candles_full.empty or entry_price is None or entry_price <= 0:
+        return {
+            "first_5m_high_pct": None,
+            "first_15m_high_pct": None,
+            "first_5m_complete": 0,
+            "first_15m_complete": 0,
+            "or_range_pct": None,
+            "distance_from_open_pct": None,
+            "distance_from_or_high_pct": None,
+        }
+    first_open = fnum(candles_full.iloc[0].get("open"))
+    bars5 = session_first_bars(candles_full, 5)
+    bars15 = session_first_bars(candles_full, 15)
+    high5 = fnum(bars5["high"].max()) if not bars5.empty else None
+    high15 = fnum(bars15["high"].max()) if not bars15.empty else None
+    low5 = fnum(bars5["low"].min()) if not bars5.empty else None
+    or_range = ((high5 - low5) / first_open * 100.0) if first_open and high5 is not None and low5 is not None else None
+    return {
+        "first_5m_high_pct": pct(high5, first_open) if high5 is not None and first_open else None,
+        "first_15m_high_pct": pct(high15, first_open) if high15 is not None and first_open else None,
+        "first_5m_complete": int(len(bars5) >= 5),
+        "first_15m_complete": int(len(bars15) >= 15),
+        "or_range_pct": or_range,
+        "distance_from_open_pct": pct(entry_price, first_open) if first_open else None,
+        "distance_from_or_high_pct": pct(entry_price, high5) if high5 else None,
+    }
+
+
+def dynamic_trade_features(trade: dict[str, Any], raw: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for name in PREMARKET_FEATURES:
+        out[name] = row_value(trade, raw, [name])
+    present = [name for name in PREMARKET_FEATURES if out.get(name) not in (None, "") and not (isinstance(out.get(name), float) and pd.isna(out.get(name)))]
+    out["premarket_feature_coverage"] = "available" if present else "unavailable_for_session"
+    return out
+
+
+def classify_bad_entry(row: dict[str, Any]) -> tuple[str, str]:
+    net_pct = fnum(row.get("net_pnl_pct"))
+    mfe = fnum(row.get("mfe_pct"))
+    mae = fnum(row.get("mae_pct"))
+    spread = fnum(row.get("spread_bps_at_entry"))
+    rank = fnum(row.get("top100_rank"))
+    minutes = fnum(row.get("entry_minutes_after_open"))
+    pullback = fnum(row.get("pullback_before_entry_pct"))
+    if net_pct is None:
+        return "inconclusive", "missing_final_pnl"
+    if net_pct >= 0 and mae is not None and mae < -3:
+        return "recovered_after_drawdown", "winner_after_large_adverse_move"
+    if net_pct >= 0:
+        return "inconclusive", "winner_or_flat"
+    if fnum(row.get("first_green_seconds")) is None and int(row.get("never_green") or 0):
+        return "never_positive", "trade_never_traded_above_entry"
+    if mfe is not None and mfe < 0.5:
+        return "low_mfe_loser", "loser_with_low_positive_excursion"
+    if spread is not None and spread > 75:
+        return "wide_spread_entry", "spread_bps_above_75"
+    if rank is not None and rank > 50:
+        return "weak_rank_entry", "top100_rank_above_50"
+    if minutes is not None and minutes < 10:
+        return "early_open_noise", "entry_before_09_40_et"
+    if pullback is not None and pullback > 3:
+        return "chase_entry", "entry_near_recent_spike"
+    if mfe is not None and mfe >= 2:
+        return "good_entry_bad_exit", "loser_had_material_mfe"
+    if mae is not None and mae < -2:
+        return "immediate_failure", "large_adverse_move_after_entry"
+    return "inconclusive", "no_single_clear_pattern"
+
 def analyze_bad_entries(
     *,
     start_date: str,
@@ -851,8 +952,11 @@ def analyze_bad_entries(
 ) -> pd.DataFrame:
     trades = load_closed_trades(sqlite_path, start_date, end_date)
     executions = load_executions(sqlite_path, start_date, end_date)
-    trades = augment_trades_from_executions(trades, executions, start_date, end_date, per_fill=per_fill)
-    source_counts = dict(trades.attrs.get("source_counts", {})) if hasattr(trades, "attrs") else {}
+    source_counts = {"sqlite_trades_count": len(trades), "reconstructed_trades_count": 0}
+    if not trades.empty:
+        trades = trades.copy()
+        trades["analysis_source"] = trades.get("analysis_source", "sqlite_trades")
+        trades.attrs["source_counts"] = source_counts
     trades = dedupe_logical_trades_for_analysis(trades, enabled=not per_fill)
     dedupe_diagnostics = dict(trades.attrs.get("dedupe_diagnostics", {})) if hasattr(trades, "attrs") else {}
     rows: list[dict[str, Any]] = []
@@ -927,6 +1031,7 @@ def analyze_bad_entries(
         if session_date not in spread_cache:
             spread_cache[session_date] = load_spread_snapshots(recorder_dir, session_date)
         spread = nearest_row(spread_cache[session_date], entry_time, symbol)
+        opening_features = opening_range_features(candles_full, entry_price)
         sig_age, sig_age_warning = signal_age(trade, entry_time)
         if sig_age_warning == "negative_age":
             signal_age_counts["negative"] += 1
@@ -995,6 +1100,7 @@ def analyze_bad_entries(
             "top100_score": row_value(trade, raw, ["top100_score"]),
             "live_entry_score": row_value(trade, raw, ["live_entry_score", "entry_score", "score"]),
             "live_entry_rank": row_value(trade, raw, ["live_entry_rank", "ranking_position"]),
+            **dynamic_trade_features(trade, raw, opening_features),
             "tp2_sl1_5_exit_reason": sim_2.exit_reason,
             "tp2_sl1_5_pnl_pct": sim_2.pnl_pct,
             "tp3_sl2_exit_reason": sim_3.exit_reason,
@@ -1002,6 +1108,7 @@ def analyze_bad_entries(
             "tp4_sl2_exit_reason": sim_4.exit_reason,
             "tp4_sl2_pnl_pct": sim_4.pnl_pct,
         }
+        row["bad_entry_label"], row["bad_entry_reason"] = classify_bad_entry(row)
         rows.append(row)
     if not rows:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
@@ -1241,6 +1348,201 @@ def print_summary(df: pd.DataFrame) -> None:
         print(f"{prefix}_simulation avg_pnl_pct={pnl.mean():.2f} wins={(pnl > 0).sum()} losses={(pnl <= 0).sum()} actual_net_pnl={actual:.2f}")
 
 
+
+
+def bucket_for_feature(column: str, value: Any) -> str:
+    val = fnum(value)
+    if val is None:
+        return "missing"
+    if column in {"top100_rank", "live_entry_rank"}:
+        return rank_bucket(val)
+    if "score" in column:
+        return score_bucket(val)
+    if column == "spread_bps_at_entry":
+        if val <= 20: return "<=20"
+        if val <= 30: return "20-30"
+        if val <= 40: return "30-40"
+        if val <= 50: return "40-50"
+        if val <= 75: return "50-75"
+        if val <= 100: return "75-100"
+        return ">100"
+    if column in {"first_5m_high_pct", "first_15m_high_pct", "or_range_pct", "distance_from_open_pct", "distance_from_or_high_pct", "premarket_range_pct", "premarket_change_pct", "distance_from_premarket_high_pct", "distance_from_premarket_low_pct", "distance_from_premarket_vwap_pct", "gap_from_previous_close_pct"}:
+        if val < -5: return "<-5"
+        if val < -2: return "-5--2"
+        if val < 0: return "-2-0"
+        if val < 1: return "0-1"
+        if val < 2: return "1-2"
+        if val < 5: return "2-5"
+        if val < 10: return "5-10"
+        return ">=10"
+    if column == "premarket_volume":
+        if val <= 0: return "<=0"
+        if val < 10000: return "0-10k"
+        if val < 50000: return "10k-50k"
+        if val < 100000: return "50k-100k"
+        return ">=100k"
+    return generic_bucket(value)
+
+
+def pnl_summary(frame: pd.DataFrame) -> dict[str, Any]:
+    net = pd.to_numeric(frame.get("net_pnl"), errors="coerce").fillna(0.0)
+    gross = pd.to_numeric(frame.get("net_pnl_pct"), errors="coerce")
+    winners = net > 0
+    losses = net[net < 0]
+    wins = net[net > 0]
+    return {
+        "trade_count": int(len(frame)),
+        "winners": int(winners.sum()),
+        "losers": int((net < 0).sum()),
+        "win_rate": float(winners.mean() * 100.0) if len(frame) else 0.0,
+        "gross_pnl": float(pd.to_numeric(frame.get("net_pnl"), errors="coerce").sum()),
+        "net_pnl": float(net.sum()),
+        "average_pnl": float(net.mean()) if len(net) else 0.0,
+        "median_pnl": float(net.median()) if len(net) else 0.0,
+        "expectancy": float(net.mean()) if len(net) else 0.0,
+        "profit_factor": float(wins.sum() / abs(losses.sum())) if abs(losses.sum()) > 1e-9 else None,
+        "max_loss": float(net.min()) if len(net) else 0.0,
+        "average_winner": float(wins.mean()) if len(wins) else 0.0,
+        "average_loser": float(losses.mean()) if len(losses) else 0.0,
+    }
+
+
+def build_time_bucket_report(df: pd.DataFrame, date: str) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    buckets = ["09:35-09:40 ET", "09:40-09:45 ET", "09:45-10:00 ET", "10:00-10:30 ET", "10:30-11:00 ET", "11:00+ ET"]
+    def label(minutes: Any) -> str:
+        val = fnum(minutes)
+        if val is None: return "missing"
+        if val < 10: return "09:35-09:40 ET"
+        if val < 15: return "09:40-09:45 ET"
+        if val < 30: return "09:45-10:00 ET"
+        if val < 60: return "10:00-10:30 ET"
+        if val < 90: return "10:30-11:00 ET"
+        return "11:00+ ET"
+    tmp = df.copy()
+    tmp["time_bucket"] = tmp["entry_minutes_after_open"].map(label)
+    rows = []
+    for bucket, group in tmp.groupby("time_bucket", dropna=False):
+        row = {"date": date, "bucket": bucket, **pnl_summary(group)}
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_feature_bucket_report(df: pd.DataFrame, date: str) -> pd.DataFrame:
+    rows = []
+    for feature in DYNAMIC_FEATURES:
+        if feature not in df.columns:
+            rows.append({"date": date, "feature": feature, "coverage": "unavailable_for_session", "bucket": "not_available", "trade_count": 0})
+            continue
+        values = pd.to_numeric(df[feature], errors="coerce")
+        non_null = int(values.notna().sum())
+        coverage = "available" if non_null else "unavailable_for_session"
+        if non_null == 0:
+            rows.append({"date": date, "feature": feature, "coverage": coverage, "bucket": "not_available", "trade_count": 0})
+            continue
+        tmp = df.copy()
+        tmp["_bucket"] = tmp[feature].map(lambda value: bucket_for_feature(feature, value))
+        for bucket, group in tmp.groupby("_bucket", dropna=False):
+            rows.append({"date": date, "feature": feature, "coverage": coverage, "bucket": bucket, **pnl_summary(group)})
+    return pd.DataFrame(rows)
+
+
+def build_filter_simulation(df: pd.DataFrame, date: str) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    baseline = pnl_summary(df)
+    rows = []
+    rules: list[tuple[str, pd.Series]] = []
+    minutes = pd.to_numeric(df.get("entry_minutes_after_open"), errors="coerce")
+    for gate, label in [(5, "entry >= 09:35"), (10, "entry >= 09:40"), (15, "entry >= 09:45"), (30, "entry >= 10:00")]:
+        rules.append((label, minutes >= gate))
+    if "spread_bps_at_entry" in df.columns:
+        spread = pd.to_numeric(df["spread_bps_at_entry"], errors="coerce")
+        for threshold in [30, 40, 50, 75]: rules.append((f"spread <= {threshold} bps", spread <= threshold))
+    if "top100_rank" in df.columns:
+        rank = pd.to_numeric(df["top100_rank"], errors="coerce")
+        for threshold in [10, 15, 20, 25, 30, 50]: rules.append((f"top100_rank <= {threshold}", rank <= threshold))
+    if "live_entry_score" in df.columns:
+        score = pd.to_numeric(df["live_entry_score"], errors="coerce")
+        for threshold in sorted({float(x) for x in score.dropna().quantile([0.25, 0.5, 0.75]).tolist()}):
+            rules.append((f"live_entry_score >= {threshold:.2f}", score >= threshold))
+    for feature in PREMARKET_FEATURES:
+        if feature in df.columns and pd.to_numeric(df[feature], errors="coerce").notna().any():
+            vals = pd.to_numeric(df[feature], errors="coerce")
+            median = vals.median()
+            rules.append((f"{feature} >= median {median:.2f}", vals >= median))
+    for rule, keep in rules:
+        keep = keep.fillna(False).astype(bool)
+        kept = df[keep]
+        removed = df[~keep]
+        summary = pnl_summary(kept)
+        removed_net = pd.to_numeric(removed.get("net_pnl"), errors="coerce").fillna(0.0)
+        row = {
+            "date": date,
+            "filter_expression": rule,
+            **summary,
+            "trades_kept": int(len(kept)),
+            "trades_removed": int(len(removed)),
+            "winners_removed": int((removed_net > 0).sum()),
+            "losers_removed": int((removed_net < 0).sum()),
+            "pnl_delta_vs_baseline": float(summary.get("net_pnl", 0.0) - baseline.get("net_pnl", 0.0)),
+            "removal_precision": float((removed_net < 0).sum() / len(removed)) if len(removed) else None,
+            "winner_sacrifice_rate": float((removed_net > 0).sum() / max(1, int((pd.to_numeric(df.get("net_pnl"), errors="coerce") > 0).sum()))),
+        }
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_data_quality_report(df: pd.DataFrame, date: str) -> dict[str, Any]:
+    features = []
+    for feature in DYNAMIC_FEATURES:
+        if feature not in df.columns:
+            features.append({"feature": feature, "coverage": "unavailable_for_session", "non_null": 0, "total": int(len(df))})
+            continue
+        non_null = int(pd.to_numeric(df[feature], errors="coerce").notna().sum())
+        features.append({"feature": feature, "coverage": "available" if non_null else "unavailable_for_session", "non_null": non_null, "total": int(len(df))})
+    return {"date": date, "premarket_feature_coverage": "available" if any(item["feature"] in PREMARKET_FEATURES and item["non_null"] for item in features) else "unavailable_for_session", "features": features}
+
+
+def write_bad_entry_strategy_outputs(df: pd.DataFrame, *, date_label: str, output_dir: Path) -> dict[str, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "trades": output_dir / f"bad_entries_trades_{date_label}.csv",
+        "time_buckets": output_dir / f"bad_entries_time_buckets_{date_label}.csv",
+        "feature_buckets": output_dir / f"bad_entries_feature_buckets_{date_label}.csv",
+        "filter_simulation": output_dir / f"bad_entries_filter_simulation_{date_label}.csv",
+        "recommendations": output_dir / f"bad_entries_recommendations_{date_label}.md",
+        "data_quality": output_dir / f"bad_entries_data_quality_{date_label}.json",
+    }
+    df.to_csv(paths["trades"], index=False)
+    build_time_bucket_report(df, date_label).to_csv(paths["time_buckets"], index=False)
+    feature_buckets = build_feature_bucket_report(df, date_label)
+    feature_buckets.to_csv(paths["feature_buckets"], index=False)
+    filters = build_filter_simulation(df, date_label)
+    filters.to_csv(paths["filter_simulation"], index=False)
+    quality = build_data_quality_report(df, date_label)
+    paths["data_quality"].write_text(__import__("json").dumps(quality, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    top_filters = filters.sort_values("net_pnl", ascending=False).head(10).to_dict("records") if not filters.empty else []
+    lines = [
+        f"# Bad Entries Recommendations {date_label}", "",
+        "FACT: Tables above are computed from finalized canonical trades only.",
+        "NOT AVAILABLE: Premarket features are unavailable_for_session when all values are NULL.",
+        "BASELINE ONLY: Gate exclusion analysis is not a delayed-entry simulation.",
+        "HYPOTHESIS: Candidate filters require multi-day validation.",
+        "REQUIRES MULTI-DAY VALIDATION: Do not change live strategy from one session.",
+        "POSSIBLE OVERFITTING: Ranking by one-day PnL can overfit.", "",
+        "## Candidate Filters", "",
+    ]
+    if top_filters:
+        for row in top_filters:
+            lines.append(f"- {row.get('filter_expression')}: trades_kept={row.get('trades_kept')}, net_pnl={row.get('net_pnl')}, win_rate={row.get('win_rate')}")
+    else:
+        lines.append("- no candidate filters available")
+    paths["recommendations"].write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return paths
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Analyze bot entries that dropped after buy and simulate TP/SL variants.")
     group = parser.add_mutually_exclusive_group(required=True)
@@ -1251,6 +1553,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--history-dir", type=Path, default=DEFAULT_HISTORY_DIR)
     parser.add_argument("--recorder-dir", type=Path, default=DEFAULT_RECORDER_DIR)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=Path("data/analysis"))
     parser.add_argument("--session-type", default="RTH")
     parser.add_argument("--per-fill", action="store_true", help="Keep reconstructed execution FIFO rows per partial fill instead of grouping by logical trade.")
     return parser
@@ -1275,8 +1578,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output, index=False)
+    date_label = start if start == end else start + "_to_" + end
+    extra_outputs = write_bad_entry_strategy_outputs(df, date_label=date_label, output_dir=args.output_dir)
     print_summary(df)
     print(f"output={output}")
+    for name, path in extra_outputs.items():
+        print(f"bad_entries_{name}_output={path}")
     return 0
 
 

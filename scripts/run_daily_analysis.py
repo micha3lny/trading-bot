@@ -3,17 +3,114 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ANALYSIS_DIR = ROOT / "data" / "analysis"
+
+
+@dataclass(frozen=True)
+class AnalyzerSpec:
+    name: str
+    script: str
+    outputs: tuple[str, ...]
+    summary_targets: tuple[str, ...] = ()
+    supports_force: bool = False
+    pass_sqlite_path: bool = False
+    pass_history_dir: bool = False
+    output_dir_arg: str | None = None
+    output_file_pattern: str | None = None
+    category: str = "strategy"
+    required: bool = True
+    extra_args: tuple[str, ...] = ()
+
+
+ANALYZER_REGISTRY: tuple[AnalyzerSpec, ...] = (
+    AnalyzerSpec(
+        name="coverage",
+        script="scripts/build_strategy_coverage_report.py",
+        outputs=("coverage_report_{date}.csv", "coverage_history.csv"),
+        summary_targets=("coverage_report_{date}.csv",),
+        supports_force=True,
+        pass_sqlite_path=True,
+        pass_history_dir=True,
+        output_dir_arg="--output-dir",
+    ),
+    AnalyzerSpec(
+        name="missed",
+        script="scripts/analyze_missed_runners.py",
+        outputs=("missed_runners_{date}.csv",),
+        summary_targets=("missed_runners_{date}.csv",),
+        supports_force=True,
+        pass_sqlite_path=True,
+        pass_history_dir=True,
+        output_file_pattern="missed_runners_{date}.csv",
+    ),
+    AnalyzerSpec(
+        name="bad_entries",
+        script="scripts/analyze_bad_entries.py",
+        outputs=(
+            "bad_entries_{date}.csv",
+            "bad_entries_trades_{date}.csv",
+            "bad_entries_time_buckets_{date}.csv",
+            "bad_entries_feature_buckets_{date}.csv",
+            "bad_entries_filter_simulation_{date}.csv",
+            "bad_entries_recommendations_{date}.md",
+            "bad_entries_data_quality_{date}.json",
+        ),
+        summary_targets=("bad_entries_{date}.csv", "bad_entries_filter_simulation_{date}.csv", "bad_entries_recommendations_{date}.md"),
+        pass_sqlite_path=True,
+        pass_history_dir=True,
+        output_dir_arg="--output-dir",
+        output_file_pattern="bad_entries_{date}.csv",
+    ),
+    AnalyzerSpec(
+        name="early_loser",
+        script="scripts/early_loser_exit_analyzer.py",
+        outputs=("early_loser_trade_paths_{date}.csv", "early_loser_rules_{date}.csv", "early_loser_summary_{date}.md"),
+        summary_targets=("early_loser_rules_{date}.csv", "early_loser_summary_{date}.md"),
+        pass_sqlite_path=True,
+        pass_history_dir=True,
+        output_dir_arg="--output-dir",
+    ),
+    AnalyzerSpec(
+        name="shs",
+        script="scripts/investigate_should_have_signaled.py",
+        outputs=("should_have_signaled_cases_{date}.csv", "should_have_signaled_summary_{date}.csv", "should_have_signaled_summary_ALL.csv"),
+        summary_targets=("should_have_signaled_summary_{date}.csv",),
+        supports_force=True,
+        pass_sqlite_path=True,
+        output_dir_arg="--output-dir",
+    ),
+    AnalyzerSpec(
+        name="nbas",
+        script="scripts/investigate_no_buy_after_signal.py",
+        outputs=("no_buy_after_signal_cases_{date}.csv", "no_buy_after_signal_summary_{date}.csv", "no_buy_after_signal_summary_ALL.csv"),
+        summary_targets=("no_buy_after_signal_summary_{date}.csv",),
+        supports_force=True,
+        pass_sqlite_path=True,
+        output_dir_arg="--output-dir",
+        category="forensic",
+    ),
+    AnalyzerSpec(
+        name="offline_runtime_pre_signal",
+        script="scripts/investigate_offline_runtime_pre_signal.py",
+        outputs=("offline_runtime_pre_signal_cases_{date}.csv", "offline_runtime_pre_signal_summary_{date}.csv", "offline_runtime_pre_signal_summary_ALL.csv"),
+        summary_targets=("offline_runtime_pre_signal_summary_{date}.csv",),
+        supports_force=True,
+        pass_sqlite_path=True,
+        pass_history_dir=True,
+        output_dir_arg="--output-dir",
+        category="forensic",
+    ),
+)
 
 
 @dataclass
@@ -24,6 +121,8 @@ class StepResult:
     status: str
     exit_code: int | None
     elapsed_seconds: float
+    output_files: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 def parse_date(value: str) -> str:
@@ -79,213 +178,274 @@ def format_float(value: float | None) -> str:
 
 
 def summarize_csv(path: Path) -> list[str]:
+    if path.suffix.lower() == ".md":
+        if not path.exists():
+            return [f"- `{rel(path)}`: missing"]
+        text = path.read_text(encoding="utf-8", errors="replace")
+        details = []
+        for prefix in ("FACT:", "HYPOTHESIS:", "NOT AVAILABLE:", "BASELINE ONLY:"):
+            line = next((line.strip() for line in text.splitlines() if line.startswith(prefix)), "")
+            if line:
+                details.append(line)
+        return [f"- `{rel(path)}`: {' | '.join(details) if details else 'written'}"]
+    if path.suffix.lower() == ".json":
+        if not path.exists():
+            return [f"- `{rel(path)}`: missing"]
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return [f"- `{rel(path)}`: written"]
+        bits = []
+        if data.get("premarket_feature_coverage"):
+            bits.append(f"premarket_feature_coverage={data.get('premarket_feature_coverage')}")
+        return [f"- `{rel(path)}`: {', '.join(bits) if bits else 'written'}"]
     fields, rows = csv_rows(path)
     if not path.exists():
         return [f"- `{rel(path)}`: missing"]
     lines = [f"- `{rel(path)}`: rows={len(rows)}"]
     if not rows:
         return lines
-
-    if "net_pnl" in fields:
-        lines.append(f"  - net_pnl_sum={format_float(numeric_sum(rows, 'net_pnl'))}")
-    if "actual_net_pnl" in fields:
-        lines.append(f"  - actual_net_pnl_sum={format_float(numeric_sum(rows, 'actual_net_pnl'))}")
-    if "gross_pnl" in fields:
-        lines.append(f"  - gross_pnl_sum={format_float(numeric_sum(rows, 'gross_pnl'))}")
+    for col in ("net_pnl", "actual_net_pnl", "gross_pnl", "net_improvement"):
+        if col in fields:
+            lines.append(f"  - {col}_sum={format_float(numeric_sum(rows, col))}")
     if "open_to_high_pct" in fields:
-        values = []
+        vals = []
         for row in rows:
-            try:
-                values.append(float(row.get("open_to_high_pct") or ""))
-            except ValueError:
-                pass
-        if values:
-            lines.append(f"  - max_open_to_high_pct={format_float(max(values))}")
-
-    for column in (
-        "final_classification",
-        "final_no_buy_reason",
-        "missed_reason_group",
-        "top100_no_signal_reason",
-        "data_quality",
-        "source_bucket",
-    ):
+            try: vals.append(float(row.get("open_to_high_pct") or ""))
+            except ValueError: pass
+        if vals: lines.append(f"  - max_open_to_high_pct={format_float(max(vals))}")
+    for column in ("final_classification", "final_no_buy_reason", "missed_reason_group", "top100_no_signal_reason", "data_quality", "source_bucket", "feature", "coverage", "bad_entry_label"):
         if column in fields:
-            counts = ", ".join(f"{key}={count}" for key, count in value_counts(rows, column))
-            lines.append(f"  - {column}: {counts}")
-
+            lines.append(f"  - {column}: " + ", ".join(f"{k}={v}" for k, v in value_counts(rows, column)))
     if len(rows) == 1:
-        interesting = [
-            "date",
-            "session_date",
-            "total_should_have_signaled",
-            "runtime_signal_ready_but_no_buy",
-            "bought_late",
-            "restart_blocked",
-            "total_cases",
-            "post_signal_stale_or_backfill_skip",
-            "post_signal_already_open_skip",
-            "unexplained_after_signal_before_dispatch",
-            "ambiguous_event_correlation",
-            "observed_runtime_signal_ready_no_buy",
-            "offline_should_have_signaled_runtime_signal_not_observed",
-            "unknown_no_buy_after_signal",
-            "coverage_pct",
-            "capture_pct",
-        ]
-        pairs = [f"{key}={rows[0].get(key)}" for key in interesting if key in fields and rows[0].get(key) not in (None, "")]
-        if pairs:
-            lines.append(f"  - summary: {', '.join(pairs)}")
+        interesting = ["date", "session_date", "total_should_have_signaled", "runtime_signal_ready_but_no_buy", "bought_late", "restart_blocked", "total_cases", "offline_should_have_signaled_runtime_signal_not_observed", "coverage_pct", "capture_pct"]
+        pairs = [f"{k}={rows[0].get(k)}" for k in interesting if k in fields and rows[0].get(k) not in (None, "")]
+        if pairs: lines.append(f"  - summary: {', '.join(pairs)}")
     return lines
 
 
+def output_paths(spec: AnalyzerSpec, session_date: str, output_dir: Path) -> list[Path]:
+    return [output_dir / pattern.format(date=session_date) for pattern in spec.outputs]
+
+
+def summary_paths(spec: AnalyzerSpec, session_date: str, output_dir: Path) -> list[Path]:
+    return [output_dir / pattern.format(date=session_date) for pattern in spec.summary_targets]
+
+
+def command_for(spec: AnalyzerSpec, session_date: str, args: argparse.Namespace) -> list[str]:
+    command = [sys.executable, spec.script]
+    if spec.extra_args:
+        command.extend(part.format(date=session_date) for part in spec.extra_args)
+    else:
+        command.extend(["--date", session_date])
+    if spec.supports_force and not args.no_force:
+        command.append("--force")
+    if spec.pass_sqlite_path:
+        command.extend(["--sqlite-path", str(args.sqlite_path)])
+    if spec.pass_history_dir:
+        command.extend(["--history-dir", str(args.history_dir)])
+    if spec.output_dir_arg:
+        command.extend([spec.output_dir_arg, str(args.output_dir)])
+    if spec.output_file_pattern:
+        command.extend(["--output", str(args.output_dir / spec.output_file_pattern.format(date=session_date))])
+    return command
+
+
+def selected_specs(args: argparse.Namespace) -> list[AnalyzerSpec]:
+    specs = list(ANALYZER_REGISTRY)
+    names = {s.name for s in specs}
+    only = set(args.only or [])
+    skips = set(args.skip or [])
+    for name in list(only | skips):
+        if name not in names:
+            raise SystemExit(f"unknown analyzer {name!r}; use --list")
+    # Backward compatible dedicated skip flags.
+    legacy_skips = {
+        "coverage": args.skip_coverage,
+        "missed": args.skip_missed,
+        "bad_entries": args.skip_bad_entries,
+        "shs": args.skip_shs,
+        "nbas": args.skip_nbas,
+        "offline_runtime_pre_signal": args.skip_offline_runtime_pre_signal,
+    }
+    skips |= {name for name, enabled in legacy_skips.items() if enabled}
+    if only:
+        specs = [s for s in specs if s.name in only]
+    return [s for s in specs if s.name not in skips]
+
+
 def build_steps(session_date: str, args: argparse.Namespace) -> list[tuple[str, list[str], bool]]:
-    force_args = [] if args.no_force else ["--force"]
-    py = sys.executable
-    return [
-        (
-            "coverage",
-            [py, "scripts/build_strategy_coverage_report.py", "--date", session_date, *force_args],
-            args.skip_coverage,
-        ),
-        (
-            "missed",
-            [py, "scripts/analyze_missed_runners.py", "--date", session_date, *force_args],
-            args.skip_missed,
-        ),
-        (
-            "bad_entries",
-            [py, "scripts/analyze_bad_entries.py", "--date", session_date],
-            args.skip_bad_entries,
-        ),
-        (
-            "shs",
-            [py, "scripts/investigate_should_have_signaled.py", "--date", session_date, *force_args],
-            args.skip_shs,
-        ),
-        (
-            "nbas",
-            [py, "scripts/investigate_no_buy_after_signal.py", "--date", session_date, *force_args],
-            args.skip_nbas,
-        ),
-    ]
+    return [(spec.name, command_for(spec, session_date, args), False) for spec in selected_specs(args)]
 
 
-def expected_outputs(session_date: str) -> list[Path]:
-    return [
-        DEFAULT_ANALYSIS_DIR / f"coverage_report_{session_date}.csv",
-        DEFAULT_ANALYSIS_DIR / "coverage_history.csv",
-        DEFAULT_ANALYSIS_DIR / f"missed_runners_{session_date}.csv",
-        DEFAULT_ANALYSIS_DIR / f"bad_entries_{session_date}.csv",
-        DEFAULT_ANALYSIS_DIR / f"should_have_signaled_cases_{session_date}.csv",
-        DEFAULT_ANALYSIS_DIR / f"should_have_signaled_summary_{session_date}.csv",
-        DEFAULT_ANALYSIS_DIR / "should_have_signaled_summary_ALL.csv",
-        DEFAULT_ANALYSIS_DIR / f"no_buy_after_signal_cases_{session_date}.csv",
-        DEFAULT_ANALYSIS_DIR / f"no_buy_after_signal_summary_{session_date}.csv",
-        DEFAULT_ANALYSIS_DIR / "no_buy_after_signal_summary_ALL.csv",
-    ]
+def expected_outputs(session_date: str, output_dir: Path | None = None) -> list[Path]:
+    out = output_dir or DEFAULT_ANALYSIS_DIR
+    paths: list[Path] = []
+    for spec in ANALYZER_REGISTRY:
+        paths.extend(output_paths(spec, session_date, out))
+    return paths
 
 
-def write_summary(session_date: str, results: list[StepResult], *, total_elapsed: float, final_failed: bool) -> Path:
-    DEFAULT_ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
-    path = DEFAULT_ANALYSIS_DIR / f"daily_analysis_summary_{session_date}.md"
-    outputs = expected_outputs(session_date)
-    generated = [p for p in outputs if p.exists()]
+def git_commit() -> str:
+    try:
+        completed = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, capture_output=True, check=False)
+        return completed.stdout.strip()
+    except Exception:
+        return ""
 
-    lines: list[str] = [
-        f"# Daily Analysis Summary {session_date}",
-        "",
+
+def write_manifest(session_date: str, results: list[StepResult], *, args: argparse.Namespace, started_at: str, completed_at: str, final_failed: bool) -> Path:
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    path = args.output_dir / "run_manifest.json"
+    payload = {
+        "session_date": session_date,
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "git_commit": git_commit(),
+        "sqlite_path": str(args.sqlite_path),
+        "history_dir": str(args.history_dir),
+        "status": "FAILED" if final_failed else "OK",
+        "analyzers": [result.__dict__ for result in results],
+        "data_quality_summary": collect_data_quality_summary(session_date, args.output_dir),
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def collect_data_quality_summary(session_date: str, output_dir: Path) -> dict[str, object]:
+    path = output_dir / f"bad_entries_data_quality_{session_date}.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"warning": "failed_to_read_bad_entries_data_quality"}
+
+
+def write_strategy_summary(session_date: str, results: list[StepResult], *, total_elapsed: float, final_failed: bool, args: argparse.Namespace) -> Path:
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    path = args.output_dir / f"strategy_analysis_summary_{session_date}.md"
+    lines = [
+        f"# Strategy Analysis Summary {session_date}", "",
         f"- final_status: {'FAILED' if final_failed else 'OK'}",
         f"- elapsed_seconds: {total_elapsed:.2f}",
-        "",
-        "## Steps",
-        "",
-        "| step | status | exit_code | elapsed_seconds | command |",
+        f"- sqlite_path: `{args.sqlite_path}`",
+        f"- history_dir: `{args.history_dir}`", "",
+        "FACT: All steps are read-only analyzers over finalized canonical trades, parquet history, recorder evidence, and runtime SQLite.",
+        "HYPOTHESIS: Filter and early-exit results are candidates for investigation, not live strategy changes.",
+        "NOT AVAILABLE: Missing or all-null feature groups, including premarket features for baseline sessions, are marked unavailable_for_session.",
+        "BASELINE ONLY: Single-session results are baseline diagnostics.",
+        "REQUIRES MULTI-DAY VALIDATION: Any proposed filter must be tested across more sessions.",
+        "POSSIBLE OVERFITTING: One-day high-performing filters can overfit.", "",
+        "## Step Status", "",
+        "| analyzer | status | exit_code | elapsed_seconds | outputs |",
         "|---|---:|---:|---:|---|",
     ]
     for result in results:
-        command = " ".join(result.command)
-        exit_code = "" if result.exit_code is None else str(result.exit_code)
-        lines.append(
-            f"| {result.name} | {result.status} | {exit_code} | {result.elapsed_seconds:.2f} | `{command}` |"
-        )
-
-    lines.extend(["", "## Generated Output Files", ""])
-    if generated:
-        for output in generated:
-            lines.append(f"- `{rel(output)}`")
-    else:
-        lines.append("- none found")
-
-    lines.extend(["", "## CSV Summaries", ""])
-    summary_targets = [
-        DEFAULT_ANALYSIS_DIR / f"coverage_report_{session_date}.csv",
-        DEFAULT_ANALYSIS_DIR / f"missed_runners_{session_date}.csv",
-        DEFAULT_ANALYSIS_DIR / f"bad_entries_{session_date}.csv",
-        DEFAULT_ANALYSIS_DIR / f"should_have_signaled_summary_{session_date}.csv",
-        DEFAULT_ANALYSIS_DIR / f"no_buy_after_signal_summary_{session_date}.csv",
+        lines.append(f"| {result.name} | {result.status} | {'' if result.exit_code is None else result.exit_code} | {result.elapsed_seconds:.2f} | {len(result.output_files)} |")
+    sections = [
+        ("Data quality", [args.output_dir / f"bad_entries_data_quality_{session_date}.json"]),
+        ("Baseline results", [args.output_dir / f"bad_entries_{session_date}.csv", args.output_dir / f"coverage_report_{session_date}.csv"]),
+        ("Entry timing", [args.output_dir / f"bad_entries_time_buckets_{session_date}.csv"]),
+        ("Bad entry patterns", [args.output_dir / f"bad_entries_feature_buckets_{session_date}.csv", args.output_dir / f"bad_entries_filter_simulation_{session_date}.csv", args.output_dir / f"bad_entries_recommendations_{session_date}.md"]),
+        ("Early loser exits", [args.output_dir / f"early_loser_rules_{session_date}.csv", args.output_dir / f"early_loser_summary_{session_date}.md"]),
+        ("Missed runners", [args.output_dir / f"missed_runners_{session_date}.csv"]),
+        ("Top100 coverage", [args.output_dir / f"coverage_report_{session_date}.csv"]),
+        ("Should-have-signal gaps", [args.output_dir / f"should_have_signaled_summary_{session_date}.csv", args.output_dir / f"no_buy_after_signal_summary_{session_date}.csv", args.output_dir / f"offline_runtime_pre_signal_summary_{session_date}.csv"]),
+        ("Recommended next experiments", [args.output_dir / f"bad_entries_recommendations_{session_date}.md"]),
     ]
-    for target in summary_targets:
-        lines.extend(summarize_csv(target))
-
+    for title, targets in sections:
+        lines.extend(["", f"## {title}", ""])
+        for target in targets:
+            lines.extend(summarize_csv(target))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
 
 
-def run_step(name: str, command: list[str], *, skipped: bool) -> StepResult:
-    if skipped:
-        print(f"DAILY_ANALYSIS_STEP_SKIPPED name={name}", flush=True)
-        return StepResult(name=name, command=command, skipped=True, status="skipped", exit_code=None, elapsed_seconds=0.0)
+def write_summary(session_date: str, results: list[StepResult], *, total_elapsed: float, final_failed: bool, output_dir: Path | None = None) -> Path:
+    out = output_dir or DEFAULT_ANALYSIS_DIR
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / f"daily_analysis_summary_{session_date}.md"
+    generated = [p for p in expected_outputs(session_date, out) if p.exists()]
+    lines = [f"# Daily Analysis Summary {session_date}", "", f"- final_status: {'FAILED' if final_failed else 'OK'}", f"- elapsed_seconds: {total_elapsed:.2f}", "", "## Steps", "", "| step | status | exit_code | elapsed_seconds | command |", "|---|---:|---:|---:|---|"]
+    for result in results:
+        lines.append(f"| {result.name} | {result.status} | {'' if result.exit_code is None else result.exit_code} | {result.elapsed_seconds:.2f} | `{' '.join(result.command)}` |")
+    lines.extend(["", "## Generated Output Files", ""])
+    lines.extend([f"- `{rel(p)}`" for p in generated] or ["- none found"])
+    lines.extend(["", "## CSV Summaries", ""])
+    for spec in ANALYZER_REGISTRY:
+        for target in summary_paths(spec, session_date, out):
+            lines.extend(summarize_csv(target))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
-    print(f"DAILY_ANALYSIS_STEP_START name={name} command={' '.join(command)}", flush=True)
+
+def run_step(spec: AnalyzerSpec, command: list[str], *, args: argparse.Namespace, session_date: str) -> StepResult:
+    print(f"DAILY_ANALYSIS_STEP_START name={spec.name} command={' '.join(command)}", flush=True)
     started = time.monotonic()
     completed = subprocess.run(command, cwd=ROOT)
     elapsed = time.monotonic() - started
-    if completed.returncode == 0:
-        print(f"DAILY_ANALYSIS_STEP_DONE name={name} elapsed={elapsed:.2f}", flush=True)
-        status = "ok"
-    else:
-        print(f"DAILY_ANALYSIS_STEP_FAILED name={name} exit_code={completed.returncode} elapsed={elapsed:.2f}", flush=True)
-        status = "failed"
-    return StepResult(
-        name=name,
-        command=command,
-        skipped=False,
-        status=status,
-        exit_code=completed.returncode,
-        elapsed_seconds=elapsed,
-    )
+    status = "ok" if completed.returncode == 0 else "failed"
+    print(("DAILY_ANALYSIS_STEP_DONE" if completed.returncode == 0 else "DAILY_ANALYSIS_STEP_FAILED") + f" name={spec.name} exit_code={completed.returncode} elapsed={elapsed:.2f}", flush=True)
+    outputs = [rel(path) for path in output_paths(spec, session_date, args.output_dir) if path.exists()]
+    return StepResult(spec.name, command, False, status, completed.returncode, elapsed, outputs)
 
 
-def main(argv: Iterable[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run the full read-only daily analysis suite for one completed session.")
-    parser.add_argument("--date", required=True, type=parse_date, help="Completed session date, YYYY-MM-DD.")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run the full read-only daily strategy analysis suite for one completed session.")
+    parser.add_argument("--date", required=False, type=parse_date, help="Completed session date, YYYY-MM-DD.")
+    parser.add_argument("--sqlite-path", type=Path, default=Path("data/runtime/trading_runtime.sqlite"))
+    parser.add_argument("--history-dir", type=Path, default=Path("data/history/universe_1m"))
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_ANALYSIS_DIR)
+    parser.add_argument("--only", action="append", help="Run only the named analyzer. Can be repeated.")
+    parser.add_argument("--skip", action="append", help="Skip the named analyzer. Can be repeated.")
+    parser.add_argument("--list", action="store_true", help="List registered analyzers and exit.")
+    parser.add_argument("--fail-fast", "--stop-on-failure", dest="stop_on_failure", action="store_true")
+    parser.add_argument("--no-force", action="store_true", help="Do not pass --force to analyzers that support it.")
+    # Backward-compatible dedicated skip flags.
     parser.add_argument("--skip-coverage", action="store_true")
     parser.add_argument("--skip-missed", action="store_true")
     parser.add_argument("--skip-bad-entries", action="store_true")
+    parser.add_argument("--skip-bad-entry-details", action="store_true")
+    parser.add_argument("--skip-bad-entry-patterns", action="store_true")
     parser.add_argument("--skip-shs", action="store_true")
     parser.add_argument("--skip-nbas", action="store_true")
-    parser.add_argument("--stop-on-failure", action="store_true")
-    parser.add_argument("--no-force", action="store_true", help="Do not pass --force to analyzers that support it.")
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    parser.add_argument("--skip-offline-runtime-pre-signal", action="store_true")
+    return parser
 
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.list:
+        for spec in ANALYZER_REGISTRY:
+            print(f"{spec.name}\t{spec.category}\t{spec.script}")
+        return 0
+    if not args.date:
+        parser.error("--date is required unless --list is used")
     session_date = args.date
-    print(f"DAILY_ANALYSIS_START date={session_date}", flush=True)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now(timezone.utc).isoformat()
+    print(f"DAILY_ANALYSIS_START date={session_date} output_dir={args.output_dir}", flush=True)
     total_started = time.monotonic()
     results: list[StepResult] = []
     failed = False
-
-    for name, command, skipped in build_steps(session_date, args):
-        result = run_step(name, command, skipped=skipped)
+    specs = selected_specs(args)
+    for spec in specs:
+        result = run_step(spec, command_for(spec, session_date, args), args=args, session_date=session_date)
         results.append(result)
         if result.status == "failed":
             failed = True
             if args.stop_on_failure:
                 break
-
     total_elapsed = time.monotonic() - total_started
-    summary_path = write_summary(session_date, results, total_elapsed=total_elapsed, final_failed=failed)
-    print(f"DAILY_ANALYSIS_SUMMARY_WRITTEN path={rel(summary_path)}", flush=True)
+    completed_at = datetime.now(timezone.utc).isoformat()
+    daily_summary = write_summary(session_date, results, total_elapsed=total_elapsed, final_failed=failed, output_dir=args.output_dir)
+    strategy_summary = write_strategy_summary(session_date, results, total_elapsed=total_elapsed, final_failed=failed, args=args)
+    manifest = write_manifest(session_date, results, args=args, started_at=started_at, completed_at=completed_at, final_failed=failed)
+    print(f"DAILY_ANALYSIS_SUMMARY_WRITTEN path={rel(daily_summary)}", flush=True)
+    print(f"STRATEGY_ANALYSIS_SUMMARY_WRITTEN path={rel(strategy_summary)}", flush=True)
+    print(f"DAILY_ANALYSIS_MANIFEST_WRITTEN path={rel(manifest)}", flush=True)
     print(f"DAILY_ANALYSIS_DONE date={session_date} elapsed={total_elapsed:.2f} status={'FAILED' if failed else 'OK'}", flush=True)
     return 1 if failed else 0
 
