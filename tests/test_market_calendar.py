@@ -29,6 +29,13 @@ class MarketCalendarTests(unittest.TestCase):
         self.assertEqual(session.open_utc.isoformat(), "2026-05-26T13:30:00+00:00")
         self.assertEqual(session.close_utc.isoformat(), "2026-05-26T20:00:00+00:00")
 
+    def test_winter_session_uses_standard_time(self) -> None:
+        session = get_us_equity_session(date(2026, 1, 5))
+
+        self.assertTrue(session.is_trading_day)
+        self.assertEqual(session.open_utc.isoformat(), "2026-01-05T14:30:00+00:00")
+        self.assertEqual(session.close_utc.isoformat(), "2026-01-05T21:00:00+00:00")
+
     def test_previous_trading_day_skips_memorial_day_weekend(self) -> None:
         self.assertEqual(previous_us_equity_trading_day(date(2026, 5, 26)), date(2026, 5, 22))
 

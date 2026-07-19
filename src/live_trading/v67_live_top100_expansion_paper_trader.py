@@ -90,6 +90,17 @@ class SymbolState:
     first_seen_utc: str | None = None
     latest_seen_utc: str | None = None
     latest_volume: float | None = None
+    rth_minutes_elapsed: float | None = None
+    premarket_start_time: str | None = None
+    premarket_open: float | None = None
+    premarket_high: float | None = None
+    premarket_low: float | None = None
+    premarket_last: float | None = None
+    premarket_volume: float | None = None
+    premarket_vwap_numerator: float | None = None
+    premarket_vwap_denominator: float | None = None
+    premarket_candle_count: int = 0
+    rth_candle_count: int = 0
     signal_sent: bool = False
     ready_since_ts: float | None = None
     ready_since_utc: str | None = None
@@ -100,6 +111,7 @@ class SymbolState:
     stale_ready_logged: bool = False
     bars: list[dict[str, Any]] = field(default_factory=list)
     last_bar_bucket: str | None = None
+    rth_state_reset_session_date: str | None = None
 
 
 @dataclass
@@ -135,6 +147,17 @@ class ManagedPosition:
     ready_since: str | None = None
     entry_order_id: str | None = None
     entry_perm_id: str | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeSessionTiming:
+    session_date: str
+    is_trading_day: bool
+    market_open: datetime | None
+    market_close: datetime | None
+    premarket_start: datetime | None
+    earliest_entry_time: datetime | None
+    entry_delay_minutes: float
 
 
 def now_utc() -> str:
@@ -905,6 +928,8 @@ def build_pre_signal_runtime_snapshot(
     stale_reason: str,
     position_usd: Any,
     now_ts: float,
+    timing: RuntimeSessionTiming | None = None,
+    observed_at: datetime | None = None,
 ) -> dict[str, Any]:
     top100_meta = dict(_runtime_dict(runtime_state, "top100_entry_metadata_by_symbol").get(symbol, {}))
     quantity, quantity_reason = pre_signal_quantity(features.get("entry_price"), position_usd)
@@ -929,11 +954,28 @@ def build_pre_signal_runtime_snapshot(
         stale_reason=stale_reason,
         quantity=quantity,
     )
+    observed_at = observed_at or datetime.now(timezone.utc)
+    minutes_from_open = None
+    minutes_from_premarket_start = None
+    entry_delay_complete = None
+    if timing is not None and timing.market_open is not None:
+        minutes_from_open = (observed_at - timing.market_open).total_seconds() / 60.0
+    if timing is not None and timing.premarket_start is not None:
+        minutes_from_premarket_start = (observed_at - timing.premarket_start).total_seconds() / 60.0
+    if timing is not None and timing.earliest_entry_time is not None:
+        entry_delay_complete = int(observed_at >= timing.earliest_entry_time)
     return {
         "symbol": symbol,
         "timestamp": now_utc(),
         "session_date": session_date,
         "scan_id": scan_id,
+        "market_open_utc": timing.market_open.isoformat() if timing and timing.market_open else "",
+        "premarket_start_utc": timing.premarket_start.isoformat() if timing and timing.premarket_start else "",
+        "minutes_from_open": None if minutes_from_open is None else round(minutes_from_open, 3),
+        "minutes_from_premarket_start": None if minutes_from_premarket_start is None else round(minutes_from_premarket_start, 3),
+        "rth_minutes_elapsed": features.get("rth_minutes_elapsed"),
+        "earliest_entry_time_utc": timing.earliest_entry_time.isoformat() if timing and timing.earliest_entry_time else "",
+        "entry_delay_complete": entry_delay_complete,
         "ranking_position": ranking_position,
         "candidate_age_seconds": None if candidate_age is None else round(candidate_age, 3),
         "in_top100": int(symbol in _runtime_set(runtime_state, "entry_symbols")),
@@ -955,8 +997,30 @@ def build_pre_signal_runtime_snapshot(
         "first_price_initialized": int(state.first_price is not None),
         "first5_initialized": int(state.first_5m_high is not None),
         "first15_initialized": int(state.first_15m_high is not None),
+        "first_5m_complete": features.get("first_5m_complete"),
+        "first_15m_complete": features.get("first_15m_complete"),
+        "premarket_data_quality": features.get("premarket_data_quality"),
+        "premarket_candle_count": features.get("premarket_candle_count"),
+        "rth_candle_count": state.rth_candle_count,
         "first_5m_high_pct": features.get("first_5m_high_pct"),
         "first_15m_high_pct": features.get("first_15m_high_pct"),
+        "premarket_open": features.get("premarket_open"),
+        "premarket_high": features.get("premarket_high"),
+        "premarket_low": features.get("premarket_low"),
+        "premarket_last": features.get("premarket_last"),
+        "premarket_range_pct": features.get("premarket_range_pct"),
+        "premarket_change_pct": features.get("premarket_change_pct"),
+        "premarket_volume": features.get("premarket_volume"),
+        "premarket_vwap": features.get("premarket_vwap"),
+        "distance_from_premarket_high_pct": features.get("distance_from_premarket_high_pct"),
+        "distance_from_premarket_low_pct": features.get("distance_from_premarket_low_pct"),
+        "distance_from_premarket_vwap_pct": features.get("distance_from_premarket_vwap_pct"),
+        "gap_from_previous_close_pct": features.get("gap_from_previous_close_pct"),
+        "rth_open": state.open_price,
+        "first_5m_high": state.first_5m_high,
+        "first_15m_high": state.first_15m_high,
+        "or_high": state.or_high,
+        "or_low": state.or_low,
         "or_range_pct": features.get("or_range_pct"),
         "live_entry_score": features.get("score"),
         "rejection_reason": features.get("reason"),
@@ -1019,6 +1083,13 @@ def emit_pre_signal_runtime_snapshot(
             "symbol",
             "session_date",
             "scan_id",
+            "market_open_utc",
+            "premarket_start_utc",
+            "minutes_from_open",
+            "minutes_from_premarket_start",
+            "rth_minutes_elapsed",
+            "earliest_entry_time_utc",
+            "entry_delay_complete",
             "ranking_position",
             "candidate_age_seconds",
             "in_top100",
@@ -1040,8 +1111,30 @@ def emit_pre_signal_runtime_snapshot(
             "first_price_initialized",
             "first5_initialized",
             "first15_initialized",
+            "first_5m_complete",
+            "first_15m_complete",
+            "premarket_data_quality",
+            "premarket_candle_count",
+            "rth_candle_count",
             "first_5m_high_pct",
             "first_15m_high_pct",
+            "premarket_open",
+            "premarket_high",
+            "premarket_low",
+            "premarket_last",
+            "premarket_range_pct",
+            "premarket_change_pct",
+            "premarket_volume",
+            "premarket_vwap",
+            "distance_from_premarket_high_pct",
+            "distance_from_premarket_low_pct",
+            "distance_from_premarket_vwap_pct",
+            "gap_from_previous_close_pct",
+            "rth_open",
+            "first_5m_high",
+            "first_15m_high",
+            "or_high",
+            "or_low",
             "or_range_pct",
             "live_entry_score",
             "rejection_reason",
@@ -1605,8 +1698,57 @@ def emit_runtime_state_growth_snapshot(
 
 def market_open_datetime_utc(args: argparse.Namespace, now: datetime | None = None) -> datetime:
     now = now or datetime.now(timezone.utc)
+    session = get_us_equity_session(now.date())
+    if session.is_trading_day and session.open_utc is not None:
+        return session.open_utc
     hh, mm = [int(x) for x in str(args.market_open_utc).split(":", 1)]
     return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+
+def runtime_session_timing(args: argparse.Namespace, now: datetime | None = None) -> RuntimeSessionTiming:
+    now = now or datetime.now(timezone.utc)
+    session = get_us_equity_session(now.date())
+    delay_minutes = float(getattr(args, "entry_delay_after_open_minutes", 5.0) or 0.0)
+    if session.is_trading_day and session.open_utc is not None:
+        premarket_minutes = float(getattr(args, "premarket_collection_minutes", 30.0) or 30.0)
+        premarket_start = session.open_utc - timedelta(minutes=max(0.0, premarket_minutes))
+        return RuntimeSessionTiming(
+            session_date=session.session_date.isoformat(),
+            is_trading_day=True,
+            market_open=session.open_utc,
+            market_close=session.close_utc,
+            premarket_start=premarket_start,
+            earliest_entry_time=session.open_utc + timedelta(minutes=max(0.0, delay_minutes)),
+            entry_delay_minutes=delay_minutes,
+        )
+    fallback_open = market_open_datetime_utc(args, now)
+    return RuntimeSessionTiming(
+        session_date=session.session_date.isoformat(),
+        is_trading_day=False,
+        market_open=fallback_open,
+        market_close=None,
+        premarket_start=fallback_open - timedelta(minutes=30),
+        earliest_entry_time=fallback_open + timedelta(minutes=max(0.0, delay_minutes)),
+        entry_delay_minutes=delay_minutes,
+    )
+
+
+def session_phase_for_time(observed_at: datetime, timing: RuntimeSessionTiming) -> str:
+    if not timing.is_trading_day or timing.market_open is None:
+        return "CLOSED"
+    if timing.premarket_start is not None and timing.premarket_start <= observed_at < timing.market_open:
+        return "PREMARKET"
+    if timing.market_close is not None and timing.market_open <= observed_at < timing.market_close:
+        return "RTH"
+    if observed_at >= timing.market_open:
+        return "RTH"
+    return "BEFORE_PREMARKET"
+
+
+def entry_delay_active_for_time(observed_at: datetime, timing: RuntimeSessionTiming) -> bool:
+    if not timing.is_trading_day or timing.earliest_entry_time is None:
+        return False
+    return observed_at < timing.earliest_entry_time
 
 
 def append_symbol_state_bar(
@@ -1622,12 +1764,13 @@ def append_symbol_state_bar(
     low: float | None = None,
     close: float | None = None,
     volume: float | None = None,
+    session_phase: str = "",
     max_bars: int = SYMBOL_STATE_MAX_BARS,
-) -> None:
+) -> dict[str, Any] | None:
     if max_bars <= 0:
         state.bars.clear()
         state.last_bar_bucket = None
-        return
+        return None
     bucket = observed_at.replace(second=0, microsecond=0).isoformat()
     high_value = high if high is not None else price
     low_value = low if low is not None else price
@@ -1645,11 +1788,13 @@ def append_symbol_state_bar(
         bar["samples"] = int(safe_int(bar.get("samples")) or 1) + 1
         if runtime_state is not None:
             runtime_state["symbol_state_duplicate_bar_suppressed_total"] = int(runtime_state.get("symbol_state_duplicate_bar_suppressed_total") or 0) + 1
-        return
+        return None
+    completed_bar = state.bars[-1] if state.bars else None
     state.bars.append(
         {
             "bar_time_utc": observed_at.isoformat(),
             "bucket_utc": bucket,
+            "session_phase": session_phase,
             "open": open_price if open_price is not None else price,
             "high": high_value,
             "low": low_value,
@@ -1667,6 +1812,7 @@ def append_symbol_state_bar(
         del state.bars[:-max_bars]
         if runtime_state is not None:
             runtime_state["symbol_state_bars_trimmed_total"] = int(runtime_state.get("symbol_state_bars_trimmed_total") or 0) + removed
+    return completed_bar
 
 
 def reset_symbol_session_state(state: SymbolState) -> None:
@@ -1683,6 +1829,17 @@ def reset_symbol_session_state(state: SymbolState) -> None:
     state.first_seen_utc = None
     state.latest_seen_utc = None
     state.latest_volume = None
+    state.rth_minutes_elapsed = None
+    state.premarket_start_time = None
+    state.premarket_open = None
+    state.premarket_high = None
+    state.premarket_low = None
+    state.premarket_last = None
+    state.premarket_volume = None
+    state.premarket_vwap_numerator = None
+    state.premarket_vwap_denominator = None
+    state.premarket_candle_count = 0
+    state.rth_candle_count = 0
     state.ready_since_ts = None
     state.ready_since_utc = None
     state.signal_source = ""
@@ -1692,6 +1849,85 @@ def reset_symbol_session_state(state: SymbolState) -> None:
     state.stale_ready_logged = False
     state.bars.clear()
     state.last_bar_bucket = None
+    state.rth_state_reset_session_date = None
+
+
+def reset_symbol_rth_state_preserve_premarket(state: SymbolState, *, session_date: str) -> None:
+    state.open_price = None
+    state.first_price = None
+    state.high = None
+    state.low = None
+    state.last_price = None
+    state.first_5m_high = None
+    state.first_15m_high = None
+    state.or_high = None
+    state.or_low = None
+    state.first_seen_ts = None
+    state.first_seen_utc = None
+    state.latest_seen_utc = None
+    state.latest_volume = None
+    state.rth_minutes_elapsed = None
+    state.rth_candle_count = 0
+    state.ready_since_ts = None
+    state.ready_since_utc = None
+    state.signal_source = ""
+    state.last_update_source = ""
+    state.last_live_update_ts = None
+    state.last_live_update_utc = None
+    state.stale_ready_logged = False
+    state.last_bar_bucket = None
+    state.rth_state_reset_session_date = session_date
+
+
+def update_premarket_state(state: SymbolState, snap: dict[str, Any], observed_at: datetime) -> None:
+    price = safe_float(snap.get("price"))
+    if price is None or price <= 0:
+        return
+    volume = safe_float(snap.get("volume"))
+    state.premarket_start_time = state.premarket_start_time or observed_at.isoformat()
+    if state.premarket_open is None:
+        state.premarket_open = price
+    state.premarket_high = max(state.premarket_high or price, price)
+    state.premarket_low = min(state.premarket_low or price, price)
+    state.premarket_last = price
+    state.premarket_candle_count += 1
+    if volume is not None and volume > 0:
+        state.premarket_volume = (state.premarket_volume or 0.0) + volume
+        state.premarket_vwap_numerator = (state.premarket_vwap_numerator or 0.0) + price * volume
+        state.premarket_vwap_denominator = (state.premarket_vwap_denominator or 0.0) + volume
+
+
+def premarket_context_fields(state: SymbolState, snap: dict[str, Any] | None = None) -> dict[str, Any]:
+    snap = snap or {}
+    premarket_vwap = None
+    if state.premarket_vwap_denominator and state.premarket_vwap_denominator > 0:
+        premarket_vwap = (state.premarket_vwap_numerator or 0.0) / state.premarket_vwap_denominator
+    premarket_range_pct = None
+    if state.premarket_low and state.premarket_low > 0 and state.premarket_high is not None:
+        premarket_range_pct = (state.premarket_high / state.premarket_low - 1.0) * 100.0
+    premarket_change_pct = pct_from(state.premarket_open, state.premarket_last)
+    current = safe_float(snap.get("price")) or state.last_price or state.premarket_last
+    distance_high = pct_from(state.premarket_high, current)
+    distance_low = pct_from(state.premarket_low, current)
+    distance_vwap = pct_from(premarket_vwap, current)
+    gap_from_previous_close = pct_from(safe_float(snap.get("close")), current)
+    return {
+        "premarket_start_time": state.premarket_start_time,
+        "premarket_open": state.premarket_open,
+        "premarket_high": state.premarket_high,
+        "premarket_low": state.premarket_low,
+        "premarket_last": state.premarket_last,
+        "premarket_range_pct": premarket_range_pct,
+        "premarket_change_pct": premarket_change_pct,
+        "premarket_volume": state.premarket_volume,
+        "premarket_vwap": premarket_vwap,
+        "distance_from_premarket_high_pct": distance_high,
+        "distance_from_premarket_low_pct": distance_low,
+        "distance_from_premarket_vwap_pct": distance_vwap,
+        "gap_from_previous_close_pct": gap_from_previous_close,
+        "premarket_candle_count": state.premarket_candle_count,
+        "premarket_data_quality": "OK" if state.premarket_candle_count > 0 else "MISSING",
+    }
 
 
 def reset_session_candle_state(
@@ -1726,10 +1962,11 @@ def update_state(
     observed_at: datetime | None = None,
     source: str = "live",
     runtime_state: dict[str, Any] | None = None,
-) -> None:
+    session_phase: str = "RTH",
+) -> dict[str, Any] | None:
     price = safe_float(snap.get("price"))
     if price is None or price <= 0:
-        return
+        return None
     observed_at = observed_at or datetime.now(timezone.utc)
     now_ts = observed_at.timestamp()
     observed_iso = observed_at.isoformat()
@@ -1740,17 +1977,31 @@ def update_state(
     if source == "live":
         state.last_live_update_ts = now_ts
         state.last_live_update_utc = observed_iso
-    append_symbol_state_bar(
+
+    phase = str(session_phase or "").upper()
+    if phase == "BEFORE_PREMARKET":
+        return None
+    if phase == "PREMARKET" or session_elapsed < 0:
+        update_premarket_state(state, snap, observed_at)
+        return append_symbol_state_bar(
+            state,
+            observed_at=observed_at,
+            price=price,
+            session_elapsed=session_elapsed,
+            source="live_ticker_snapshot" if source == "live" else source,
+            runtime_state=runtime_state,
+            session_phase="PREMARKET",
+        )
+
+    completed_bar = append_symbol_state_bar(
         state,
         observed_at=observed_at,
         price=price,
         session_elapsed=session_elapsed,
         source="live_ticker_snapshot" if source == "live" else source,
         runtime_state=runtime_state,
+        session_phase="RTH",
     )
-
-    if session_elapsed < 0:
-        return
 
     if state.first_seen_ts is None:
         state.first_seen_ts = now_ts
@@ -1761,6 +2012,8 @@ def update_state(
         state.low = price
     state.high = max(state.high or price, price)
     state.low = min(state.low or price, price)
+    state.rth_minutes_elapsed = session_elapsed / 60.0
+    state.rth_candle_count += 1
     if 0 <= session_elapsed < 5 * 60:
         state.first_5m_high = max(state.first_5m_high or price, price)
     if 0 <= session_elapsed < 15 * 60:
@@ -1768,6 +2021,7 @@ def update_state(
     if 0 <= session_elapsed < opening_range_seconds:
         state.or_high = max(state.or_high or price, price)
         state.or_low = min(state.or_low or price, price)
+    return completed_bar
 
 
 def pct_from(base: float | None, value: float | None) -> float | None:
@@ -1787,6 +2041,9 @@ def compute_live_safe_features(state: SymbolState, snap: dict[str, Any], args: a
 
     price = last
     spread_bps = safe_float(snap.get("spread_bps"))
+    rth_minutes_elapsed = state.rth_minutes_elapsed
+    first_5m_complete = bool(rth_minutes_elapsed is not None and rth_minutes_elapsed >= 5.0)
+    first_15m_complete = bool(rth_minutes_elapsed is not None and rth_minutes_elapsed >= 15.0)
     ready = (
         first_5m_high_pct is not None
         and first_15m_high_pct is not None
@@ -1824,9 +2081,14 @@ def compute_live_safe_features(state: SymbolState, snap: dict[str, Any], args: a
         "reason": ";".join(reasons) if reasons else "live_safe_expansion_ready",
         "first_5m_high_pct": first_5m_high_pct,
         "first_15m_high_pct": first_15m_high_pct,
+        "first_5m_complete": int(first_5m_complete),
+        "first_15m_complete": int(first_15m_complete),
+        "rth_minutes_elapsed": rth_minutes_elapsed,
+        "first_15m_status": "complete" if first_15m_complete else "partial",
         "or_range_pct": or_range_pct,
         "entry_price": price,
         "spread_bps": spread_bps,
+        **premarket_context_fields(state, snap),
     }
 
 
@@ -2602,6 +2864,53 @@ def existing_candle_keys(recorder: LiveDataRecorder) -> set[tuple[str, str]]:
     return keys
 
 
+def candle_session_phase(ts: datetime, timing: RuntimeSessionTiming) -> str:
+    return session_phase_for_time(ts, timing)
+
+
+def record_candle_rows_with_phase(recorder: LiveDataRecorder, rows: list[dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    total = recorder.record_candles_1m(rows)
+    premarket_rows = []
+    for row in rows:
+        if str(row.get("session_phase") or "").upper() == "PREMARKET":
+            premarket_rows.append({**row, "session_type": "premarket"})
+    if premarket_rows:
+        try:
+            recorder.record_extended_hours_candles_1m(premarket_rows)
+        except Exception as exc:
+            print(f"{now_utc()} PREMARKET_CANDLE_RECORD_FAILED rows={len(premarket_rows)} error={exc!r}", flush=True)
+    return total
+
+
+def record_completed_live_state_bar(recorder: LiveDataRecorder, symbol: str, bar: dict[str, Any] | None) -> int:
+    if not bar:
+        return 0
+    phase = str(bar.get("session_phase") or "").upper()
+    if phase not in {"PREMARKET", "RTH"}:
+        return 0
+    row = {
+        "symbol": symbol,
+        "bar_time": bar.get("bucket_utc") or bar.get("bar_time_utc"),
+        "session_phase": phase,
+        "open": safe_float(bar.get("open")),
+        "high": safe_float(bar.get("high")),
+        "low": safe_float(bar.get("low")),
+        "close": safe_float(bar.get("close")),
+        "volume": safe_float(bar.get("volume")),
+        "wap": None,
+        "trade_count": safe_int(bar.get("samples")),
+        "source": str(bar.get("source") or "live_ticker_snapshot"),
+        "recorded_at": now_utc(),
+    }
+    try:
+        return record_candle_rows_with_phase(recorder, [row])
+    except Exception as exc:
+        print(f"{now_utc()} LIVE_CANDLE_RECORD_FAILED symbol={symbol} session_phase={phase} error={exc!r}", flush=True)
+        return 0
+
+
 def backfill_recent_1m(ib: IB, recorder: LiveDataRecorder, contracts: list[tuple[str, Any]], args: argparse.Namespace) -> int:
     if not args.backfill_1m_on_start:
         return 0
@@ -2633,6 +2942,7 @@ def backfill_recent_1m(ib: IB, recorder: LiveDataRecorder, contracts: list[tuple
             rows.append({
                 "symbol": symbol,
                 "bar_time": bar_time,
+                "session_phase": "",
                 "open": safe_float(getattr(bar, "open", None)),
                 "high": safe_float(getattr(bar, "high", None)),
                 "low": safe_float(getattr(bar, "low", None)),
@@ -2644,7 +2954,7 @@ def backfill_recent_1m(ib: IB, recorder: LiveDataRecorder, contracts: list[tuple
                 "recorded_at": now_utc(),
             })
         if rows:
-            total += recorder.record_candles_1m(rows)
+            total += record_candle_rows_with_phase(recorder, rows)
         ib.sleep(args.backfill_pause_seconds)
     print(f"{now_utc()} backfill_1m_done symbols={len(subset)} rows={total}", flush=True)
     return total
@@ -2655,9 +2965,9 @@ def current_session_candle_count(recorder: LiveDataRecorder, args: argparse.Name
     if not path.exists() or path.stat().st_size == 0:
         return 0
     try:
-        hh, mm = [int(x) for x in str(args.market_open_utc).split(":", 1)]
         today = datetime.now(timezone.utc).date()
-        market_open = datetime(today.year, today.month, today.day, hh, mm, tzinfo=timezone.utc)
+        session = get_us_equity_session(today)
+        market_open = session.open_utc or market_open_datetime_utc(args)
     except Exception:
         return 0
     count = 0
@@ -2682,23 +2992,33 @@ def backfill_current_session_1m(
         return 0
 
     try:
-        hh, mm = [int(x) for x in str(args.market_open_utc).split(":", 1)]
         now = datetime.now(timezone.utc)
-        market_open = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        timing = runtime_session_timing(args, now)
+        market_open = timing.market_open
+        premarket_start = timing.premarket_start
     except Exception as exc:
-        print(f"{now_utc()} current_session_backfill_skipped reason=bad_market_open error={exc!r}", flush=True)
+        print(f"{now_utc()} current_session_backfill_skipped reason=bad_session_timing error={exc!r}", flush=True)
         return 0
 
-    if now < market_open:
-        print(f"{now_utc()} current_session_backfill_skipped reason=before_market_open", flush=True)
+    if not timing.is_trading_day or market_open is None or premarket_start is None:
+        print(f"{now_utc()} current_session_backfill_skipped reason=not_trading_day", flush=True)
         return 0
 
-    duration_seconds = max(60, int((now - market_open).total_seconds()) + 300)
+    if now < premarket_start:
+        print(f"{now_utc()} current_session_backfill_skipped reason=before_premarket_collection", flush=True)
+        return 0
+
+    duration_seconds = max(60, int((now - premarket_start).total_seconds()) + 300)
     duration = f"{duration_seconds} S"
     keys = existing_candle_keys(recorder)
     total = 0
     subset = contracts[: max(0, int(getattr(args, "backfill_top_n", len(contracts))))]
-    print(f"{now_utc()} current_session_backfill_start symbols={len(subset)} duration={duration}", flush=True)
+    print(
+        f"{now_utc()} PREMARKET_BACKFILL_START session_date={timing.session_date} "
+        f"premarket_start_utc={premarket_start.isoformat()} market_open_utc={market_open.isoformat()} "
+        f"symbols={len(subset)} duration={duration}",
+        flush=True,
+    )
 
     for symbol, contract in subset:
         try:
@@ -2720,7 +3040,10 @@ def backfill_current_session_1m(
         for bar in bars:
             bar_time = str(getattr(bar, "date", ""))
             ts = _parse_bar_time_utc(bar_time)
-            if ts is None or ts < market_open:
+            if ts is None or ts < premarket_start:
+                continue
+            phase = candle_session_phase(ts, timing)
+            if phase not in {"PREMARKET", "RTH"}:
                 continue
             key = (symbol, bar_time)
             if key in keys:
@@ -2729,6 +3052,7 @@ def backfill_current_session_1m(
             rows.append({
                 "symbol": symbol,
                 "bar_time": bar_time,
+                "session_phase": phase,
                 "open": safe_float(getattr(bar, "open", None)),
                 "high": safe_float(getattr(bar, "high", None)),
                 "low": safe_float(getattr(bar, "low", None)),
@@ -2740,10 +3064,10 @@ def backfill_current_session_1m(
                 "recorded_at": now_utc(),
             })
         if rows:
-            total += recorder.record_candles_1m(rows)
+            total += record_candle_rows_with_phase(recorder, rows)
         ib.sleep(float(getattr(args, "backfill_pause_seconds", 0.15)))
 
-    print(f"{now_utc()} current_session_backfill_done symbols={len(subset)} rows={total}", flush=True)
+    print(f"{now_utc()} PREMARKET_BACKFILL_DONE session_date={timing.session_date} symbols={len(subset)} candle_rows={total}", flush=True)
     return total
 
 
@@ -6731,11 +7055,15 @@ def rebuild_symbol_states_from_1m_candles(
         return 0
 
     try:
-        hh, mm = [int(x) for x in str(args.market_open_utc).split(":", 1)]
         now = datetime.now(timezone.utc)
-        market_open = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        timing = runtime_session_timing(args, now)
+        market_open = timing.market_open
+        premarket_start = timing.premarket_start
     except Exception as exc:
-        print(f"{now_utc()} state_rebuild_skipped reason=bad_market_open error={exc!r}", flush=True)
+        print(f"{now_utc()} state_rebuild_skipped reason=bad_session_timing error={exc!r}", flush=True)
+        return 0
+    if not timing.is_trading_day or market_open is None or premarket_start is None:
+        print(f"{now_utc()} state_rebuild_skipped reason=not_trading_day", flush=True)
         return 0
 
     by_symbol: dict[str, list[dict[str, Any]]] = {}
@@ -6746,7 +7074,7 @@ def rebuild_symbol_states_from_1m_candles(
                 if symbol not in states:
                     continue
                 ts = _parse_bar_time_utc(row.get("bar_time", ""))
-                if ts is None or ts < market_open:
+                if ts is None or ts < premarket_start:
                     continue
                 by_symbol.setdefault(symbol, []).append(row)
     except Exception as exc:
@@ -6759,22 +7087,10 @@ def rebuild_symbol_states_from_1m_candles(
         if not rows:
             continue
 
-        first = safe_float(rows[0].get("open")) or safe_float(rows[0].get("close"))
-        if first is None or first <= 0:
-            continue
-
         st = states[symbol]
         reset_symbol_session_state(st)
         st.signal_source = "reconstructed"
         st.last_update_source = "reconstructed"
-        st.first_seen_ts = time.time()
-        first_ts = _parse_bar_time_utc(rows[0].get("bar_time", ""))
-        st.first_seen_utc = first_ts.isoformat() if first_ts is not None else None
-        st.latest_seen_utc = st.first_seen_utc
-        st.first_price = first
-        st.open_price = first
-        st.high = first
-        st.low = first
 
         for row in rows:
             ts = _parse_bar_time_utc(row.get("bar_time", ""))
@@ -6790,16 +7106,30 @@ def rebuild_symbol_states_from_1m_candles(
                 continue
 
             minutes = (ts - market_open).total_seconds() / 60.0
-
-            st.high = max(st.high or high, high)
-            st.low = min(st.low or low, low)
-            st.last_price = close or st.last_price
-            st.latest_volume = vol or st.latest_volume
-            st.latest_seen_utc = ts.isoformat()
+            phase = str(row.get("session_phase") or candle_session_phase(ts, timing)).upper()
+            price = close or high
+            if phase == "PREMARKET" or minutes < 0:
+                update_premarket_state(st, {"price": price, "volume": vol, "close": safe_float(row.get("close"))}, ts)
+            else:
+                if st.first_seen_ts is None:
+                    st.first_seen_ts = time.time()
+                    st.first_seen_utc = ts.isoformat()
+                    first = safe_float(row.get("open")) or safe_float(row.get("close")) or high
+                    st.first_price = first
+                    st.open_price = first
+                    st.high = first
+                    st.low = first
+                st.high = max(st.high or high, high)
+                st.low = min(st.low or low, low)
+                st.last_price = close or st.last_price
+                st.latest_volume = vol or st.latest_volume
+                st.latest_seen_utc = ts.isoformat()
+                st.rth_minutes_elapsed = minutes
+                st.rth_candle_count += 1
             append_symbol_state_bar(
                 st,
                 observed_at=ts,
-                price=close or high,
+                price=price,
                 session_elapsed=minutes * 60.0,
                 source="candles_1m_rebuild",
                 runtime_state=runtime_state,
@@ -6808,19 +7138,25 @@ def rebuild_symbol_states_from_1m_candles(
                 low=low,
                 close=close,
                 volume=vol,
+                session_phase="PREMARKET" if phase == "PREMARKET" or minutes < 0 else "RTH",
             )
 
-            if 0 <= minutes < 5:
-                st.first_5m_high = max(st.first_5m_high or high, high)
-            if 0 <= minutes < 15:
-                st.first_15m_high = max(st.first_15m_high or high, high)
-            if 0 <= minutes < (args.opening_range_seconds / 60.0):
-                st.or_high = max(st.or_high or high, high)
-                st.or_low = min(st.or_low or low, low)
+            if minutes >= 0:
+                if 0 <= minutes < 5:
+                    st.first_5m_high = max(st.first_5m_high or high, high)
+                if 0 <= minutes < 15:
+                    st.first_15m_high = max(st.first_15m_high or high, high)
+                if 0 <= minutes < (args.opening_range_seconds / 60.0):
+                    st.or_high = max(st.or_high or high, high)
+                    st.or_low = min(st.or_low or low, low)
 
         rebuilt += 1
 
-    print(f"{now_utc()} state_rebuild_done symbols={rebuilt} source=candles_1m market_open_utc={args.market_open_utc}", flush=True)
+    print(
+        f"{now_utc()} state_rebuild_done symbols={rebuilt} source=candles_1m "
+        f"premarket_start_utc={premarket_start.isoformat()} market_open_utc={market_open.isoformat()}",
+        flush=True,
+    )
     return rebuilt
 
 
@@ -7022,6 +7358,12 @@ def main() -> int:
     parser.add_argument("--market-open-utc", default="13:30")
     parser.add_argument("--market-close-utc", default="20:00")
     parser.add_argument("--new-entries-start-utc", default="13:35")
+    parser.add_argument(
+        "--entry-delay-after-open-minutes",
+        type=float,
+        default=float(os.environ.get("TRADING_BOT_ENTRY_DELAY_AFTER_OPEN_MINUTES", "5") or 5.0),
+    )
+    parser.add_argument("--premarket-collection-minutes", type=float, default=30.0)
     parser.add_argument("--manage-exits-start-utc", default="13:30")
     parser.add_argument("--restart-cooldown-seconds", type=float, default=300.0)
     parser.add_argument("--backfill-1m-on-start", action=argparse.BooleanOptionalAction, default=True)
@@ -7575,10 +7917,43 @@ def main() -> int:
             if loop_now - float(runtime_state.get("disk_usage_last_check_ts") or 0.0) >= 60.0:
                 runtime_state["disk_usage_last_check_ts"] = loop_now
                 monitor_disk_usage(args.recorder_dir, runtime_state, log_dir=log_dir)
-            market_open = market_open_datetime_utc(args, observed_at)
+            timing = runtime_session_timing(args, observed_at)
+            market_open = timing.market_open or market_open_datetime_utc(args, observed_at)
             session_elapsed = (observed_at - market_open).total_seconds()
+            current_session_phase = session_phase_for_time(observed_at, timing)
             today_session = get_us_equity_session(observed_at.date())
             market_closed_today = not today_session.is_trading_day
+            if timing.is_trading_day and timing.premarket_start and observed_at >= timing.premarket_start:
+                premarket_log_key = f"premarket_collection_start_logged:{timing.session_date}"
+                if not runtime_state.get(premarket_log_key):
+                    runtime_state[premarket_log_key] = True
+                    print(
+                        f"{now_utc()} PREMARKET_COLLECTION_START session_date={timing.session_date} "
+                        f"premarket_start_utc={timing.premarket_start.isoformat()} "
+                        f"market_open_utc={market_open.isoformat()} symbols={len(contracts)}",
+                        flush=True,
+                    )
+            if timing.is_trading_day and observed_at >= market_open:
+                rth_log_key = f"rth_session_start_logged:{timing.session_date}"
+                if not runtime_state.get(rth_log_key):
+                    runtime_state[rth_log_key] = True
+                    print(
+                        f"{now_utc()} RTH_SESSION_START session_date={timing.session_date} "
+                        f"market_open_utc={market_open.isoformat()} symbols={len(contracts)}",
+                        flush=True,
+                    )
+                rth_reset_key = f"rth_state_reset:{timing.session_date}"
+                if not runtime_state.get(rth_reset_key):
+                    reset_count = 0
+                    for state in states.values():
+                        reset_symbol_rth_state_preserve_premarket(state, session_date=timing.session_date)
+                        reset_count += 1
+                    runtime_state[rth_reset_key] = True
+                    print(
+                        f"{now_utc()} RTH_STATE_RESET session_date={timing.session_date} "
+                        f"states_reset={reset_count} premarket_preserved=1",
+                        flush=True,
+                    )
             if today_session.is_trading_day:
                 boundary_key = today_session.session_date.isoformat()
                 if runtime_state.get("last_session_boundary_check_date") != boundary_key:
@@ -7639,10 +8014,30 @@ def main() -> int:
             debug_symbol = contracts[0][0] if contracts else None
             debug_payload: tuple[str, SymbolState, dict[str, Any], dict[str, Any]] | None = None
             zeroish_feature_count = 0
+            entry_delay_active = entry_delay_active_for_time(observed_at, timing)
+            if entry_delay_active:
+                delay_log_key = f"entry_delay_active_logged:{timing.session_date}"
+                if not runtime_state.get(delay_log_key):
+                    runtime_state[delay_log_key] = True
+                    print(
+                        f"{now_utc()} ENTRY_DELAY_ACTIVE session_date={timing.session_date} "
+                        f"entry_delay_minutes={timing.entry_delay_minutes} "
+                        f"earliest_entry_time_utc={timing.earliest_entry_time.isoformat() if timing.earliest_entry_time else ''}",
+                        flush=True,
+                    )
+            elif timing.is_trading_day and timing.earliest_entry_time and observed_at >= timing.earliest_entry_time:
+                delay_complete_key = f"entry_delay_complete_logged:{timing.session_date}"
+                if not runtime_state.get(delay_complete_key):
+                    runtime_state[delay_complete_key] = True
+                    print(
+                        f"{now_utc()} ENTRY_DELAY_COMPLETE session_date={timing.session_date} "
+                        f"entry_delay_minutes={timing.entry_delay_minutes} "
+                        f"earliest_entry_time_utc={timing.earliest_entry_time.isoformat()}",
+                        flush=True,
+                    )
             time_entries_blocked = (
                 market_closed_today
-                or
-                not is_after_utc(args.new_entries_start_utc)
+                or entry_delay_active
                 or is_after_utc(args.no_new_entries_after_utc)
                 or is_after_utc(args.eod_flatten_utc)
             )
@@ -7655,6 +8050,10 @@ def main() -> int:
             top100_entries_blocked = bool(runtime_state.get("top100_entries_blocked", False))
             if pending_eod_entries_blocked:
                 runtime_state["entries_blocked_reason"] = "pending_eod_flatten"
+            elif entry_delay_active:
+                runtime_state["entries_blocked_reason"] = "entry_delay_after_open"
+            elif runtime_state.get("entries_blocked_reason") == "entry_delay_after_open":
+                runtime_state["entries_blocked_reason"] = ""
             elif disk_entries_blocked:
                 runtime_state["entries_blocked_reason"] = "disk_full_risk"
             elif runtime_state.get("entries_blocked_reason") == "disk_full_risk":
@@ -7700,7 +8099,18 @@ def main() -> int:
                 latest_snapshots[symbol] = snap
                 data_count += 1
                 state = states[symbol]
-                update_state(state, snap, session_elapsed, args.opening_range_seconds, observed_at=observed_at, runtime_state=runtime_state)
+                completed_bar = update_state(
+                    state,
+                    snap,
+                    session_elapsed,
+                    args.opening_range_seconds,
+                    observed_at=observed_at,
+                    runtime_state=runtime_state,
+                    session_phase=current_session_phase,
+                )
+                recorded_candle_rows = record_completed_live_state_bar(recorder, symbol, completed_bar)
+                if recorded_candle_rows:
+                    runtime_state["live_candle_rows_recorded_total"] = int(runtime_state.get("live_candle_rows_recorded_total") or 0) + recorded_candle_rows
                 features = compute_live_safe_features(state, snap, args)
                 if features_are_all_zeroish(features):
                     zeroish_feature_count += 1
@@ -7742,6 +8152,8 @@ def main() -> int:
                             stale_reason="",
                             position_usd=args.position_usd,
                             now_ts=loop_now,
+                            timing=timing,
+                            observed_at=observed_at,
                         )
                     )
                     info = runtime_ineligible_info(runtime_state, symbol)
@@ -7808,6 +8220,8 @@ def main() -> int:
                         stale_reason=stale_reason_for_snapshot,
                         position_usd=args.position_usd,
                         now_ts=loop_now,
+                        timing=timing,
+                        observed_at=observed_at,
                     )
                 )
                 if features["ready"] and not state.signal_sent and not has_active_position and entry_symbol_allowed and entries_blocked:
@@ -7826,6 +8240,7 @@ def main() -> int:
                             "time_entries_blocked": time_entries_blocked,
                             "restart_entries_blocked": restart_entries_blocked,
                             "reconnect_entries_blocked": reconnect_entries_blocked,
+                            "entry_delay_active": entry_delay_active,
                             "entries_blocked_reason": runtime_state.get("entries_blocked_reason"),
                         },
                     )
@@ -8482,7 +8897,7 @@ def main() -> int:
                 persist_managed_positions(recorder, managed_positions, latest_snapshots, latest_portfolio_rows)
             time_entries_blocked = (
                 market_closed_today
-                or not is_after_utc(args.new_entries_start_utc)
+                or entry_delay_active
                 or is_after_utc(args.no_new_entries_after_utc)
                 or is_after_utc(args.eod_flatten_utc)
             )
@@ -8527,7 +8942,7 @@ def main() -> int:
                 f"last_restart_unblock_time={runtime_state.get('last_restart_unblock_utc') or ''} "
                 f"adopted={adopted_count} exits_sent={exit_count} managed_open={active_managed} entries_blocked={int(entries_blocked)} "
                 f"entries_blocked_reason={runtime_state.get('entries_blocked_reason') or ''} "
-                f"manual_block={int(manual_entries_blocked)} restart_block={int(restart_entries_blocked)} reconnect_block={int(reconnect_entries_blocked)} disk_block={int(disk_entries_blocked)} "
+                f"manual_block={int(manual_entries_blocked)} entry_delay_block={int(entry_delay_active)} restart_block={int(restart_entries_blocked)} reconnect_block={int(reconnect_entries_blocked)} disk_block={int(disk_entries_blocked)} "
                 f"top100_block={int(top100_entries_blocked)} "
                 f"pending_eod_flatten={int(pending_eod_entries_blocked)} eod_recovery_active={int(bool(runtime_state.get('eod_recovery_active')))} "
                 f"last_eod_retry_age_seconds={last_eod_retry_age_text} eod_active={int(eod_active)} "

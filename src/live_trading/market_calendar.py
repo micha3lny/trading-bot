@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+
+US_EASTERN = ZoneInfo("America/New_York")
 
 
 @dataclass(frozen=True)
@@ -106,9 +110,11 @@ def get_us_equity_session(value: date | datetime) -> EquitySession:
         return EquitySession(session_date, None, None, False, False, holiday_reason)
 
     early_reason = us_equity_early_closes(session_date.year).get(session_date)
-    open_utc = datetime.combine(session_date, dtime(hour=13, minute=30), tzinfo=timezone.utc)
-    close_time = dtime(hour=18, minute=0) if early_reason else dtime(hour=20, minute=0)
-    close_utc = datetime.combine(session_date, close_time, tzinfo=timezone.utc)
+    open_local = datetime.combine(session_date, dtime(hour=9, minute=30), tzinfo=US_EASTERN)
+    close_local_time = dtime(hour=13, minute=0) if early_reason else dtime(hour=16, minute=0)
+    close_local = datetime.combine(session_date, close_local_time, tzinfo=US_EASTERN)
+    open_utc = open_local.astimezone(timezone.utc)
+    close_utc = close_local.astimezone(timezone.utc)
     return EquitySession(
         session_date=session_date,
         open_utc=open_utc,

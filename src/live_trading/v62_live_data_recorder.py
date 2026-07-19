@@ -66,6 +66,7 @@ def append_csv_rows(path: Path, rows: Iterable[dict[str, Any]], fieldnames: list
 class LiveCandle1m:
     symbol: str
     bar_time: str
+    session_phase: str = ""
     open: float | None = None
     high: float | None = None
     low: float | None = None
