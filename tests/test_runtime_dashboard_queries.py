@@ -13,6 +13,7 @@ import pandas as pd
 from src.dashboard.runtime_queries import (
     DateWindow,
     aggregate_closed_positions,
+    apply_symbol_session_peak_fallbacks,
     dataframe_memory_mb,
     execution_window_predicate,
     list_sessions,
@@ -1355,6 +1356,78 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             self.assertTrue(closed["drop_from_peak_pct"] != closed["drop_from_peak_pct"])
             self.assertEqual(closed["peak_source"], "canonical_peak_unavailable")
             self.assertEqual(closed["peak_data_quality"], "NEEDS_REBUILD")
+
+    def test_peak_fallback_does_not_rehydrate_needs_rebuild_values(self) -> None:
+        closed = pd.DataFrame([
+            {
+                "symbol": "MASK",
+                "session_date": "2026-05-27",
+                "strategy": "v67",
+                "peak_pct": float("nan"),
+                "drop_from_peak_pct": float("nan"),
+                "peak_data_quality": "NEEDS_REBUILD",
+                "peak_source": "unavailable",
+            }
+        ])
+
+        out = apply_symbol_session_peak_fallbacks(
+            closed,
+            {("2026-05-27", "v67", "MASK"): {"peak_pct": 12.0, "drop_from_peak_pct": -3.0, "source": "runtime_events_symbol_session"}},
+            {},
+        )
+
+        self.assertTrue(out.iloc[0]["peak_pct"] != out.iloc[0]["peak_pct"])
+        self.assertTrue(out.iloc[0]["drop_from_peak_pct"] != out.iloc[0]["drop_from_peak_pct"])
+        self.assertEqual(out.iloc[0]["peak_data_quality"], "NEEDS_REBUILD")
+
+    def test_aggregate_closed_positions_masks_invalid_peak_quality(self) -> None:
+        closed = pd.DataFrame([
+            {
+                "symbol": "PARTIAL",
+                "session_date": "2026-05-27",
+                "entry_order_id": "123",
+                "qty": 1,
+                "buy": 10,
+                "sell": 11,
+                "gross": 1,
+                "ibkr_commission": 0.1,
+                "net_actual": 1,
+                "net_pct": 10,
+                "entry_time": "2026-05-27T13:30:00+00:00",
+                "exit_time": "2026-05-27T13:40:00+00:00",
+                "peak_pct": 0,
+                "drop_from_peak_pct": -4,
+                "peak_data_quality": "NEEDS_REBUILD",
+                "commission_status": "OK",
+                "data_quality": "OK",
+            },
+            {
+                "symbol": "PARTIAL",
+                "session_date": "2026-05-27",
+                "entry_order_id": "123",
+                "qty": 2,
+                "buy": 10,
+                "sell": 11,
+                "gross": 2,
+                "ibkr_commission": 0.2,
+                "net_actual": 2,
+                "net_pct": 10,
+                "entry_time": "2026-05-27T13:30:00+00:00",
+                "exit_time": "2026-05-27T13:41:00+00:00",
+                "peak_pct": 5,
+                "drop_from_peak_pct": -2,
+                "peak_data_quality": "NEEDS_REBUILD",
+                "commission_status": "OK",
+                "data_quality": "OK",
+            },
+        ])
+
+        out = aggregate_closed_positions(closed)
+
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out.iloc[0]["peak_pct"] is None or out.iloc[0]["peak_pct"] != out.iloc[0]["peak_pct"])
+        self.assertTrue(out.iloc[0]["drop_from_peak_pct"] is None or out.iloc[0]["drop_from_peak_pct"] != out.iloc[0]["drop_from_peak_pct"])
+        self.assertEqual(out.iloc[0]["peak_data_quality"], "NEEDS_REBUILD")
 
     def test_missing_entry_time_does_not_reuse_exit_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

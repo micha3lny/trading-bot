@@ -370,8 +370,9 @@ def aggregate_closed_positions(df: pd.DataFrame) -> pd.DataFrame:
     for _, group in working.groupby("_logical_trade_key", dropna=False, sort=False):
         group = group.drop(columns=["_logical_trade_key"], errors="ignore")
         records = group.to_dict("records")
-        def numeric_group_col(name: str) -> pd.Series:
-            return pd.to_numeric(group[name], errors="coerce") if name in group.columns else pd.Series(dtype=float)
+        def numeric_group_col(name: str, frame: pd.DataFrame | None = None) -> pd.Series:
+            frame = group if frame is None else frame
+            return pd.to_numeric(frame[name], errors="coerce") if name in frame.columns else pd.Series(dtype=float)
 
         qty = pd.to_numeric(group.get("qty"), errors="coerce").fillna(0.0).abs()
         qty_sum = float(qty.sum())
@@ -386,18 +387,25 @@ def aggregate_closed_positions(df: pd.DataFrame) -> pd.DataFrame:
         net_pct = float((net / denominator) * 100.0) if denominator and pd.notna(net) else None
         entry_times = [x for x in group.get("entry_time", pd.Series(dtype=object)).tolist() if x]
         exit_times = [x for x in group.get("exit_time", pd.Series(dtype=object)).tolist() if x]
-        peak = numeric_group_col("peak_pct").max()
-        mae = numeric_group_col("mae_pct").min()
-        peak_price = numeric_group_col("peak_price").max()
-        low_price = numeric_group_col("low_price").min()
-        peak_upnl = numeric_group_col("peak_unrealized_pnl").sum(min_count=1)
-        max_adverse_upnl = numeric_group_col("max_adverse_unrealized_pnl").sum(min_count=1)
-        giveback = numeric_group_col("giveback_from_peak").sum(min_count=1)
-        drop = numeric_group_col("drop_from_peak_pct").min()
         hold = hold_minutes(min(entry_times) if entry_times else None, max(exit_times) if exit_times else None)
         first = records[0]
         qualities = sorted({str(x) for x in group.get("data_quality", pd.Series(dtype=str)).dropna().tolist() if str(x)})
         peak_qualities = sorted({str(x) for x in group.get("peak_data_quality", pd.Series(dtype=str)).dropna().tolist() if str(x)})
+        if "peak_data_quality" in group.columns:
+            peak_quality_upper = group["peak_data_quality"].fillna("").astype(str).str.upper()
+            peak_metric_group = group[peak_quality_upper.isin(VALID_CANONICAL_PEAK_QUALITIES)]
+        else:
+            peak_metric_group = group
+        peak = numeric_group_col("peak_pct", peak_metric_group).max()
+        mae = numeric_group_col("mae_pct", peak_metric_group).min()
+        peak_price = numeric_group_col("peak_price", peak_metric_group).max()
+        low_price = numeric_group_col("low_price", peak_metric_group).min()
+        peak_upnl = numeric_group_col("peak_unrealized_pnl", peak_metric_group).sum(min_count=1)
+        max_adverse_upnl = numeric_group_col("max_adverse_unrealized_pnl", peak_metric_group).sum(min_count=1)
+        giveback = numeric_group_col("giveback_from_peak", peak_metric_group).sum(min_count=1)
+        drop = numeric_group_col("drop_from_peak_pct", peak_metric_group).min()
+        if peak_metric_group.empty and "peak_data_quality" in group.columns:
+            peak_qualities = [str(x) for x in peak_qualities if str(x).upper() in INVALID_CANONICAL_PEAK_QUALITIES] or ["NEEDS_REBUILD"]
         statuses = sorted({str(x) for x in group.get("commission_status", pd.Series(dtype=str)).dropna().tolist() if str(x)})
         rows.append(
             {
@@ -429,6 +437,47 @@ def aggregate_closed_positions(df: pd.DataFrame) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+INVALID_CANONICAL_PEAK_QUALITIES = {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"}
+VALID_CANONICAL_PEAK_QUALITIES = {"EXACT", "PARTIAL"}
+
+
+def mask_untrusted_peak_values(closed: pd.DataFrame) -> pd.DataFrame:
+    if closed.empty or "peak_data_quality" not in closed.columns:
+        return closed
+    out = closed.copy()
+    peak_quality = out["peak_data_quality"].fillna("").astype(str).str.upper()
+    invalid_peak_mask = peak_quality.isin(INVALID_CANONICAL_PEAK_QUALITIES)
+    peak_cols = [
+        "peak_pct",
+        "peak_price",
+        "low_price",
+        "peak_unrealized_pnl",
+        "max_adverse_unrealized_pnl",
+        "giveback_from_peak",
+        "drop_from_peak_pct",
+    ]
+    available_peak_cols = [col for col in peak_cols if col in out.columns]
+    if available_peak_cols and invalid_peak_mask.any():
+        out.loc[invalid_peak_mask, available_peak_cols] = pd.NA
+
+    if "net_pct" in out.columns and "peak_pct" in out.columns:
+        peak_pct = pd.to_numeric(out["peak_pct"], errors="coerce")
+        net_pct = pd.to_numeric(out["net_pct"], errors="coerce")
+        profitable_peak_invalid = (
+            peak_quality.isin(VALID_CANONICAL_PEAK_QUALITIES)
+            & net_pct.notna()
+            & peak_pct.notna()
+            & (net_pct > 0)
+            & (peak_pct + 0.05 < net_pct)
+        )
+        if profitable_peak_invalid.any():
+            out.loc[profitable_peak_invalid, "peak_data_quality"] = "NEEDS_REBUILD"
+            out.loc[profitable_peak_invalid, "peak_source"] = "canonical_peak_validation_failed"
+            out.loc[profitable_peak_invalid, "peak_match_quality"] = "missing"
+            out.loc[profitable_peak_invalid, available_peak_cols] = pd.NA
+    return out
 
 
 def age_days(start: Any, end: Any = None) -> float | None:
@@ -2671,9 +2720,14 @@ def apply_symbol_session_peak_fallbacks(
 ) -> pd.DataFrame:
     if closed.empty or "peak_pct" not in closed.columns:
         return closed
-    out = closed.copy()
+    out = mask_untrusted_peak_values(closed)
     symbol_counts = out.groupby(["session_date", "symbol"], dropna=False).size().to_dict()
     for idx, row in out.iterrows():
+        peak_quality = str(row.get("peak_data_quality") or "").upper()
+        if peak_quality in INVALID_CANONICAL_PEAK_QUALITIES:
+            out.at[idx, "peak_match_quality"] = "missing"
+            out.at[idx, "peak_source"] = row.get("peak_source") or "canonical_peak_unavailable"
+            continue
         if pd.notna(row.get("peak_pct")):
             out.at[idx, "peak_match_quality"] = out.at[idx, "peak_match_quality"] if "peak_match_quality" in out.columns and pd.notna(out.at[idx, "peak_match_quality"]) else "exact_trade_id"
             continue
@@ -2711,7 +2765,7 @@ def apply_symbol_session_peak_fallbacks(
             out.at[idx, "drop_from_peak_pct"] = float(drop_pct)
         elif pd.notna(row.get("net_pct")):
             out.at[idx, "drop_from_peak_pct"] = float(row.get("net_pct")) - peak_pct
-    return out
+    return mask_untrusted_peak_values(out)
 
 
 def load_closed_positions(
