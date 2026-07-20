@@ -908,6 +908,65 @@ def pre_signal_ready_block_reason(
     return "would_emit_SIGNAL_READY"
 
 
+
+
+ENTRY_FEATURE_SNAPSHOT_PREMARKET_FIELDS = (
+    "premarket_open",
+    "premarket_high",
+    "premarket_low",
+    "premarket_last",
+    "premarket_range_pct",
+    "premarket_change_pct",
+    "premarket_volume",
+    "premarket_vwap",
+    "distance_from_premarket_high_pct",
+    "distance_from_premarket_low_pct",
+    "distance_from_premarket_vwap_pct",
+    "gap_from_previous_close_pct",
+)
+
+
+def build_entry_feature_snapshot(
+    *,
+    top100_meta: dict[str, Any],
+    signal_payload: dict[str, Any],
+    diagnostics: dict[str, Any],
+    features: dict[str, Any],
+    live_entry_score: float,
+    ranking_position: int | None,
+    order_id: Any,
+    perm_id: Any,
+) -> dict[str, Any]:
+    snapshot = {**top100_meta, **signal_payload}
+    spread = snapshot.get("spread_bps_at_entry")
+    if spread is None:
+        spread = snapshot.get("spread_bps")
+    snapshot.update({
+        "spread_bps_at_entry": spread,
+        "top100_rank": top100_meta.get("top100_rank", snapshot.get("top100_rank")),
+        "top100_score": top100_meta.get("top100_score", snapshot.get("top100_score")),
+        "top100_source_date": top100_meta.get("top100_source_date", snapshot.get("top100_source_date")),
+        "top100_features_json": top100_meta.get("top100_features_json", snapshot.get("top100_features_json")),
+        "live_entry_score": live_entry_score,
+        "live_entry_rank": ranking_position,
+        "ranking_position": ranking_position,
+        "candidate_age_seconds": diagnostics.get("candidate_age_seconds", snapshot.get("candidate_age_seconds")),
+        "entry_decision_time": diagnostics.get("entry_decision_time", snapshot.get("entry_decision_time")),
+        "feature_snapshot_time": now_utc(),
+        "source_snapshot_time": diagnostics.get("signal_time") or diagnostics.get("entry_decision_time") or snapshot.get("signal_time"),
+        "top100_snapshot_time": top100_meta.get("top100_snapshot_time") or top100_meta.get("top100_source_date"),
+        "signal_ready_reason": diagnostics.get("signal_ready_reason") or features.get("reason"),
+        "rejection_reason": features.get("reason"),
+        "entry_order_id": str(order_id or ""),
+        "entry_perm_id": str(perm_id or ""),
+        "entry_feature_snapshot_version": 1,
+        "entry_feature_snapshot_source": "buy_decision_runtime",
+    })
+    for field in ENTRY_FEATURE_SNAPSHOT_PREMARKET_FIELDS:
+        snapshot.setdefault(field, signal_payload.get(field))
+    return snapshot
+
+
 def build_pre_signal_runtime_snapshot(
     *,
     symbol: str,
@@ -8489,21 +8548,16 @@ def main() -> int:
                         )
                         entry_dispatch_stage = "entry_metadata_build"
                         top100_meta = dict(_runtime_dict(runtime_state, "top100_entry_metadata_by_symbol").get(symbol, {}))
-                        entry_feature_snapshot = {
-                            **top100_meta,
-                            **signal_payload,
-                            "live_entry_score": live_entry_score,
-                            "live_entry_rank": ranking_position,
-                            "ranking_position": ranking_position,
-                            "candidate_age_seconds": diagnostics.get("candidate_age_seconds"),
-                            "entry_decision_time": diagnostics.get("entry_decision_time"),
-                            "signal_ready_reason": diagnostics.get("signal_ready_reason") or features.get("reason"),
-                            "rejection_reason": features.get("reason"),
-                            "entry_order_id": str(order_id_for_entry or ""),
-                            "entry_perm_id": entry_perm_id,
-                            "entry_feature_snapshot_version": 1,
-                            "entry_feature_snapshot_source": "buy_decision_runtime",
-                        }
+                        entry_feature_snapshot = build_entry_feature_snapshot(
+                            top100_meta=top100_meta,
+                            signal_payload=signal_payload,
+                            diagnostics=diagnostics,
+                            features=features,
+                            live_entry_score=live_entry_score,
+                            ranking_position=ranking_position,
+                            order_id=order_id_for_entry,
+                            perm_id=entry_perm_id,
+                        )
                         live_features_json = json.dumps(entry_feature_snapshot, ensure_ascii=False, default=str, sort_keys=True)
                         entry_trade_id = f"entry:{getattr(recorder, 'session_date', '')}:{symbol}:{order_id_for_entry}"
                         entry_metadata = {

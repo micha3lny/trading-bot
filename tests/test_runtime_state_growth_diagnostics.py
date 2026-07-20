@@ -9,6 +9,7 @@ from pathlib import Path
 from src.live_trading.v67_live_top100_expansion_paper_trader import (
     ManagedPosition,
     SymbolState,
+    build_entry_feature_snapshot,
     emit_pre_signal_runtime_snapshot,
     runtime_state_growth_current_metrics,
     runtime_state_growth_delta_json,
@@ -52,6 +53,46 @@ class RuntimeStateGrowthDiagnosticsTests(unittest.TestCase):
             "sqlite_writer_status": {"ack_timeouts_total": 0},
             "process_start_monotonic": 0.0,
         }
+
+
+    def test_entry_feature_snapshot_includes_buy_time_required_features(self) -> None:
+        snapshot = build_entry_feature_snapshot(
+            top100_meta={"top100_rank": 4, "top100_score": 91.2, "top100_source_date": "2026-07-17"},
+            signal_payload={
+                "spread_bps": 18.5,
+                "first_5m_high_pct": 1.1,
+                "first_15m_high_pct": 2.2,
+                "or_range_pct": 0.8,
+                "premarket_range_pct": 7.7,
+                "premarket_change_pct": 3.3,
+                "premarket_volume": 12345,
+                "premarket_vwap": 10.42,
+                "distance_from_premarket_high_pct": -1.2,
+                "distance_from_premarket_low_pct": 4.4,
+                "distance_from_premarket_vwap_pct": 0.9,
+                "gap_from_previous_close_pct": 5.5,
+            },
+            diagnostics={"candidate_age_seconds": 12.3, "signal_time": "2026-07-17T13:45:00+00:00"},
+            features={"score": 88.8, "reason": "breakout_ready"},
+            live_entry_score=88.8,
+            ranking_position=2,
+            order_id=12345,
+            perm_id=67890,
+        )
+        self.assertEqual(snapshot["spread_bps_at_entry"], 18.5)
+        self.assertEqual(snapshot["top100_rank"], 4)
+        self.assertEqual(snapshot["top100_score"], 91.2)
+        self.assertEqual(snapshot["live_entry_score"], 88.8)
+        self.assertEqual(snapshot["live_entry_rank"], 2)
+        self.assertEqual(snapshot["premarket_range_pct"], 7.7)
+        self.assertEqual(snapshot["premarket_change_pct"], 3.3)
+        self.assertEqual(snapshot["premarket_volume"], 12345)
+        self.assertEqual(snapshot["premarket_vwap"], 10.42)
+        self.assertEqual(snapshot["distance_from_premarket_high_pct"], -1.2)
+        self.assertEqual(snapshot["distance_from_premarket_vwap_pct"], 0.9)
+        self.assertEqual(snapshot["gap_from_previous_close_pct"], 5.5)
+        self.assertEqual(snapshot["entry_feature_snapshot_source"], "buy_decision_runtime")
+        self.assertIn("feature_snapshot_time", snapshot)
 
     def test_two_sessions_without_restart_detects_old_symbol_state(self) -> None:
         states = {
