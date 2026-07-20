@@ -34,16 +34,16 @@ def args_for(**overrides: object) -> argparse.Namespace:
 class StrategyAnalysisRunnerTests(unittest.TestCase):
     def test_registry_order_includes_required_strategy_analyzers(self) -> None:
         names = [spec.name for spec in runner.ANALYZER_REGISTRY]
-        self.assertEqual(names[:4], ["coverage", "missed", "bad_entries", "early_loser"])
+        self.assertEqual(names[:5], ["coverage", "missed", "bad_entries", "early_loser", "stop_loss"])
         self.assertIn("shs", names)
         self.assertIn("nbas", names)
         self.assertIn("offline_runtime_pre_signal", names)
         self.assertNotIn("bad_entry_details", names)
 
     def test_only_and_skip_use_registry(self) -> None:
-        args = args_for(only=["bad_entries", "early_loser"], skip=["early_loser"])
+        args = args_for(only=["bad_entries", "early_loser", "stop_loss"], skip=["early_loser"])
         specs = runner.selected_specs(args)
-        self.assertEqual([spec.name for spec in specs], ["bad_entries"])
+        self.assertEqual([spec.name for spec in specs], ["bad_entries", "stop_loss"])
 
     def test_force_and_common_paths_are_passed(self) -> None:
         args = args_for(output_dir=Path("out"), sqlite_path=Path("runtime.sqlite"), history_dir=Path("history"))
@@ -52,7 +52,9 @@ class StrategyAnalysisRunnerTests(unittest.TestCase):
         self.assertNotIn("--force", commands["bad_entries"])
         self.assertIn("--sqlite-path", commands["bad_entries"])
         self.assertIn("--history-dir", commands["early_loser"])
+        self.assertIn("--history-dir", commands["stop_loss"])
         self.assertIn("--output-dir", commands["bad_entries"])
+        self.assertIn("--output-dir", commands["stop_loss"])
 
     def test_no_force_removes_force(self) -> None:
         args = args_for(no_force=True)
@@ -64,6 +66,9 @@ class StrategyAnalysisRunnerTests(unittest.TestCase):
         self.assertIn("bad_entries_trades_2026-07-17.csv", outputs)
         self.assertIn("bad_entries_data_quality_2026-07-17.json", outputs)
         self.assertIn("early_loser_trade_paths_2026-07-17.csv", outputs)
+        self.assertIn("stop_loss_trade_paths_2026-07-17.csv", outputs)
+        self.assertIn("stop_loss_fixed_grid_2026-07-17.csv", outputs)
+        self.assertIn("stop_loss_data_quality_2026-07-17.json", outputs)
         self.assertIn("offline_runtime_pre_signal_summary_2026-07-17.csv", outputs)
 
     def test_strategy_summary_mentions_required_markers(self) -> None:
@@ -80,6 +85,7 @@ class StrategyAnalysisRunnerTests(unittest.TestCase):
             for marker in ["FACT:", "HYPOTHESIS:", "NOT AVAILABLE:", "BASELINE ONLY:", "REQUIRES MULTI-DAY VALIDATION:", "POSSIBLE OVERFITTING:"]:
                 self.assertIn(marker, text)
             self.assertIn("premarket_feature_coverage=unavailable_for_session", text)
+            self.assertIn("Stop loss strategy", text)
 
 
 if __name__ == "__main__":
