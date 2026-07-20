@@ -1119,9 +1119,22 @@ class SQLiteRuntimeStore:
         raw = raw or parse_jsonish(row.get("raw_json"))
         symbol = str(row.get("symbol") or raw.get("symbol") or "").upper()
         session = row.get("session_date") or raw.get("session_date") or session_date_utc()
-        trade_id = str(row.get("trade_id") or raw.get("trade_id") or "").strip()
+        trade_id = str(row.get("trade_id") or raw.get("trade_id") or raw.get("entry_trade_id") or "").strip()
         order_id = normalized_identifier(row.get("order_id") or raw.get("order_id") or raw.get("entry_order_id"))
         perm_id = normalized_identifier(row.get("perm_id") or raw.get("perm_id") or raw.get("entry_perm_id"))
+        raw_entry_metadata: dict[str, Any] = {
+            "trade_id": trade_id or raw.get("entry_trade_id"),
+            "strategy_name": row.get("strategy_name") or raw.get("strategy_name"),
+            "session_date": session,
+        }
+        for field in ENTRY_METADATA_FIELDS:
+            value = raw.get(field)
+            if value not in (None, ""):
+                raw_entry_metadata[field] = value
+        if raw.get("entry_decision_time"):
+            raw_entry_metadata["entry_decision_time"] = raw.get("entry_decision_time")
+        if raw.get("entry_order_time"):
+            raw_entry_metadata["entry_order_time"] = raw.get("entry_order_time")
 
         predicates: list[str] = []
         params: list[Any] = []
@@ -1200,7 +1213,7 @@ class SQLiteRuntimeStore:
             )
             if rows:
                 return self._entry_metadata_from_trade_row(rows[0])
-        return {}
+        return {key: value for key, value in raw_entry_metadata.items() if value not in (None, "")}
 
     def _merge_entry_metadata_into_raw(self, raw: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
         if not meta:
@@ -1209,6 +1222,14 @@ class SQLiteRuntimeStore:
             value = meta.get(field)
             if value not in (None, "") and raw.get(field) in (None, ""):
                 raw[field] = value
+        feature_snapshot = parse_jsonish(meta.get("live_entry_features_json"))
+        if feature_snapshot:
+            raw.setdefault("entry_feature_snapshot", feature_snapshot)
+            raw.setdefault("entry_feature_snapshot_version", feature_snapshot.get("entry_feature_snapshot_version") or 1)
+            raw.setdefault("entry_feature_snapshot_source", feature_snapshot.get("entry_feature_snapshot_source") or "live_entry_features_json")
+            for field, value in feature_snapshot.items():
+                if value not in (None, "") and raw.get(field) in (None, ""):
+                    raw[field] = value
         if meta.get("entry_decision_time") and raw.get("entry_decision_time") in (None, ""):
             raw["entry_decision_time"] = meta.get("entry_decision_time")
         if meta.get("trade_id") and raw.get("entry_trade_id") in (None, ""):
@@ -2201,6 +2222,7 @@ class SQLiteRuntimeStore:
                     **status_raw,
                 }
             )
+            raw = self._merge_entry_metadata_into_raw(raw, entry_metadata)
             self.upsert_trade(
                 {
                     "trade_id": persist_trade_id,
@@ -2226,6 +2248,18 @@ class SQLiteRuntimeStore:
                     "max_adverse_unrealized_pnl": None,
                     "giveback_from_peak": None,
                     "exit_reason": exit_reason,
+                    "top100_rank": safe_int(entry_metadata.get("top100_rank")),
+                    "top100_score": safe_float(entry_metadata.get("top100_score")),
+                    "top100_source_date": entry_metadata.get("top100_source_date"),
+                    "top100_features_json": entry_metadata.get("top100_features_json"),
+                    "live_entry_score": safe_float(entry_metadata.get("live_entry_score")),
+                    "live_entry_rank": safe_int(entry_metadata.get("live_entry_rank")),
+                    "live_entry_features_json": entry_metadata.get("live_entry_features_json"),
+                    "signal_source": entry_metadata.get("signal_source"),
+                    "signal_time": entry_metadata.get("signal_time"),
+                    "ready_since": entry_metadata.get("ready_since"),
+                    "entry_order_id": entry_metadata.get("entry_order_id"),
+                    "entry_perm_id": entry_metadata.get("entry_perm_id"),
                     "ibkr_entry_confirmed": True,
                     "ibkr_exit_confirmed": True,
                     "ibkr_position_flat_confirmed": True,

@@ -8489,7 +8489,22 @@ def main() -> int:
                         )
                         entry_dispatch_stage = "entry_metadata_build"
                         top100_meta = dict(_runtime_dict(runtime_state, "top100_entry_metadata_by_symbol").get(symbol, {}))
-                        live_features_json = json.dumps(features, ensure_ascii=False, default=str, sort_keys=True)
+                        entry_feature_snapshot = {
+                            **top100_meta,
+                            **signal_payload,
+                            "live_entry_score": live_entry_score,
+                            "live_entry_rank": ranking_position,
+                            "ranking_position": ranking_position,
+                            "candidate_age_seconds": diagnostics.get("candidate_age_seconds"),
+                            "entry_decision_time": diagnostics.get("entry_decision_time"),
+                            "signal_ready_reason": diagnostics.get("signal_ready_reason") or features.get("reason"),
+                            "rejection_reason": features.get("reason"),
+                            "entry_order_id": str(order_id_for_entry or ""),
+                            "entry_perm_id": entry_perm_id,
+                            "entry_feature_snapshot_version": 1,
+                            "entry_feature_snapshot_source": "buy_decision_runtime",
+                        }
+                        live_features_json = json.dumps(entry_feature_snapshot, ensure_ascii=False, default=str, sort_keys=True)
                         entry_trade_id = f"entry:{getattr(recorder, 'session_date', '')}:{symbol}:{order_id_for_entry}"
                         entry_metadata = {
                             **top100_meta,

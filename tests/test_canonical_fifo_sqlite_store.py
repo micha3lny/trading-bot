@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,6 +71,69 @@ class CanonicalFifoSQLiteStoreTests(unittest.TestCase):
                 self.assertEqual(components[1]["buy_execution_id"], "B_NEW")
                 self.assertEqual(components[1]["sell_execution_id"], "S_NEW")
                 self.assertNotEqual(components[0]["trade_id"], components[1]["trade_id"])
+            finally:
+                store.close()
+
+    def test_entry_feature_snapshot_survives_canonical_finalization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                session = "2026-07-17"
+                snapshot = {
+                    "score": 76.5,
+                    "live_entry_score": 76.5,
+                    "ranking_position": 7,
+                    "candidate_age_seconds": 42.25,
+                    "signal_ready_reason": "would_emit_SIGNAL_READY",
+                    "rejection_reason": "momentum_breakout",
+                    "spread_bps": 18.4,
+                    "or_range_pct": 1.12,
+                    "first_5m_high_pct": 2.34,
+                    "first_15m_high_pct": 4.56,
+                    "distance_from_open_pct": 3.21,
+                    "distance_from_or_high_pct": 0.44,
+                    "entry_feature_snapshot_version": 1,
+                    "entry_feature_snapshot_source": "buy_decision_runtime",
+                }
+                store.upsert_trade(
+                    {
+                        "trade_id": f"entry:{session}:FEAT:1001",
+                        "strategy_name": "v67",
+                        "session_date": session,
+                        "symbol": "FEAT",
+                        "status": "ENTRY_PENDING",
+                        "entry_order_id": "1001",
+                        "top100_rank": 7,
+                        "top100_score": 88.8,
+                        "live_entry_score": 76.5,
+                        "live_entry_rank": 7,
+                        "live_entry_features_json": snapshot,
+                        "signal_source": "live",
+                        "signal_time": "2026-07-17T13:35:00+00:00",
+                        "ready_since": "2026-07-17T13:34:50+00:00",
+                        "raw_json": {"entry_order_id": "1001", "live_entry_features_json": snapshot},
+                    }
+                )
+                add_execution(store, "B_FEAT", "BOT", 10, 10, "2026-07-17T13:36:00+00:00", symbol="FEAT", order_id="1001")
+                add_execution(store, "S_FEAT", "SLD", 10, 11, "2026-07-17T13:46:00+00:00", symbol="FEAT", realized_pnl=10)
+
+                store.rebuild_symbol_trade_state("FEAT")
+                rows = store.query("SELECT * FROM trades WHERE symbol = 'FEAT' AND status = 'CLOSED'")
+
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                raw = json.loads(row["raw_json"])
+                self.assertEqual(row["top100_rank"], 7)
+                self.assertAlmostEqual(row["top100_score"], 88.8)
+                self.assertAlmostEqual(row["live_entry_score"], 76.5)
+                self.assertEqual(row["live_entry_rank"], 7)
+                self.assertEqual(raw["entry_feature_snapshot_source"], "buy_decision_runtime")
+                self.assertAlmostEqual(raw["or_range_pct"], 1.12)
+                self.assertAlmostEqual(raw["first_5m_high_pct"], 2.34)
+                self.assertAlmostEqual(raw["first_15m_high_pct"], 4.56)
+                self.assertAlmostEqual(raw["candidate_age_seconds"], 42.25)
+                self.assertEqual(raw["signal_ready_reason"], "would_emit_SIGNAL_READY")
+                self.assertIn("entry_feature_snapshot", raw)
             finally:
                 store.close()
 
