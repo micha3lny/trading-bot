@@ -34,6 +34,12 @@ DEFAULT_MIN_FIRST_5M_HIGH_PCT = 0.5
 DEFAULT_MIN_FIRST_15M_HIGH_PCT = 1.0
 DEFAULT_MIN_OR_RANGE_PCT = 0.5
 NEEDED_PARQUET_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
+METRIC_DEFINITIONS = {
+    "coverage_pct": "Top100 runner count divided by universe runner count for the threshold. This measures ranking quality.",
+    "capture_pct": "Bought Top100 runner count divided by Top100 runner count for the threshold. This measures entry strategy capture.",
+    "missed_top100_move_count": "Top100 symbols whose intraday open-to-high move exceeded the threshold but were not bought.",
+    "runtime_missing": "Offline should-have-signaled runner with no symbol-specific runtime evidence.",
+}
 
 
 @dataclass(frozen=True)
@@ -105,19 +111,28 @@ def read_history_for_coverage(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def load_bought_symbols(sqlite_path: Path, session_date: str) -> set[str]:
+def load_bought_activity(sqlite_path: Path, session_date: str) -> tuple[set[str], int]:
     executions = read_sql_table(
         sqlite_path,
         "executions",
-        columns=["symbol", "side", "session_date", "executed_at", "recorded_at"],
+        columns=["symbol", "side", "session_date", "executed_at", "recorded_at", "order_id"],
         where="session_date = ? OR substr(executed_at, 1, 10) = ? OR substr(recorded_at, 1, 10) = ?",
         params=[session_date, session_date, session_date],
     )
     if executions.empty:
-        return set()
+        return set(), 0
     side = executions.get("side", pd.Series(dtype=str)).fillna("").astype(str).str.upper()
     buys = executions[side.isin(["BOT", "BUY", "BOUGHT"])]
-    return set(buys.get("symbol", pd.Series(dtype=str)).map(normalize_symbol).dropna().tolist())
+    symbols = set(buys.get("symbol", pd.Series(dtype=str)).map(normalize_symbol).dropna().tolist())
+    if "order_id" in buys.columns:
+        trade_count = int(buys["order_id"].fillna("").astype(str).replace("", pd.NA).dropna().nunique())
+    else:
+        trade_count = int(len(buys))
+    return symbols, trade_count
+
+
+def load_bought_symbols(sqlite_path: Path, session_date: str) -> set[str]:
+    return load_bought_activity(sqlite_path, session_date)[0]
 
 
 def load_runtime_evidence_symbols(sqlite_path: Path, session_date: str) -> set[str]:
@@ -161,7 +176,7 @@ def build_runner_rows(
     universe_symbols = set(load_universe_symbols(universe_path))
     top100 = load_top100(top100_path)
     top100_symbols = set(top100.get("symbol", pd.Series(dtype=str)).map(normalize_symbol).dropna().tolist()) if not top100.empty else set()
-    bought_symbols = load_bought_symbols(sqlite_path, session_date)
+    bought_symbols, bought_trade_count = load_bought_activity(sqlite_path, session_date)
     runtime_evidence_symbols = load_runtime_evidence_symbols(sqlite_path, session_date)
     history_files = find_history_files(history_dir, session_date)
     symbols = sorted(symbol for symbol in universe_symbols if symbol in history_files)
@@ -213,6 +228,7 @@ def build_runner_rows(
         "universe_files_found": len(history_files),
         "top100_total_symbols": len(top100_symbols),
         "bought_symbols": len(bought_symbols),
+        "bought_trade_count": bought_trade_count,
         "runtime_evidence_symbols": len(runtime_evidence_symbols),
         "processed_symbols": len(symbols),
     }
@@ -237,6 +253,7 @@ def summarize_coverage_from_missed(
         "runner_threshold_base_pct": min(thresholds),
         "universe_total_symbols": "",
         "top100_total_symbols": "",
+        "definition": "Wide daily KPI row; see coverage_report_YYYY-MM-DD.md for metric definitions.",
     }
     if df.empty:
         for threshold in thresholds:
@@ -261,6 +278,9 @@ def summarize_coverage_from_missed(
     open_to_high = _numeric(df.get("open_to_high_pct")).fillna(-1.0)
     was_bought = _numeric(df.get("was_bought")).fillna(0).astype(int)
     source_bucket = df.get("source_bucket", pd.Series("", index=df.index)).fillna("").astype(str)
+    top100_mask = source_bucket.eq("top100")
+    row["appeared_in_top100_at_least_once_count"] = int(top100_mask.sum())
+    row["bot_bought_unique_symbol_count"] = int((was_bought.eq(1)).sum())
     for threshold in thresholds:
         label = threshold_label(float(threshold))
         above = open_to_high >= float(threshold)
@@ -275,7 +295,16 @@ def summarize_coverage_from_missed(
         row[f"bought_gt_{label}"] = bought_count
         row[f"bought_runner_count_gt_{label}"] = bought_count
         row[f"capture_gt_{label}_pct"] = round((bought_count / top100_count * 100.0), 2) if top100_count else 0.0
+        bought_top100_count = int((above & was_bought.eq(1) & top100_mask).sum())
+        missed_top100_count = int((above & top100_mask & was_bought.ne(1)).sum())
         row[f"missed_gt_{label}"] = universe_count - bought_count
+        row[f"universe_symbols_move_gt_{label}_count"] = universe_count
+        row[f"appeared_in_top100_and_move_gt_{label}_count"] = top100_count
+        row[f"bot_bought_and_move_gt_{label}_count"] = bought_count
+        row[f"bot_bought_from_top100_count_gt_{label}"] = bought_top100_count
+        row[f"bot_bought_from_top100_and_move_gt_{label}_count"] = bought_top100_count
+        row[f"missed_top100_move_gt_{label}_count"] = missed_top100_count
+        row[f"coverage_reconciliation_ok_gt_{label}"] = int(0 <= top100_count <= universe_count and 0 <= bought_top100_count <= top100_count and missed_top100_count == top100_count - bought_top100_count)
 
     base = open_to_high >= min(thresholds)
     missed_mask = base & was_bought.ne(1)
@@ -331,11 +360,32 @@ def build_coverage_report(
     )
     summary = summarize_coverage_from_missed(runners, session_date=session_date, thresholds=thresholds)
     summary.update(diagnostics)
+    summary["universe_symbols_count"] = diagnostics.get("processed_symbols", diagnostics.get("universe_files_found", 0))
+    summary["bot_bought_trade_count"] = diagnostics.get("bought_trade_count", "")
     return pd.DataFrame([summary])
 
 
 def report_path(output_dir: Path, session_date: str) -> Path:
     return output_dir / f"coverage_report_{session_date}.csv"
+
+
+def write_coverage_markdown(output_dir: Path, session_date: str, report: pd.DataFrame) -> Path:
+    path = output_dir / f"coverage_report_{session_date}.md"
+    row = report.iloc[0].to_dict() if not report.empty else {}
+    lines = [
+        f"# Strategy Coverage {session_date}",
+        "",
+        "## Metric Definitions",
+        "",
+    ]
+    for metric, definition in METRIC_DEFINITIONS.items():
+        lines.append(f"- {metric}: {definition}")
+    lines.extend(["", "## Reconciliation", ""] )
+    for key, value in row.items():
+        if str(key).startswith("coverage_reconciliation_ok"):
+            lines.append(f"- {key}: {value}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 def update_coverage_history(output_dir: Path, report: pd.DataFrame) -> Path:
@@ -369,8 +419,9 @@ def write_coverage_report(
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
     history_path = update_coverage_history(output_dir, df)
+    markdown_path = write_coverage_markdown(output_dir, session_date, df)
     processed = int(df.iloc[0].get("processed_symbols", 0) or 0) if not df.empty else 0
-    print(f"COVERAGE_DONE date={session_date} processed_symbols={processed} elapsed_seconds={elapsed:.1f} output={path} history={history_path}", flush=True)
+    print(f"COVERAGE_DONE date={session_date} processed_symbols={processed} elapsed_seconds={elapsed:.1f} output={path} history={history_path} markdown={markdown_path}", flush=True)
     return path
 
 

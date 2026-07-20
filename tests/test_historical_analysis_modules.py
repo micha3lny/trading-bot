@@ -9,10 +9,12 @@ import pandas as pd
 
 from src.live_trading.analysis.bad_entries_analyzer import (
     analyze_bad_entries,
+    build_filter_simulation,
     dedupe_logical_trades_for_analysis,
     first_green_seconds,
     load_closed_trades,
     rank_bucket,
+    row_value,
     signal_age,
     signal_age_bucket,
 )
@@ -130,10 +132,10 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         self.assertAlmostEqual(sim.pnl_pct or 0.0, 1.0)
 
     def test_entry_time_buckets(self) -> None:
-        self.assertEqual(entry_time_bucket(pd.Timestamp("2026-06-18T13:35:00Z"), "2026-06-18"), "0-15m")
-        self.assertEqual(entry_time_bucket(pd.Timestamp("2026-06-18T13:50:00Z"), "2026-06-18"), "15-30m")
-        self.assertEqual(entry_time_bucket(pd.Timestamp("2026-06-18T14:10:00Z"), "2026-06-18"), "30-60m")
-        self.assertEqual(entry_time_bucket(pd.Timestamp("2026-06-18T15:00:00Z"), "2026-06-18"), "60m+")
+        self.assertEqual(entry_time_bucket(pd.Timestamp("2026-06-18T13:35:00Z"), "2026-06-18"), "09:35-09:40 ET")
+        self.assertEqual(entry_time_bucket(pd.Timestamp("2026-06-18T13:40:00Z"), "2026-06-18"), "09:40-09:45 ET")
+        self.assertEqual(entry_time_bucket(pd.Timestamp("2026-06-18T13:50:00Z"), "2026-06-18"), "09:45-10:00 ET")
+        self.assertEqual(entry_time_bucket(pd.Timestamp("2026-06-18T14:00:00Z"), "2026-06-18"), "10:00+ ET")
 
     def test_missed_runner_threshold_detection(self) -> None:
         stats = calculate_runner_stats(self.candles())
@@ -1416,6 +1418,36 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         self.assertIn("next_high>=5", reason)
         self.assertEqual(score_bucket(20), "avoid_overnight")
         self.assertEqual(score_bucket(50), "hold_candidate")
+
+    def test_bad_entries_row_value_reads_entry_feature_snapshot(self) -> None:
+        raw = {
+            "entry_feature_snapshot": {
+                "live_entry_score": 77.5,
+                "spread_bps": 12.3,
+                "first_5m_high_pct": 1.4,
+            }
+        }
+        self.assertEqual(row_value({}, raw, ["live_entry_score"]), 77.5)
+        self.assertEqual(row_value({}, raw, ["spread_bps_at_entry", "spread_bps"]), 12.3)
+        self.assertEqual(row_value({}, raw, ["first_5m_high_pct"]), 1.4)
+
+    def test_filter_simulation_missing_feature_is_not_removed_trade(self) -> None:
+        frame = pd.DataFrame([
+            {"net_pnl": 10.0, "spread_bps_at_entry": 20.0, "entry_minutes_after_open": 6.0, "entry_time_quality": "exact_time_match"},
+            {"net_pnl": -5.0, "spread_bps_at_entry": None, "entry_minutes_after_open": None, "entry_time_quality": "missing"},
+        ])
+        out = build_filter_simulation(frame, "2026-07-17")
+        spread_row = out[out["filter_expression"].eq("spread <= 30 bps")].iloc[0]
+        self.assertEqual(int(spread_row["total_trades"]), 2)
+        self.assertEqual(int(spread_row["eligible_trades"]), 1)
+        self.assertEqual(int(spread_row["missing_feature_count"]), 1)
+        self.assertEqual(int(spread_row["trades_removed"]), 0)
+        missing_time = out[out["filter_expression"].eq("entry >= 09:35")].iloc[0]
+        self.assertEqual(int(missing_time["eligible_trades"]), 1)
+
+    def test_rth_open_uses_new_york_timezone_dst(self) -> None:
+        self.assertEqual(entry_time_bucket(pd.Timestamp("2026-01-05T14:35:00Z"), "2026-01-05"), "09:35-09:40 ET")
+        self.assertEqual(entry_time_bucket(pd.Timestamp("2026-07-17T13:35:00Z"), "2026-07-17"), "09:35-09:40 ET")
 
     def test_overnight_missing_next_session_data_has_no_score(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

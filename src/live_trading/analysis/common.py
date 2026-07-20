@@ -4,6 +4,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -14,6 +15,7 @@ from src.live_trading.ranking.daily_top100_builder import normalize_history_df, 
 
 RTH_OPEN_UTC = time(13, 30)
 EOD_FLATTEN_UTC = time(19, 45)
+NY_TZ = ZoneInfo("America/New_York")
 
 
 def parse_dt(value: Any) -> pd.Timestamp | None:
@@ -197,7 +199,7 @@ def load_trade_candles(
 
 def rth_open_timestamp(session_date: str | date) -> pd.Timestamp:
     d = pd.Timestamp(session_date).date() if not isinstance(session_date, date) else session_date
-    return pd.Timestamp(datetime.combine(d, RTH_OPEN_UTC, tzinfo=timezone.utc))
+    return pd.Timestamp(datetime.combine(d, time(9, 30), tzinfo=NY_TZ)).tz_convert("UTC")
 
 
 def eod_timestamp(session_date: str | date) -> pd.Timestamp:
@@ -291,16 +293,18 @@ def min_after_pct(candles: pd.DataFrame, entry_price: float, entry_time: pd.Time
 
 def entry_time_bucket(entry_time: pd.Timestamp | None, session_date: str | date | None = None) -> str:
     if entry_time is None:
-        return ""
+        return "missing"
     open_ts = rth_open_timestamp(session_date or entry_time.date())
     minutes = (entry_time - open_ts).total_seconds() / 60.0
+    if minutes < 5:
+        return "before_09:35 ET"
+    if minutes < 10:
+        return "09:35-09:40 ET"
     if minutes < 15:
-        return "0-15m"
+        return "09:40-09:45 ET"
     if minutes < 30:
-        return "15-30m"
-    if minutes < 60:
-        return "30-60m"
-    return "60m+"
+        return "09:45-10:00 ET"
+    return "10:00+ ET"
 
 
 def entry_minutes_after_open(entry_time: pd.Timestamp | None, session_date: str | date | None = None) -> float | None:

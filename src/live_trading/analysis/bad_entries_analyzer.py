@@ -47,6 +47,7 @@ DYNAMIC_FEATURES = [
     "top100_score",
     "live_entry_score",
     "live_entry_rank",
+    "candidate_age_seconds",
     "first_5m_high_pct",
     "first_15m_high_pct",
     "or_range_pct",
@@ -64,6 +65,7 @@ OUTPUT_COLUMNS = [
     "entry_time",
     "entry_time_source",
     "entry_time_normalization_warning",
+    "entry_time_quality",
     "matched_first_candle_time",
     "candle_source",
     "candle_coverage_warning",
@@ -112,6 +114,13 @@ OUTPUT_COLUMNS = [
     "top100_score",
     "live_entry_score",
     "live_entry_rank",
+    "candidate_age_seconds",
+    "signal_ready_reason",
+    "rejection_reason",
+    "entry_feature_snapshot_present",
+    "feature_snapshot_time",
+    "source_snapshot_time",
+    "top100_snapshot_time",
     "first_5m_high_pct",
     "first_15m_high_pct",
     "first_5m_complete",
@@ -850,17 +859,49 @@ def max_adverse_before_peak(candles: pd.DataFrame, entry_price: float, entry_tim
     return pct(float(before_peak["low"].min()), entry_price)
 
 
+def _value_present(value: Any) -> bool:
+    if value in (None, ""):
+        return False
+    try:
+        return not bool(pd.isna(value))
+    except Exception:
+        return True
+
+
+def entry_feature_snapshot(raw: dict[str, Any]) -> dict[str, Any]:
+    snapshot = raw.get("entry_feature_snapshot")
+    if isinstance(snapshot, dict):
+        return snapshot
+    parsed = parse_raw_json(snapshot)
+    if parsed:
+        return parsed
+    parsed = parse_raw_json(raw.get("live_entry_features_json"))
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def row_value(row: dict[str, Any], raw: dict[str, Any], names: list[str]) -> Any:
     direct = first_existing_column(row, names)
-    if direct not in (None, ""):
+    if _value_present(direct):
         return direct
-    for name in names:
-        value = raw.get(name)
-        if value not in (None, ""):
-            return value
+    snapshot = entry_feature_snapshot(raw)
+    for source in (snapshot, raw):
+        for name in names:
+            value = source.get(name)
+            if _value_present(value):
+                return value
     return None
 
 
+def entry_time_quality(entry_time: pd.Timestamp | None, entry_warning: str, metrics_ok: bool, candle_warning: str) -> str:
+    if entry_time is None:
+        return "missing"
+    if entry_warning == "time_mismatch":
+        return "ambiguous_timezone"
+    if not metrics_ok or candle_warning in {"parquet_missing", "missing"}:
+        return "no_candle_coverage"
+    if entry_warning:
+        return "normalized_time_match"
+    return "exact_time_match"
 
 
 def session_first_bars(candles: pd.DataFrame, minutes: int) -> pd.DataFrame:
@@ -901,9 +942,18 @@ def opening_range_features(candles_full: pd.DataFrame, entry_price: float | None
 
 def dynamic_trade_features(trade: dict[str, Any], raw: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
     out = dict(base)
-    for name in PREMARKET_FEATURES:
-        out[name] = row_value(trade, raw, [name])
-    present = [name for name in PREMARKET_FEATURES if out.get(name) not in (None, "") and not (isinstance(out.get(name), float) and pd.isna(out.get(name)))]
+    aliases = {
+        "spread_bps_at_entry": ["spread_bps_at_entry", "spread_bps", "bid_ask_spread_bps"],
+        "live_entry_rank": ["live_entry_rank", "ranking_position"],
+        "distance_from_open_pct": ["distance_from_open_pct", "distance_from_day_open_pct"],
+    }
+    for name in DYNAMIC_FEATURES:
+        value = row_value(trade, raw, aliases.get(name, [name]))
+        if _value_present(value):
+            out[name] = value
+        else:
+            out.setdefault(name, base.get(name))
+    present = [name for name in PREMARKET_FEATURES if _value_present(out.get(name))]
     out["premarket_feature_coverage"] = "available" if present else "unavailable_for_session"
     return out
 
@@ -1031,6 +1081,7 @@ def analyze_bad_entries(
         if session_date not in spread_cache:
             spread_cache[session_date] = load_spread_snapshots(recorder_dir, session_date)
         spread = nearest_row(spread_cache[session_date], entry_time, symbol)
+        snapshot_spread = row_value(trade, raw, ["spread_bps_at_entry", "spread_bps", "bid_ask_spread_bps"])
         opening_features = opening_range_features(candles_full, entry_price)
         sig_age, sig_age_warning = signal_age(trade, entry_time)
         if sig_age_warning == "negative_age":
@@ -1052,6 +1103,7 @@ def analyze_bad_entries(
             "entry_time": iso_ts(entry_time),
             "entry_time_source": entry_time_source,
             "entry_time_normalization_warning": entry_warning,
+            "entry_time_quality": entry_time_quality(entry_time, entry_warning, metrics_ok, candle_warning),
             "matched_first_candle_time": iso_ts(first_candle),
             "candle_source": candle_source,
             "candle_coverage_warning": candle_warning,
@@ -1095,11 +1147,18 @@ def analyze_bad_entries(
             "entry_time_bucket": entry_time_bucket(entry_time, session_date) if entry_phase(entry_time, session_date, entry_warning) == "rth" else entry_phase(entry_time, session_date, entry_warning),
             "signal_age_seconds": sig_age,
             "signal_age_warning": sig_age_warning,
-            "spread_bps_at_entry": first_existing_column(spread, ["spread_bps", "bid_ask_spread_bps"]),
+            "spread_bps_at_entry": snapshot_spread if _value_present(snapshot_spread) else first_existing_column(spread, ["spread_bps", "bid_ask_spread_bps"]),
             "top100_rank": row_value(trade, raw, ["top100_rank"]),
             "top100_score": row_value(trade, raw, ["top100_score"]),
             "live_entry_score": row_value(trade, raw, ["live_entry_score", "entry_score", "score"]),
             "live_entry_rank": row_value(trade, raw, ["live_entry_rank", "ranking_position"]),
+            "candidate_age_seconds": row_value(trade, raw, ["candidate_age_seconds"]),
+            "signal_ready_reason": row_value(trade, raw, ["signal_ready_reason"]),
+            "rejection_reason": row_value(trade, raw, ["rejection_reason"]),
+            "entry_feature_snapshot_present": int(bool(entry_feature_snapshot(raw))),
+            "feature_snapshot_time": row_value(trade, raw, ["feature_snapshot_time", "entry_decision_time", "signal_time"]),
+            "source_snapshot_time": row_value(trade, raw, ["source_snapshot_time"]),
+            "top100_snapshot_time": row_value(trade, raw, ["top100_snapshot_time"]),
             **dynamic_trade_features(trade, raw, opening_features),
             "tp2_sl1_5_exit_reason": sim_2.exit_reason,
             "tp2_sl1_5_pnl_pct": sim_2.pnl_pct,
@@ -1410,22 +1469,35 @@ def pnl_summary(frame: pd.DataFrame) -> dict[str, Any]:
 def build_time_bucket_report(df: pd.DataFrame, date: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
-    buckets = ["09:35-09:40 ET", "09:40-09:45 ET", "09:45-10:00 ET", "10:00-10:30 ET", "10:30-11:00 ET", "11:00+ ET"]
-    def label(minutes: Any) -> str:
-        val = fnum(minutes)
-        if val is None: return "missing"
-        if val < 10: return "09:35-09:40 ET"
-        if val < 15: return "09:40-09:45 ET"
-        if val < 30: return "09:45-10:00 ET"
-        if val < 60: return "10:00-10:30 ET"
-        if val < 90: return "10:30-11:00 ET"
-        return "11:00+ ET"
     tmp = df.copy()
-    tmp["time_bucket"] = tmp["entry_minutes_after_open"].map(label)
+    quality = tmp.get("entry_time_quality", pd.Series("missing", index=tmp.index)).fillna("missing").astype(str)
+    valid_time = quality.isin(["exact_time_match", "normalized_time_match"])
+    ambiguous = quality.eq("ambiguous_timezone")
+    tmp["time_bucket"] = tmp.get("entry_time_bucket", pd.Series("missing", index=tmp.index)).fillna("missing").astype(str)
     rows = []
-    for bucket, group in tmp.groupby("time_bucket", dropna=False):
-        row = {"date": date, "bucket": bucket, **pnl_summary(group)}
+    valid_count = int(valid_time.sum())
+    status = "ok" if valid_count else "not_evaluable_due_to_time_coverage"
+    for bucket, group in tmp[valid_time].groupby("time_bucket", dropna=False):
+        row = {
+            "date": date,
+            "bucket": bucket,
+            "valid_time_count": valid_count,
+            "missing_time_count": int(quality.eq("missing").sum()),
+            "ambiguous_time_count": int(ambiguous.sum()),
+            "result_status": status,
+            **pnl_summary(group),
+        }
         rows.append(row)
+    if not rows:
+        rows.append({
+            "date": date,
+            "bucket": "not_evaluable",
+            "valid_time_count": valid_count,
+            "missing_time_count": int(quality.eq("missing").sum()),
+            "ambiguous_time_count": int(ambiguous.sum()),
+            "result_status": status,
+            **pnl_summary(pd.DataFrame()),
+        })
     return pd.DataFrame(rows)
 
 
@@ -1453,42 +1525,72 @@ def build_filter_simulation(df: pd.DataFrame, date: str) -> pd.DataFrame:
         return pd.DataFrame()
     baseline = pnl_summary(df)
     rows = []
-    rules: list[tuple[str, pd.Series]] = []
+    rules: list[tuple[str, pd.Series, pd.Series, str]] = []
     minutes = pd.to_numeric(df.get("entry_minutes_after_open"), errors="coerce")
+    time_quality = df.get("entry_time_quality", pd.Series("missing", index=df.index)).fillna("missing").astype(str)
+    time_eligible = minutes.notna() & time_quality.isin(["exact_time_match", "normalized_time_match"])
     for gate, label in [(5, "entry >= 09:35"), (10, "entry >= 09:40"), (15, "entry >= 09:45"), (30, "entry >= 10:00")]:
-        rules.append((label, minutes >= gate))
+        rules.append((label, minutes >= gate, time_eligible, "time"))
     if "spread_bps_at_entry" in df.columns:
         spread = pd.to_numeric(df["spread_bps_at_entry"], errors="coerce")
-        for threshold in [30, 40, 50, 75]: rules.append((f"spread <= {threshold} bps", spread <= threshold))
+        for threshold in [30, 40, 50, 75]:
+            rules.append((f"spread <= {threshold} bps", spread <= threshold, spread.notna(), "feature"))
     if "top100_rank" in df.columns:
         rank = pd.to_numeric(df["top100_rank"], errors="coerce")
-        for threshold in [10, 15, 20, 25, 30, 50]: rules.append((f"top100_rank <= {threshold}", rank <= threshold))
+        for threshold in [10, 15, 20, 25, 30, 50]:
+            rules.append((f"top100_rank <= {threshold}", rank <= threshold, rank.notna(), "feature"))
     if "live_entry_score" in df.columns:
         score = pd.to_numeric(df["live_entry_score"], errors="coerce")
         for threshold in sorted({float(x) for x in score.dropna().quantile([0.25, 0.5, 0.75]).tolist()}):
-            rules.append((f"live_entry_score >= {threshold:.2f}", score >= threshold))
+            rules.append((f"live_entry_score >= {threshold:.2f}", score >= threshold, score.notna(), "feature"))
     for feature in PREMARKET_FEATURES:
         if feature in df.columns and pd.to_numeric(df[feature], errors="coerce").notna().any():
             vals = pd.to_numeric(df[feature], errors="coerce")
             median = vals.median()
-            rules.append((f"{feature} >= median {median:.2f}", vals >= median))
-    for rule, keep in rules:
+            if pd.notna(median):
+                rules.append((f"{feature} >= median {median:.2f}", vals >= median, vals.notna(), "feature"))
+    total = int(len(df))
+    total_winners = max(1, int((pd.to_numeric(df.get("net_pnl"), errors="coerce") > 0).sum()))
+    total_losers = max(1, int((pd.to_numeric(df.get("net_pnl"), errors="coerce") < 0).sum()))
+    for rule, keep, eligible, rule_type in rules:
+        eligible = eligible.fillna(False).astype(bool)
         keep = keep.fillna(False).astype(bool)
-        kept = df[keep]
-        removed = df[~keep]
+        kept = df[eligible & keep]
+        removed = df[eligible & ~keep]
         summary = pnl_summary(kept)
         removed_net = pd.to_numeric(removed.get("net_pnl"), errors="coerce").fillna(0.0)
+        eligible_count = int(eligible.sum())
+        missing_count = int(total - eligible_count)
+        if eligible_count == 0:
+            evaluable = "not_evaluable_due_to_time_coverage" if rule_type == "time" else "not_evaluable_due_to_missing_feature"
+        else:
+            evaluable = "ok"
+        winners_kept = int((pd.to_numeric(kept.get("net_pnl"), errors="coerce") > 0).sum())
+        losers_kept = int((pd.to_numeric(kept.get("net_pnl"), errors="coerce") < 0).sum())
         row = {
             "date": date,
             "filter_expression": rule,
+            "total_trades": total,
+            "eligible_trades": eligible_count,
+            "missing_feature_count": missing_count,
+            "missing_feature_rate": float(missing_count / total * 100.0) if total else 0.0,
             **summary,
             "trades_kept": int(len(kept)),
             "trades_removed": int(len(removed)),
+            "winners_kept": winners_kept,
             "winners_removed": int((removed_net > 0).sum()),
+            "losers_kept": losers_kept,
             "losers_removed": int((removed_net < 0).sum()),
+            "pnl_kept": float(pd.to_numeric(kept.get("net_pnl"), errors="coerce").fillna(0.0).sum()),
+            "pnl_removed": float(removed_net.sum()),
+            "win_rate_kept": float(winners_kept / len(kept) * 100.0) if len(kept) else 0.0,
+            "expectancy_kept": float(pd.to_numeric(kept.get("net_pnl"), errors="coerce").mean()) if len(kept) else 0.0,
+            "profit_factor_kept": summary.get("profit_factor"),
             "pnl_delta_vs_baseline": float(summary.get("net_pnl", 0.0) - baseline.get("net_pnl", 0.0)),
             "removal_precision": float((removed_net < 0).sum() / len(removed)) if len(removed) else None,
-            "winner_sacrifice_rate": float((removed_net > 0).sum() / max(1, int((pd.to_numeric(df.get("net_pnl"), errors="coerce") > 0).sum()))),
+            "winner_sacrifice_rate": float((removed_net > 0).sum() / total_winners),
+            "loser_removal_rate": float((removed_net < 0).sum() / total_losers),
+            "evaluable": evaluable,
         }
         rows.append(row)
     return pd.DataFrame(rows)
@@ -1496,13 +1598,34 @@ def build_filter_simulation(df: pd.DataFrame, date: str) -> pd.DataFrame:
 
 def build_data_quality_report(df: pd.DataFrame, date: str) -> dict[str, Any]:
     features = []
+    total = int(len(df))
     for feature in DYNAMIC_FEATURES:
         if feature not in df.columns:
-            features.append({"feature": feature, "coverage": "unavailable_for_session", "non_null": 0, "total": int(len(df))})
+            features.append({"feature": feature, "coverage": "unavailable_for_session", "non_null": 0, "total": total})
             continue
         non_null = int(pd.to_numeric(df[feature], errors="coerce").notna().sum())
-        features.append({"feature": feature, "coverage": "available" if non_null else "unavailable_for_session", "non_null": non_null, "total": int(len(df))})
-    return {"date": date, "premarket_feature_coverage": "available" if any(item["feature"] in PREMARKET_FEATURES and item["non_null"] for item in features) else "unavailable_for_session", "features": features}
+        features.append({"feature": feature, "coverage": "available" if non_null else "unavailable_for_session", "non_null": non_null, "total": total})
+    snapshot_present = pd.to_numeric(df.get("entry_feature_snapshot_present", pd.Series(dtype=float)), errors="coerce").fillna(0).astype(int) if not df.empty else pd.Series(dtype=int)
+    entry_times = pd.to_datetime(df.get("entry_time", pd.Series(dtype=str)), errors="coerce", utc=True) if not df.empty else pd.Series(dtype="datetime64[ns, UTC]")
+    feature_times = pd.to_datetime(df.get("feature_snapshot_time", pd.Series(dtype=str)), errors="coerce", utc=True) if not df.empty else pd.Series(dtype="datetime64[ns, UTC]")
+    impossible_zero_fields = []
+    for feature in ["spread_bps_at_entry", "top100_score", "live_entry_score", "first_5m_high_pct", "first_15m_high_pct"]:
+        if feature in df.columns:
+            vals = pd.to_numeric(df[feature], errors="coerce")
+            zeros = int((vals == 0).sum())
+            if zeros:
+                impossible_zero_fields.append({"feature": feature, "zero_count": zeros})
+    return {
+        "date": date,
+        "finalized_trades_count": total,
+        "trades_with_entry_snapshot": int(snapshot_present.sum()) if len(snapshot_present) else 0,
+        "entry_snapshot_coverage_pct": float(snapshot_present.mean() * 100.0) if len(snapshot_present) else 0.0,
+        "feature_snapshot_time_after_entry_time": int(((feature_times.notna()) & (entry_times.notna()) & (feature_times > entry_times)).sum()) if len(df) else 0,
+        "impossible_zero_default_values": impossible_zero_fields,
+        "entry_time_quality_counts": df.get("entry_time_quality", pd.Series(dtype=str)).fillna("missing").astype(str).value_counts().to_dict() if not df.empty else {},
+        "premarket_feature_coverage": "available" if any(item["feature"] in PREMARKET_FEATURES and item["non_null"] for item in features) else "unavailable_for_session",
+        "features": features,
+    }
 
 
 def write_bad_entry_strategy_outputs(df: pd.DataFrame, *, date_label: str, output_dir: Path) -> dict[str, Path]:
@@ -1523,7 +1646,11 @@ def write_bad_entry_strategy_outputs(df: pd.DataFrame, *, date_label: str, outpu
     filters.to_csv(paths["filter_simulation"], index=False)
     quality = build_data_quality_report(df, date_label)
     paths["data_quality"].write_text(__import__("json").dumps(quality, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    top_filters = filters.sort_values("net_pnl", ascending=False).head(10).to_dict("records") if not filters.empty else []
+    if not filters.empty and "evaluable" in filters.columns:
+        eligible_filters = filters[filters["evaluable"].eq("ok")].copy()
+    else:
+        eligible_filters = filters
+    top_filters = eligible_filters.sort_values("net_pnl", ascending=False).head(10).to_dict("records") if not eligible_filters.empty else []
     lines = [
         f"# Bad Entries Recommendations {date_label}", "",
         "FACT: Tables above are computed from finalized canonical trades only.",
