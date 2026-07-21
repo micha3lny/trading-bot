@@ -16,6 +16,7 @@ from typing import Any, Iterable
 from src.live_trading.storage.canonical_fifo import build_canonical_fifo
 from src.live_trading.storage.trade_peak_rebuilder import (
     DEFAULT_HISTORY_DIR as DEFAULT_TRADE_PEAK_HISTORY_DIR,
+    DEFAULT_RECORDER_DIR as DEFAULT_TRADE_PEAK_RECORDER_DIR,
     DEFAULT_SESSION_TYPE as DEFAULT_TRADE_PEAK_SESSION_TYPE,
     calculate_and_store_trade_peak as calculate_and_store_trade_peak_on_connection,
 )
@@ -428,7 +429,9 @@ class SQLiteRuntimeStore:
             self.conn,
             trade_id,
             history_dir=DEFAULT_TRADE_PEAK_HISTORY_DIR,
+            recorder_dir=DEFAULT_TRADE_PEAK_RECORDER_DIR,
             session_type=DEFAULT_TRADE_PEAK_SESSION_TYPE,
+            history_finalized=False,
         )
         return {
             "trade_id": trade_id,
@@ -515,8 +518,13 @@ class SQLiteRuntimeStore:
                 raw_json IS NULL
                 OR raw_json NOT LIKE '%"peak_data_quality": "EXACT"%'
                 OR raw_json LIKE '%"peak_data_quality": "PARTIAL"%'
-                OR raw_json LIKE '%"peak_data_quality": "MISSING_CANDLES"%'
+                OR raw_json LIKE '%"peak_data_quality": "PARTIAL_COVERAGE"%'
+                OR raw_json LIKE '%"peak_data_quality": "HISTORY_NOT_FINALIZED"%'
+                OR raw_json LIKE '%"peak_data_quality": "RETRY_PENDING"%'
+                OR raw_json LIKE '%"peak_data_quality": "MISSING_CANDLES_FINAL"%'
                 OR raw_json LIKE '%"peak_data_quality": "OUTSIDE_CANDLE_RANGE"%'
+                OR raw_json LIKE '%"peak_data_quality": "MISSING_ENTRY_TIME"%'
+                OR raw_json LIKE '%"peak_data_quality": "MISSING_EXIT_TIME"%'
                 OR raw_json LIKE '%"peak_data_quality": "NEEDS_REBUILD"%'
             )
             """,
@@ -530,20 +538,37 @@ class SQLiteRuntimeStore:
             sql += " LIMIT ?"
             params.append(int(limit))
         rows = self.query(sql, params)
-        summary = {"scanned": len(rows), "exact": 0, "partial": 0, "missing": 0, "needs_rebuild": 0, "errors": 0}
+        summary = {"scanned": len(rows), "exact": 0, "partial": 0, "retry_pending": 0, "missing_final": 0, "needs_rebuild": 0, "errors": 0}
         for row in rows:
             trade_id = str(row.get("trade_id") or "")
             if not trade_id:
                 continue
             try:
-                result = self.calculate_and_store_trade_peak(trade_id)
+                result = calculate_and_store_trade_peak_on_connection(
+                    self.conn,
+                    trade_id,
+                    history_dir=DEFAULT_TRADE_PEAK_HISTORY_DIR,
+                    recorder_dir=DEFAULT_TRADE_PEAK_RECORDER_DIR,
+                    session_type=DEFAULT_TRADE_PEAK_SESSION_TYPE,
+                    history_finalized=True,
+                )
+                result = {
+                    "trade_id": trade_id,
+                    "peak_data_quality": result.peak_data_quality,
+                    "validation_status": result.validation_status,
+                    "validation_reason": result.validation_reason,
+                    "peak_price": result.peak_price,
+                    "peak_pct": result.peak_pct,
+                }
                 quality = str(result.get("peak_data_quality") or "")
                 if quality == "EXACT":
                     summary["exact"] += 1
-                elif quality == "PARTIAL":
+                elif quality in {"PARTIAL", "PARTIAL_COVERAGE"}:
                     summary["partial"] += 1
-                elif quality in {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE"}:
-                    summary["missing"] += 1
+                elif quality in {"HISTORY_NOT_FINALIZED", "RETRY_PENDING"}:
+                    summary["retry_pending"] += 1
+                elif quality in {"MISSING_CANDLES_FINAL", "OUTSIDE_CANDLE_RANGE", "MISSING_ENTRY_TIME", "MISSING_EXIT_TIME"}:
+                    summary["missing_final"] += 1
                 else:
                     summary["needs_rebuild"] += 1
             except Exception:
@@ -551,7 +576,8 @@ class SQLiteRuntimeStore:
         log_sqlite_line(
             f"{utc_now_iso()} TRADE_PEAK_EOD_REPAIR_DONE session_date={session_date or ''} "
             f"scanned={summary['scanned']} exact={summary['exact']} partial={summary['partial']} "
-            f"missing={summary['missing']} needs_rebuild={summary['needs_rebuild']} errors={summary['errors']}"
+            f"retry_pending={summary['retry_pending']} missing_final={summary['missing_final']} "
+            f"needs_rebuild={summary['needs_rebuild']} errors={summary['errors']}"
         )
         return summary
 

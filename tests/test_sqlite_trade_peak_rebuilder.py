@@ -78,14 +78,14 @@ class SQLiteTradePeakRebuilderTests(unittest.TestCase):
                 self.assertAlmostEqual(row["mfe_pct"], 10.0)
                 self.assertAlmostEqual(row["giveback_from_peak"], 5.0)
                 self.assertEqual(raw["peak_source"], "canonical_trade_candles_1m")
-                self.assertEqual(raw["peak_version"], 2)
+                self.assertEqual(raw["peak_version"], 3)
                 self.assertIn("peak_calculated_at", raw)
             finally:
                 store.close()
                 sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED = previous_async
                 sqlite_store_module.DEFAULT_TRADE_PEAK_HISTORY_DIR = previous_history
 
-    def test_missing_candles_store_null_peak_not_zero(self) -> None:
+    def test_missing_candles_before_history_finalization_store_retry_pending_not_zero(self) -> None:
         previous_async = sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED
         previous_history = sqlite_store_module.DEFAULT_TRADE_PEAK_HISTORY_DIR
         sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED = False
@@ -101,11 +101,12 @@ class SQLiteTradePeakRebuilderTests(unittest.TestCase):
                 row = store.query("SELECT mfe_pct, peak_price, giveback_from_peak, raw_json FROM trades WHERE trade_id = ?", [trade["trade_id"]])[0]
                 raw = json.loads(row["raw_json"])
 
-                self.assertEqual(result["peak_data_quality"], "MISSING_CANDLES")
+                self.assertEqual(result["peak_data_quality"], "RETRY_PENDING")
                 self.assertIsNone(row["mfe_pct"])
                 self.assertIsNone(row["peak_price"])
                 self.assertIsNone(row["giveback_from_peak"])
-                self.assertEqual(raw["peak_data_quality"], "MISSING_CANDLES")
+                self.assertEqual(raw["peak_data_quality"], "RETRY_PENDING")
+                self.assertEqual(raw["peak_rebuild_status"], "retry_pending")
                 self.assertEqual(raw["peak_source"], "unavailable")
             finally:
                 store.close()
@@ -151,6 +152,46 @@ class SQLiteTradePeakRebuilderTests(unittest.TestCase):
                 self.assertNotIn("giveback_pct", raw)
                 self.assertNotIn("peak_gain_pct", raw)
                 self.assertNotIn("peak_position_key", raw)
+            finally:
+                store.close()
+                sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED = previous_async
+                sqlite_store_module.DEFAULT_TRADE_PEAK_HISTORY_DIR = previous_history
+
+
+    def test_retry_after_history_arrives_persists_peak(self) -> None:
+        previous_async = sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED
+        previous_history = sqlite_store_module.DEFAULT_TRADE_PEAK_HISTORY_DIR
+        sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED = False
+        with tempfile.TemporaryDirectory() as tmp:
+            history_dir = Path(tmp) / "late_history"
+            sqlite_store_module.DEFAULT_TRADE_PEAK_HISTORY_DIR = history_dir
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                add_execution(store, "B1", "BOT", 10, 10, "2026-07-16T13:30:00+00:00", symbol="LATEPEAK")
+                add_execution(store, "S1", "SLD", 10, 10.5, "2026-07-16T13:32:00+00:00", symbol="LATEPEAK", realized_pnl=5)
+                trade = store.query("SELECT trade_id FROM trades WHERE symbol = 'LATEPEAK' AND status = 'CLOSED'")[0]
+
+                first = store.calculate_and_store_trade_peak(trade["trade_id"])
+                self.assertEqual(first["peak_data_quality"], "RETRY_PENDING")
+
+                write_history(
+                    history_dir,
+                    "LATEPEAK",
+                    "2026-07-16",
+                    [
+                        ("2026-07-16T13:30:00+00:00", 10.1, 9.9),
+                        ("2026-07-16T13:31:00+00:00", 11.0, 10.2),
+                        ("2026-07-16T13:32:00+00:00", 10.7, 10.4),
+                    ],
+                )
+                retry = store.repair_trade_peaks_needing_rebuild("2026-07-16")
+                row = store.query("SELECT mfe_pct, mae_pct, peak_price, raw_json FROM trades WHERE trade_id = ?", [trade["trade_id"]])[0]
+                raw = json.loads(row["raw_json"])
+
+                self.assertEqual(retry["exact"], 1)
+                self.assertAlmostEqual(row["peak_price"], 11.0)
+                self.assertAlmostEqual(row["mfe_pct"], 10.0)
+                self.assertEqual(raw["peak_data_quality"], "EXACT")
             finally:
                 store.close()
                 sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED = previous_async

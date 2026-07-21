@@ -445,8 +445,8 @@ def aggregate_closed_positions(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-INVALID_CANONICAL_PEAK_QUALITIES = {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"}
-VALID_CANONICAL_PEAK_QUALITIES = {"EXACT", "PARTIAL"}
+INVALID_CANONICAL_PEAK_QUALITIES = {"HISTORY_NOT_FINALIZED", "RETRY_PENDING", "MISSING_CANDLES_FINAL", "MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "MISSING_ENTRY_TIME", "MISSING_EXIT_TIME", "NEEDS_REBUILD"}
+VALID_CANONICAL_PEAK_QUALITIES = {"EXACT", "PARTIAL", "PARTIAL_COVERAGE"}
 PEAK_ALGEBRA_TOLERANCE_PCT = 0.05
 
 
@@ -2216,10 +2216,10 @@ def closed_from_trades(
         if canonical_peak_source and peak_quality not in {"EXACT", "PARTIAL"}:
             peak_pct = None
             peak_source = "canonical_peak_unavailable"
-        if peak_quality in {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"}:
+        if peak_quality in INVALID_CANONICAL_PEAK_QUALITIES:
             peak_pct = None
             peak_source = "canonical_peak_unavailable"
-        if peak_pct is None and not canonical_peak_source and peak_quality not in {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"}:
+        if peak_pct is None and not canonical_peak_source and peak_quality not in INVALID_CANONICAL_PEAK_QUALITIES:
             peak_fallback = trade_raw_peak_by_symbol_session.get(
                 (
                     str(row.get("session_date") or ""),
@@ -2230,11 +2230,11 @@ def closed_from_trades(
             if peak_fallback is not None:
                 peak_pct, peak_source = peak_fallback
         drop_from_peak = to_float(raw.get("drop_from_peak_pct"), None)
-        if peak_pct is None or peak_quality in {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"}:
+        if peak_pct is None or peak_quality in INVALID_CANONICAL_PEAK_QUALITIES:
             drop_from_peak = None
         if drop_from_peak is None:
             drop_from_peak = to_float(raw.get("giveback_pct"), None)
-        if peak_pct is None or peak_quality in {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"}:
+        if peak_pct is None or peak_quality in INVALID_CANONICAL_PEAK_QUALITIES:
             drop_from_peak = None
         commissions.append(commission)
         commission_statuses.append(commission_status)
@@ -2343,7 +2343,7 @@ def closed_from_trades(
     out["qty"] = pd.to_numeric(out["qty"], errors="coerce").fillna(0.0)
     out["peak_pct"] = pd.to_numeric(out["peak_pct"], errors="coerce")
     peak_quality_series = out["peak_data_quality"].fillna("").astype(str).str.upper()
-    invalid_peak_mask = peak_quality_series.isin({"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"})
+    invalid_peak_mask = peak_quality_series.isin(INVALID_CANONICAL_PEAK_QUALITIES)
     if invalid_peak_mask.any():
         out.loc[invalid_peak_mask, ["peak_pct", "peak_price", "low_price", "peak_unrealized_pnl", "max_adverse_unrealized_pnl", "giveback_from_peak", "drop_from_peak_pct"]] = pd.NA
     persisted_net = pd.to_numeric(out.get("persisted_net_pnl"), errors="coerce")
@@ -2878,12 +2878,8 @@ def load_closed_positions(
         **fifo_diag,
     }
     prefer_execution_closed = (
-        not execution_closed.empty
-        and (
-            len(execution_closed) > persisted_count
-            or int(fifo_diag.get("duplicate_reconstructed_sell_rows") or 0) > 0
-            or int(fifo_diag.get("cross_session_fifo_match_count") or 0) > 0
-        )
+        persisted_count == 0
+        and not execution_closed.empty
     )
     if prefer_execution_closed:
         closed = apply_symbol_session_peak_fallbacks(execution_closed, runtime_symbol_peak_map, lifecycle_symbol_peak_map)

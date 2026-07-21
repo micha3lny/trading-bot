@@ -6,6 +6,7 @@ import subprocess
 import sys
 import hashlib
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -146,7 +147,7 @@ def display_time(value) -> str:
     ts = pd.to_datetime(value, errors="coerce", utc=True)
     if pd.isna(ts):
         return "MISSING"
-    return ts.strftime("%d-%m-%Y %H:%M:%S")
+    return ts.tz_convert(ZoneInfo("America/New_York")).strftime("%d-%m-%Y %H:%M:%S ET")
 
 
 def display_optional_number(value) -> object:
@@ -1560,7 +1561,7 @@ def render_broker_reality_tab(sqlite_path: str) -> None:
     broker_status = "CSV_REQUIRED_FOR_HISTORICAL_DATE"
     broker_execution_diagnostics = {
         "selected_date": selected_date,
-        "timezone_used": "UTC",
+        "timezone_used": "America/New_York (display), UTC (storage)",
         "api_methods_used": [],
         "raw_execution_count_before_filtering": 0,
         "execution_count_after_date_filtering": 0,

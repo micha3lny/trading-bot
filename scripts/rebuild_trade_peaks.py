@@ -19,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.live_trading.analysis.common import fnum, parse_dt
+from src.live_trading.analysis.common import fnum, parse_dt, load_trade_candles as load_shared_trade_candles
 from src.live_trading.ranking.daily_top100_builder import normalize_history_df, parquet_path
 
 
@@ -27,7 +27,9 @@ DEFAULT_DB = Path("data/runtime/trading_runtime.sqlite")
 DEFAULT_HISTORY_DIR = Path("data/history/universe_1m")
 DEFAULT_OUTPUT_DIR = Path("data/analysis")
 PEAK_REBUILD_VERSION = 2
-VALID_PEAK_QUALITIES = {"EXACT", "PARTIAL"}
+VALID_PEAK_QUALITIES = {"EXACT", "PARTIAL", "PARTIAL_COVERAGE"}
+RETRY_PEAK_QUALITIES = {"HISTORY_NOT_FINALIZED", "RETRY_PENDING"}
+FINAL_MISSING_PEAK_QUALITIES = {"MISSING_CANDLES_FINAL", "OUTSIDE_CANDLE_RANGE", "MISSING_ENTRY_TIME", "MISSING_EXIT_TIME", "NEEDS_REBUILD"}
 PEAK_VALIDATION_TOLERANCE_PCT = 0.05
 
 
@@ -279,32 +281,44 @@ def validate_peak(
     return ("VALID" if not unique_reasons else "INVALID", ";".join(unique_reasons))
 
 
-def calculate_peak(candles: pd.DataFrame, *, trade: dict[str, Any]) -> PeakResult:
+def calculate_peak(candles: pd.DataFrame, *, trade: dict[str, Any], history_finalized: bool = True) -> PeakResult:
     entry_time = parse_dt(trade.get("entry_fill_time"))
     exit_time = parse_dt(trade.get("exit_fill_time") or trade.get("closed_at"))
     entry_price = fnum(trade.get("entry_price"))
     exit_price = fnum(trade.get("exit_price"))
     qty = abs(fnum(trade.get("quantity")) or 0.0)
     gross_return_pct = pct(exit_price, entry_price)
-    if entry_time is None or exit_time is None or entry_price is None or entry_price <= 0 or exit_price is None:
-        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, 0, "", "", "NEEDS_REBUILD", "FAIL", "missing_trade_inputs")
+    if entry_time is None:
+        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, 0, "", "", "MISSING_ENTRY_TIME", "FAIL", "missing_entry_time")
+    if exit_time is None:
+        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, 0, "", "", "MISSING_EXIT_TIME", "FAIL", "missing_exit_time")
+    if entry_price is None or entry_price <= 0 or exit_price is None:
+        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, 0, "", "", "NEEDS_REBUILD", "FAIL", "missing_trade_prices")
     expected = expected_candles(entry_time, exit_time)
     if candles.empty:
-        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, expected, "", "", "MISSING_CANDLES", "OK", "")
+        quality = "MISSING_CANDLES_FINAL" if history_finalized else "RETRY_PENDING"
+        reason = "missing_candles_after_history_finalized" if history_finalized else "history_not_finalized"
+        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, expected, "", "", quality, "OK", reason)
     rows = candles.copy()
     rows["timestamp"] = pd.to_datetime(rows["timestamp"], errors="coerce", utc=True)
     rows["high"] = pd.to_numeric(rows["high"], errors="coerce")
     rows["low"] = pd.to_numeric(rows["low"], errors="coerce")
     rows = rows.dropna(subset=["timestamp", "high", "low"]).sort_values("timestamp").reset_index(drop=True)
     if rows.empty:
-        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, expected, "", "", "MISSING_CANDLES", "OK", "")
+        quality = "MISSING_CANDLES_FINAL" if history_finalized else "RETRY_PENDING"
+        reason = "empty_candles_after_history_finalized" if history_finalized else "history_not_finalized"
+        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, expected, "", "", quality, "OK", reason)
     min_ts = rows["timestamp"].min()
     max_ts = rows["timestamp"].max()
     window = rows[(rows["timestamp"] >= entry_time) & (rows["timestamp"] <= exit_time)].copy()
     if window.empty:
-        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, expected, min_ts.isoformat(), max_ts.isoformat(), "OUTSIDE_CANDLE_RANGE", "OK", "")
+        quality = "OUTSIDE_CANDLE_RANGE" if history_finalized else "RETRY_PENDING"
+        reason = "outside_candle_range" if history_finalized else "history_not_finalized"
+        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, expected, min_ts.isoformat(), max_ts.isoformat(), quality, "OK", reason)
 
-    quality = "EXACT" if min_ts <= entry_time and max_ts >= exit_time and len(window) >= expected else "PARTIAL"
+    if max_ts < exit_time and not history_finalized:
+        return PeakResult(None, "", None, None, "", None, None, None, None, None, len(window), expected, min_ts.isoformat(), max_ts.isoformat(), "RETRY_PENDING", "OK", "history_not_finalized")
+    quality = "EXACT" if min_ts <= entry_time and max_ts >= exit_time and len(window) >= expected else "PARTIAL_COVERAGE"
     peak_idx = pd.to_numeric(window["high"], errors="coerce").idxmax()
     low_idx = pd.to_numeric(window["low"], errors="coerce").idxmin()
     raw_peak_price = fnum(window.loc[peak_idx, "high"])
@@ -361,7 +375,7 @@ def calculate_peak(candles: pd.DataFrame, *, trade: dict[str, Any]) -> PeakResul
     )
 
 
-def build_peak_rows(sqlite_path: Path, *, date: str | None, trade_id: str | None, history_dir: Path, session_type: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def build_peak_rows(sqlite_path: Path, *, date: str | None, trade_id: str | None, history_dir: Path, recorder_dir: Path, session_type: str, history_finalized: bool) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     with connect_sqlite(sqlite_path, read_only=True) as conn:
         trades = selected_trade_rows(conn, date=date, trade_id=trade_id)
     cache: dict[tuple[str, str, str], pd.DataFrame] = {}
@@ -375,9 +389,10 @@ def build_peak_rows(sqlite_path: Path, *, date: str | None, trade_id: str | None
         else:
             key = (symbol, entry_time.date().isoformat(), exit_time.date().isoformat())
             if key not in cache:
-                cache[key] = load_trade_candles(history_dir, symbol, entry_time, exit_time, session_type)
+                session = str(trade.get("session_date") or entry_time.date().isoformat())
+                cache[key] = load_shared_trade_candles(history_dir, recorder_dir, symbol, session, entry_time, exit_time, session_type)
             candles = cache[key]
-        peak = calculate_peak(candles, trade=trade)
+        peak = calculate_peak(candles, trade=trade, history_finalized=history_finalized)
         raw = parse_raw_json(trade.get("raw_json"))
         old_peak_price = fnum(trade.get("peak_price"))
         old_peak_pct = fnum(trade.get("mfe_pct"))
@@ -445,11 +460,24 @@ def build_peak_rows(sqlite_path: Path, *, date: str | None, trade_id: str | None
                 ),
             }
         )
+    net_values = [fnum(trade.get("net_pnl"), 0.0) or 0.0 for trade in trades]
     summary = {
+        "session_date": date or "",
+        "canonical_trade_count": len(rows),
         "trades_scanned": len(rows),
+        "net_pnl_canonical": sum(net_values),
         "exact": sum(1 for row in rows if row["peak_data_quality"] == "EXACT"),
-        "partial": sum(1 for row in rows if row["peak_data_quality"] == "PARTIAL"),
-        "missing": sum(1 for row in rows if row["peak_data_quality"] in {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"}),
+        "partial": sum(1 for row in rows if row["peak_data_quality"] in {"PARTIAL", "PARTIAL_COVERAGE"}),
+        "peak_exact_count": sum(1 for row in rows if row["peak_data_quality"] == "EXACT"),
+        "peak_partial_count": sum(1 for row in rows if row["peak_data_quality"] in {"PARTIAL", "PARTIAL_COVERAGE"}),
+        "peak_retry_pending_count": sum(1 for row in rows if row["peak_data_quality"] in RETRY_PEAK_QUALITIES),
+        "peak_missing_final_count": sum(1 for row in rows if row["peak_data_quality"] in FINAL_MISSING_PEAK_QUALITIES),
+        "retry_pending": sum(1 for row in rows if row["peak_data_quality"] in RETRY_PEAK_QUALITIES),
+        "missing_final": sum(1 for row in rows if row["peak_data_quality"] in FINAL_MISSING_PEAK_QUALITIES),
+        "missing": sum(1 for row in rows if row["peak_data_quality"] in (RETRY_PEAK_QUALITIES | FINAL_MISSING_PEAK_QUALITIES)),
+        "mfe_missing_count": sum(1 for row in rows if row.get("peak_pct") is None),
+        "mae_missing_count": sum(1 for row in rows if row.get("mae_pct") is None),
+        "peak_price_missing_count": sum(1 for row in rows if row.get("new_peak_price") is None),
         "profitable_peak_below_final_return": sum(1 for row in rows if row["validation_reason"] and "profitable_long_peak_pct_below_gross_return" in row["validation_reason"]),
         "exact_valid": sum(1 for row in rows if row["peak_data_quality"] == "EXACT" and row["validation_status"] == "VALID"),
         "exact_invalid": sum(1 for row in rows if row["peak_data_quality"] == "EXACT" and row["validation_status"] != "VALID"),
@@ -529,9 +557,15 @@ def update_trade_peak(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
         "position_key",
     ):
         raw.pop(key, None)
+    if row["peak_data_quality"] in VALID_PEAK_QUALITIES and row["validation_status"] == "VALID":
+        rebuild_status = "rebuilt_from_candles"
+    elif row["peak_data_quality"] in RETRY_PEAK_QUALITIES:
+        rebuild_status = "retry_pending"
+    else:
+        rebuild_status = "needs_rebuild"
     raw.update(
         {
-            "peak_rebuild_status": "rebuilt_from_candles" if row["peak_data_quality"] in VALID_PEAK_QUALITIES else "needs_rebuild",
+            "peak_rebuild_status": rebuild_status,
             "peak_rebuild_version": PEAK_REBUILD_VERSION,
             "peak_version": PEAK_REBUILD_VERSION,
             "peak_data_quality": row["peak_data_quality"],
@@ -606,14 +640,17 @@ def run(args: argparse.Namespace, *, audit: bool = False) -> int:
         date=args.date,
         trade_id=args.trade_id,
         history_dir=Path(args.history_dir),
+        recorder_dir=Path(args.recorder_dir),
         session_type=args.session_type,
+        history_finalized=bool(args.history_finalized),
     )
     suffix = args.trade_id or args.date or "all"
     output = write_report(rows, summary, Path(args.output_dir), suffix, audit=audit)
     event = "TRADE_PEAK_AUDIT_DONE" if audit else "TRADE_PEAK_REBUILD_DRY_RUN"
     print(
         f"{event} trades_scanned={summary['trades_scanned']} exact={summary['exact']} "
-        f"partial={summary['partial']} missing={summary['missing']} "
+        f"partial={summary['partial']} retry_pending={summary.get('retry_pending', 0)} "
+        f"missing_final={summary.get('missing_final', 0)} missing={summary['missing']} "
         f"profitable_peak_below_final_return={summary['profitable_peak_below_final_return']} "
         f"suspicious_peak_zero_values={summary['suspicious_peak_zero_values']} output={output}",
         flush=True,
@@ -630,9 +667,11 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--trade-id")
     parser.add_argument("--sqlite-path", default=str(DEFAULT_DB))
     parser.add_argument("--history-dir", default=str(DEFAULT_HISTORY_DIR))
+    parser.add_argument("--recorder-dir", default="data/live/recorder")
     parser.add_argument("--session-type", default="RTH")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--dry-run", action="store_true", help="Explicit no-op alias; dry-run is the default.")
+    parser.add_argument("--history-finalized", action="store_true", help="Allow final MISSING_CANDLES_FINAL/OUTSIDE states after history has been finalized.")
     parser.add_argument("--apply", action="store_true", help="Apply changes to SQLite. Default is dry-run.")
     return parser
 

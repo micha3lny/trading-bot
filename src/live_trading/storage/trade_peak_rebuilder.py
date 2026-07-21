@@ -10,11 +10,15 @@ from typing import Any
 
 import pandas as pd
 
+
 DEFAULT_HISTORY_DIR = Path(os.environ.get("TRADING_BOT_TRADE_PEAK_HISTORY_DIR", "data/history/universe_1m"))
+DEFAULT_RECORDER_DIR = Path(os.environ.get("TRADING_BOT_TRADE_PEAK_RECORDER_DIR", "data/live/recorder"))
 DEFAULT_SESSION_TYPE = os.environ.get("TRADING_BOT_TRADE_PEAK_SESSION_TYPE", "RTH")
-PEAK_VERSION = 2
-VALID_PEAK_QUALITIES = {"EXACT", "PARTIAL"}
-MISSING_PEAK_QUALITIES = {"MISSING_CANDLES", "OUTSIDE_CANDLE_RANGE", "NEEDS_REBUILD"}
+PEAK_VERSION = 3
+VALID_PEAK_QUALITIES = {"EXACT", "PARTIAL", "PARTIAL_COVERAGE"}
+RETRY_PEAK_QUALITIES = {"HISTORY_NOT_FINALIZED", "RETRY_PENDING"}
+MISSING_PEAK_QUALITIES = {"MISSING_CANDLES_FINAL", "OUTSIDE_CANDLE_RANGE", "MISSING_ENTRY_TIME", "MISSING_EXIT_TIME", "NEEDS_REBUILD"}
+UNTRUSTED_PEAK_QUALITIES = RETRY_PEAK_QUALITIES | MISSING_PEAK_QUALITIES
 PEAK_VALIDATION_TOLERANCE_PCT = 0.05
 
 
@@ -196,32 +200,44 @@ def validate_peak(
     return ("VALID" if not unique_reasons else "INVALID", ";".join(unique_reasons))
 
 
-def calculate_peak(candles: pd.DataFrame, *, trade: dict[str, Any]) -> PeakResult:
+def calculate_peak(candles: pd.DataFrame, *, trade: dict[str, Any], history_finalized: bool = True) -> PeakResult:
     entry_time = parse_dt(trade.get("entry_fill_time"))
     exit_time = parse_dt(trade.get("exit_fill_time") or trade.get("closed_at"))
     entry_price = fnum(trade.get("entry_price"))
     exit_price = fnum(trade.get("exit_price"))
     qty = abs(fnum(trade.get("quantity")) or 0.0)
     gross_return_pct = pct(exit_price, entry_price)
-    if entry_time is None or exit_time is None or entry_price is None or entry_price <= 0 or exit_price is None:
-        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, 0, "", "", "NEEDS_REBUILD", "FAIL", "missing_trade_inputs")
+    if entry_time is None:
+        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, 0, "", "", "MISSING_ENTRY_TIME", "FAIL", "missing_entry_time")
+    if exit_time is None:
+        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, 0, "", "", "MISSING_EXIT_TIME", "FAIL", "missing_exit_time")
+    if entry_price is None or entry_price <= 0 or exit_price is None:
+        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, 0, "", "", "NEEDS_REBUILD", "FAIL", "missing_trade_prices")
     expected = expected_candles(entry_time, exit_time)
     if candles.empty:
-        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, expected, "", "", "MISSING_CANDLES", "OK", "")
+        quality = "MISSING_CANDLES_FINAL" if history_finalized else "RETRY_PENDING"
+        reason = "missing_candles_after_history_finalized" if history_finalized else "history_not_finalized"
+        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, expected, "", "", quality, "OK", reason)
     rows = candles.copy()
     rows["timestamp"] = pd.to_datetime(rows["timestamp"], errors="coerce", utc=True)
     rows["high"] = pd.to_numeric(rows["high"], errors="coerce")
     rows["low"] = pd.to_numeric(rows["low"], errors="coerce")
     rows = rows.dropna(subset=["timestamp", "high", "low"]).sort_values("timestamp").reset_index(drop=True)
     if rows.empty:
-        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, expected, "", "", "MISSING_CANDLES", "OK", "")
+        quality = "MISSING_CANDLES_FINAL" if history_finalized else "RETRY_PENDING"
+        reason = "empty_candles_after_history_finalized" if history_finalized else "history_not_finalized"
+        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, expected, "", "", quality, "OK", reason)
     min_ts = rows["timestamp"].min()
     max_ts = rows["timestamp"].max()
     window = rows[(rows["timestamp"] >= entry_time) & (rows["timestamp"] <= exit_time)].copy()
     if window.empty:
-        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, expected, min_ts.isoformat(), max_ts.isoformat(), "OUTSIDE_CANDLE_RANGE", "OK", "")
+        quality = "OUTSIDE_CANDLE_RANGE" if history_finalized else "RETRY_PENDING"
+        reason = "outside_candle_range" if history_finalized else "history_not_finalized"
+        return PeakResult(None, "", None, None, "", None, None, None, None, None, 0, expected, min_ts.isoformat(), max_ts.isoformat(), quality, "OK", reason)
 
-    quality = "EXACT" if min_ts <= entry_time and max_ts >= exit_time and len(window) >= expected else "PARTIAL"
+    if max_ts < exit_time and not history_finalized:
+        return PeakResult(None, "", None, None, "", None, None, None, None, None, len(window), expected, min_ts.isoformat(), max_ts.isoformat(), "RETRY_PENDING", "OK", "history_not_finalized")
+    quality = "EXACT" if min_ts <= entry_time and max_ts >= exit_time and len(window) >= expected else "PARTIAL_COVERAGE"
     peak_idx = pd.to_numeric(window["high"], errors="coerce").idxmax()
     low_idx = pd.to_numeric(window["low"], errors="coerce").idxmin()
     raw_peak_price = fnum(window.loc[peak_idx, "high"])
@@ -278,19 +294,41 @@ def calculate_peak(candles: pd.DataFrame, *, trade: dict[str, Any]) -> PeakResul
     )
 
 
-def calculate_peak_for_trade(trade: dict[str, Any], *, history_dir: Path = DEFAULT_HISTORY_DIR, session_type: str = DEFAULT_SESSION_TYPE) -> PeakResult:
+def calculate_peak_for_trade(
+    trade: dict[str, Any],
+    *,
+    history_dir: Path = DEFAULT_HISTORY_DIR,
+    recorder_dir: Path = DEFAULT_RECORDER_DIR,
+    session_type: str = DEFAULT_SESSION_TYPE,
+    history_finalized: bool = False,
+) -> PeakResult:
     entry_time = parse_dt(trade.get("entry_fill_time"))
     exit_time = parse_dt(trade.get("exit_fill_time") or trade.get("closed_at"))
     symbol = str(trade.get("symbol") or "").upper()
     if entry_time is None or exit_time is None or not symbol:
-        return calculate_peak(pd.DataFrame(), trade=trade)
-    return calculate_peak(load_trade_candles(history_dir, symbol, entry_time, exit_time, session_type), trade=trade)
+        return calculate_peak(pd.DataFrame(), trade=trade, history_finalized=history_finalized)
+    session_date = str(trade.get("session_date") or entry_time.date().isoformat())
+    try:
+        from src.live_trading.analysis.common import load_trade_candles as load_shared_trade_candles
+
+        candles = load_shared_trade_candles(history_dir, recorder_dir, symbol, session_date, entry_time, exit_time, session_type)
+        if candles.empty:
+            candles = load_trade_candles(history_dir, symbol, entry_time, exit_time, session_type)
+    except Exception:
+        candles = load_trade_candles(history_dir, symbol, entry_time, exit_time, session_type)
+    return calculate_peak(candles, trade=trade, history_finalized=history_finalized)
 
 
 def peak_raw_payload(result: PeakResult) -> dict[str, Any]:
     peak_ok = result.peak_data_quality in VALID_PEAK_QUALITIES and result.validation_status == "VALID"
+    if peak_ok:
+        rebuild_status = "rebuilt_from_candles"
+    elif result.peak_data_quality in RETRY_PEAK_QUALITIES:
+        rebuild_status = "retry_pending"
+    else:
+        rebuild_status = "needs_rebuild"
     return {
-        "peak_rebuild_status": "rebuilt_from_candles" if result.peak_data_quality in VALID_PEAK_QUALITIES else "needs_rebuild",
+        "peak_rebuild_status": rebuild_status,
         "peak_data_quality": result.peak_data_quality,
         "peak_source": "canonical_trade_candles_1m" if peak_ok else "unavailable",
         "peak_version": PEAK_VERSION,
@@ -416,13 +454,15 @@ def calculate_and_store_trade_peak(
     trade_id: str,
     *,
     history_dir: Path = DEFAULT_HISTORY_DIR,
+    recorder_dir: Path = DEFAULT_RECORDER_DIR,
     session_type: str = DEFAULT_SESSION_TYPE,
+    history_finalized: bool = False,
 ) -> PeakResult:
     row = trade_row(conn, trade_id)
     if not row:
         raise ValueError(f"trade_id not found: {trade_id}")
     try:
-        result = calculate_peak_for_trade(row, history_dir=history_dir, session_type=session_type)
+        result = calculate_peak_for_trade(row, history_dir=history_dir, recorder_dir=recorder_dir, session_type=session_type, history_finalized=history_finalized)
         update_trade_peak(conn, trade_id, result)
         return result
     except Exception as exc:

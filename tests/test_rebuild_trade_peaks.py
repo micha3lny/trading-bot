@@ -136,11 +136,23 @@ class RebuildTradePeaksTests(unittest.TestCase):
             trade=trade("MISS", "2026-07-16T13:30:00+00:00", "2026-07-16T13:31:00+00:00", 10.0, 11.0),
         )
 
-        self.assertEqual(result.peak_data_quality, "MISSING_CANDLES")
+        self.assertEqual(result.peak_data_quality, "MISSING_CANDLES_FINAL")
         self.assertIsNone(result.peak_price)
         self.assertIsNone(result.peak_pct)
         self.assertIsNone(result.drop_from_peak_pct)
         self.assertIsNone(result.giveback_usd)
+
+
+    def test_missing_candles_before_history_finalization_are_retry_pending(self) -> None:
+        result = calculate_peak(
+            pd.DataFrame(),
+            trade=trade("MISS", "2026-07-16T13:30:00+00:00", "2026-07-16T13:31:00+00:00", 10.0, 11.0),
+            history_finalized=False,
+        )
+
+        self.assertEqual(result.peak_data_quality, "RETRY_PENDING")
+        self.assertIsNone(result.peak_price)
+        self.assertIsNone(result.peak_pct)
 
     def test_mixed_sqlite_timestamp_formats_are_normalized(self) -> None:
         result = calculate_peak(

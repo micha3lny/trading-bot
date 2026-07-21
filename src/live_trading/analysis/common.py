@@ -263,9 +263,15 @@ def calculate_path_stats(candles: pd.DataFrame, entry_price: float, entry_time: 
     rows = candles.sort_values("timestamp").reset_index(drop=True)
     peak_idx = pd.to_numeric(rows["high"], errors="coerce").idxmax()
     low_idx = pd.to_numeric(rows["low"], errors="coerce").idxmin()
-    peak_price = float(rows.loc[peak_idx, "high"])
+    raw_peak_price = float(rows.loc[peak_idx, "high"])
     low_price = float(rows.loc[low_idx, "low"])
-    peak_time = rows.loc[peak_idx, "timestamp"]
+    raw_peak_time = rows.loc[peak_idx, "timestamp"]
+    if raw_peak_price < entry_price:
+        peak_price = float(entry_price)
+        peak_time = entry_time or rows.iloc[0]["timestamp"]
+    else:
+        peak_price = raw_peak_price
+        peak_time = raw_peak_time
     low_time = rows.loc[low_idx, "timestamp"]
     after_peak = rows[rows["timestamp"] >= peak_time]
     post_peak_low = fnum(after_peak["low"].min()) if not after_peak.empty else low_price

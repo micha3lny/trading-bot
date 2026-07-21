@@ -170,6 +170,85 @@ class RuntimeDashboardQueriesTests(unittest.TestCase):
             finally:
                 store.close()
 
+
+    def test_closed_positions_prefer_canonical_trades_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            session_date = "2026-07-20"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_trade({
+                    "trade_id": "canonical:2026-07-20:CANON",
+                    "strategy_name": "v67",
+                    "session_date": session_date,
+                    "symbol": "CANON",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-07-20T13:35:00+00:00",
+                    "exit_fill_time": "2026-07-20T14:00:00+00:00",
+                    "closed_at": "2026-07-20T14:00:00+00:00",
+                    "entry_price": 10.0,
+                    "exit_price": 10.5,
+                    "quantity": 10,
+                    "gross_pnl": 5.0,
+                    "commission": 1.0,
+                    "net_pnl": 4.0,
+                    "raw_json": {"peak_data_quality": "EXACT", "peak_pct": 6.0},
+                })
+                self.insert_execution_direct(store, {
+                    "execution_id": "B_CANON",
+                    "trade_id": "canonical:2026-07-20:CANON",
+                    "strategy_name": "v67",
+                    "session_date": session_date,
+                    "symbol": "CANON",
+                    "side": "BOT",
+                    "quantity": 10,
+                    "price": 10,
+                    "executed_at": "2026-07-20T13:35:00+00:00",
+                    "recorded_at": "2026-07-20T13:35:01+00:00",
+                    "commission": 0.5,
+                    "commission_source": "ibkr",
+                })
+                self.insert_execution_direct(store, {
+                    "execution_id": "S_CANON",
+                    "trade_id": "canonical:2026-07-20:CANON",
+                    "strategy_name": "v67",
+                    "session_date": session_date,
+                    "symbol": "CANON",
+                    "side": "SLD",
+                    "quantity": 10,
+                    "price": 10.5,
+                    "executed_at": "2026-07-20T14:00:00+00:00",
+                    "recorded_at": "2026-07-20T14:00:01+00:00",
+                    "commission": 0.5,
+                    "commission_source": "ibkr",
+                    "raw_json": {"realized_pnl": 5.0},
+                })
+                self.insert_execution_direct(store, {
+                    "execution_id": "S_DIAG",
+                    "trade_id": "diag",
+                    "strategy_name": "v67",
+                    "session_date": session_date,
+                    "symbol": "DIAGONLY",
+                    "side": "SLD",
+                    "quantity": 1,
+                    "price": 9,
+                    "executed_at": "2026-07-20T15:00:00+00:00",
+                    "recorded_at": "2026-07-20T15:00:01+00:00",
+                    "commission": 0.1,
+                    "commission_source": "ibkr",
+                    "raw_json": {"realized_pnl": -1.0},
+                })
+            finally:
+                store.close()
+
+            snapshot = load_dashboard_snapshot(db, DateWindow(session_date, session_date), "v67")
+            closed = snapshot["closed_positions"]
+            diagnostics = snapshot["diagnostics"]
+
+            self.assertEqual(closed["symbol"].tolist(), ["CANON"])
+            self.assertEqual(int(diagnostics["displayed_closed_trades_count"]), 1)
+            self.assertEqual(diagnostics["runtime_closed_source"], "persisted_trades")
+
     def test_runtime_open_positions_use_sqlite_positions_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             session_date = utc_today()
