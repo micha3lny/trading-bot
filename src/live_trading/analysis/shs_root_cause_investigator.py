@@ -324,33 +324,16 @@ def find_order_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [r for r in records if any(tok in (str(r.get("event"))+" "+str(r.get("text"))).upper() for tok in tokens)]
 
 
-def load_cases(session_date: str, analysis_dir: Path, cases_csv: Path | None) -> pd.DataFrame:
-    candidates = []
-    if cases_csv:
-        candidates.append(cases_csv)
-    candidates.extend([
-        analysis_dir / f"no_buy_after_signal_cases_{session_date}.csv",
-        analysis_dir / f"should_have_signaled_cases_{session_date}.csv",
-    ])
-    for path in candidates:
-        df = safe_read_csv(path)
-        if df.empty:
-            continue
-        if "final_no_buy_reason" in df.columns:
-            out = df[df["final_no_buy_reason"].fillna("").astype(str).isin([
-                "runtime_signal_ready_but_no_buy",
-                "unexplained_after_signal_before_dispatch",
-                "unknown_no_buy_after_signal",
-                "entries_blocked",
-                "lower_rank_candidate_not_selected",
-            ]) | df.get("order_dispatch_attempted", pd.Series(dtype=object)).fillna("0").astype(str).eq("0")].copy()
-            if not out.empty:
-                return out
-        if "final_classification" in df.columns:
-            out = df[df["final_classification"].fillna("").astype(str) == "runtime_signal_ready_but_no_buy"].copy()
-            if not out.empty:
-                return out
-    return pd.DataFrame()
+def load_cases(cases_csv: Path) -> pd.DataFrame:
+    df = safe_read_csv(cases_csv)
+    if df.empty:
+        return df
+    if "symbol" not in df.columns:
+        raise RuntimeError(f"SHS_ROOT_CAUSE_CASES_MISSING_SYMBOL selected_cases_csv={cases_csv}")
+    out = df.copy()
+    out["symbol"] = out["symbol"].map(normalize_symbol)
+    out = out[out["symbol"].astype(str).str.len() > 0].copy()
+    return out
 
 
 def classify_root_cause(*, row: dict[str, Any], symbol_records: list[dict[str, Any]], window_records: list[dict[str, Any]], global_window: list[dict[str, Any]], order_records: list[dict[str, Any]], execution_record: dict[str, Any] | None) -> tuple[str, str]:
@@ -519,8 +502,19 @@ def run(args: argparse.Namespace) -> int:
     session_date = args.date
     analysis_dir = Path(args.analysis_dir)
     output_dir = Path(args.output_dir or analysis_dir)
-    cases = load_cases(session_date, analysis_dir, Path(args.cases_csv) if args.cases_csv else None)
-    if args.max_cases is not None and not cases.empty:
+    if not args.cases_csv:
+        raise RuntimeError("SHS_ROOT_CAUSE_CASES_CSV_REQUIRED --cases-csv is required")
+    cases_csv = Path(args.cases_csv)
+    cases = load_cases(cases_csv)
+    rows_loaded = len(cases)
+    symbols_loaded = cases["symbol"].nunique() if "symbol" in cases.columns else 0
+    print(
+        f"SHS_ROOT_CAUSE_INPUT selected_cases_csv={cases_csv} rows_loaded={rows_loaded} symbols_loaded={symbols_loaded}",
+        flush=True,
+    )
+    if rows_loaded == 0:
+        raise RuntimeError(f"SHS_ROOT_CAUSE_NO_CASES selected_cases_csv={cases_csv} rows_loaded=0")
+    if args.max_cases is not None:
         cases = cases.head(args.max_cases).copy()
     target_symbols = {normalize_symbol(v) for v in cases.get("symbol", pd.Series(dtype=object)).tolist() if normalize_symbol(v)}
     print(f"SHS_ROOT_CAUSE_START date={session_date} targets={len(cases)}", flush=True)
@@ -558,7 +552,7 @@ def run(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Find final root causes for Should-Have-Signaled runtime-ready no-buy cases.")
     parser.add_argument("--date", required=True)
-    parser.add_argument("--cases-csv")
+    parser.add_argument("--cases-csv", required=True)
     parser.add_argument("--sqlite-path", default=str(DEFAULT_SQLITE_PATH))
     parser.add_argument("--recorder-dir", default=str(DEFAULT_RECORDER_DIR))
     parser.add_argument("--analysis-dir", default=str(DEFAULT_ANALYSIS_DIR))
