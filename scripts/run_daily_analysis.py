@@ -151,6 +151,16 @@ class StepResult:
     elapsed_seconds: float
     output_files: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    expected_output_files: list[str] = field(default_factory=list)
+    existing_output_files: list[str] = field(default_factory=list)
+    row_counts: dict[str, int | None] = field(default_factory=dict)
+    failure_traceback_summary: str = ""
+    output_files: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    expected_output_files: list[str] = field(default_factory=list)
+    existing_output_files: list[str] = field(default_factory=list)
+    row_counts: dict[str, int | None] = field(default_factory=dict)
+    failure_traceback_summary: str = ""
 
 
 def parse_date(value: str) -> str:
@@ -272,6 +282,12 @@ def command_for(spec: AnalyzerSpec, session_date: str, args: argparse.Namespace)
         command.extend(["--sqlite-path", str(args.sqlite_path)])
     if spec.pass_history_dir:
         command.extend(["--history-dir", str(args.history_dir)])
+    if spec.name == "shs":
+        command.extend(["--missed-runners-csv", str(args.output_dir / f"missed_runners_{session_date}.csv")])
+    if spec.name == "nbas":
+        command.extend(["--should-have-signaled-csv", str(args.output_dir / f"should_have_signaled_cases_{session_date}.csv")])
+    if spec.name == "offline_runtime_pre_signal":
+        command.extend(["--cases-csv", str(args.output_dir / f"no_buy_after_signal_cases_{session_date}.csv")])
     if spec.output_dir_arg:
         command.extend([spec.output_dir_arg, str(args.output_dir)])
     if spec.output_file_pattern:
@@ -314,6 +330,65 @@ def expected_outputs(session_date: str, output_dir: Path | None = None) -> list[
     return paths
 
 
+def row_count_for_path(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    if path.suffix.lower() != ".csv" or path.stat().st_size <= 0:
+        return None
+    _fields, rows = csv_rows(path)
+    return len(rows)
+
+
+def output_row_counts(paths: list[Path]) -> dict[str, int | None]:
+    return {rel(path): row_count_for_path(path) for path in paths}
+
+
+def traceback_summary(stdout: str, stderr: str) -> str:
+    text = "\n".join(part for part in (stdout, stderr) if part)
+    if not text:
+        return ""
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    tb_start = next((idx for idx, line in enumerate(lines) if line.startswith("Traceback ")), None)
+    if tb_start is not None:
+        return " | ".join(lines[tb_start:][-8:])[:2000]
+    return " | ".join(lines[-5:])[:1000]
+
+
+def missed_should_have_signaled_count(output_dir: Path, session_date: str) -> int:
+    path = output_dir / f"missed_runners_{session_date}.csv"
+    fields, rows = csv_rows(path)
+    if "top100_no_signal_reason" not in fields:
+        return 0
+    return sum(1 for row in rows if str(row.get("top100_no_signal_reason") or "") == "should_have_signaled")
+
+
+def shs_targets_count(output_dir: Path, session_date: str) -> int:
+    path = output_dir / f"should_have_signaled_summary_{session_date}.csv"
+    fields, rows = csv_rows(path)
+    if not rows or "total_should_have_signaled" not in fields:
+        return 0
+    try:
+        return int(float(rows[0].get("total_should_have_signaled") or 0))
+    except ValueError:
+        return 0
+
+
+def validate_shs_handoff(result: StepResult, *, output_dir: Path, session_date: str) -> None:
+    if result.name != "shs":
+        return
+    missed_count = missed_should_have_signaled_count(output_dir, session_date)
+    target_count = shs_targets_count(output_dir, session_date)
+    result.warnings.append(f"missed_should_have_signaled_count={missed_count}")
+    result.warnings.append(f"shs_targets_count={target_count}")
+    result.warnings.append(f"shs_target_handoff_match={int(missed_count == target_count)}")
+    if missed_count > 0 and target_count == 0:
+        result.status = "failed"
+        result.failure_traceback_summary = (
+            f"SHS target handoff failed: missed_should_have_signaled_count={missed_count} "
+            f"but shs_targets_count={target_count}"
+        )
+
+
 def git_commit() -> str:
     try:
         completed = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, capture_output=True, check=False)
@@ -333,6 +408,13 @@ def write_manifest(session_date: str, results: list[StepResult], *, args: argpar
         "sqlite_path": str(args.sqlite_path),
         "history_dir": str(args.history_dir),
         "status": "FAILED" if final_failed else "OK",
+        "successful_steps": [result.name for result in results if result.status == "ok"],
+        "failed_steps": [result.name for result in results if result.status == "failed"],
+        "degraded_steps": [result.name for result in results if result.status == "degraded" or result.warnings],
+        "analysis_complete": not any(result.status == "failed" for result in results),
+        "missed_should_have_signaled_count": missed_should_have_signaled_count(args.output_dir, session_date),
+        "shs_targets_count": shs_targets_count(args.output_dir, session_date),
+        "shs_target_handoff_match": missed_should_have_signaled_count(args.output_dir, session_date) == shs_targets_count(args.output_dir, session_date),
         "analyzers": [result.__dict__ for result in results],
         "data_quality_summary": collect_data_quality_summary(session_date, args.output_dir),
     }
@@ -421,12 +503,30 @@ def write_summary(session_date: str, results: list[StepResult], *, total_elapsed
 def run_step(spec: AnalyzerSpec, command: list[str], *, args: argparse.Namespace, session_date: str) -> StepResult:
     print(f"DAILY_ANALYSIS_STEP_START name={spec.name} command={' '.join(command)}", flush=True)
     started = time.monotonic()
-    completed = subprocess.run(command, cwd=ROOT)
+    completed = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+    if completed.stdout:
+        print(completed.stdout, end="")
+    if completed.stderr:
+        print(completed.stderr, end="", file=sys.stderr)
     elapsed = time.monotonic() - started
     status = "ok" if completed.returncode == 0 else "failed"
     print(("DAILY_ANALYSIS_STEP_DONE" if completed.returncode == 0 else "DAILY_ANALYSIS_STEP_FAILED") + f" name={spec.name} exit_code={completed.returncode} elapsed={elapsed:.2f}", flush=True)
-    outputs = [rel(path) for path in output_paths(spec, session_date, args.output_dir) if path.exists()]
-    return StepResult(spec.name, command, False, status, completed.returncode, elapsed, outputs)
+    expected = output_paths(spec, session_date, args.output_dir)
+    existing = [path for path in expected if path.exists()]
+    return StepResult(
+        spec.name,
+        command,
+        False,
+        status,
+        completed.returncode,
+        elapsed,
+        [rel(path) for path in existing],
+        [],
+        [rel(path) for path in expected],
+        [rel(path) for path in existing],
+        output_row_counts(expected),
+        "" if completed.returncode == 0 else traceback_summary(completed.stdout, completed.stderr),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -471,6 +571,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     specs = selected_specs(args)
     for spec in specs:
         result = run_step(spec, command_for(spec, session_date, args), args=args, session_date=session_date)
+        validate_shs_handoff(result, output_dir=args.output_dir, session_date=session_date)
         results.append(result)
         if result.status == "failed":
             failed = True

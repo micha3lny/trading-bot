@@ -450,12 +450,56 @@ def build_dynamic_rules(base: pd.DataFrame, *, history_dir: Path, date: str, ses
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
+def require_unique_columns(df: pd.DataFrame, *, context: str) -> None:
+    duplicates = sorted({str(col) for col in df.columns if list(df.columns).count(col) > 1})
+    if duplicates:
+        raise ValueError(f"{context} duplicate columns: {duplicates}")
+
+
+def require_series_columns(df: pd.DataFrame, columns: list[str], *, context: str) -> None:
+    missing = [column for column in columns if column not in df.columns]
+    if missing:
+        raise ValueError(f"{context} missing required columns: {missing}")
+    for column in columns:
+        value = df[column]
+        if not isinstance(value, pd.Series):
+            raise TypeError(f"{context} column {column!r} is not a Series")
+
+
+def stop_loss_to_early_loser_adapter(base: pd.DataFrame) -> pd.DataFrame:
+    """Build the exact early-loser input schema without duplicate renamed columns."""
+    require_unique_columns(base, context="stop_loss_hybrid_base")
+    out = pd.DataFrame(index=base.index)
+    out["net_pnl"] = base["actual_net_pnl"] if "actual_net_pnl" in base.columns else base.get("net_pnl", pd.Series(pd.NA, index=base.index))
+    out["final_pnl_pct"] = base["actual_return_pct"] if "actual_return_pct" in base.columns else base.get("final_pnl_pct", pd.Series(pd.NA, index=base.index))
+    required_path_columns = ["quantity", "entry_price"]
+    for column in required_path_columns:
+        out[column] = base[column] if column in base.columns else pd.NA
+    for minutes in [5, 10, 15, 20, 30, 45, 60]:
+        for prefix in ("pnl_pct_at", "positive_seen_to"):
+            column = f"{prefix}_{minutes}m"
+            if column in base.columns:
+                out[column] = base[column]
+    for column in ("trade_id", "symbol", "entry_time", "exit_time"):
+        if column in base.columns:
+            out[column] = base[column]
+    require_unique_columns(out, context="stop_loss_early_loser_adapter")
+    require_series_columns(out, ["net_pnl", "final_pnl_pct", *required_path_columns], context="stop_loss_early_loser_adapter")
+    return out
+
+
 def build_hybrid_rules(paths: pd.DataFrame) -> pd.DataFrame:
     if paths.empty:
         return pd.DataFrame()
     base = paths[paths["slippage_bps"].eq(CONSERVATIVE_SLIPPAGE_BPS) & paths["activation_delay_min"].eq(0)].copy()
+    print(
+        "STOP_LOSS_HYBRID_INPUT_COLUMNS "
+        f"columns={list(base.columns)} "
+        f"duplicate_columns={sorted({col for col in base.columns if list(base.columns).count(col) > 1})}",
+        flush=True,
+    )
     # Add early-loser style rules over actual trade paths, then compare side by side. Hybrid execution is approximated conservatively.
-    early = build_early_loser_rules(base.rename(columns={"actual_net_pnl": "net_pnl", "actual_return_pct": "final_pnl_pct"}))
+    early = build_early_loser_rules(stop_loss_to_early_loser_adapter(base))
     if early.empty:
         return pd.DataFrame()
     rows = []

@@ -660,9 +660,11 @@ def load_spread_snapshots(recorder_dir: Path, session_date: str) -> pd.DataFrame
     for name in ["spread_snapshots.csv", "market_snapshots.csv"]:
         df = safe_read_csv(root / name)
         if not df.empty:
+            df.attrs["spread_snapshot_source"] = name
             return df
-    print(f"SPREAD_DATA_MISSING date={session_date} reason=no_spread_or_market_snapshots")
-    return pd.DataFrame()
+    out = pd.DataFrame()
+    out.attrs["spread_snapshot_source"] = "missing"
+    return out
 
 
 def signal_age(row: dict[str, Any], entry_time: pd.Timestamp | None) -> tuple[float | None, str]:
@@ -1020,6 +1022,10 @@ def analyze_bad_entries(
         "time_mismatch_count": 0,
         "metrics_computed_count": 0,
         "metrics_missing_count": 0,
+        "buy_snapshot_spread_count": 0,
+        "market_snapshot_spread_count": 0,
+        "spread_missing_count": 0,
+        "spread_market_snapshot_files_found": 0,
     }
     signal_age_counts = {"ready_since": 0, "signal_time": 0, "missing": 0, "negative": 0}
     for trade in trades.to_dict("records"):
@@ -1080,8 +1086,17 @@ def analyze_bad_entries(
         sim_4 = simulate_tp_sl(candles, entry_price=entry_price or 0.0, tp_pct=4.0, sl_pct=-2.0, fallback_exit_time=fallback_exit_time, fallback_exit_price=fallback_exit_price)
         if session_date not in spread_cache:
             spread_cache[session_date] = load_spread_snapshots(recorder_dir, session_date)
+            if spread_cache[session_date].attrs.get("spread_snapshot_source") not in {None, "", "missing"}:
+                diagnostics["spread_market_snapshot_files_found"] += 1
         spread = nearest_row(spread_cache[session_date], entry_time, symbol)
         snapshot_spread = row_value(trade, raw, ["spread_bps_at_entry", "spread_bps", "bid_ask_spread_bps"])
+        recorder_spread = first_existing_column(spread, ["spread_bps", "bid_ask_spread_bps"])
+        if _value_present(snapshot_spread):
+            diagnostics["buy_snapshot_spread_count"] += 1
+        if _value_present(recorder_spread):
+            diagnostics["market_snapshot_spread_count"] += 1
+        if not _value_present(snapshot_spread) and not _value_present(recorder_spread):
+            diagnostics["spread_missing_count"] += 1
         opening_features = opening_range_features(candles_full, entry_price)
         sig_age, sig_age_warning = signal_age(trade, entry_time)
         if sig_age_warning == "negative_age":
@@ -1147,7 +1162,7 @@ def analyze_bad_entries(
             "entry_time_bucket": entry_time_bucket(entry_time, session_date) if entry_phase(entry_time, session_date, entry_warning) == "rth" else entry_phase(entry_time, session_date, entry_warning),
             "signal_age_seconds": sig_age,
             "signal_age_warning": sig_age_warning,
-            "spread_bps_at_entry": snapshot_spread if _value_present(snapshot_spread) else first_existing_column(spread, ["spread_bps", "bid_ask_spread_bps"]),
+            "spread_bps_at_entry": snapshot_spread if _value_present(snapshot_spread) else recorder_spread,
             "top100_rank": row_value(trade, raw, ["top100_rank"]),
             "top100_score": row_value(trade, raw, ["top100_score"]),
             "live_entry_score": row_value(trade, raw, ["live_entry_score", "entry_score", "score"]),
@@ -1283,6 +1298,8 @@ def print_bucket_summary(df: pd.DataFrame, column: str) -> None:
         tmp["_bucket"] = tmp[column].map(seconds_bucket)
     elif column in {"pullback_before_entry_pct", "entry_near_local_peak_pct"}:
         tmp["_bucket"] = tmp[column].map(pct_bucket)
+    elif column == "spread_bps_at_entry":
+        tmp["_bucket"] = tmp[column].map(lambda value: bucket_for_feature(column, value))
     else:
         tmp["_bucket"] = tmp[column].map(generic_bucket)
     grouped = tmp.groupby("_bucket", dropna=False).agg(
@@ -1320,6 +1337,17 @@ def print_summary(df: pd.DataFrame) -> None:
             f"metrics_computed_count={diag.get('metrics_computed_count', 0)} "
             f"metrics_missing_count={diag.get('metrics_missing_count', 0)}"
         )
+        print(
+            "SPREAD_COVERAGE "
+            f"buy_snapshot_spread_count={diag.get('buy_snapshot_spread_count', 0)} "
+            f"market_snapshot_spread_count={diag.get('market_snapshot_spread_count', 0)} "
+            f"spread_missing_count={diag.get('spread_missing_count', 0)} "
+            f"market_snapshot_files_found={diag.get('spread_market_snapshot_files_found', 0)}"
+        )
+        if diag.get('market_snapshot_spread_count', 0) == 0 and diag.get('buy_snapshot_spread_count', 0) > 0:
+            print("SPREAD_MARKET_SNAPSHOT_MISSING reason=no_spread_or_market_snapshots buy_snapshot_spread_available=1")
+        elif diag.get('market_snapshot_spread_count', 0) == 0 and diag.get('buy_snapshot_spread_count', 0) == 0:
+            print("SPREAD_DATA_MISSING reason=no_spread_or_market_snapshots_and_no_buy_snapshot_spread")
     source_counts = df.attrs.get("source_counts", {}) if hasattr(df, "attrs") else {}
     dedupe_diag = df.attrs.get("dedupe_diagnostics", {}) if hasattr(df, "attrs") else {}
     duplicate_groups = pd.DataFrame()
@@ -1418,13 +1446,11 @@ def bucket_for_feature(column: str, value: Any) -> str:
     if "score" in column:
         return score_bucket(val)
     if column == "spread_bps_at_entry":
-        if val <= 20: return "<=20"
-        if val <= 30: return "20-30"
-        if val <= 40: return "30-40"
-        if val <= 50: return "40-50"
-        if val <= 75: return "50-75"
-        if val <= 100: return "75-100"
-        return ">100"
+        if val < 20: return "<20 bps"
+        if val < 30: return "20-30 bps"
+        if val < 40: return "30-40 bps"
+        if val < 50: return "40-50 bps"
+        return ">=50 bps"
     if column in {"first_5m_high_pct", "first_15m_high_pct", "or_range_pct", "distance_from_open_pct", "distance_from_or_high_pct", "premarket_range_pct", "premarket_change_pct", "distance_from_premarket_high_pct", "distance_from_premarket_low_pct", "distance_from_premarket_vwap_pct", "gap_from_previous_close_pct"}:
         if val < -5: return "<-5"
         if val < -2: return "-5--2"
@@ -1624,6 +1650,11 @@ def build_data_quality_report(df: pd.DataFrame, date: str) -> dict[str, Any]:
         "impossible_zero_default_values": impossible_zero_fields,
         "entry_time_quality_counts": df.get("entry_time_quality", pd.Series(dtype=str)).fillna("missing").astype(str).value_counts().to_dict() if not df.empty else {},
         "premarket_feature_coverage": "available" if any(item["feature"] in PREMARKET_FEATURES and item["non_null"] for item in features) else "unavailable_for_session",
+        "spread_buy_snapshot_coverage": {
+            "non_null": int(pd.to_numeric(df.get("spread_bps_at_entry", pd.Series(dtype=float)), errors="coerce").notna().sum()) if not df.empty else 0,
+            "total": total,
+        },
+        "spread_market_snapshot_coverage": "reported_in_console_diagnostics",
         "features": features,
     }
 

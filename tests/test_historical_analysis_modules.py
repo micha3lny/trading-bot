@@ -1204,6 +1204,23 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
         self.assertIn("Analyze whether live entries chase spikes", help_text)
         self.assertIn("--date", help_text)
 
+    def test_bad_entries_spread_bucket_ranges(self) -> None:
+        from src.live_trading.analysis.bad_entries_analyzer import bucket_for_feature, build_feature_bucket_report
+
+        self.assertEqual(bucket_for_feature("spread_bps_at_entry", 19.9), "<20 bps")
+        self.assertEqual(bucket_for_feature("spread_bps_at_entry", 20.0), "20-30 bps")
+        self.assertEqual(bucket_for_feature("spread_bps_at_entry", 30.0), "30-40 bps")
+        self.assertEqual(bucket_for_feature("spread_bps_at_entry", 40.0), "40-50 bps")
+        self.assertEqual(bucket_for_feature("spread_bps_at_entry", 50.0), ">=50 bps")
+        df = pd.DataFrame([
+            {"date": "2026-07-20", "symbol": "AAA", "spread_bps_at_entry": 12.0, "net_pnl": 1.0},
+            {"date": "2026-07-20", "symbol": "BBB", "spread_bps_at_entry": 55.0, "net_pnl": -1.0},
+        ])
+        report = build_feature_bucket_report(df, "2026-07-20")
+        spread = report[report["feature"].eq("spread_bps_at_entry")]
+        self.assertIn("<20 bps", set(spread["bucket"].tolist()))
+        self.assertIn(">=50 bps", set(spread["bucket"].tolist()))
+
     def test_signal_replay_filters_should_have_signaled_targets(self) -> None:
         missed = pd.DataFrame([
             {"symbol": "AAA", "source_bucket": "top100", "was_bought": 0, "top100_no_signal_reason": "should_have_signaled"},

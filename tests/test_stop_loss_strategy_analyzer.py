@@ -11,6 +11,9 @@ from src.live_trading.analysis.stop_loss_strategy_analyzer import (
     simulate_stop,
     build_segment_analysis,
     add_segment_buckets,
+    build_hybrid_rules,
+    stop_loss_to_early_loser_adapter,
+    CONSERVATIVE_SLIPPAGE_BPS,
     STOP_LOSS_PCTS,
 )
 
@@ -39,6 +42,49 @@ class StopLossStrategyAnalyzerTests(unittest.TestCase):
         self.assertEqual(result["stop_hit"], 1)
         self.assertEqual(result["stop_outcome"], "false_stop")
         self.assertGreater(result["later_mfe_pct"], 0)
+
+
+    def test_hybrid_adapter_avoids_duplicate_net_pnl_columns(self) -> None:
+        paths = pd.DataFrame([
+            {
+                "trade_id": "T1",
+                "symbol": "AAA",
+                "stop_pct": 2.0,
+                "slippage_bps": CONSERVATIVE_SLIPPAGE_BPS,
+                "activation_delay_min": 0,
+                "entry_price": 10.0,
+                "quantity": 10,
+                "net_pnl": -99.0,
+                "actual_net_pnl": -5.0,
+                "final_pnl_pct": -99.0,
+                "actual_return_pct": -2.0,
+                "simulated_net_pnl": -4.0,
+                "pnl_pct_at_5m": -1.0,
+                "positive_seen_to_5m": 0,
+            },
+            {
+                "trade_id": "T2",
+                "symbol": "BBB",
+                "stop_pct": 2.0,
+                "slippage_bps": CONSERVATIVE_SLIPPAGE_BPS,
+                "activation_delay_min": 0,
+                "entry_price": 20.0,
+                "quantity": 5,
+                "net_pnl": 99.0,
+                "actual_net_pnl": 8.0,
+                "final_pnl_pct": 99.0,
+                "actual_return_pct": 3.0,
+                "simulated_net_pnl": 6.0,
+                "pnl_pct_at_5m": 1.0,
+                "positive_seen_to_5m": 1,
+            },
+        ])
+        adapted = stop_loss_to_early_loser_adapter(paths)
+        self.assertEqual(list(adapted.columns).count("net_pnl"), 1)
+        self.assertEqual(list(adapted.columns).count("final_pnl_pct"), 1)
+        self.assertEqual(adapted["net_pnl"].tolist(), [-5.0, 8.0])
+        hybrid = build_hybrid_rules(paths)
+        self.assertFalse(hybrid.empty)
 
     def test_premarket_coverage_unavailable_when_missing(self) -> None:
         paths = pd.DataFrame([

@@ -134,6 +134,38 @@ class RunDailyAnalysisTests(unittest.TestCase):
             self.assertIn("offline_should_have_signaled_runtime_signal_not_observed=1", text)
             self.assertIn("offline_runtime_pre_signal_summary_2026-07-09.csv", text)
 
+
+    def test_shs_command_receives_missed_output_from_selected_output_dir(self) -> None:
+        output_dir = Path("custom/analysis")
+        steps = runner.build_steps("2026-07-20", args_for(output_dir=output_dir))
+        commands = {name: command for name, command, _skipped in steps}
+        self.assertIn("--missed-runners-csv", commands["shs"])
+        self.assertIn(str(output_dir / "missed_runners_2026-07-20.csv"), commands["shs"])
+        self.assertIn("--should-have-signaled-csv", commands["nbas"])
+        self.assertIn(str(output_dir / "should_have_signaled_cases_2026-07-20.csv"), commands["nbas"])
+        self.assertIn("--cases-csv", commands["offline_runtime_pre_signal"])
+        self.assertIn(str(output_dir / "no_buy_after_signal_cases_2026-07-20.csv"), commands["offline_runtime_pre_signal"])
+
+    def test_shs_handoff_mismatch_marks_step_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            missed = output_dir / "missed_runners_2026-07-20.csv"
+            with missed.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["symbol", "top100_no_signal_reason"])
+                writer.writeheader()
+                for symbol in ["AAA", "BBB", "CCC"]:
+                    writer.writerow({"symbol": symbol, "top100_no_signal_reason": "should_have_signaled"})
+            summary = output_dir / "should_have_signaled_summary_2026-07-20.csv"
+            with summary.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["date", "total_should_have_signaled"])
+                writer.writeheader()
+                writer.writerow({"date": "2026-07-20", "total_should_have_signaled": "0"})
+            result = runner.StepResult("shs", [], False, "ok", 0, 0.1)
+            runner.validate_shs_handoff(result, output_dir=output_dir, session_date="2026-07-20")
+            self.assertEqual(result.status, "failed")
+            self.assertIn("missed_should_have_signaled_count=3", result.warnings)
+            self.assertIn("shs_targets_count=0", result.warnings)
+
     def test_only_filters_registered_steps(self) -> None:
         steps = runner.build_steps("2026-07-09", args_for(only=["coverage", "nbas"]))
         self.assertEqual([name for name, _command, _skipped in steps], ["coverage", "nbas"])
