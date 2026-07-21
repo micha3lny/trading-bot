@@ -23,6 +23,7 @@ from src.live_trading.analysis.common import (
 )
 from src.live_trading.analysis.signal_replay_analyzer import (
     build_symbol_timeline,
+    event_keyword_seen,
     filter_should_have_signaled_targets,
     has_event,
     load_recorder_source,
@@ -276,6 +277,20 @@ def bool_text(text: str, *needles: str) -> int:
     return int(any(needle.upper() in text for needle in needles))
 
 
+def runtime_signal_ready_seen(timeline: list[dict[str, Any]], symbol_journal: str) -> int:
+    for event in timeline:
+        source = str(event.get("source") or "").lower()
+        if source == "candle":
+            continue
+        event_type = str(event.get("event") or "").strip().upper().replace(" ", "_")
+        details = str(event.get("details") or "")
+        if event_type in {"SIGNAL_READY", "ENTRY_SIGNAL"}:
+            return 1
+        if event_keyword_seen(details, "SIGNAL_READY") or event_keyword_seen(details, "ENTRY_SIGNAL"):
+            return 1
+    return int(event_keyword_seen(symbol_journal, "SIGNAL_READY") or event_keyword_seen(symbol_journal, "ENTRY_SIGNAL"))
+
+
 def buy_details(symbol: str, sqlite_sources: dict[str, pd.DataFrame], recorder_sources: dict[str, pd.DataFrame]) -> tuple[str, str]:
     symbol = normalize_symbol(symbol)
     candidates: list[dict[str, Any]] = []
@@ -407,7 +422,7 @@ def investigate_case(
         "buy_time": buy_time,
         "runtime_evidence_found": int(runtime_count > 0 or bool(symbol_journal)),
         "ready_candidate_seen": bool_text(combined, "READY_CANDIDATES", "LIVE_READY_CANDIDATES"),
-        "signal_ready_seen": bool_text(combined, "SIGNAL_READY"),
+        "signal_ready_seen": runtime_signal_ready_seen(timeline, symbol_journal),
         "buy_attempt_seen": bool_text(combined, "PAPER BUY", "PAPER_BUY", "BUY_ORDER_SENT", "ORDER_SUBMITTED"),
         "buy_fill_seen": bool_text(combined, "FILL", "EXECUTION", "BOT", "BOUGHT"),
         "risk_guard_blocked": bool_text(combined, "RISK_GUARD_BLOCK_ENTRY", "RISK_GUARD"),

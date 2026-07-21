@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -251,15 +252,28 @@ def recorder_events(recorder_dir: Path, session_date: str, symbol: str, center: 
     return out
 
 
+def event_keyword_seen(text: str, keyword: str) -> bool:
+    text = str(text or "").upper()
+    keyword = str(keyword or "").upper()
+    if not keyword:
+        return False
+    if keyword in {"SIGNAL_READY", "ENTRY_SIGNAL"}:
+        return re.search(rf"(?<![A-Z0-9_]){re.escape(keyword)}(?![A-Z0-9_])", text) is not None
+    return keyword in text
+
+
 def has_event(events: list[dict[str, Any]], keywords: list[str]) -> bool:
-    joined = "\n".join(f"{event.get('event','')} {event.get('reason','')} {event.get('details','')}" for event in events).upper()
-    return any(keyword.upper() in joined for keyword in keywords)
+    for event in events:
+        text = f"{event.get('event','')} {event.get('reason','')} {event.get('details','')}"
+        if any(event_keyword_seen(text, keyword) for keyword in keywords):
+            return True
+    return False
 
 
 def first_matching_reason(events: list[dict[str, Any]], keywords: list[str]) -> str:
     for event in events:
-        text = f"{event.get('event','')} {event.get('reason','')} {event.get('details','')}".upper()
-        if any(keyword.upper() in text for keyword in keywords):
+        text = f"{event.get('event','')} {event.get('reason','')} {event.get('details','')}"
+        if any(event_keyword_seen(text, keyword) for keyword in keywords):
             return str(event.get("reason") or event.get("event") or "")
     return ""
 

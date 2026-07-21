@@ -61,6 +61,7 @@ from src.live_trading.analysis.signal_replay_analyzer import (
     build_parser as build_signal_replay_parser,
     classify_replay_reason,
     filter_should_have_signaled_targets,
+    has_event,
     merge_timeline_events,
 )
 from src.live_trading.analysis.signal_case_trace import (
@@ -70,6 +71,7 @@ from src.live_trading.analysis.signal_case_trace import (
 )
 from src.live_trading.analysis.should_have_signaled_investigator import (
     build_parser as build_shs_investigator_parser,
+    runtime_signal_ready_seen,
     summary_for_cases,
 )
 from src.live_trading.analysis.strategy_coverage_report import build_runner_rows, summarize_coverage_from_missed
@@ -1259,6 +1261,41 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
             {"trades_count": 0, "executions_count": 0},
         )
         self.assertEqual(reason, "signal_ready_but_no_buy_attempt")
+
+
+    def test_signal_replay_does_not_treat_candle_signal_ready_as_runtime_signal(self) -> None:
+        timeline = [{
+            "time": "2026-07-20T13:45:00Z",
+            "source": "candle",
+            "event": "possible_signal",
+            "reason": "",
+            "details": "candle_signal_ready open_to_high_pct=12.3",
+            "symbol": "ADVB",
+        }]
+        self.assertFalse(has_event(timeline, ["SIGNAL_READY"]))
+        self.assertEqual(classify_replay_reason(timeline, {"trades_count": 0, "executions_count": 0}), "no_runtime_evidence")
+
+    def test_shs_investigator_does_not_treat_candle_signal_ready_as_runtime_signal(self) -> None:
+        timeline = [{
+            "time": "2026-07-20T13:45:00Z",
+            "source": "candle",
+            "event": "possible_signal",
+            "reason": "",
+            "details": "candle_signal_ready open_to_high_pct=12.3",
+            "symbol": "ADVB",
+        }]
+        self.assertEqual(runtime_signal_ready_seen(timeline, ""), 0)
+
+    def test_shs_investigator_accepts_real_runtime_signal_ready(self) -> None:
+        timeline = [{
+            "time": "2026-07-20T13:45:01Z",
+            "source": "runtime_events",
+            "event": "SIGNAL_READY",
+            "reason": "would_emit_signal_ready",
+            "details": "symbol=ADVB",
+            "symbol": "ADVB",
+        }]
+        self.assertEqual(runtime_signal_ready_seen(timeline, ""), 1)
 
     def test_signal_replay_classifies_no_runtime_evidence(self) -> None:
         self.assertEqual(classify_replay_reason([], {"trades_count": 0, "executions_count": 0}), "no_runtime_evidence")
