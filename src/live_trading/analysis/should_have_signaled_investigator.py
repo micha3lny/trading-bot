@@ -28,6 +28,7 @@ from src.live_trading.analysis.signal_replay_analyzer import (
     has_event,
     load_recorder_source,
     read_sqlite_sources,
+    row_belongs_to_session,
     row_symbol,
     row_text,
     row_time,
@@ -184,20 +185,22 @@ def load_recorder_sources(recorder_dir: Path, session_date: str) -> dict[str, pd
     }
 
 
-def rows_in_window(df: pd.DataFrame, center: pd.Timestamp | None, minutes: int = 30) -> pd.DataFrame:
-    if df.empty or center is None:
+def rows_in_window(df: pd.DataFrame, center: pd.Timestamp | None, minutes: int = 30, session_date: str | None = None) -> pd.DataFrame:
+    if df.empty:
         return df
     records = []
-    start = center - pd.Timedelta(minutes=minutes)
-    end = center + pd.Timedelta(minutes=minutes)
+    start = center - pd.Timedelta(minutes=minutes) if center is not None else None
+    end = center + pd.Timedelta(minutes=minutes) if center is not None else None
     for row in df.to_dict("records"):
+        if not row_belongs_to_session(row, session_date):
+            continue
         ts = row_time(row)
-        if ts is None or start <= ts <= end:
+        if center is None or (ts is not None and start <= ts <= end):
             records.append(row)
     return pd.DataFrame(records)
 
 
-def build_symbol_index(sources: dict[str, pd.DataFrame], target_symbols: set[str]) -> dict[str, dict[str, pd.DataFrame]]:
+def build_symbol_index(sources: dict[str, pd.DataFrame], target_symbols: set[str], session_date: str | None = None) -> dict[str, dict[str, pd.DataFrame]]:
     indexed: dict[str, dict[str, list[dict[str, Any]]]] = {
         source: {symbol: [] for symbol in target_symbols}
         for source in sources
@@ -210,6 +213,8 @@ def build_symbol_index(sources: dict[str, pd.DataFrame], target_symbols: set[str
         if df.empty:
             continue
         for row in df.to_dict("records"):
+            if not row_belongs_to_session(row, session_date):
+                continue
             symbol = row_symbol(row)
             text = row_text(row).upper()
             matched: set[str] = set()
@@ -253,8 +258,8 @@ def load_evidence_bundle(
     return EvidenceBundle(
         sqlite_sources=sqlite_sources,
         recorder_sources=recorder_sources,
-        sqlite_by_symbol=build_symbol_index(sqlite_sources, target_symbols),
-        recorder_by_symbol=build_symbol_index(recorder_sources, target_symbols),
+        sqlite_by_symbol=build_symbol_index(sqlite_sources, target_symbols, session_date),
+        recorder_by_symbol=build_symbol_index(recorder_sources, target_symbols, session_date),
         journal_lines=journal,
         heartbeat_states=build_heartbeat_index(journal),
     )

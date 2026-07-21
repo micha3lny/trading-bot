@@ -127,13 +127,63 @@ def row_symbol(row: dict[str, Any]) -> str:
 def row_time(row: dict[str, Any]) -> pd.Timestamp | None:
     raw = parse_raw_json(row.get("raw_json"))
     return parse_dt(
-        first_existing_column(row, ["event_time", "timestamp", "time", "created_at", "updated_at", "recorded_at", "executed_at", "submitted_at"])
+        first_existing_column(row, [
+            "event_time",
+            "timestamp",
+            "time",
+            "created_at",
+            "updated_at",
+            "recorded_at",
+            "executed_at",
+            "submitted_at",
+            "filled_at",
+            "entry_fill_time",
+            "exit_fill_time",
+            "closed_at",
+        ])
         or raw.get("event_time")
         or raw.get("timestamp")
         or raw.get("time")
         or raw.get("submitted_at")
         or raw.get("executed_at")
+        or raw.get("filled_at")
+        or raw.get("entry_fill_time")
+        or raw.get("exit_fill_time")
+        or raw.get("closed_at")
     )
+
+
+def row_declared_session_date(row: dict[str, Any]) -> str:
+    raw = parse_raw_json(row.get("raw_json"))
+    value = (
+        first_existing_column(row, ["session_date", "trading_session_date", "trade_session_date"])
+        or raw.get("session_date")
+        or raw.get("trading_session_date")
+        or raw.get("trade_session_date")
+    )
+    if value in (None, ""):
+        return ""
+    text = str(value)[:10]
+    return text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text) else ""
+
+
+def row_belongs_to_session(row: dict[str, Any], session_date: str | None) -> bool:
+    if not session_date:
+        return True
+    declared = row_declared_session_date(row)
+    if declared:
+        return declared == session_date
+    ts = row_time(row)
+    if ts is not None:
+        return ts.strftime("%Y-%m-%d") == session_date
+    return False
+
+
+def filter_rows_for_session(df: pd.DataFrame, session_date: str | None) -> pd.DataFrame:
+    if df.empty or not session_date:
+        return df
+    rows = [row for row in df.to_dict("records") if row_belongs_to_session(row, session_date)]
+    return pd.DataFrame(rows)
 
 
 def row_event_type(row: dict[str, Any], default: str = "") -> str:
@@ -217,18 +267,27 @@ def read_sqlite_sources(sqlite_path: Path, session_date: str) -> dict[str, pd.Da
     out: dict[str, pd.DataFrame] = {}
     for table, (where, params) in tables.items():
         try:
-            out[table] = read_sql_table(sqlite_path, table, where=where, params=params)
+            out[table] = filter_rows_for_session(read_sql_table(sqlite_path, table, where=where, params=params), session_date)
         except Exception:
             out[table] = pd.DataFrame()
     return out
 
 
-def symbol_rows(df: pd.DataFrame, symbol: str, center: pd.Timestamp | None = None, *, window_minutes: int = 15) -> pd.DataFrame:
+def symbol_rows(
+    df: pd.DataFrame,
+    symbol: str,
+    center: pd.Timestamp | None = None,
+    *,
+    window_minutes: int = 15,
+    session_date: str | None = None,
+) -> pd.DataFrame:
     if df.empty:
         return df
     records = []
     needle = normalize_symbol(symbol)
     for row in df.to_dict("records"):
+        if not row_belongs_to_session(row, session_date):
+            continue
         text = row_text(row).upper()
         if row_symbol(row) != needle and needle not in text:
             continue
@@ -248,7 +307,7 @@ def recorder_events(recorder_dir: Path, session_date: str, symbol: str, center: 
     }
     out: dict[str, pd.DataFrame] = {}
     for key, name in names.items():
-        out[key] = symbol_rows(load_recorder_source(recorder_dir, session_date, name), symbol, center)
+        out[key] = symbol_rows(load_recorder_source(recorder_dir, session_date, name), symbol, center, session_date=session_date)
     return out
 
 
