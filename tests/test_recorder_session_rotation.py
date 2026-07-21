@@ -121,6 +121,23 @@ class RecorderSessionRotationTests(unittest.TestCase):
             self.assertEqual(mismatches[0]["actual_session_date"], "2026-07-21")
             self.assertEqual(mismatches[0]["file"], "trade_lifecycle.csv")
 
+    def test_audit_payload_excerpt_handles_malformed_csv_extra_fields(self) -> None:
+        from scripts.audit_recorder_session_consistency import audit_date
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session_dir = Path(tmp) / "2026-07-20"
+            session_dir.mkdir(parents=True)
+            # Extra trailing field makes csv.DictReader store it under key None.
+            (session_dir / "trade_lifecycle.csv").write_text(
+                "recorded_at,event,symbol\n"
+                "2026-07-21T13:45:01+00:00,PRE_SIGNAL_RUNTIME_SNAPSHOT,ADVB,extra-field\n",
+                encoding="utf-8",
+            )
+            mismatches = audit_date(session_dir)
+            self.assertEqual(len(mismatches), 1)
+            self.assertEqual(mismatches[0]["symbol"], "ADVB")
+            self.assertIn("None", mismatches[0]["payload_excerpt"])
+
 
 if __name__ == "__main__":
     unittest.main()

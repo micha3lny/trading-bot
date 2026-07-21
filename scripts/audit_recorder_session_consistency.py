@@ -19,6 +19,17 @@ from src.live_trading.v62_live_data_recorder import resolved_record_session_date
 TEXT_SUFFIXES = {".csv", ".jsonl", ".json"}
 
 
+def safe_payload_excerpt(row: dict[str, Any], *, limit: int = 1000) -> str:
+    try:
+        normalized = {str(key): value for key, value in row.items()}
+        return json.dumps(normalized, ensure_ascii=False, default=str, sort_keys=True)[:limit]
+    except Exception:
+        try:
+            return repr(row)[:limit]
+        except Exception:
+            return "<unserializable row>"
+
+
 def load_csv_rows(path: Path) -> list[dict[str, Any]]:
     try:
         with path.open(newline="", encoding="utf-8", errors="replace") as fh:
@@ -87,7 +98,7 @@ def audit_date(session_dir: Path) -> list[dict[str, Any]]:
                     "symbol": row.get("symbol") or row.get("contract_symbol") or "",
                     "event_type": row.get("event") or row.get("event_type") or row.get("status") or "",
                     "timestamp": row.get("recorded_at") or row.get("event_time") or row.get("timestamp") or row.get("bar_time") or row.get("executed_at") or "",
-                    "payload_excerpt": json.dumps(row, ensure_ascii=False, default=str, sort_keys=True)[:1000],
+                    "payload_excerpt": safe_payload_excerpt(row),
                 })
     return out
 
