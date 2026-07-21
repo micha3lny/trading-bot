@@ -6,11 +6,82 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Iterable
 
 
 DEFAULT_OUTPUT_DIR = "data/live/recorder"
+
+
+NY_TZ = ZoneInfo("America/New_York")
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def valid_date_text(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    text = str(value).strip()[:10]
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        return text
+    return ""
+
+
+def parse_jsonish(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def resolved_record_session_date(row: dict[str, Any] | None = None, *, fallback_session_date: str | None = None) -> str:
+    row = row or {}
+    raw = parse_jsonish(row.get("raw_json"))
+    for key in ("session_date", "trading_session_date", "trade_session_date"):
+        explicit = valid_date_text(row.get(key) or raw.get(key))
+        if explicit:
+            return explicit
+    for key in (
+        "event_time",
+        "timestamp",
+        "time",
+        "bar_time",
+        "recorded_at",
+        "executed_at",
+        "submitted_at",
+        "filled_at",
+        "created_at",
+        "updated_at",
+        "closed_at",
+    ):
+        dt = parse_timestamp(row.get(key) or raw.get(key))
+        if dt is not None:
+            return dt.astimezone(NY_TZ).date().isoformat()
+    return fallback_session_date or session_date_utc()
 
 
 def utc_now_iso() -> str:
@@ -326,22 +397,67 @@ class LiveDataRecorder:
         self.session_dir = self.output_dir / self.session_date
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
-    def path(self, name: str) -> Path:
+    def rotate_session(self, new_session_date: str, *, event_type: str = "", symbol: str = "", filename: str = "") -> None:
+        old_session_date = self.session_date
+        if not new_session_date or new_session_date == old_session_date:
+            return
+        old_path = self.session_dir / filename if filename else self.session_dir
+        self.session_date = new_session_date
+        self.session_dir = self.output_dir / self.session_date
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        target_path = self.session_dir / filename if filename else self.session_dir
+        print(
+            f"{utc_now_iso()} RECORDER_SESSION_ROTATED "
+            f"old_session_date={old_session_date} new_session_date={new_session_date} "
+            f"event_type={event_type or ''} symbol={symbol or ''} target_path={target_path} old_path={old_path}",
+            flush=True,
+        )
+
+    def path(
+        self,
+        name: str,
+        *,
+        row: dict[str, Any] | None = None,
+        session_date: str | None = None,
+        event_type: str = "",
+        symbol: str = "",
+    ) -> Path:
+        if row is not None or session_date:
+            record_session = session_date or resolved_record_session_date(row, fallback_session_date=self.session_date)
+            if record_session != self.session_date:
+                print(
+                    f"{utc_now_iso()} RECORDER_SESSION_PATH_MISMATCH "
+                    f"old_session_date={self.session_date} new_session_date={record_session} "
+                    f"event_type={event_type or (row or {}).get('event') or (row or {}).get('event_type') or ''} "
+                    f"symbol={symbol or (row or {}).get('symbol') or ''} target_file={name}",
+                    flush=True,
+                )
+                self.rotate_session(record_session, event_type=event_type or str((row or {}).get("event") or (row or {}).get("event_type") or ""), symbol=symbol or str((row or {}).get("symbol") or ""), filename=name)
         return self.session_dir / name
 
     def record_candle_1m(self, candle: LiveCandle1m | dict[str, Any]) -> None:
         row = asdict(candle) if isinstance(candle, LiveCandle1m) else dict(candle)
-        append_csv_row(self.path("candles_1m.csv"), row, self.candle_fields)
+        append_csv_row(self.path("candles_1m.csv", row=row, event_type="candle_1m", symbol=str(row.get("symbol") or "")), row, self.candle_fields)
 
     def record_candles_1m(self, candles: Iterable[LiveCandle1m | dict[str, Any]]) -> int:
         rows = [asdict(c) if isinstance(c, LiveCandle1m) else dict(c) for c in candles]
-        return append_csv_rows(self.path("candles_1m.csv"), rows, self.candle_fields)
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            grouped.setdefault(resolved_record_session_date(row, fallback_session_date=self.session_date), []).append(row)
+        total = 0
+        for session, session_rows in grouped.items():
+            total += append_csv_rows(
+                self.path("candles_1m.csv", row=session_rows[0], session_date=session, event_type="candles_1m", symbol=str(session_rows[0].get("symbol") or "")),
+                session_rows,
+                self.candle_fields,
+            )
+        return total
 
     def record_extended_hours_candle_1m(self, candle: ExtendedHoursCandle1m | dict[str, Any]) -> None:
         row = asdict(candle) if isinstance(candle, ExtendedHoursCandle1m) else dict(candle)
         session_type = str(row.get("session_type", "")).lower()
         filename = "premarket_1m.csv" if session_type == "premarket" else "afterhours_1m.csv"
-        append_csv_row(self.path(filename), row, self.extended_candle_fields)
+        append_csv_row(self.path(filename, row=row, event_type=str(row.get("session_type") or "extended_hours_candle"), symbol=str(row.get("symbol") or "")), row, self.extended_candle_fields)
 
     def record_extended_hours_candles_1m(self, candles: Iterable[ExtendedHoursCandle1m | dict[str, Any]]) -> int:
         count = 0
@@ -353,82 +469,83 @@ class LiveDataRecorder:
     def record_premarket_candle_1m(self, candle: ExtendedHoursCandle1m | dict[str, Any]) -> None:
         row = asdict(candle) if isinstance(candle, ExtendedHoursCandle1m) else dict(candle)
         row["session_type"] = "premarket"
-        append_csv_row(self.path("premarket_1m.csv"), row, self.extended_candle_fields)
+        append_csv_row(self.path("premarket_1m.csv", row=row, event_type="premarket_1m", symbol=str(row.get("symbol") or "")), row, self.extended_candle_fields)
 
     def record_afterhours_candle_1m(self, candle: ExtendedHoursCandle1m | dict[str, Any]) -> None:
         row = asdict(candle) if isinstance(candle, ExtendedHoursCandle1m) else dict(candle)
         row["session_type"] = "afterhours"
-        append_csv_row(self.path("afterhours_1m.csv"), row, self.extended_candle_fields)
+        append_csv_row(self.path("afterhours_1m.csv", row=row, event_type="afterhours_1m", symbol=str(row.get("symbol") or "")), row, self.extended_candle_fields)
 
     def record_market_snapshot(self, snapshot: MarketDataSnapshot | dict[str, Any]) -> None:
         row = asdict(snapshot) if isinstance(snapshot, MarketDataSnapshot) else dict(snapshot)
-        append_csv_row(self.path("market_snapshots.csv"), row, self.market_fields)
+        append_csv_row(self.path("market_snapshots.csv", row=row, event_type="market_snapshot", symbol=str(row.get("symbol") or "")), row, self.market_fields)
 
     def record_spread_snapshot(self, snapshot: SpreadSnapshot | dict[str, Any]) -> None:
         row = asdict(snapshot) if isinstance(snapshot, SpreadSnapshot) else dict(snapshot)
-        append_csv_row(self.path("spread_snapshots.csv"), row, self.spread_fields)
+        append_csv_row(self.path("spread_snapshots.csv", row=row, event_type="spread_snapshot", symbol=str(row.get("symbol") or "")), row, self.spread_fields)
 
     def record_premarket_summary(self, summary: PremarketSummary | dict[str, Any]) -> None:
         row = asdict(summary) if isinstance(summary, PremarketSummary) else dict(summary)
         if row.get("features_json") and not isinstance(row.get("features_json"), str):
             row["features_json"] = safe_json(row["features_json"])
-        append_csv_row(self.path("premarket_summary.csv"), row, self.premarket_summary_fields)
+        append_csv_row(self.path("premarket_summary.csv", row=row, event_type="premarket_summary", symbol=str(row.get("symbol") or "")), row, self.premarket_summary_fields)
 
     def record_afterhours_summary(self, summary: AfterhoursSummary | dict[str, Any]) -> None:
         row = asdict(summary) if isinstance(summary, AfterhoursSummary) else dict(summary)
         if row.get("features_json") and not isinstance(row.get("features_json"), str):
             row["features_json"] = safe_json(row["features_json"])
-        append_csv_row(self.path("afterhours_summary.csv"), row, self.afterhours_summary_fields)
+        append_csv_row(self.path("afterhours_summary.csv", row=row, event_type="afterhours_summary", symbol=str(row.get("symbol") or "")), row, self.afterhours_summary_fields)
 
     def record_overnight_market_context(self, context: OvernightMarketContext | dict[str, Any]) -> None:
         row = asdict(context) if isinstance(context, OvernightMarketContext) else dict(context)
         if row.get("context_json") and not isinstance(row.get("context_json"), str):
             row["context_json"] = safe_json(row["context_json"])
-        append_csv_row(self.path("overnight_market_context.csv"), row, self.overnight_context_fields)
+        append_csv_row(self.path("overnight_market_context.csv", row=row, event_type="overnight_market_context"), row, self.overnight_context_fields)
 
     def record_selection(self, event: SelectionEvent | dict[str, Any]) -> None:
         row = asdict(event) if isinstance(event, SelectionEvent) else dict(event)
         if row.get("features_json") and not isinstance(row.get("features_json"), str):
             row["features_json"] = safe_json(row["features_json"])
-        append_csv_row(self.path("selection_events.csv"), row, self.selection_fields)
+        append_csv_row(self.path("selection_events.csv", row=row, event_type="selection", symbol=str(row.get("symbol") or "")), row, self.selection_fields)
 
     def record_signal(self, signal: SignalSnapshot | dict[str, Any]) -> None:
         row = asdict(signal) if isinstance(signal, SignalSnapshot) else dict(signal)
         if row.get("features_json") and not isinstance(row.get("features_json"), str):
             row["features_json"] = safe_json(row["features_json"])
-        append_csv_row(self.path("signal_snapshots.csv"), row, self.signal_fields)
+        append_csv_row(self.path("signal_snapshots.csv", row=row, event_type="signal", symbol=str(row.get("symbol") or "")), row, self.signal_fields)
 
     def record_order_intent(self, intent: OrderIntent | dict[str, Any]) -> None:
         row = asdict(intent) if isinstance(intent, OrderIntent) else dict(intent)
         if row.get("features_json") and not isinstance(row.get("features_json"), str):
             row["features_json"] = safe_json(row["features_json"])
-        append_csv_row(self.path("order_intents.csv"), row, self.order_fields)
+        append_csv_row(self.path("order_intents.csv", row=row, event_type="order_intent", symbol=str(row.get("symbol") or "")), row, self.order_fields)
 
     def record_fill(self, fill: FillEvent | dict[str, Any]) -> None:
         row = asdict(fill) if isinstance(fill, FillEvent) else dict(fill)
         if row.get("raw_json") and not isinstance(row.get("raw_json"), str):
             row["raw_json"] = safe_json(row["raw_json"])
-        append_csv_row(self.path("fills.csv"), row, self.fill_fields)
+        append_csv_row(self.path("fills.csv", row=row, event_type="fill", symbol=str(row.get("symbol") or "")), row, self.fill_fields)
 
     def record_portfolio(self, snapshot: PortfolioSnapshot | dict[str, Any]) -> None:
         row = asdict(snapshot) if isinstance(snapshot, PortfolioSnapshot) else dict(snapshot)
         if row.get("positions_json") and not isinstance(row.get("positions_json"), str):
             row["positions_json"] = safe_json(row["positions_json"])
-        append_csv_row(self.path("portfolio_snapshots.csv"), row, self.portfolio_fields)
+        append_csv_row(self.path("portfolio_snapshots.csv", row=row, event_type="portfolio_snapshot"), row, self.portfolio_fields)
 
     def record_error(self, event: ErrorEvent | dict[str, Any]) -> None:
         row = asdict(event) if isinstance(event, ErrorEvent) else dict(event)
         if row.get("raw_json") and not isinstance(row.get("raw_json"), str):
             row["raw_json"] = safe_json(row["raw_json"])
-        append_csv_row(self.path("error_events.csv"), row, self.error_fields)
+        append_csv_row(self.path("error_events.csv", row=row, event_type="error", symbol=str(row.get("symbol") or "")), row, self.error_fields)
 
     def record_run_metadata(self, metadata: dict[str, Any]) -> None:
+        metadata_session_date = resolved_record_session_date(metadata, fallback_session_date=self.session_date)
         payload = {
-            "recorded_at": utc_now_iso(),
-            "session_date": self.session_date,
+            "recorded_at": metadata.get("recorded_at") or utc_now_iso(),
+            "session_date": metadata_session_date,
             "metadata_json": safe_json(metadata),
         }
-        append_csv_row(self.path("run_metadata.csv"), payload, ["recorded_at", "session_date", "metadata_json"])
+        append_csv_row(self.path("run_metadata.csv", row=payload, session_date=metadata_session_date, event_type="run_metadata"), payload, ["recorded_at", "session_date", "metadata_json"])
 
     def write_manifest(self) -> Path:
         manifest = {
@@ -453,7 +570,7 @@ class LiveDataRecorder:
                 "run_metadata.csv",
             ],
         }
-        path = self.path("manifest.json")
+        path = self.path("manifest.json", session_date=self.session_date, event_type="manifest")
         path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
         return path
 

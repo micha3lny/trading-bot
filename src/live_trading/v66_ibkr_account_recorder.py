@@ -367,7 +367,7 @@ def upsert_fill_row(recorder: LiveDataRecorder, row: dict[str, Any]) -> str:
     execution_id = str(row.get("execution_id") or "").strip()
     if not execution_id:
         raise ValueError("fill row missing execution_id")
-    path = recorder.path("fills.csv")
+    path = recorder.path("fills.csv", row=row, event_type="fill", symbol=str(row.get("symbol") or ""))
     rows = read_csv_rows(path)
     for idx, existing in enumerate(rows):
         if str(existing.get("execution_id") or "").strip() == execution_id:
@@ -452,7 +452,7 @@ def record_commission_report(recorder: LiveDataRecorder, commission_report: Any)
     execution_id = row.get("execution_id")
     if not execution_id:
         return "missing_exec_id"
-    path = recorder.path("fills.csv")
+    path = recorder.path("fills.csv", row=row, event_type="commission_report", symbol=str(row.get("symbol") or ""))
     rows = read_csv_rows(path)
     for idx, existing in enumerate(rows):
         if str(existing.get("execution_id") or "").strip() == str(execution_id):
