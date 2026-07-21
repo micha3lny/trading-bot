@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -128,6 +127,48 @@ def enforce_apply_guard(sqlite_path: Path) -> None:
         return
     print(f"NON_PRODUCTION_DATABASE_APPLY sqlite_path={absolute_path}", flush=True)
 
+
+
+
+def run_integrity_check(sqlite_path: Path) -> str:
+    try:
+        with connect_sqlite(sqlite_path, read_only=True) as conn:
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+    except Exception as exc:
+        return f"ERROR: {exc!r}"
+    if row is None:
+        return "ERROR: integrity_check returned no rows"
+    return str(row[0])
+
+
+def assert_sqlite_integrity_ok(sqlite_path: Path, *, label: str) -> None:
+    result = run_integrity_check(sqlite_path)
+    if result.lower() != "ok":
+        raise RuntimeError(
+            f"SQLITE_INTEGRITY_CHECK_FAILED label={label} "
+            f"sqlite_path={resolved_path(sqlite_path)} result={result}"
+        )
+
+
+def create_online_backup(source_path: Path, target_path: Path) -> Path:
+    source = resolved_path(source_path)
+    target = resolved_path(target_path)
+    if source == target:
+        raise RuntimeError(f"SQLITE_BACKUP_REFUSES_SAME_PATH sqlite_path={source}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        raise RuntimeError(f"SQLITE_BACKUP_TARGET_EXISTS backup_path={target}")
+    src_conn = connect_sqlite(source, read_only=True)
+    dst_conn = sqlite3.connect(target, timeout=30)
+    try:
+        src_conn.backup(dst_conn)
+        dst_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    finally:
+        dst_conn.close()
+        src_conn.close()
+    assert_sqlite_integrity_ok(target, label="backup")
+    print(f"SQLITE_ONLINE_BACKUP_DONE source_path={source} backup_path={target}", flush=True)
+    return target
 
 def selected_trade_rows(conn: sqlite3.Connection, *, date: str | None, trade_id: str | None) -> list[dict[str, Any]]:
     columns = table_columns(conn, "trades")
@@ -613,10 +654,11 @@ def update_trade_peak(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
     )
 
 
-def apply_rows(sqlite_path: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
+def apply_rows(sqlite_path: Path, rows: list[dict[str, Any]], *, backup_to: Path | None = None) -> dict[str, Any]:
     enforce_apply_guard(sqlite_path)
-    backup = backup_path(sqlite_path)
-    shutil.copy2(sqlite_path, backup)
+    assert_sqlite_integrity_ok(sqlite_path, label="target_before_apply")
+    backup = backup_to or backup_path(sqlite_path)
+    create_online_backup(sqlite_path, backup)
     updated = 0
     with connect_sqlite(sqlite_path, read_only=False) as conn:
         try:
@@ -656,7 +698,7 @@ def run(args: argparse.Namespace, *, audit: bool = False) -> int:
         flush=True,
     )
     if getattr(args, "apply", False):
-        result = apply_rows(sqlite_path, rows)
+        result = apply_rows(sqlite_path, rows, backup_to=Path(args.backup_to) if args.backup_to else None)
         print("TRADE_PEAK_REBUILD_APPLIED " + json.dumps(result, sort_keys=True), flush=True)
     return 0
 
@@ -672,7 +714,15 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--dry-run", action="store_true", help="Explicit no-op alias; dry-run is the default.")
     parser.add_argument("--history-finalized", action="store_true", help="Allow final MISSING_CANDLES_FINAL/OUTSIDE states after history has been finalized.")
-    parser.add_argument("--apply", action="store_true", help="Apply changes to SQLite. Default is dry-run.")
+    parser.add_argument("--apply", action="store_true", help="Apply changes to SQLite. Default is dry-run. Refuses production DB while v67 trader is active.")
+    parser.add_argument("--backup-to", help="Create a consistent SQLite online backup at this path before --apply. Never use plain cp on a live WAL database.")
+    parser.epilog = (
+        'Safe live-copy example: sqlite3 data/runtime/trading_runtime.sqlite "'
+        '.backup data/runtime/trading_runtime.peak_test.sqlite"\n'
+        "Python/apply example: python scripts/rebuild_trade_peaks.py --date 2026-07-20 "
+        "--sqlite-path data/runtime/trading_runtime.peak_test.sqlite --history-finalized --apply "
+        "--backup-to data/runtime/trading_runtime.peak_test.pre_peak_apply.sqlite"
+    )
     return parser
 
 

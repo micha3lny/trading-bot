@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import importlib.util
+import sqlite3
+import sys
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
 from src.live_trading.storage.trade_peak_rebuilder import calculate_peak
+
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "rebuild_trade_peaks.py"
+SPEC = importlib.util.spec_from_file_location("rebuild_trade_peaks_script", SCRIPT_PATH)
+assert SPEC and SPEC.loader
+peak_script = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = peak_script
+SPEC.loader.exec_module(peak_script)
 
 
 def candle_rows(rows: list[tuple[str, float, float]]) -> pd.DataFrame:
@@ -203,6 +216,57 @@ class RebuildTradePeaksTests(unittest.TestCase):
         self.assertEqual(status, "INVALID")
         self.assertIn("PEAK_DROP_ALGEBRA_MISMATCH", reason)
         self.assertIn("PEAK_ZERO_DROP_INCONSISTENT", reason)
+
+
+class RebuildTradePeaksSafetyTests(unittest.TestCase):
+    def create_healthy_db(self, path: Path) -> None:
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("CREATE TABLE trades (trade_id TEXT PRIMARY KEY, raw_json TEXT)")
+            conn.execute("INSERT INTO trades (trade_id, raw_json) VALUES ('T1', '{}')")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_healthy_online_backup_passes_integrity_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.sqlite"
+            backup = Path(tmp) / "backup.sqlite"
+            self.create_healthy_db(source)
+
+            peak_script.create_online_backup(source, backup)
+
+            self.assertTrue(backup.exists())
+            self.assertEqual(peak_script.run_integrity_check(backup), "ok")
+
+    def test_backup_to_is_created_and_integrity_checked_before_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.sqlite"
+            backup = Path(tmp) / "explicit_backup.sqlite"
+            self.create_healthy_db(source)
+
+            result = peak_script.apply_rows(source, [], backup_to=backup)
+
+            self.assertEqual(Path(result["backup_path"]).resolve(), backup.resolve())
+            self.assertTrue(backup.exists())
+            self.assertEqual(peak_script.run_integrity_check(backup), "ok")
+
+    def test_malformed_database_aborts_before_backup_or_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            malformed = Path(tmp) / "malformed.sqlite"
+            backup = Path(tmp) / "should_not_exist.sqlite"
+            malformed.write_bytes(b"not a sqlite database")
+
+            with self.assertRaisesRegex(RuntimeError, "SQLITE_INTEGRITY_CHECK_FAILED"):
+                peak_script.apply_rows(malformed, [], backup_to=backup)
+
+            self.assertFalse(backup.exists())
+
+    def test_production_process_guard_still_refuses_active_trader(self) -> None:
+        with patch.object(peak_script, "trader_process_running", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "production DB"):
+                peak_script.enforce_apply_guard(peak_script.production_db_path())
+
 
 
 if __name__ == "__main__":
