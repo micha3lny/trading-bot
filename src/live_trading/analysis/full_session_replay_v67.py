@@ -34,6 +34,7 @@ DEFAULT_OUTPUT_DIR = Path("data/analysis")
 TRADE_COLUMNS = [
     "date",
     "profile",
+    "effective_config_json",
     "source",
     "symbol",
     "signal_time",
@@ -60,6 +61,8 @@ TRADE_COLUMNS = [
 
 EVENT_COLUMNS = [
     "date",
+    "profile",
+    "effective_config_json",
     "timestamp",
     "event_type",
     "symbol",
@@ -75,6 +78,7 @@ EVENT_COLUMNS = [
 COMPARISON_COLUMNS = [
     "date",
     "profile",
+    "effective_config_json",
     "symbol",
     "offline_entry_time",
     "live_entry_time",
@@ -89,6 +93,7 @@ COMPARISON_COLUMNS = [
 PROFILE_COMPARISON_COLUMNS = [
     "date",
     "profile",
+    "effective_config_json",
     "signals",
     "entries",
     "winners",
@@ -105,6 +110,9 @@ PROFILE_COMPARISON_COLUMNS = [
     "trades_unique_to_profile",
     "symbols_entered_only_because_of_lower_thresholds",
     "symbols_entered_only_because_of_legacy_non_causal_behavior",
+    "NUAI_status",
+    "IREN_status",
+    "FBYD_status",
 ]
 
 
@@ -176,6 +184,7 @@ def effective_config_dict(config: ReplayConfig) -> dict[str, Any]:
         "profile": config.profile,
         "first5_threshold": config.first5_threshold,
         "first15_threshold": config.first15_threshold,
+        "or_max_range_pct": config.min_or_range_pct,
         "min_or_range_pct": config.min_or_range_pct,
         "min_price": config.min_price,
         "max_spread_bps": config.max_spread_bps,
@@ -203,6 +212,7 @@ class ReplayResult:
     skipped: dict[str, int] = field(default_factory=dict)
     max_concurrent_positions: int = 0
     equity_curve: list[tuple[pd.Timestamp, float]] = field(default_factory=list)
+    effective_config_json: str = ""
 
 
 def _rows(candles: pd.DataFrame, semantics: str) -> pd.DataFrame:
@@ -287,6 +297,8 @@ def _feature_at(rows: pd.DataFrame, timestamp: pd.Timestamp, config: ReplayConfi
 def _event(result: ReplayResult, session_date: str, timestamp: pd.Timestamp, event_type: str, symbol: str = "", **kwargs: Any) -> None:
     result.events.append({
         "date": session_date,
+        "profile": kwargs.get("profile", ""),
+        "effective_config_json": kwargs.get("effective_config_json", ""),
         "timestamp": iso_ts(timestamp),
         "event_type": event_type,
         "symbol": symbol,
@@ -316,6 +328,7 @@ def _close_position(pos: ReplayPosition, *, timestamp: pd.Timestamp, price: floa
     return {
         "date": "",
         "profile": config.profile,
+        "effective_config_json": json.dumps(effective_config_dict(config), sort_keys=True),
         "source": "offline_replay",
         "symbol": pos.symbol,
         "signal_time": iso_ts(pos.signal_time),
@@ -368,7 +381,7 @@ def _manage_positions(result: ReplayResult, session_date: str, timestamp: pd.Tim
             row_out = _close_position(pos, timestamp=timestamp, price=exit_price, reason=reason, config=config)
             row_out["date"] = session_date
             result.trades.append(row_out)
-            _event(result, session_date, timestamp, "EXIT", symbol, price=exit_price, reason=reason, open_positions=len(open_positions) - 1)
+            _event(result, session_date, timestamp, "EXIT", symbol, profile=config.profile, effective_config_json=json.dumps(effective_config_dict(config), sort_keys=True), price=exit_price, reason=reason, open_positions=len(open_positions) - 1)
             del open_positions[symbol]
 
 
@@ -389,6 +402,8 @@ def replay_session(
     config: ReplayConfig,
 ) -> ReplayResult:
     result = ReplayResult()
+    config_json = json.dumps(effective_config_dict(config), sort_keys=True)
+    result.effective_config_json = config_json
     top100 = load_top100(top100_path)
     if top100.empty:
         return result
@@ -405,6 +420,7 @@ def replay_session(
     entry_delay_until = min(rows["timestamp"].min() for rows in non_empty) + pd.Timedelta(minutes=config.entry_delay_after_open_minutes)
     open_positions: dict[str, ReplayPosition] = {}
     traded_symbols: set[str] = set()
+    signaled_symbols: set[str] = set()
     realized = 0.0
     current = start.floor("min")
     while current <= end.ceil("min"):
@@ -433,8 +449,11 @@ def replay_session(
             if not features.get("ready"):
                 result.skipped[str(features.get("reason") or "not_ready")] = result.skipped.get(str(features.get("reason") or "not_ready"), 0) + 1
                 continue
+            if symbol not in signaled_symbols:
+                signaled_symbols.add(symbol)
+                _event(result, session_date, current, "SIGNAL", symbol, profile=config.profile, effective_config_json=config_json, score=features.get("score"), price=features.get("entry_price"), reason=features.get("reason"), open_positions=len(open_positions))
             if current < entry_delay_until:
-                _event(result, session_date, current, "ENTRY_BLOCKED", symbol, score=features.get("score"), price=features.get("entry_price"), reason="entry_delay_after_open", open_positions=len(open_positions))
+                _event(result, session_date, current, "ENTRY_BLOCKED", symbol, profile=config.profile, effective_config_json=config_json, score=features.get("score"), price=features.get("entry_price"), reason="entry_delay_after_open", open_positions=len(open_positions))
                 result.skipped["entry_delay_after_open"] = result.skipped.get("entry_delay_after_open", 0) + 1
                 continue
             candidates.append((symbol, float(features.get("score") or 0.0), features))
@@ -442,15 +461,15 @@ def replay_session(
         entries_this_minute = 0
         for rank, (symbol, score, features) in enumerate(candidates, start=1):
             if config.max_open_positions > 0 and len(open_positions) >= config.max_open_positions:
-                _event(result, session_date, current, "ENTRY_BLOCKED", symbol, candidate_rank=rank, score=score, price=features.get("entry_price"), reason="max_positions_full", open_positions=len(open_positions))
+                _event(result, session_date, current, "ENTRY_BLOCKED", symbol, profile=config.profile, effective_config_json=config_json, candidate_rank=rank, score=score, price=features.get("entry_price"), reason="max_positions_full", open_positions=len(open_positions))
                 result.skipped["max_positions_full"] = result.skipped.get("max_positions_full", 0) + 1
                 continue
             if config.max_entries_per_cycle > 0 and entries_this_minute >= config.max_entries_per_cycle:
-                _event(result, session_date, current, "ENTRY_BLOCKED", symbol, candidate_rank=rank, score=score, price=features.get("entry_price"), reason="max_entries_per_cycle", open_positions=len(open_positions))
+                _event(result, session_date, current, "ENTRY_BLOCKED", symbol, profile=config.profile, effective_config_json=config_json, candidate_rank=rank, score=score, price=features.get("entry_price"), reason="max_entries_per_cycle", open_positions=len(open_positions))
                 result.skipped["max_entries_per_cycle"] = result.skipped.get("max_entries_per_cycle", 0) + 1
                 continue
             if config.max_entries_per_minute > 0 and entries_this_minute >= config.max_entries_per_minute:
-                _event(result, session_date, current, "ENTRY_BLOCKED", symbol, candidate_rank=rank, score=score, price=features.get("entry_price"), reason="max_entries_per_minute", open_positions=len(open_positions))
+                _event(result, session_date, current, "ENTRY_BLOCKED", symbol, profile=config.profile, effective_config_json=config_json, candidate_rank=rank, score=score, price=features.get("entry_price"), reason="max_entries_per_minute", open_positions=len(open_positions))
                 result.skipped["max_entries_per_minute"] = result.skipped.get("max_entries_per_minute", 0) + 1
                 continue
             if score < config.min_live_entry_score:
@@ -467,7 +486,7 @@ def replay_session(
             traded_symbols.add(symbol)
             entries_this_minute += 1
             result.max_concurrent_positions = max(result.max_concurrent_positions, len(open_positions))
-            _event(result, session_date, current, "ENTRY", symbol, candidate_rank=rank, score=score, price=entry_price, quantity=qty, reason="entered", open_positions=len(open_positions))
+            _event(result, session_date, current, "ENTRY", symbol, profile=config.profile, effective_config_json=config_json, candidate_rank=rank, score=score, price=entry_price, quantity=qty, reason="entered", open_positions=len(open_positions))
         realized = sum(float(row.get("net_pnl") or 0.0) for row in result.trades)
         result.equity_curve.append((current, realized))
         current += pd.Timedelta(minutes=1)
@@ -489,6 +508,7 @@ def load_live_trades(sqlite_path: Path, session_date: str) -> list[dict[str, Any
         rows.append({
             "date": session_date,
             "profile": "live_actual",
+            "effective_config_json": json.dumps({"profile": "live_actual"}, sort_keys=True),
             "source": "live_sqlite",
             "symbol": normalize_symbol(row.get("symbol")),
             "signal_time": iso_ts(row.get("signal_time") or row.get("ready_since") or entry),
@@ -545,6 +565,7 @@ def compare_trades(session_date: str, offline: list[dict[str, Any]], live: list[
         out.append({
             "date": session_date,
             "profile": off.get("profile", ""),
+            "effective_config_json": off.get("effective_config_json", ""),
             "symbol": sym,
             "offline_entry_time": off.get("entry_time"),
             "live_entry_time": live_row.get("entry_time") if live_row else "",
@@ -562,6 +583,7 @@ def compare_trades(session_date: str, offline: list[dict[str, Any]], live: list[
             out.append({
                 "date": session_date,
                 "profile": "live_actual",
+                "effective_config_json": json.dumps({"profile": "live_actual"}, sort_keys=True),
                 "symbol": sym,
                 "offline_entry_time": "",
                 "live_entry_time": row.get("entry_time"),
@@ -613,6 +635,16 @@ def _avg(rows: list[dict[str, Any]], key: str) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def _focus_symbol_status(replay: ReplayResult, symbol: str) -> str:
+    symbol = normalize_symbol(symbol)
+    if any(normalize_symbol(row.get("symbol")) == symbol for row in replay.trades):
+        return "entered"
+    blocks = [event for event in replay.events if normalize_symbol(event.get("symbol")) == symbol and event.get("event_type") == "ENTRY_BLOCKED"]
+    if blocks:
+        return f"blocked:{blocks[0].get('reason') or 'unknown'}"
+    return "not_entered"
+
+
 def profile_comparison_rows(session_date: str, profile_results: dict[str, ReplayResult]) -> list[dict[str, Any]]:
     live_symbols = {str(row.get("symbol") or "") for row in profile_results.get("live", ReplayResult()).trades}
     low_symbols = {str(row.get("symbol") or "") for row in profile_results.get("low_threshold_causal", ReplayResult()).trades}
@@ -624,7 +656,8 @@ def profile_comparison_rows(session_date: str, profile_results: dict[str, Replay
         rows.append({
             "date": session_date,
             "profile": profile,
-            "signals": len([event for event in replay.events if event.get("event_type") == "ENTRY"]),
+            "effective_config_json": replay.effective_config_json,
+            "signals": len([event for event in replay.events if event.get("event_type") == "SIGNAL"]),
             "entries": metrics["entries"],
             "winners": metrics["winners"],
             "losers": metrics["losers"],
@@ -640,6 +673,9 @@ def profile_comparison_rows(session_date: str, profile_results: dict[str, Replay
             "trades_unique_to_profile": ",".join(sorted(symbols - live_symbols)) if profile != "live" else "",
             "symbols_entered_only_because_of_lower_thresholds": ",".join(sorted((low_symbols - live_symbols) & symbols)) if profile == "low_threshold_causal" else "",
             "symbols_entered_only_because_of_legacy_non_causal_behavior": ",".join(sorted((legacy_symbols - live_symbols - low_symbols) & symbols)) if profile == "legacy_offline" else "",
+            "NUAI_status": _focus_symbol_status(replay, "NUAI"),
+            "IREN_status": _focus_symbol_status(replay, "IREN"),
+            "FBYD_status": _focus_symbol_status(replay, "FBYD"),
         })
     return rows
 
@@ -692,6 +728,7 @@ def build_effective_config(args: argparse.Namespace, profile: str) -> ReplayConf
     config = profile_config(profile)
     config.first5_threshold = args.first5_threshold if args.first5_threshold is not None else config.first5_threshold
     config.first15_threshold = args.first15_threshold if args.first15_threshold is not None else config.first15_threshold
+    config.min_or_range_pct = args.or_max_range_pct if args.or_max_range_pct is not None else config.min_or_range_pct
     config.breakout_mode = args.breakout_mode or config.breakout_mode
     config.bar_timestamp_semantics = args.bar_timestamp_semantics or config.bar_timestamp_semantics
     config.entry_price_mode = args.entry_price_mode or config.entry_price_mode
@@ -779,6 +816,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--first5-threshold", type=float, default=None)
     parser.add_argument("--first15-threshold", type=float, default=None)
+    parser.add_argument("--or-max-range-pct", type=float, default=None, help="Override the live OR range threshold. The existing replay engine treats this as the OR range gate value.")
     parser.add_argument("--breakout-mode", choices=["live", "current_price_or_high", "legacy_candle_high"], default=None)
     parser.add_argument("--bar-timestamp-semantics", choices=["bar_start", "bar_end"], default=None)
     parser.add_argument("--entry-price-mode", choices=["open", "high", "low", "close"], default=None)

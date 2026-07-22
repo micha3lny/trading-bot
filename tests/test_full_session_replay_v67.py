@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from src.live_trading.analysis.full_session_replay_v67 import ReplayConfig, build_effective_config, build_parser, profile_config, replay_session
+from src.live_trading.analysis.full_session_replay_v67 import ReplayConfig, build_effective_config, build_parser, profile_comparison_rows, profile_config, replay_session
 from src.live_trading.analysis.signal_opportunity_forensics import load_case_rows, run as run_signal_opportunity, build_parser as build_signal_parser
 
 
@@ -113,6 +113,7 @@ class FullSessionReplayTests(unittest.TestCase):
             "--profile", "live",
             "--first5-threshold", "0.5",
             "--first15-threshold", "1.0",
+            "--or-max-range-pct", "3.5",
             "--notional", "500",
             "--max-positions", "3",
             "--hard-stop-pct", "4",
@@ -123,6 +124,7 @@ class FullSessionReplayTests(unittest.TestCase):
         config = build_effective_config(args, "live")
         self.assertEqual(config.first5_threshold, 0.5)
         self.assertEqual(config.first15_threshold, 1.0)
+        self.assertEqual(config.min_or_range_pct, 3.5)
         self.assertEqual(config.position_usd, 500)
         self.assertEqual(config.max_open_positions, 3)
         self.assertEqual(config.exit_stop_loss_pct, 4)
@@ -153,6 +155,21 @@ class FullSessionReplayTests(unittest.TestCase):
         entered = self.replay_with(data, **legacy.__dict__)
         self.assertFalse(any(event["event_type"] == "ENTRY" for event in blocked.events))
         self.assertTrue(any(event["event_type"] == "ENTRY" for event in entered.events))
+
+    def test_output_rows_include_effective_config(self) -> None:
+        result = self.replay_with({"CFG": ready_candles(11.0)}, **profile_config("low_threshold_causal").__dict__)
+        entry_event = [event for event in result.events if event["event_type"] == "ENTRY"][0]
+        self.assertIn('"profile": "low_threshold_causal"', entry_event["effective_config_json"])
+        if result.trades:
+            self.assertIn('"first5_threshold": 0.5', result.trades[0]["effective_config_json"])
+
+    def test_profile_comparison_contains_focus_symbol_statuses_and_config(self) -> None:
+        result = self.replay_with({"NUAI": ready_candles(11.0)}, **profile_config("live").__dict__)
+        rows = profile_comparison_rows("2026-07-20", {"live": result})
+        self.assertEqual(rows[0]["signals"], 1)
+        self.assertEqual(rows[0]["NUAI_status"], "entered")
+        self.assertEqual(rows[0]["IREN_status"], "not_entered")
+        self.assertIn('"profile": "live"', rows[0]["effective_config_json"])
 
     def test_cases_csv_three_rows_produces_three_signal_opportunity_cases(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
