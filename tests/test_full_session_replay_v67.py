@@ -74,8 +74,15 @@ class FullSessionReplayTests(unittest.TestCase):
         result = self.replay_with({"DELAY": ready_candles(11.0)}, entry_delay_after_open_minutes=20.0)
         self.assertTrue(any(event["event_type"] == "ENTRY_BLOCKED" and event["reason"] == "entry_delay_after_open" for event in result.events))
 
-    def test_no_lookahead_1345_boundary(self) -> None:
-        result = self.replay_with({"BOUND": ready_candles(11.0)})
+    def test_live_partial_windows_can_enter_after_entry_delay(self) -> None:
+        result = self.replay_with({"BOUND": ready_candles(11.0)}, **profile_config("live").__dict__)
+        entry = [event for event in result.events if event["event_type"] == "ENTRY"][0]
+        self.assertEqual(entry["timestamp"], "2026-07-20T13:35:00+00:00")
+
+    def test_finalized_window_mode_waits_for_first15_boundary(self) -> None:
+        config = profile_config("legacy_offline")
+        config.breakout_mode = "live"
+        result = self.replay_with({"BOUND": ready_candles(11.0)}, **config.__dict__)
         entry = [event for event in result.events if event["event_type"] == "ENTRY"][0]
         self.assertEqual(entry["timestamp"], "2026-07-20T13:45:00+00:00")
 
@@ -99,6 +106,7 @@ class FullSessionReplayTests(unittest.TestCase):
         self.assertEqual(low.first15_threshold, 1.0)
         self.assertEqual(low.breakout_mode, live.breakout_mode)
         self.assertEqual(low.bar_timestamp_semantics, live.bar_timestamp_semantics)
+        self.assertEqual(low.window_availability_mode, live.window_availability_mode)
 
     def test_legacy_offline_profile_is_marked_non_causal(self) -> None:
         legacy = profile_config("legacy_offline")
@@ -106,6 +114,7 @@ class FullSessionReplayTests(unittest.TestCase):
         self.assertEqual(legacy.first15_threshold, 1.0)
         self.assertEqual(legacy.breakout_mode, "legacy_candle_high")
         self.assertEqual(legacy.bar_timestamp_semantics, "bar_end")
+        self.assertEqual(legacy.window_availability_mode, "finalized_windows")
 
     def test_cli_overrides_profile_thresholds_and_risk_parameters(self) -> None:
         args = build_parser().parse_args([
@@ -144,17 +153,19 @@ class FullSessionReplayTests(unittest.TestCase):
         causal_result = self.replay_with({"LOWT": low_threshold}, **profile_config("low_threshold_causal").__dict__)
         self.assertFalse(any(event["event_type"] == "ENTRY" for event in live_result.events))
         entries = [event for event in causal_result.events if event["event_type"] == "ENTRY"]
-        self.assertEqual(entries[0]["timestamp"], "2026-07-20T13:45:00+00:00")
+        self.assertEqual(entries[0]["timestamp"], "2026-07-20T13:35:00+00:00")
 
     def test_legacy_candle_high_breakout_can_differ_from_current_price_breakout(self) -> None:
         data = {"LEG": ready_candles(close_at_1344=10.7)}
         current_price_breakout = profile_config("low_threshold_causal")
         current_price_breakout.breakout_mode = "current_price_or_high"
         legacy = profile_config("legacy_offline")
-        blocked = self.replay_with(data, **current_price_breakout.__dict__)
-        entered = self.replay_with(data, **legacy.__dict__)
-        self.assertFalse(any(event["event_type"] == "ENTRY" for event in blocked.events))
-        self.assertTrue(any(event["event_type"] == "ENTRY" for event in entered.events))
+        current_price_result = self.replay_with(data, **current_price_breakout.__dict__)
+        legacy_result = self.replay_with(data, **legacy.__dict__)
+        current_entry = [event for event in current_price_result.events if event["event_type"] == "ENTRY"][0]
+        legacy_entry = [event for event in legacy_result.events if event["event_type"] == "ENTRY"][0]
+        self.assertEqual(legacy_entry["timestamp"], "2026-07-20T13:45:00+00:00")
+        self.assertEqual(current_entry["timestamp"], "2026-07-20T13:47:00+00:00")
 
     def test_output_rows_include_effective_config(self) -> None:
         result = self.replay_with({"CFG": ready_candles(11.0)}, **profile_config("low_threshold_causal").__dict__)
@@ -170,6 +181,27 @@ class FullSessionReplayTests(unittest.TestCase):
         self.assertEqual(rows[0]["NUAI_status"], "entered")
         self.assertEqual(rows[0]["IREN_status"], "not_entered")
         self.assertIn('"profile": "live"', rows[0]["effective_config_json"])
+
+
+    def test_parity_trace_uses_same_replay_config(self) -> None:
+        from src.live_trading.analysis.full_session_replay_v67 import build_parity_trace
+
+        data = {"FCEL": ready_candles(11.0)}
+        result = self.replay_with(data, **profile_config("live").__dict__)
+        top = pd.DataFrame({"symbol": ["FCEL"], "top100_rank": [1]})
+        with patch("src.live_trading.analysis.full_session_replay_v67.load_top100", return_value=top), patch("src.live_trading.analysis.full_session_replay_v67.load_session_candles", side_effect=lambda _history, symbol, _date, _type: data[symbol]):
+            rows = build_parity_trace(
+                session_date="2026-07-20",
+                symbols=["FCEL"],
+                top100_path=Path("unused.csv"),
+                history_dir=Path("unused"),
+                config=profile_config("live"),
+                replay=result,
+                live=[],
+            )
+        entry_rows = [row for row in rows if row["replay_entered_by_this_time"]]
+        self.assertEqual(entry_rows[0]["timestamp"], "2026-07-20T13:35:00+00:00")
+        self.assertEqual(entry_rows[0]["window_availability_mode"], "live_partial")
 
     def test_cases_csv_three_rows_produces_three_signal_opportunity_cases(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

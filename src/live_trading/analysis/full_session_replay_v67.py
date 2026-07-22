@@ -115,6 +115,40 @@ PROFILE_COMPARISON_COLUMNS = [
     "FBYD_status",
 ]
 
+PARITY_TRACE_COLUMNS = [
+    "date",
+    "profile",
+    "symbol",
+    "timestamp",
+    "bar_open",
+    "bar_high",
+    "bar_low",
+    "bar_close",
+    "first_5m_high_pct",
+    "first_15m_high_pct",
+    "first_5m_complete",
+    "first_15m_complete",
+    "or_high",
+    "or_low",
+    "or_range_pct",
+    "current_price",
+    "spread_bps",
+    "first5_gate",
+    "first15_gate",
+    "or_gate",
+    "price_gate",
+    "spread_gate",
+    "ready",
+    "reason",
+    "replay_entry_time",
+    "live_entry_time",
+    "replay_entered_by_this_time",
+    "live_entered_by_this_time",
+    "first_divergence",
+    "window_availability_mode",
+    "effective_config_json",
+]
+
 
 @dataclass
 class ReplayPosition:
@@ -161,6 +195,7 @@ class ReplayConfig:
     commission_per_share: float = 0.005
     min_commission: float = 1.0
     bar_timestamp_semantics: str = "bar_start"
+    window_availability_mode: str = "live_partial"
 
 
 def profile_config(profile: str) -> ReplayConfig:
@@ -175,6 +210,7 @@ def profile_config(profile: str) -> ReplayConfig:
             first15_threshold=1.0,
             breakout_mode="legacy_candle_high",
             bar_timestamp_semantics="bar_end",
+            window_availability_mode="finalized_windows",
         )
     raise ValueError(f"unknown replay profile: {profile}")
 
@@ -190,6 +226,7 @@ def effective_config_dict(config: ReplayConfig) -> dict[str, Any]:
         "max_spread_bps": config.max_spread_bps,
         "breakout_mode": config.breakout_mode,
         "bar_timestamp_semantics": config.bar_timestamp_semantics,
+        "window_availability_mode": config.window_availability_mode,
         "entry_price_mode": config.entry_price_mode,
         "notional": config.position_usd,
         "slippage_bps": config.slippage_bps,
@@ -243,9 +280,17 @@ def _feature_at(rows: pd.DataFrame, timestamp: pd.Timestamp, config: ReplayConfi
     first5_end = start + pd.Timedelta(minutes=5)
     first15_end = start + pd.Timedelta(minutes=15)
     or_end = start + pd.Timedelta(seconds=LIVE_SIGNAL_OPENING_RANGE_SECONDS)
-    first5 = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < first5_end)] if timestamp >= first5_end else pd.DataFrame()
-    first15 = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < first15_end)] if timestamp >= first15_end else pd.DataFrame()
-    or_rows = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < or_end)] if timestamp >= or_end else pd.DataFrame()
+    first5_complete = timestamp >= first5_end
+    first15_complete = timestamp >= first15_end
+    or_complete = timestamp >= or_end
+    if config.window_availability_mode == "finalized_windows":
+        first5 = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < first5_end)] if first5_complete else pd.DataFrame()
+        first15 = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < first15_end)] if first15_complete else pd.DataFrame()
+        or_rows = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < or_end)] if or_complete else pd.DataFrame()
+    else:
+        first5 = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < first5_end)]
+        first15 = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < first15_end)]
+        or_rows = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < or_end)]
     first5_high = fnum(first5["high"].max()) if not first5.empty else None
     first15_high = fnum(first15["high"].max()) if not first15.empty else None
     or_high = fnum(or_rows["high"].max()) if not or_rows.empty else None
@@ -289,7 +334,11 @@ def _feature_at(rows: pd.DataFrame, timestamp: pd.Timestamp, config: ReplayConfi
         "spread_bps": spread,
         "first_5m_high_pct": first5_pct,
         "first_15m_high_pct": first15_pct,
+        "first_5m_complete": int(first5_complete),
+        "first_15m_complete": int(first15_complete),
         "or_range_pct": or_range,
+        "or_high": or_high,
+        "or_low": or_low,
         "breakout_gate_used": breakout_gate_used,
     }
 
@@ -535,6 +584,122 @@ def load_live_trades(sqlite_path: Path, session_date: str) -> list[dict[str, Any
     return rows
 
 
+
+def build_parity_trace(
+    *,
+    session_date: str,
+    symbols: list[str],
+    top100_path: Path,
+    history_dir: Path,
+    config: ReplayConfig,
+    replay: ReplayResult,
+    live: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    config_json = json.dumps(effective_config_dict(config), sort_keys=True)
+    top100 = load_top100(top100_path)
+    top100_symbols = {normalize_symbol(value) for value in top100.get("symbol", pd.Series(dtype=str)).tolist()}
+    focus = [normalize_symbol(symbol) for symbol in symbols if normalize_symbol(symbol)]
+    replay_entry_by_symbol = {
+        normalize_symbol(event.get("symbol")): parse_dt(event.get("timestamp"))
+        for event in replay.events
+        if event.get("event_type") == "ENTRY"
+    }
+    live_entry_by_symbol: dict[str, pd.Timestamp] = {}
+    for row in live:
+        symbol = normalize_symbol(row.get("symbol"))
+        entry_time = parse_dt(row.get("entry_time"))
+        if symbol and entry_time is not None and symbol not in live_entry_by_symbol:
+            live_entry_by_symbol[symbol] = entry_time
+    out: list[dict[str, Any]] = []
+    for symbol in focus:
+        if top100_symbols and symbol not in top100_symbols:
+            out.append({
+                "date": session_date,
+                "profile": config.profile,
+                "symbol": symbol,
+                "timestamp": "",
+                "ready": 0,
+                "reason": "symbol_not_in_top100",
+                "replay_entry_time": iso_ts(replay_entry_by_symbol.get(symbol)),
+                "live_entry_time": iso_ts(live_entry_by_symbol.get(symbol)),
+                "first_divergence": "symbol_not_in_replay_top100",
+                "window_availability_mode": config.window_availability_mode,
+                "effective_config_json": config_json,
+            })
+            continue
+        rows = _rows(load_session_candles(history_dir, symbol, session_date, "RTH"), config.bar_timestamp_semantics)
+        if rows.empty:
+            out.append({
+                "date": session_date,
+                "profile": config.profile,
+                "symbol": symbol,
+                "timestamp": "",
+                "ready": 0,
+                "reason": "missing_candles",
+                "replay_entry_time": iso_ts(replay_entry_by_symbol.get(symbol)),
+                "live_entry_time": iso_ts(live_entry_by_symbol.get(symbol)),
+                "first_divergence": "missing_replay_candles",
+                "window_availability_mode": config.window_availability_mode,
+                "effective_config_json": config_json,
+            })
+            continue
+        start = rows["available_at"].min().floor("min")
+        end = rows["available_at"].max().ceil("min")
+        replay_entry = replay_entry_by_symbol.get(symbol)
+        live_entry = live_entry_by_symbol.get(symbol)
+        first_divergence_seen = False
+        current = start
+        while current <= end:
+            visible = rows[rows["available_at"] <= current]
+            bar = visible.iloc[-1] if not visible.empty else pd.Series(dtype=object)
+            features = _feature_at(rows, current, config)
+            replay_entered = replay_entry is not None and replay_entry <= current
+            live_entered = live_entry is not None and live_entry <= current
+            divergence = ""
+            if not first_divergence_seen and replay_entered != live_entered:
+                divergence = "replay_entered_before_live" if replay_entered else "live_entered_before_replay"
+                first_divergence_seen = True
+            first5 = fnum(features.get("first_5m_high_pct"))
+            first15 = fnum(features.get("first_15m_high_pct"))
+            or_range = fnum(features.get("or_range_pct"))
+            price = fnum(features.get("entry_price"))
+            spread = fnum(features.get("spread_bps"))
+            out.append({
+                "date": session_date,
+                "profile": config.profile,
+                "symbol": symbol,
+                "timestamp": iso_ts(current),
+                "bar_open": bar.get("open", ""),
+                "bar_high": bar.get("high", ""),
+                "bar_low": bar.get("low", ""),
+                "bar_close": bar.get("close", ""),
+                "first_5m_high_pct": first5,
+                "first_15m_high_pct": first15,
+                "first_5m_complete": features.get("first_5m_complete", ""),
+                "first_15m_complete": features.get("first_15m_complete", ""),
+                "or_high": features.get("or_high", ""),
+                "or_low": features.get("or_low", ""),
+                "or_range_pct": or_range,
+                "current_price": price,
+                "spread_bps": spread,
+                "first5_gate": int(first5 is not None and first5 >= config.first5_threshold),
+                "first15_gate": int(first15 is not None and first15 >= config.first15_threshold),
+                "or_gate": int(or_range is not None and or_range >= config.min_or_range_pct),
+                "price_gate": int(price is not None and price >= config.min_price),
+                "spread_gate": int(spread is None or spread <= config.max_spread_bps),
+                "ready": int(bool(features.get("ready"))),
+                "reason": features.get("reason"),
+                "replay_entry_time": iso_ts(replay_entry),
+                "live_entry_time": iso_ts(live_entry),
+                "replay_entered_by_this_time": int(replay_entered),
+                "live_entered_by_this_time": int(live_entered),
+                "first_divergence": divergence,
+                "window_availability_mode": config.window_availability_mode,
+                "effective_config_json": config_json,
+            })
+            current += pd.Timedelta(minutes=1)
+    return out
+
 def compare_trades(session_date: str, offline: list[dict[str, Any]], live: list[dict[str, Any]]) -> list[dict[str, Any]]:
     live_by_symbol: dict[str, list[dict[str, Any]]] = {}
     for row in live:
@@ -731,6 +896,7 @@ def build_effective_config(args: argparse.Namespace, profile: str) -> ReplayConf
     config.min_or_range_pct = args.or_max_range_pct if args.or_max_range_pct is not None else config.min_or_range_pct
     config.breakout_mode = args.breakout_mode or config.breakout_mode
     config.bar_timestamp_semantics = args.bar_timestamp_semantics or config.bar_timestamp_semantics
+    config.window_availability_mode = args.window_availability_mode or config.window_availability_mode
     config.entry_price_mode = args.entry_price_mode or config.entry_price_mode
     config.position_usd = args.notional if args.notional is not None else (args.position_usd if args.position_usd is not None else config.position_usd)
     config.slippage_bps = args.slippage_bps if args.slippage_bps is not None else config.slippage_bps
@@ -770,6 +936,7 @@ def run_one_profile(args: argparse.Namespace, profile: str, live: list[dict[str,
     trades_path = output_dir / f"full_session_replay{suffix}_{args.date}.csv"
     events_path = output_dir / f"full_session_replay_events{suffix}_{args.date}.csv"
     comparison_path = output_dir / f"full_session_replay_comparison{suffix}_{args.date}.csv"
+    trace_path = output_dir / f"full_session_replay_parity_trace{suffix}_{args.date}.csv"
     summary_path = output_dir / f"full_session_replay_summary{suffix}_{args.date}.md"
     config_path = output_dir / f"full_session_replay_config{suffix}_{args.date}.json"
     write_csv(trades_path, combined, TRADE_COLUMNS)
@@ -777,11 +944,21 @@ def run_one_profile(args: argparse.Namespace, profile: str, live: list[dict[str,
     write_csv(comparison_path, comparison, COMPARISON_COLUMNS)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(json.dumps(effective_config_dict(config), indent=2, sort_keys=True) + "\n")
-    focus = [normalize_symbol(s) for s in str(args.focus_symbols or "NUAI,IREN,FBYD").split(",") if normalize_symbol(s)]
+    focus = [normalize_symbol(s) for s in str(args.focus_symbols or "").split(",") if normalize_symbol(s)]
+    trace_rows = build_parity_trace(
+        session_date=args.date,
+        symbols=focus,
+        top100_path=top100_path,
+        history_dir=args.history_dir,
+        config=config,
+        replay=replay,
+        live=live,
+    )
+    write_csv(trace_path, trace_rows, PARITY_TRACE_COLUMNS)
     write_summary(summary_path, args.date, replay, live, comparison, focus, config)
     print(
         f"FULL_SESSION_REPLAY_DONE date={args.date} profile={profile} offline_entries={len(offline_rows)} live_entries={len(live)} "
-        f"output={trades_path} events={events_path} comparison={comparison_path} summary={summary_path} config={config_path}",
+        f"output={trades_path} events={events_path} comparison={comparison_path} trace={trace_path} summary={summary_path} config={config_path}",
         flush=True,
     )
     return replay, comparison
@@ -819,6 +996,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--or-max-range-pct", type=float, default=None, help="Override the live OR range threshold. The existing replay engine treats this as the OR range gate value.")
     parser.add_argument("--breakout-mode", choices=["live", "current_price_or_high", "legacy_candle_high"], default=None)
     parser.add_argument("--bar-timestamp-semantics", choices=["bar_start", "bar_end"], default=None)
+    parser.add_argument("--window-availability-mode", choices=["live_partial", "finalized_windows"], default=None)
     parser.add_argument("--entry-price-mode", choices=["open", "high", "low", "close"], default=None)
     parser.add_argument("--notional", type=float, default=None)
     parser.add_argument("--position-usd", type=float, default=None, help="Backward-compatible alias for --notional.")
@@ -833,7 +1011,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-entries-per-minute", type=int, default=5)
     parser.add_argument("--entry-delay-after-open-minutes", type=float, default=5.0)
     parser.add_argument("--min-live-entry-score", type=float, default=0.0)
-    parser.add_argument("--focus-symbols", default="NUAI,IREN,FBYD")
+    parser.add_argument("--focus-symbols", default="FCEL,AXTI,FRMI,FBYD,IREN,NUAI")
     return parser
 
 

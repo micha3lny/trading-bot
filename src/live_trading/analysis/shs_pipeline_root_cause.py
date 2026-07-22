@@ -422,14 +422,14 @@ def contract_telemetry_assessment(evidence: list[EvidenceItem]) -> str:
     stages = stage_presence(evidence)
     if any(any(token in _text(item) for token in ["CONTRACT_FAILED", "NOT_QUALIFIED", "NO SECURITY DEFINITION"]) for item in evidence):
         return "CONTRACT_REQUEST_FAILED"
+    if _positive_contract_absence(evidence):
+        return "CONTRACT_REQUEST_NOT_SENT"
     if stages["contract_resolution"]:
         if any(any(token in _text(item) for token in ["CACHE", "CONTRACT_CACHE", "CONTRACT_PRESENT=1", "CONTRACT_PRESENT\": 1", "CONID"]) for item in evidence):
             return "CONTRACT_RESOLVED_FROM_CACHE" if not stages["contract_qualification_request"] else "CONTRACT_REQUEST_RECORDED"
         return "CONTRACT_REQUEST_RECORDED"
     if stages["contract_qualification_request"]:
         return "CONTRACT_REQUEST_RECORDED"
-    if _positive_contract_absence(evidence):
-        return "CONTRACT_REQUEST_NOT_SENT"
     if stages["market_data_subscription_request"] or stages["first_ticker_price_update"] or stages["candidate_state_creation"]:
         return "CONTRACT_REQUEST_SENT_BUT_NOT_RECORDED"
     return "INSUFFICIENT_TELEMETRY"
@@ -439,10 +439,10 @@ def subscription_telemetry_assessment(evidence: list[EvidenceItem]) -> str:
     stages = stage_presence(evidence)
     if any(any(token in _text(item) for token in ["SUBSCRIBE_ERROR", "DELAYED", "PERMISSION", "NO MARKET DATA"]) for item in evidence):
         return "MARKET_DATA_SUBSCRIPTION_FAILED"
-    if stages["market_data_subscription_request"]:
-        return "SUBSCRIPTION_REQUEST_RECORDED"
     if _positive_subscription_absence(evidence):
         return "SUBSCRIPTION_REQUEST_NOT_SENT"
+    if stages["market_data_subscription_request"]:
+        return "SUBSCRIPTION_REQUEST_RECORDED"
     if stages["first_ticker_price_update"] or stages["candidate_state_creation"]:
         return "SUBSCRIPTION_REQUEST_SENT_BUT_NOT_RECORDED"
     return "INSUFFICIENT_TELEMETRY"
