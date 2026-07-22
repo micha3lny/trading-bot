@@ -434,6 +434,55 @@ def record_contract_metadata(recorder: LiveDataRecorder, contract: Any, *, sourc
     )
 
 
+def top100_rank_for_symbol(runtime_state: dict[str, Any], symbol: str) -> Any:
+    metadata = dict(_runtime_dict(runtime_state, "top100_entry_metadata_by_symbol").get(str(symbol or "").upper(), {}))
+    return metadata.get("top100_rank") or metadata.get("ranking_position") or metadata.get("rank") or ""
+
+
+def emit_top100_symbol_pipeline_event(
+    recorder: LiveDataRecorder,
+    runtime_state: dict[str, Any],
+    event_type: str,
+    symbol: str,
+    *,
+    session_date: str | None = None,
+    rank: Any = "",
+    run_id: str | None = None,
+    outcome: str = "observed",
+    **fields: Any,
+) -> None:
+    symbol = str(symbol or "").upper()
+    if not symbol:
+        return
+    event_session_date = session_date or getattr(recorder, "session_date", None) or ""
+    event_rank = rank if rank not in (None, "") else top100_rank_for_symbol(runtime_state, symbol)
+    event_run_id = run_id or str(runtime_state.get("top100_pipeline_run_id") or runtime_state.get("top100_reload_ranking_date") or "")
+    timestamp = now_utc()
+    payload = {
+        "session_date": event_session_date,
+        "symbol": symbol,
+        "rank": event_rank,
+        "timestamp": timestamp,
+        "run_id": event_run_id,
+        "outcome": outcome,
+        **fields,
+    }
+    extra = " ".join(f"{key}={value}" for key, value in payload.items() if value not in (None, ""))
+    print(f"{timestamp} {event_type} {extra}", flush=True)
+    safe_sqlite_call(
+        getattr(recorder, "sqlite_store", None),
+        "record_runtime_event",
+        event_type=event_type,
+        severity="INFO" if outcome not in {"failed", "error", "not_qualified"} else "WARN",
+        strategy_name=STRATEGY_NAME,
+        session_date=event_session_date,
+        symbol=symbol,
+        source="v67_live_runtime",
+        reason=str(outcome or ""),
+        raw_json=payload,
+    )
+
+
 def load_top_symbols(alpha_rank_csv: str, top_n: int, min_price: float | None = None) -> list[str]:
     p = Path(alpha_rank_csv)
     if not p.exists():
@@ -1901,6 +1950,7 @@ def reset_symbol_session_state(state: SymbolState) -> None:
     state.rth_candle_count = 0
     state.ready_since_ts = None
     state.ready_since_utc = None
+    state.signal_sent = False
     state.signal_source = ""
     state.last_update_source = ""
     state.last_live_update_ts = None
@@ -1929,6 +1979,7 @@ def reset_symbol_rth_state_preserve_premarket(state: SymbolState, *, session_dat
     state.rth_candle_count = 0
     state.ready_since_ts = None
     state.ready_since_utc = None
+    state.signal_sent = False
     state.signal_source = ""
     state.last_update_source = ""
     state.last_live_update_ts = None
@@ -5932,6 +5983,7 @@ def reload_top100_universe_if_requested(
 
     reload_path = str(runtime_state.get("top100_reload_path") or getattr(args, "daily_top100_latest_output", args.alpha_rank_csv))
     ranking_date = runtime_state.get("top100_reload_ranking_date")
+    runtime_state["top100_pipeline_run_id"] = f"top100_reload:{ranking_date or ''}:{int(time.time())}"
     print(f"{now_utc()} TOP100_RELOAD_START ranking_date={ranking_date} path={reload_path}", flush=True)
     today_session = get_us_equity_session(datetime.now(timezone.utc).date())
     emit_runtime_state_growth_snapshot(
@@ -5985,6 +6037,8 @@ def reload_top100_universe_if_requested(
             int(args.top_n),
             min_price=args.min_price,
         )
+        for symbol in entry_symbols:
+            emit_top100_symbol_pipeline_event(recorder, runtime_state, "TOP100_SYMBOL_LOAD", symbol, session_date=recorder.session_date, outcome="loaded")
         if len(entry_symbols) < int(args.top_n):
             print(
                 f"{now_utc()} TOP100_RELOAD_WARNING reason=fewer_tradeable_symbols_after_ineligible_filter "
@@ -6043,13 +6097,24 @@ def reload_top100_universe_if_requested(
             if contract is None:
                 contract = Stock(symbol, "SMART", "USD")
                 try:
+                    emit_top100_symbol_pipeline_event(recorder, runtime_state, "CONTRACT_REQUESTED", symbol, session_date=recorder.session_date, outcome="requested")
                     qualified = ib.qualifyContracts(contract)
                     if not qualified:
                         failed_symbols.append(symbol)
+                        emit_top100_symbol_pipeline_event(recorder, runtime_state, "CONTRACT_RESOLVED", symbol, session_date=recorder.session_date, outcome="not_qualified")
                         print(f"{now_utc()} TOP100_RELOAD_CONTRACT_FAILED symbol={symbol} reason=not_qualified", flush=True)
                         continue
                     contract = qualified[0]
                     record_contract_metadata(recorder, contract, source="top100_reload")
+                    emit_top100_symbol_pipeline_event(
+                        recorder,
+                        runtime_state,
+                        "CONTRACT_RESOLVED",
+                        symbol,
+                        session_date=recorder.session_date,
+                        outcome="resolved",
+                        conId=getattr(contract, "conId", ""),
+                    )
                     metadata_reason = None if symbol in active_symbol_set else contract_ineligible_reason(contract)
                     if metadata_reason:
                         failed_symbols.append(symbol)
@@ -6069,12 +6134,25 @@ def reload_top100_universe_if_requested(
                         continue
                 except Exception as exc:
                     failed_symbols.append(symbol)
+                    emit_top100_symbol_pipeline_event(recorder, runtime_state, "CONTRACT_RESOLVED", symbol, session_date=recorder.session_date, outcome="error", error=repr(exc))
                     print(f"{now_utc()} TOP100_RELOAD_CONTRACT_FAILED symbol={symbol} error={exc!r}", flush=True)
                     continue
 
-            states.setdefault(symbol, SymbolState(symbol=symbol))
+            if symbol not in states:
+                states[symbol] = SymbolState(symbol=symbol)
+                emit_top100_symbol_pipeline_event(recorder, runtime_state, "STATE_CREATED", symbol, session_date=recorder.session_date, outcome="created")
+            emit_top100_symbol_pipeline_event(recorder, runtime_state, "SYMBOL_REGISTERED", symbol, session_date=recorder.session_date, outcome="registered")
             if symbol not in tickers:
                 print(f"{now_utc()} TOP100_RELOAD_REQUESTED symbol={symbol} conId={getattr(contract, 'conId', '')}", flush=True)
+                emit_top100_symbol_pipeline_event(
+                    recorder,
+                    runtime_state,
+                    "MKT_DATA_REQUESTED",
+                    symbol,
+                    session_date=recorder.session_date,
+                    outcome="requested",
+                    conId=getattr(contract, "conId", ""),
+                )
                 try:
                     tickers[symbol] = ib.reqMktData(contract, "", False, False)
                     runtime_state["reqMktData_total_count"] = int(runtime_state.get("reqMktData_total_count") or 0) + 1
@@ -6084,6 +6162,16 @@ def reload_top100_universe_if_requested(
                     print(f"{now_utc()} TOP100_RELOAD_SUBSCRIBED symbol={symbol} conId={getattr(contract, 'conId', '')}", flush=True)
                 except Exception as exc:
                     failed_symbols.append(symbol)
+                    emit_top100_symbol_pipeline_event(
+                        recorder,
+                        runtime_state,
+                        "MKT_DATA_REQUESTED",
+                        symbol,
+                        session_date=recorder.session_date,
+                        outcome="error",
+                        conId=getattr(contract, "conId", ""),
+                        error=repr(exc),
+                    )
                     error_text = repr(exc)
                     if "101" in error_text or "Max number of tickers" in error_text:
                         ibkr_error_101_count += 1
@@ -7613,7 +7701,9 @@ def main() -> int:
         "top100_entries_blocked": False,
         "top100_freshness": {},
         "top100_entry_metadata_by_symbol": dict(top100_entry_metadata_by_symbol),
+        "top100_pipeline_run_id": f"startup:{recorder.session_date}:{int(time.time())}",
         "subscription_started_monotonic_by_symbol": {},
+        "first_tick_received_symbols": set(),
         "reqMktData_total_count": 0,
         "cancelMktData_total_count": 0,
         "symbols_added_since_start": set(),
@@ -7653,6 +7743,10 @@ def main() -> int:
         refresh_reason="startup",
     )
     latest_snapshots: dict[str, dict[str, Any]] = {}
+    for symbol in symbols:
+        emit_top100_symbol_pipeline_event(recorder, runtime_state, "TOP100_SYMBOL_LOAD", symbol, session_date=recorder.session_date, outcome="loaded")
+        emit_top100_symbol_pipeline_event(recorder, runtime_state, "SYMBOL_REGISTERED", symbol, session_date=recorder.session_date, outcome="registered")
+        emit_top100_symbol_pipeline_event(recorder, runtime_state, "STATE_CREATED", symbol, session_date=recorder.session_date, outcome="created")
     last_portfolio_record = 0.0
     adopted_once = False
     normal_exit = False
@@ -7680,12 +7774,23 @@ def main() -> int:
         startup_subscribed_symbols: list[str] = []
         for symbol in symbols:
             contract = Stock(symbol, "SMART", "USD")
+            emit_top100_symbol_pipeline_event(recorder, runtime_state, "CONTRACT_REQUESTED", symbol, session_date=recorder.session_date, outcome="requested")
             qualified = ib.qualifyContracts(contract)
             if not qualified:
+                emit_top100_symbol_pipeline_event(recorder, runtime_state, "CONTRACT_RESOLVED", symbol, session_date=recorder.session_date, outcome="not_qualified")
                 print(f"{now_utc()} TOP100_STARTUP_CONTRACT_FAILED symbol={symbol} reason=not_qualified", flush=True)
                 continue
             q = qualified[0]
             record_contract_metadata(recorder, q, source="startup")
+            emit_top100_symbol_pipeline_event(
+                recorder,
+                runtime_state,
+                "CONTRACT_RESOLVED",
+                symbol,
+                session_date=recorder.session_date,
+                outcome="resolved",
+                conId=getattr(q, "conId", ""),
+            )
             metadata_reason = contract_ineligible_reason(q)
             if metadata_reason:
                 mark_runtime_symbol_ineligible(
@@ -7704,6 +7809,15 @@ def main() -> int:
                 continue
             contracts.append((symbol, q))
             contract_by_symbol[symbol] = q
+            emit_top100_symbol_pipeline_event(
+                recorder,
+                runtime_state,
+                "MKT_DATA_REQUESTED",
+                symbol,
+                session_date=recorder.session_date,
+                outcome="requested",
+                conId=getattr(q, "conId", ""),
+            )
             tickers[symbol] = ib.reqMktData(q, "", False, False)
             runtime_state["reqMktData_total_count"] = int(runtime_state.get("reqMktData_total_count") or 0) + 1
             _runtime_dict(runtime_state, "subscription_started_monotonic_by_symbol")[symbol] = time.monotonic()
@@ -8158,6 +8272,20 @@ def main() -> int:
                 symbols_with_price.append(symbol)
                 latest_snapshots[symbol] = snap
                 data_count += 1
+                first_tick_seen = _runtime_set(runtime_state, "first_tick_received_symbols")
+                if symbol not in first_tick_seen:
+                    first_tick_seen.add(symbol)
+                    emit_top100_symbol_pipeline_event(
+                        recorder,
+                        runtime_state,
+                        "FIRST_TICK_RECEIVED",
+                        symbol,
+                        session_date=timing.session_date,
+                        outcome="received",
+                        price=snap.get("price"),
+                        bid=snap.get("bid"),
+                        ask=snap.get("ask"),
+                    )
                 state = states[symbol]
                 completed_bar = update_state(
                     state,

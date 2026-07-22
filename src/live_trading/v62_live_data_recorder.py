@@ -58,13 +58,26 @@ def parse_jsonish(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def resolved_record_session_date(row: dict[str, Any] | None = None, *, fallback_session_date: str | None = None) -> str:
+def explicit_record_session_date(row: dict[str, Any] | None = None) -> str:
     row = row or {}
-    raw = parse_jsonish(row.get("raw_json"))
+    payloads = [parse_jsonish(row.get(key)) for key in ("raw_json", "features_json", "positions_json", "metadata_json", "context_json")]
     for key in ("session_date", "trading_session_date", "trade_session_date"):
-        explicit = valid_date_text(row.get(key) or raw.get(key))
+        explicit = valid_date_text(row.get(key))
         if explicit:
             return explicit
+        for payload in payloads:
+            explicit = valid_date_text(payload.get(key))
+            if explicit:
+                return explicit
+    return ""
+
+
+def resolved_record_session_date(row: dict[str, Any] | None = None, *, fallback_session_date: str | None = None) -> str:
+    row = row or {}
+    explicit = explicit_record_session_date(row)
+    if explicit:
+        return explicit
+    raw = parse_jsonish(row.get("raw_json"))
     for key in (
         "event_time",
         "timestamp",
@@ -396,6 +409,10 @@ class LiveDataRecorder:
         self.session_date = session_date or session_date_utc()
         self.session_dir = self.output_dir / self.session_date
         self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.rotation_count = 0
+        self.path_mismatch_count = 0
+        self.backward_rotation_suppressed_count = 0
+        self._backward_rotation_suppression_log_keys: set[tuple[str, str, str]] = set()
 
     def rotate_session(self, new_session_date: str, *, event_type: str = "", symbol: str = "", filename: str = "") -> None:
         old_session_date = self.session_date
@@ -405,6 +422,7 @@ class LiveDataRecorder:
         self.session_date = new_session_date
         self.session_dir = self.output_dir / self.session_date
         self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.rotation_count += 1
         target_path = self.session_dir / filename if filename else self.session_dir
         print(
             f"{utc_now_iso()} RECORDER_SESSION_ROTATED "
@@ -412,6 +430,13 @@ class LiveDataRecorder:
             f"event_type={event_type or ''} symbol={symbol or ''} target_path={target_path} old_path={old_path}",
             flush=True,
         )
+
+    def record_session_for_row(self, row: dict[str, Any] | None = None, *, session_date: str | None = None) -> str:
+        explicit_session = session_date or explicit_record_session_date(row)
+        record_session = explicit_session or resolved_record_session_date(row, fallback_session_date=self.session_date)
+        if record_session and record_session < self.session_date and not explicit_session:
+            return self.session_date
+        return record_session
 
     def path(
         self,
@@ -423,8 +448,22 @@ class LiveDataRecorder:
         symbol: str = "",
     ) -> Path:
         if row is not None or session_date:
-            record_session = session_date or resolved_record_session_date(row, fallback_session_date=self.session_date)
+            raw_record_session = resolved_record_session_date(row, fallback_session_date=self.session_date)
+            record_session = self.record_session_for_row(row, session_date=session_date)
+            if raw_record_session and raw_record_session < self.session_date and not (session_date or explicit_record_session_date(row)):
+                self.backward_rotation_suppressed_count += 1
+                log_key = (self.session_date, raw_record_session, name)
+                if log_key not in self._backward_rotation_suppression_log_keys:
+                    self._backward_rotation_suppression_log_keys.add(log_key)
+                    print(
+                        f"{utc_now_iso()} RECORDER_SESSION_BACKWARD_ROTATION_SUPPRESSED "
+                        f"current_session_date={self.session_date} parsed_session_date={raw_record_session} "
+                        f"event_type={event_type or (row or {}).get('event') or (row or {}).get('event_type') or ''} "
+                        f"symbol={symbol or (row or {}).get('symbol') or ''} target_file={name}",
+                        flush=True,
+                    )
             if record_session != self.session_date:
+                self.path_mismatch_count += 1
                 print(
                     f"{utc_now_iso()} RECORDER_SESSION_PATH_MISMATCH "
                     f"old_session_date={self.session_date} new_session_date={record_session} "
@@ -443,7 +482,7 @@ class LiveDataRecorder:
         rows = [asdict(c) if isinstance(c, LiveCandle1m) else dict(c) for c in candles]
         grouped: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
-            grouped.setdefault(resolved_record_session_date(row, fallback_session_date=self.session_date), []).append(row)
+            grouped.setdefault(self.record_session_for_row(row), []).append(row)
         total = 0
         for session, session_rows in grouped.items():
             total += append_csv_rows(
@@ -539,7 +578,7 @@ class LiveDataRecorder:
         append_csv_row(self.path("error_events.csv", row=row, event_type="error", symbol=str(row.get("symbol") or "")), row, self.error_fields)
 
     def record_run_metadata(self, metadata: dict[str, Any]) -> None:
-        metadata_session_date = resolved_record_session_date(metadata, fallback_session_date=self.session_date)
+        metadata_session_date = self.record_session_for_row(metadata)
         payload = {
             "recorded_at": metadata.get("recorded_at") or utc_now_iso(),
             "session_date": metadata_session_date,

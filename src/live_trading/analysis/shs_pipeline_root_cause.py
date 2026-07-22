@@ -78,6 +78,7 @@ CSV_COLUMNS = [
     "signal_evaluation_seen",
     "buy_decision_seen",
     "first_confirmed_divergence_stage",
+    "first_unproven_transition",
     "final_root_cause",
     "confidence",
     "missed_trade_was_real",
@@ -573,6 +574,16 @@ def run_symbol(args: argparse.Namespace, symbol: str) -> dict[str, Any]:
     replay_ready = replay.possible_signal_time is not None
     root, reason, confidence = classify_root_cause(top, evidence, replay_ready)
     present = stage_presence(evidence)
+    first_missing_stage = next((stage for stage, ok in present.items() if not ok and stage != "daily_top100_inclusion"), "")
+    first_unproven_transition = ""
+    if top and first_missing_stage:
+        prior_stage = "daily_top100_inclusion"
+        for stage in PIPELINE_STAGES[1:]:
+            if stage == first_missing_stage:
+                break
+            if present.get(stage):
+                prior_stage = stage
+        first_unproven_transition = f"{prior_stage.upper()} -> {first_missing_stage.upper()}"
     missed_real = "yes" if replay_ready else "no"
     eligible = "yes" if replay_ready else "no"
     required_fix = {
@@ -613,7 +624,8 @@ def run_symbol(args: argparse.Namespace, symbol: str) -> dict[str, Any]:
         "state_seen": int(present["candidate_state_creation"]),
         "signal_evaluation_seen": int(present["signal_evaluation"]),
         "buy_decision_seen": int(present["buy_decision"]),
-        "first_confirmed_divergence_stage": next((stage for stage, ok in present.items() if not ok and stage != "daily_top100_inclusion"), ""),
+        "first_confirmed_divergence_stage": first_missing_stage,
+        "first_unproven_transition": first_unproven_transition,
         "final_root_cause": root,
         "confidence": confidence,
         "missed_trade_was_real": missed_real,
@@ -664,6 +676,7 @@ def write_symbol_markdown(path: Path, summary: dict[str, Any], top: dict[str, An
         f"- Symbol state seen: {summary['state_seen']}",
         f"- Signal evaluation seen: {summary['signal_evaluation_seen']}",
         f"- Buy decision seen: {summary['buy_decision_seen']}",
+        f"- First unproven transition: {summary.get('first_unproven_transition', '')}",
         f"- Runtime evidence basis: {summary['runtime_evidence_basis']} from {summary['runtime_evidence_source']}",
         f"- Runtime evidence payload excerpt: {summary['runtime_evidence_payload_excerpt']}",
         f"- Contract telemetry assessment: {summary['contract_telemetry_assessment']}",

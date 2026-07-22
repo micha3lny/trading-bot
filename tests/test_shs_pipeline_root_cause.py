@@ -187,6 +187,7 @@ class SHSPipelineRootCauseTests(unittest.TestCase):
                 row = run_symbol(args, "NUAI")
             self.assertEqual(row["symbol"], "NUAI")
             self.assertEqual(row["final_root_cause"], "INSUFFICIENT_SYMBOL_SPECIFIC_RUNTIME_TELEMETRY")
+            self.assertEqual(row["first_unproven_transition"], "DAILY_TOP100_INCLUSION -> RUNTIME_TOP100_WATCHLIST_LOADING")
             self.assertEqual(row["contract_telemetry_assessment"], "INSUFFICIENT_TELEMETRY")
             self.assertTrue((root / "analysis" / "shs_root_cause_NUAI_2026-07-20.md").exists())
 

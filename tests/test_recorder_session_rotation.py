@@ -138,6 +138,46 @@ class RecorderSessionRotationTests(unittest.TestCase):
             self.assertEqual(mismatches[0]["symbol"], "ADVB")
             self.assertIn("None", mismatches[0]["payload_excerpt"])
 
+    def test_next_session_rotates_once_and_never_returns_to_stale_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(tmp, session_date="2026-07-21")
+            recorder.record_signal(SignalSnapshot(symbol="AAA", signal_name="x", action="BUY", recorded_at="2026-07-21T13:45:00+00:00"))
+
+            first_next = {
+                "recorded_at": "2026-07-22T13:31:00+00:00",
+                "event": "TOP100_SYMBOL_LOAD",
+                "symbol": "NUAI",
+                "session_date": "2026-07-22",
+                "raw_json": json.dumps({"session_date": "2026-07-22", "top100_source_date": "2026-07-21"}),
+            }
+            append_csv_row(
+                recorder.path("trade_lifecycle.csv", row=first_next, event_type="TOP100_SYMBOL_LOAD", symbol="NUAI"),
+                first_next,
+                list(first_next.keys()),
+            )
+
+            for idx in range(100):
+                minute = idx % 60
+                recorded_at = f"2026-07-22T00:{minute:02d}:30+00:00"
+                raw = {"session_date": "2026-07-22", "top100_source_date": "2026-07-21"}
+                recorder.record_signal(SignalSnapshot(symbol="NUAI", signal_name="x", action="BUY", recorded_at=recorded_at, features_json=raw))
+                recorder.record_selection(SelectionEvent(symbol="NUAI", stage="scan", decision="accepted", recorded_at=recorded_at, features_json=raw))
+                recorder.record_order_intent(OrderIntent(symbol="NUAI", action="BUY", recorded_at=recorded_at, features_json=json.dumps(raw)))
+                recorder.record_fill(FillEvent(execution_id=f"e{idx}", symbol="NUAI", action="BUY", recorded_at=recorded_at, raw_json=raw))
+                recorder.record_portfolio(PortfolioSnapshot(recorded_at=recorded_at, positions_json=raw))
+                recorder.record_run_metadata({"recorded_at": recorded_at, "session_date": "2026-07-22", "top100_source_date": "2026-07-21"})
+                recorder.record_candles_1m([
+                    LiveCandle1m(symbol="NUAI", bar_time=recorded_at, close=10.0, volume=100),
+                ])
+
+            self.assertEqual(recorder.session_date, "2026-07-22")
+            self.assertEqual(recorder.rotation_count, 1)
+            self.assertEqual(recorder.path_mismatch_count, 1)
+            self.assertEqual([r["symbol"] for r in read_csv(Path(tmp) / "2026-07-21" / "signal_snapshots.csv")], ["AAA"])
+            self.assertTrue((Path(tmp) / "2026-07-22" / "signal_snapshots.csv").exists())
+            self.assertTrue((Path(tmp) / "2026-07-22" / "fills.csv").exists())
+            self.assertFalse((Path(tmp) / "2026-07-21" / "fills.csv").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
