@@ -37,9 +37,21 @@ class SHSPipelineRootCauseTests(unittest.TestCase):
         self.assertEqual(confidence, "medium")
         self.assertIn("no symbol-specific", reason)
 
-    def test_contract_request_missing_after_runtime_watchlist(self) -> None:
-        root, _, _ = classify_root_cause({"symbol": "NUAI"}, [item("TOP100_RELOAD", "TOP100_RELOAD_SUBSCRIBED symbol=NUAI")], True)
-        self.assertEqual(root, "CONTRACT_REQUEST_MISSING")
+    def test_watchlist_only_is_insufficient_telemetry_not_contract_missing(self) -> None:
+        root, reason, confidence = classify_root_cause({"symbol": "NUAI"}, [item("TOP100_RELOAD", "TOP100_RELOAD_START symbol=NUAI")], True)
+        self.assertEqual(root, "INSUFFICIENT_TELEMETRY")
+        self.assertEqual(confidence, "low")
+        self.assertIn("not comprehensive", reason)
+
+    def test_positive_contract_absence_is_contract_request_not_sent(self) -> None:
+        root, _, confidence = classify_root_cause({"symbol": "NUAI"}, [item("PRE_SIGNAL_RUNTIME_SNAPSHOT", "symbol=NUAI contract_present=0 ticker_present=0 state_present=0")], True)
+        self.assertEqual(root, "CONTRACT_REQUEST_NOT_SENT")
+        self.assertEqual(confidence, "high")
+
+    def test_downstream_subscription_without_contract_record_is_not_missing_proof(self) -> None:
+        root, _, confidence = classify_root_cause({"symbol": "NUAI"}, [item("TOP100_RELOAD_SUBSCRIBED", "symbol=NUAI subscribed reqMktData")], True)
+        self.assertEqual(root, "CONTRACT_REQUEST_SENT_BUT_NOT_RECORDED")
+        self.assertEqual(confidence, "low")
 
     def test_no_ticker_after_subscription(self) -> None:
         evidence = [
@@ -114,6 +126,7 @@ class SHSPipelineRootCauseTests(unittest.TestCase):
                 row = run_symbol(args, "NUAI")
             self.assertEqual(row["symbol"], "NUAI")
             self.assertEqual(row["final_root_cause"], "DATA_RETENTION_PREVENTS_ROOT_CAUSE")
+            self.assertEqual(row["contract_telemetry_assessment"], "INSUFFICIENT_TELEMETRY")
             self.assertTrue((root / "analysis" / "shs_root_cause_NUAI_2026-07-20.md").exists())
 
 

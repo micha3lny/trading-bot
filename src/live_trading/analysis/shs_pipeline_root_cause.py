@@ -47,6 +47,13 @@ FINAL_CLASSIFICATIONS = {
     "RECORDER_EVIDENCE_MISSING",
     "ACTUAL_RUNTIME_PROCESSING_BUG",
     "DATA_RETENTION_PREVENTS_ROOT_CAUSE",
+    "CONTRACT_REQUEST_NOT_SENT",
+    "CONTRACT_REQUEST_SENT_BUT_NOT_RECORDED",
+    "CONTRACT_RESOLVED_FROM_CACHE",
+    "CONTRACT_REQUEST_FAILED",
+    "SUBSCRIPTION_REQUEST_NOT_SENT",
+    "SUBSCRIPTION_REQUEST_SENT_BUT_NOT_RECORDED",
+    "INSUFFICIENT_TELEMETRY",
 }
 
 CSV_COLUMNS = [
@@ -71,6 +78,12 @@ CSV_COLUMNS = [
     "missed_trade_was_real",
     "live_would_have_been_eligible_at_offline_signal_time",
     "exact_reason_missed",
+    "runtime_evidence_basis",
+    "runtime_evidence_source",
+    "runtime_evidence_payload_excerpt",
+    "contract_telemetry_assessment",
+    "subscription_telemetry_assessment",
+    "could_contract_have_been_cached",
     "required_fix",
     "regression_test_needed",
     "another_symbol_occupied_subscription_slot",
@@ -383,24 +396,86 @@ def stage_presence(evidence: list[EvidenceItem]) -> dict[str, bool]:
     return stages
 
 
+def _text(item: EvidenceItem) -> str:
+    return f"{item.event_type} {item.source} {item.payload}".upper()
+
+
+def runtime_reach_evidence(evidence: list[EvidenceItem]) -> EvidenceItem | None:
+    for stage in PIPELINE_STAGES[1:]:
+        for item in evidence:
+            if stage in _stage_flags_for_item(item):
+                return item
+    return evidence[0] if evidence else None
+
+
+def _positive_contract_absence(evidence: list[EvidenceItem]) -> bool:
+    tokens = ["CONTRACT_PRESENT=0", "CONTRACT_PRESENT\": 0", "CONTRACT_PRESENT\": FALSE", "NO_CONTRACT", "CONTRACT_MISSING", "MISSING_CONTRACT", "CONTRACT_REQUEST_NOT_SENT"]
+    return any(any(token in _text(item) for token in tokens) for item in evidence)
+
+
+def _positive_subscription_absence(evidence: list[EvidenceItem]) -> bool:
+    tokens = ["TICKER_PRESENT=0", "TICKER_PRESENT\": 0", "SUBSCRIPTION_PRESENT=0", "SUBSCRIPTION_PRESENT\": 0", "MISSING_SUBSCRIPTION", "NO_SUBSCRIPTION", "SUBSCRIPTION_REQUEST_NOT_SENT"]
+    return any(any(token in _text(item) for token in tokens) for item in evidence)
+
+
+def contract_telemetry_assessment(evidence: list[EvidenceItem]) -> str:
+    stages = stage_presence(evidence)
+    if any(any(token in _text(item) for token in ["CONTRACT_FAILED", "NOT_QUALIFIED", "NO SECURITY DEFINITION"]) for item in evidence):
+        return "CONTRACT_REQUEST_FAILED"
+    if stages["contract_resolution"]:
+        if any(any(token in _text(item) for token in ["CACHE", "CONTRACT_CACHE", "CONTRACT_PRESENT=1", "CONTRACT_PRESENT\": 1", "CONID"]) for item in evidence):
+            return "CONTRACT_RESOLVED_FROM_CACHE" if not stages["contract_qualification_request"] else "CONTRACT_REQUEST_RECORDED"
+        return "CONTRACT_REQUEST_RECORDED"
+    if stages["contract_qualification_request"]:
+        return "CONTRACT_REQUEST_RECORDED"
+    if _positive_contract_absence(evidence):
+        return "CONTRACT_REQUEST_NOT_SENT"
+    if stages["market_data_subscription_request"] or stages["first_ticker_price_update"] or stages["candidate_state_creation"]:
+        return "CONTRACT_REQUEST_SENT_BUT_NOT_RECORDED"
+    return "INSUFFICIENT_TELEMETRY"
+
+
+def subscription_telemetry_assessment(evidence: list[EvidenceItem]) -> str:
+    stages = stage_presence(evidence)
+    if any(any(token in _text(item) for token in ["SUBSCRIBE_ERROR", "DELAYED", "PERMISSION", "NO MARKET DATA"]) for item in evidence):
+        return "MARKET_DATA_SUBSCRIPTION_FAILED"
+    if stages["market_data_subscription_request"]:
+        return "SUBSCRIPTION_REQUEST_RECORDED"
+    if _positive_subscription_absence(evidence):
+        return "SUBSCRIPTION_REQUEST_NOT_SENT"
+    if stages["first_ticker_price_update"] or stages["candidate_state_creation"]:
+        return "SUBSCRIPTION_REQUEST_SENT_BUT_NOT_RECORDED"
+    return "INSUFFICIENT_TELEMETRY"
+
+
 def classify_root_cause(top_row: dict[str, Any], evidence: list[EvidenceItem], replay_ready: bool) -> tuple[str, str, str]:
     stages = stage_presence(evidence)
+    contract_assessment = contract_telemetry_assessment(evidence)
+    subscription_assessment = subscription_telemetry_assessment(evidence)
     if not top_row:
         return "TOP100_NOT_LOADED_RUNTIME", "daily Top100 row missing", "high"
     if not evidence:
         return "DATA_RETENTION_PREVENTS_ROOT_CAUSE", "no symbol-specific runtime/recorder/SQLite/journal evidence retained for this session", "medium"
     if not stages["runtime_top100_watchlist_loading"] and not stages["symbol_registration"]:
         return "WATCHLIST_REGISTRATION_MISSING", "Top100 file contains symbol but runtime watchlist/state evidence is missing", "medium"
-    if not stages["contract_qualification_request"] and not stages["contract_resolution"]:
-        return "CONTRACT_REQUEST_MISSING", "symbol reached runtime evidence but no contract qualification/resolution evidence found", "medium"
     contract_failed = any("FAILED" in item.event_type or "NOT_QUALIFIED" in item.payload.upper() for item in evidence if "CONTRACT" in item.payload.upper() or "CONTRACT" in item.event_type)
     if contract_failed:
-        return "CONTRACT_QUALIFICATION_FAILED", "contract qualification failure evidence found", "high"
-    if not stages["market_data_subscription_request"]:
-        return "MARKET_DATA_SUBSCRIPTION_MISSING", "contract evidence exists but no market-data subscription/request evidence found", "medium"
+        return "CONTRACT_REQUEST_FAILED", "contract qualification failure evidence found", "high"
+    if contract_assessment == "CONTRACT_REQUEST_NOT_SENT":
+        return "CONTRACT_REQUEST_NOT_SENT", "positive telemetry says no contract was present/requested for this symbol", "high"
+    if contract_assessment == "CONTRACT_REQUEST_SENT_BUT_NOT_RECORDED":
+        return "CONTRACT_REQUEST_SENT_BUT_NOT_RECORDED", "downstream runtime evidence exists without a recorded contract request, consistent with cache or missing contract telemetry", "low"
+    if contract_assessment == "INSUFFICIENT_TELEMETRY":
+        return "INSUFFICIENT_TELEMETRY", "symbol reached runtime evidence, but contract request/cache telemetry is not comprehensive enough to prove whether a request was sent", "low"
+    if subscription_assessment == "SUBSCRIPTION_REQUEST_NOT_SENT":
+        return "SUBSCRIPTION_REQUEST_NOT_SENT", "positive telemetry says ticker/subscription was absent for this symbol", "high"
     sub_failed = any(any(token in item.payload.upper() for token in ["SUBSCRIBE_ERROR", "DELAYED", "PERMISSION", "NO MARKET DATA"]) for item in evidence)
     if sub_failed:
         return "MARKET_DATA_SUBSCRIPTION_FAILED", "subscription or market-data error evidence found", "high"
+    if not stages["market_data_subscription_request"]:
+        if subscription_assessment == "SUBSCRIPTION_REQUEST_SENT_BUT_NOT_RECORDED":
+            return "SUBSCRIPTION_REQUEST_SENT_BUT_NOT_RECORDED", "ticker/state evidence exists without a recorded reqMktData call", "low"
+        return "INSUFFICIENT_TELEMETRY", "contract evidence exists, but market-data request telemetry is not comprehensive enough to prove whether reqMktData was sent", "low"
     if not stages["first_ticker_price_update"]:
         return "NO_TICKER_RECEIVED", "subscription evidence exists but no ticker/price/candle evidence found", "medium"
     if not stages["candidate_state_creation"]:
@@ -464,7 +539,17 @@ def run_symbol(args: argparse.Namespace, symbol: str) -> dict[str, Any]:
         "NO_TICKER_RECEIVED": "add subscription/ticker watchdog and retry or mark symbol blocked with reason",
         "SYMBOL_STATE_NOT_CREATED": "assert SymbolState creation after first usable ticker",
         "ACTUAL_RUNTIME_PROCESSING_BUG": "instrument/evaluate pre-signal state for symbol at replay signal time",
+        "CONTRACT_REQUEST_NOT_SENT": "add an invariant test that every runtime Top100 symbol has contract_present=1 or a recorded contract failure before market-data subscription",
+        "CONTRACT_REQUEST_SENT_BUT_NOT_RECORDED": "record contract cache hits and qualifyContracts calls/results for every Top100 symbol",
+        "CONTRACT_RESOLVED_FROM_CACHE": "record cache-hit source and conId in symbol-specific contract telemetry",
+        "CONTRACT_REQUEST_FAILED": "record contract failure reason and keep symbol-specific failure evidence in recorder/SQLite",
+        "SUBSCRIPTION_REQUEST_NOT_SENT": "add an invariant test that every resolved contract produces reqMktData or a symbol-specific skip reason",
+        "SUBSCRIPTION_REQUEST_SENT_BUT_NOT_RECORDED": "record reqMktData calls and active ticker map reconciliation per symbol",
+        "INSUFFICIENT_TELEMETRY": "add comprehensive symbol-specific Top100 watchlist, contract cache/request/result, reqMktData, ticker-map, and SymbolState telemetry",
     }.get(root, "investigate with retained symbol-specific runtime evidence")
+    basis = runtime_reach_evidence(evidence)
+    contract_assessment = contract_telemetry_assessment(evidence)
+    subscription_assessment = subscription_telemetry_assessment(evidence)
     summary = {
         "date": args.date,
         "symbol": symbol,
@@ -487,8 +572,14 @@ def run_symbol(args: argparse.Namespace, symbol: str) -> dict[str, Any]:
         "missed_trade_was_real": missed_real,
         "live_would_have_been_eligible_at_offline_signal_time": eligible,
         "exact_reason_missed": reason,
+        "runtime_evidence_basis": basis.event_type if basis else "",
+        "runtime_evidence_source": basis.source if basis else "",
+        "runtime_evidence_payload_excerpt": basis.payload[:300] if basis else "",
+        "contract_telemetry_assessment": contract_assessment,
+        "subscription_telemetry_assessment": subscription_assessment,
+        "could_contract_have_been_cached": int(contract_assessment in {"CONTRACT_REQUEST_SENT_BUT_NOT_RECORDED", "CONTRACT_RESOLVED_FROM_CACHE"}),
         "required_fix": required_fix,
-        "regression_test_needed": int(root in {"WATCHLIST_REGISTRATION_MISSING", "CONTRACT_REQUEST_MISSING", "MARKET_DATA_SUBSCRIPTION_MISSING", "NO_TICKER_RECEIVED", "SYMBOL_STATE_NOT_CREATED", "ACTUAL_RUNTIME_PROCESSING_BUG"}),
+        "regression_test_needed": int(root in {"WATCHLIST_REGISTRATION_MISSING", "CONTRACT_REQUEST_NOT_SENT", "CONTRACT_REQUEST_SENT_BUT_NOT_RECORDED", "CONTRACT_REQUEST_FAILED", "SUBSCRIPTION_REQUEST_NOT_SENT", "SUBSCRIPTION_REQUEST_SENT_BUT_NOT_RECORDED", "MARKET_DATA_SUBSCRIPTION_FAILED", "NO_TICKER_RECEIVED", "SYMBOL_STATE_NOT_CREATED", "ACTUAL_RUNTIME_PROCESSING_BUG", "INSUFFICIENT_TELEMETRY"}),
         "another_symbol_occupied_subscription_slot": "unknown" if not evidence else "not_observed",
         "reconnect_or_rollover_evidence": int(_has_any(evidence, ["RECONNECT", "RECORDER_SESSION_ROTATED", "SESSION_BOUNDARY", "ROLLOVER"])),
         "could_recur": "yes" if root in {"WATCHLIST_REGISTRATION_MISSING", "CONTRACT_REQUEST_MISSING", "MARKET_DATA_SUBSCRIPTION_MISSING", "NO_TICKER_RECEIVED", "SYMBOL_STATE_NOT_CREATED", "DATA_RETENTION_PREVENTS_ROOT_CAUSE", "ACTUAL_RUNTIME_PROCESSING_BUG"} else "uncertain",
@@ -526,6 +617,11 @@ def write_symbol_markdown(path: Path, summary: dict[str, Any], top: dict[str, An
         f"- Symbol state seen: {summary['state_seen']}",
         f"- Signal evaluation seen: {summary['signal_evaluation_seen']}",
         f"- Buy decision seen: {summary['buy_decision_seen']}",
+        f"- Runtime evidence basis: {summary['runtime_evidence_basis']} from {summary['runtime_evidence_source']}",
+        f"- Runtime evidence payload excerpt: {summary['runtime_evidence_payload_excerpt']}",
+        f"- Contract telemetry assessment: {summary['contract_telemetry_assessment']}",
+        f"- Subscription telemetry assessment: {summary['subscription_telemetry_assessment']}",
+        f"- Could a cached contract have been used without a new qualification request: {summary['could_contract_have_been_cached']}",
         f"- Missed trade was real: {summary['missed_trade_was_real']}",
         f"- Live would have been eligible at offline signal time: {summary['live_would_have_been_eligible_at_offline_signal_time']}",
         f"- Another symbol occupied intended subscription slot: {summary['another_symbol_occupied_subscription_slot']}",
