@@ -17,6 +17,14 @@ RTH_OPEN_UTC = time(13, 30)
 EOD_FLATTEN_UTC = time(19, 45)
 NY_TZ = ZoneInfo("America/New_York")
 
+LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT = 4.0
+LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT = 6.5
+LIVE_SIGNAL_MIN_OR_RANGE_PCT = 0.5
+LIVE_SIGNAL_MIN_PRICE = 5.0
+LIVE_SIGNAL_MAX_SPREAD_BPS = 50.0
+LIVE_SIGNAL_OPENING_RANGE_SECONDS = 15 * 60
+
+
 
 def parse_dt(value: Any) -> pd.Timestamp | None:
     if value in (None, ""):
@@ -240,7 +248,216 @@ def calculate_runner_stats(candles: pd.DataFrame) -> RunnerStats | None:
         open_to_high_pct=pct(high_price, open_price) or 0.0,
         first_5m_high_pct=pct(fnum(first5["high"].max()) if not first5.empty else None, open_price),
         first_15m_high_pct=pct(or_high, open_price),
-        or_range_pct=((or_high - or_low) / open_price * 100.0) if or_high is not None and or_low is not None else None,
+        or_range_pct=((or_high / or_low - 1.0) * 100.0) if or_high is not None and or_low is not None and or_low > 0 else None,
+    )
+
+
+@dataclass(frozen=True)
+class LiveSignalReplayResult:
+    possible_signal_time: pd.Timestamp | None
+    reason: str
+    open_price: float | None
+    current_price: float | None
+    candle_timestamp: pd.Timestamp | None
+    first_5m_high: float | None
+    first_5m_high_pct: float | None
+    first_15m_high: float | None
+    first_15m_high_pct: float | None
+    or_high: float | None
+    or_low: float | None
+    or_range_pct: float | None
+    opening_range_break_time: pd.Timestamp | None
+    did_break_or_high: int
+    had_required_first5: int
+    had_required_first15: int
+    had_required_or_range: int
+    price_pass: int
+    spread_pass: int
+    score: float | None
+    earliest_legal_signal_time: pd.Timestamp | None
+    signal_price_source: str
+    bar_timestamp_semantics: str
+    breakout_gate_used: int
+
+
+def _coerce_candle_rows(candles: pd.DataFrame) -> pd.DataFrame:
+    if candles.empty or "timestamp" not in candles.columns:
+        return pd.DataFrame()
+    rows = candles.copy()
+    rows["timestamp"] = pd.to_datetime(rows["timestamp"], errors="coerce", utc=True)
+    rows = rows.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    for col in ["open", "high", "low", "close", "volume", "spread_bps"]:
+        if col in rows.columns:
+            rows[col] = pd.to_numeric(rows[col], errors="coerce")
+    return rows
+
+
+def _bar_available_at(rows: pd.DataFrame, semantics: str) -> pd.Series:
+    if semantics == "bar_end":
+        return rows["timestamp"]
+    return rows["timestamp"] + pd.Timedelta(minutes=1)
+
+
+def live_signal_replay(
+    candles: pd.DataFrame,
+    *,
+    min_first_5m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT,
+    min_first_15m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT,
+    min_or_range_pct: float = LIVE_SIGNAL_MIN_OR_RANGE_PCT,
+    min_price: float = LIVE_SIGNAL_MIN_PRICE,
+    max_spread_bps: float = LIVE_SIGNAL_MAX_SPREAD_BPS,
+    opening_range_seconds: int = LIVE_SIGNAL_OPENING_RANGE_SECONDS,
+    bar_timestamp_semantics: str = "bar_start",
+) -> LiveSignalReplayResult:
+    """Replay the live v67 pre-signal gates using only completed 1m bars.
+
+    Live runtime updates first5/first15/opening-range features from tick prices and
+    checks the latest usable tick price. Offline 1m replay therefore uses completed
+    candle highs/lows only after the bar is available and uses candle close as the
+    live-equivalent current price. Candle high is diagnostic only; it is not an
+    extra breakout gate in v67.
+    """
+    rows = _coerce_candle_rows(candles)
+    if rows.empty:
+        return LiveSignalReplayResult(
+            None,
+            "missing_candles",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            None,
+            None,
+            "close",
+            bar_timestamp_semantics,
+            0,
+        )
+    semantics = "bar_end" if bar_timestamp_semantics == "bar_end" else "bar_start"
+    rows = rows.copy()
+    rows["available_at"] = _bar_available_at(rows, semantics)
+    start = rows.iloc[0]["timestamp"]
+    open_price = fnum(rows.iloc[0].get("open"))
+    if open_price is None or open_price <= 0:
+        return LiveSignalReplayResult(None, "invalid_open_price", None, None, None, None, None, None, None, None, None, None, None, 0, 0, 0, 0, 0, 1, None, None, "close", semantics, 0)
+
+    first5_end = start + pd.Timedelta(minutes=5)
+    first15_end = start + pd.Timedelta(minutes=15)
+    or_end = start + pd.Timedelta(seconds=opening_range_seconds)
+    earliest = max(first5_end, first15_end, or_end)
+
+    first5 = rows[(rows["timestamp"] >= start) & (rows["timestamp"] < first5_end)]
+    first15 = rows[(rows["timestamp"] >= start) & (rows["timestamp"] < first15_end)]
+    or_rows = rows[(rows["timestamp"] >= start) & (rows["timestamp"] < or_end)]
+    first5_high = fnum(first5["high"].max()) if not first5.empty and "high" in first5 else None
+    first15_high = fnum(first15["high"].max()) if not first15.empty and "high" in first15 else None
+    or_high = fnum(or_rows["high"].max()) if not or_rows.empty and "high" in or_rows else None
+    or_low = fnum(or_rows["low"].min()) if not or_rows.empty and "low" in or_rows else None
+    first5_pct = pct(first5_high, open_price)
+    first15_pct = pct(first15_high, open_price)
+    or_range_pct = (or_high / or_low - 1.0) * 100.0 if or_high is not None and or_low is not None and or_low > 0 else None
+
+    after_or = rows[rows["available_at"] >= earliest]
+    break_time = None
+    if or_high is not None and "high" in rows:
+        broke = after_or[pd.to_numeric(after_or["high"], errors="coerce") >= or_high]
+        if not broke.empty:
+            break_time = broke.iloc[0]["available_at"]
+
+    had_first5 = int(first5_pct is not None and first5_pct >= min_first_5m_high_pct)
+    had_first15 = int(first15_pct is not None and first15_pct >= min_first_15m_high_pct)
+    had_or = int(or_range_pct is not None and or_range_pct >= min_or_range_pct)
+    base_score = 0.0
+    for value, weight in [(first5_pct, 2.0), (first15_pct, 2.0), (or_range_pct, 1.0)]:
+        if value is not None:
+            base_score += float(value) * weight
+
+    last_reason = "no_completed_bar_after_required_windows"
+    for _, row in rows.iterrows():
+        eval_time = row["available_at"]
+        if eval_time < earliest:
+            continue
+        current_price = fnum(row.get("close"), fnum(row.get("open")))
+        spread = fnum(row.get("spread_bps")) if "spread_bps" in rows.columns else None
+        price_pass = int(current_price is not None and current_price >= min_price)
+        spread_pass = int(spread is None or spread <= max_spread_bps)
+        score = base_score
+        if spread is not None and max_spread_bps > 0:
+            score += max(0.0, max_spread_bps - spread) / max_spread_bps * 5.0
+        if not had_first5:
+            last_reason = "failed_first5"
+        elif not had_first15:
+            last_reason = "failed_first15"
+        elif not had_or:
+            last_reason = "failed_or_range"
+        elif not price_pass:
+            last_reason = "price_too_low"
+        elif not spread_pass:
+            last_reason = "spread_too_wide"
+        else:
+            return LiveSignalReplayResult(
+                eval_time,
+                "should_have_signaled",
+                open_price,
+                current_price,
+                row["timestamp"],
+                first5_high,
+                first5_pct,
+                first15_high,
+                first15_pct,
+                or_high,
+                or_low,
+                or_range_pct,
+                break_time,
+                int(break_time is not None),
+                had_first5,
+                had_first15,
+                had_or,
+                price_pass,
+                spread_pass,
+                round(score, 4),
+                earliest,
+                "close",
+                semantics,
+                0,
+            )
+    return LiveSignalReplayResult(
+        None,
+        last_reason,
+        open_price,
+        None,
+        None,
+        first5_high,
+        first5_pct,
+        first15_high,
+        first15_pct,
+        or_high,
+        or_low,
+        or_range_pct,
+        break_time,
+        int(break_time is not None),
+        had_first5,
+        had_first15,
+        had_or,
+        0,
+        1,
+        round(base_score, 4),
+        earliest,
+        "close",
+        semantics,
+        0,
     )
 
 

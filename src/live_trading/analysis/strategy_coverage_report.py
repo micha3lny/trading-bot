@@ -12,6 +12,9 @@ from typing import Iterable
 import pandas as pd
 
 from src.live_trading.analysis.common import (
+    LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT,
+    LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT,
+    LIVE_SIGNAL_MIN_OR_RANGE_PCT,
     calculate_runner_stats,
     load_top100,
     load_universe_symbols,
@@ -30,9 +33,9 @@ from src.live_trading.ranking.daily_top100_builder import normalize_history_df
 
 DEFAULT_OUTPUT_DIR = Path("data/analysis")
 DEFAULT_THRESHOLDS = (5.0, 10.0, 15.0, 20.0)
-DEFAULT_MIN_FIRST_5M_HIGH_PCT = 0.5
-DEFAULT_MIN_FIRST_15M_HIGH_PCT = 1.0
-DEFAULT_MIN_OR_RANGE_PCT = 0.5
+DEFAULT_MIN_FIRST_5M_HIGH_PCT = LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT
+DEFAULT_MIN_FIRST_15M_HIGH_PCT = LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT
+DEFAULT_MIN_OR_RANGE_PCT = LIVE_SIGNAL_MIN_OR_RANGE_PCT
 NEEDED_PARQUET_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 METRIC_DEFINITIONS = {
     "coverage_pct": "Top100 runner count divided by universe runner count for the threshold. This measures ranking quality.",

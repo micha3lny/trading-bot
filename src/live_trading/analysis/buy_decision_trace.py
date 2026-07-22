@@ -9,6 +9,9 @@ from typing import Any
 import pandas as pd
 
 from src.live_trading.analysis.common import (
+    LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT,
+    LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT,
+    LIVE_SIGNAL_MIN_OR_RANGE_PCT,
     calculate_runner_stats,
     fnum,
     iso_ts,
@@ -273,7 +276,8 @@ def offline_signal_details(
         "first15_pass": first15,
         "or_pass": or_pass,
         "breakout_pass": breakout,
-        "offline_signal_ready": bool(top) and first5 and first15 and or_pass and breakout,
+        "breakout_gate_used": bool(diag.get("breakout_gate_used")),
+        "offline_signal_ready": bool(top) and first5 and first15 and or_pass and bool(diag.get("possible_signal_time")),
     }
 
 
@@ -341,9 +345,9 @@ def trace_buy_decision(
     history_dir: Path,
     recorder_dir: Path,
     top100_path: Path,
-    min_first_5m_high_pct: float = 0.5,
-    min_first_15m_high_pct: float = 1.0,
-    min_or_range_pct: float = 0.5,
+    min_first_5m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT,
+    min_first_15m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT,
+    min_or_range_pct: float = LIVE_SIGNAL_MIN_OR_RANGE_PCT,
 ) -> tuple[str, dict[str, Any]]:
     symbol = normalize_symbol(symbol)
     offline = offline_signal_details(
@@ -566,9 +570,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--summary-output", type=Path, default=None)
     parser.add_argument("--no-summary-all", action="store_true", help="Only trace requested symbol(s), without building all post-unblock no-signal summary.")
-    parser.add_argument("--min-first-5m-high-pct", type=float, default=0.5)
-    parser.add_argument("--min-first-15m-high-pct", type=float, default=1.0)
-    parser.add_argument("--min-or-range-pct", type=float, default=0.5)
+    parser.add_argument("--min-first-5m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT)
+    parser.add_argument("--min-first-15m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT)
+    parser.add_argument("--min-or-range-pct", type=float, default=LIVE_SIGNAL_MIN_OR_RANGE_PCT)
     return parser
 
 

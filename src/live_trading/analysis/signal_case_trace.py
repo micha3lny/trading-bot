@@ -8,6 +8,9 @@ from typing import Any
 import pandas as pd
 
 from src.live_trading.analysis.common import (
+    LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT,
+    LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT,
+    LIVE_SIGNAL_MIN_OR_RANGE_PCT,
     calculate_runner_stats,
     fnum,
     iso_ts,
@@ -164,9 +167,9 @@ def trace_signal_case(
     recorder_dir: Path,
     top100_path: Path,
     universe_path: Path = DEFAULT_UNIVERSE,
-    min_first_5m_high_pct: float = 0.5,
-    min_first_15m_high_pct: float = 1.0,
-    min_or_range_pct: float = 0.5,
+    min_first_5m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT,
+    min_first_15m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT,
+    min_or_range_pct: float = LIVE_SIGNAL_MIN_OR_RANGE_PCT,
 ) -> str:
     symbol = normalize_symbol(symbol)
     top100 = load_top100(top100_path)
@@ -192,7 +195,8 @@ def trace_signal_case(
     first15_ok = bool(diag.get("had_required_first15"))
     or_ok = bool(diag.get("had_required_or_range"))
     breakout_ok = bool(diag.get("did_break_or_high"))
-    offline_ready = top100_ok and first5_ok and first15_ok and or_ok and breakout_ok
+    breakout_gate_used = bool(diag.get("breakout_gate_used"))
+    offline_ready = top100_ok and first5_ok and first15_ok and or_ok and bool(diag.get("possible_signal_time"))
     decision = decision_classification(offline_ready, timeline, counts)
     block_reason = first_matching_reason(timeline, ["BUY_BLOCKED", "RISK_GUARD", "MAX_POSITION", "RESTART_BLOCK", "TOP100_BLOCK", "COOLDOWN", "STALE", "NO_MARKET_DATA", "INELIGIBLE"])
 
@@ -229,7 +233,8 @@ def trace_signal_case(
     lines.append(f"- first5 >= {min_first_5m_high_pct}% {pass_fail(first5_ok)}")
     lines.append(f"- first15 >= {min_first_15m_high_pct}% {pass_fail(first15_ok)}")
     lines.append(f"- OR range >= {min_or_range_pct}% {pass_fail(or_ok)}")
-    lines.append(f"- breakout {pass_fail(breakout_ok)}")
+    lines.append(f"- breakout diagnostic {pass_fail(breakout_ok)} gate_used={int(breakout_gate_used)}")
+    lines.append(f"- signal_price_source={diag.get('signal_price_source')} earliest_legal_signal_time={diag.get('earliest_legal_signal_time')}")
     lines.append(f"- final offline_signal_ready={'YES' if offline_ready else 'NO'}")
     lines.append("")
     lines.append("4. Runtime Evidence")
@@ -268,9 +273,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top100", type=Path, default=None)
     parser.add_argument("--universe", type=Path, default=DEFAULT_UNIVERSE)
     parser.add_argument("--output", type=Path, default=None)
-    parser.add_argument("--min-first-5m-high-pct", type=float, default=0.5)
-    parser.add_argument("--min-first-15m-high-pct", type=float, default=1.0)
-    parser.add_argument("--min-or-range-pct", type=float, default=0.5)
+    parser.add_argument("--min-first-5m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT)
+    parser.add_argument("--min-first-15m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT)
+    parser.add_argument("--min-or-range-pct", type=float, default=LIVE_SIGNAL_MIN_OR_RANGE_PCT)
     return parser
 
 

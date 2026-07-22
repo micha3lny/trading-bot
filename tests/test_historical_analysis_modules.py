@@ -33,6 +33,7 @@ from src.live_trading.analysis.common import (
     calculate_path_stats,
     calculate_runner_stats,
     entry_time_bucket,
+    live_signal_replay,
     load_recorder_candles,
     min_after_pct,
     simulate_tp_sl,
@@ -677,23 +678,64 @@ class HistoricalAnalysisModuleTests(unittest.TestCase):
 
     def test_missed_runner_no_signal_classification_should_have_signaled(self) -> None:
         candles = pd.DataFrame([
-            {"timestamp": pd.Timestamp("2026-06-26T13:30:00Z"), "open": 10.0, "high": 10.2, "low": 9.9, "close": 10.1, "volume": 100},
-            {"timestamp": pd.Timestamp("2026-06-26T13:34:00Z"), "open": 10.1, "high": 10.7, "low": 10.0, "close": 10.6, "volume": 100},
-            {"timestamp": pd.Timestamp("2026-06-26T13:44:00Z"), "open": 10.6, "high": 11.2, "low": 10.5, "close": 11.0, "volume": 100},
-            {"timestamp": pd.Timestamp("2026-06-26T13:46:00Z"), "open": 11.0, "high": 11.5, "low": 10.9, "close": 11.4, "volume": 100},
+            {"timestamp": pd.Timestamp("2026-06-26T13:30:00Z"), "open": 10.0, "high": 10.7, "low": 9.9, "close": 10.5, "volume": 100},
+            {"timestamp": pd.Timestamp("2026-06-26T13:34:00Z"), "open": 10.5, "high": 10.8, "low": 10.0, "close": 10.7, "volume": 100},
+            {"timestamp": pd.Timestamp("2026-06-26T13:44:00Z"), "open": 10.7, "high": 11.0, "low": 10.4, "close": 10.9, "volume": 100},
+            {"timestamp": pd.Timestamp("2026-06-26T13:45:00Z"), "open": 10.9, "high": 10.95, "low": 10.7, "close": 10.8, "volume": 100},
         ])
-        diag = no_signal_diagnostics(candles, min_first_5m_high_pct=0.5, min_first_15m_high_pct=1.0, min_or_range_pct=0.5)
+        diag = no_signal_diagnostics(candles, min_first_5m_high_pct=4.0, min_first_15m_high_pct=6.5, min_or_range_pct=0.5)
         self.assertEqual(diag["top100_no_signal_reason"], "should_have_signaled")
         self.assertEqual(diag["had_required_first5"], 1)
         self.assertEqual(diag["had_required_first15"], 1)
+        self.assertEqual(diag["possible_signal_time"], "2026-06-26T13:45:00+00:00")
+        self.assertEqual(diag["breakout_gate_used"], 0)
+        self.assertEqual(diag["signal_price_source"], "close")
 
     def test_missed_runner_no_signal_classification_failed_first5(self) -> None:
         candles = pd.DataFrame([
             {"timestamp": pd.Timestamp("2026-06-26T13:30:00Z"), "open": 10.0, "high": 10.01, "low": 9.9, "close": 10.0, "volume": 100},
             {"timestamp": pd.Timestamp("2026-06-26T13:46:00Z"), "open": 10.0, "high": 11.0, "low": 9.9, "close": 10.8, "volume": 100},
         ])
-        diag = no_signal_diagnostics(candles, min_first_5m_high_pct=0.5, min_first_15m_high_pct=1.0, min_or_range_pct=0.5)
+        diag = no_signal_diagnostics(candles, min_first_5m_high_pct=4.0, min_first_15m_high_pct=6.5, min_or_range_pct=0.5)
         self.assertEqual(diag["top100_no_signal_reason"], "failed_first5")
+
+    def test_live_signal_replay_bar_start_boundaries_do_not_use_unfinished_bar(self) -> None:
+        candles = pd.DataFrame([
+            {"timestamp": pd.Timestamp("2026-07-20T13:30:00Z"), "open": 10.0, "high": 10.8, "low": 9.9, "close": 10.6},
+            {"timestamp": pd.Timestamp("2026-07-20T13:34:00Z"), "open": 10.6, "high": 10.9, "low": 10.2, "close": 10.8},
+            {"timestamp": pd.Timestamp("2026-07-20T13:44:00Z"), "open": 10.8, "high": 11.0, "low": 10.4, "close": 10.9},
+            {"timestamp": pd.Timestamp("2026-07-20T13:45:00Z"), "open": 10.9, "high": 12.0, "low": 10.7, "close": 10.8},
+        ])
+        replay = live_signal_replay(candles, min_first_5m_high_pct=4.0, min_first_15m_high_pct=6.5, min_or_range_pct=0.5)
+        self.assertEqual(replay.earliest_legal_signal_time, pd.Timestamp("2026-07-20T13:45:00Z"))
+        self.assertEqual(replay.possible_signal_time, pd.Timestamp("2026-07-20T13:45:00Z"))
+        self.assertEqual(replay.candle_timestamp, pd.Timestamp("2026-07-20T13:44:00Z"))
+        self.assertEqual(replay.current_price, 10.9)
+
+    def test_live_signal_replay_bar_end_boundary_can_use_timestamped_bar(self) -> None:
+        candles = pd.DataFrame([
+            {"timestamp": pd.Timestamp("2026-07-20T13:30:00Z"), "open": 10.0, "high": 10.8, "low": 9.9, "close": 10.6},
+            {"timestamp": pd.Timestamp("2026-07-20T13:34:00Z"), "open": 10.6, "high": 10.9, "low": 10.2, "close": 10.8},
+            {"timestamp": pd.Timestamp("2026-07-20T13:44:00Z"), "open": 10.8, "high": 11.0, "low": 10.4, "close": 10.9},
+            {"timestamp": pd.Timestamp("2026-07-20T13:45:00Z"), "open": 10.9, "high": 12.0, "low": 10.7, "close": 11.5},
+        ])
+        replay = live_signal_replay(candles, min_first_5m_high_pct=4.0, min_first_15m_high_pct=6.5, min_or_range_pct=0.5, bar_timestamp_semantics="bar_end")
+        self.assertEqual(replay.possible_signal_time, pd.Timestamp("2026-07-20T13:45:00Z"))
+        self.assertEqual(replay.candle_timestamp, pd.Timestamp("2026-07-20T13:45:00Z"))
+        self.assertEqual(replay.current_price, 11.5)
+
+    def test_live_signal_replay_does_not_turn_candle_high_breakout_into_signal(self) -> None:
+        candles = pd.DataFrame([
+            {"timestamp": pd.Timestamp("2026-07-20T13:30:00Z"), "open": 10.0, "high": 10.8, "low": 9.9, "close": 10.6},
+            {"timestamp": pd.Timestamp("2026-07-20T13:34:00Z"), "open": 10.6, "high": 10.9, "low": 10.2, "close": 10.8},
+            {"timestamp": pd.Timestamp("2026-07-20T13:44:00Z"), "open": 10.8, "high": 11.0, "low": 4.8, "close": 4.9},
+            {"timestamp": pd.Timestamp("2026-07-20T13:45:00Z"), "open": 4.9, "high": 12.5, "low": 4.8, "close": 4.9},
+        ])
+        replay = live_signal_replay(candles, min_first_5m_high_pct=4.0, min_first_15m_high_pct=6.5, min_or_range_pct=0.5, min_price=5.0)
+        self.assertEqual(replay.breakout_gate_used, 0)
+        self.assertEqual(replay.did_break_or_high, 1)
+        self.assertIsNone(replay.possible_signal_time)
+        self.assertEqual(replay.reason, "price_too_low")
 
     def test_missed_runners_cli_has_performance_flags(self) -> None:
         help_text = build_missed_runners_parser().format_help()

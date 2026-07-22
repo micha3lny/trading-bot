@@ -10,11 +10,15 @@ from typing import Any
 import pandas as pd
 
 from src.live_trading.analysis.common import (
+    LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT,
+    LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT,
+    LIVE_SIGNAL_MIN_OR_RANGE_PCT,
     calculate_runner_stats,
     first_existing_column,
     fnum,
     iso_ts,
     load_session_candles,
+    live_signal_replay,
     load_top100,
     load_universe_symbols,
     nearest_row,
@@ -87,6 +91,12 @@ OUTPUT_COLUMNS = [
     "had_required_first15",
     "had_required_or_range",
     "possible_signal_time",
+    "live_equivalent_possible_signal_time",
+    "earliest_legal_signal_time",
+    "signal_price_source",
+    "bar_timestamp_semantics",
+    "breakout_gate_used",
+    "offline_signal_model",
 ]
 
 
@@ -367,6 +377,12 @@ def no_signal_diagnostics(
     min_or_range_pct: float,
 ) -> dict[str, Any]:
     stats = calculate_runner_stats(candles)
+    replay = live_signal_replay(
+        candles,
+        min_first_5m_high_pct=min_first_5m_high_pct,
+        min_first_15m_high_pct=min_first_15m_high_pct,
+        min_or_range_pct=min_or_range_pct,
+    )
     if stats is None or candles.empty:
         return {
             "top100_no_signal_reason": "missing_candles",
@@ -380,35 +396,18 @@ def no_signal_diagnostics(
             "had_required_first15": 0,
             "had_required_or_range": 0,
             "possible_signal_time": "",
+            "live_equivalent_possible_signal_time": "",
+            "earliest_legal_signal_time": "",
+            "signal_price_source": "close",
+            "bar_timestamp_semantics": replay.bar_timestamp_semantics,
+            "breakout_gate_used": 0,
+            "offline_signal_model": "live_equivalent_completed_1m",
         }
     rows = candles.sort_values("timestamp").reset_index(drop=True)
-    start = rows.iloc[0]["timestamp"]
-    first15 = rows[rows["timestamp"] < start + pd.Timedelta(minutes=15)]
-    or_high = fnum(first15["high"].max()) if not first15.empty else None
-    or_low = fnum(first15["low"].min()) if not first15.empty else None
-    or_high_pct = pct(or_high, stats.open_price)
-    or_low_pct = pct(or_low, stats.open_price)
-    break_time: pd.Timestamp | None = None
-    if or_high is not None:
-        after_or = rows[rows["timestamp"] >= start + pd.Timedelta(minutes=15)]
-        broke = after_or[pd.to_numeric(after_or["high"], errors="coerce") >= or_high]
-        if not broke.empty:
-            break_time = broke.iloc[0]["timestamp"]
-    had_first5 = bool((stats.first_5m_high_pct or -999.0) >= min_first_5m_high_pct)
-    had_first15 = bool((stats.first_15m_high_pct or -999.0) >= min_first_15m_high_pct)
-    had_or = bool((stats.or_range_pct or -999.0) >= min_or_range_pct)
-    possible_signal_time = break_time if had_first5 and had_first15 and had_or and break_time is not None else None
-    if not had_first5:
-        reason = "failed_first5"
-    elif not had_first15:
-        reason = "failed_first15"
-    elif not had_or:
-        reason = "failed_or_range"
-    elif break_time is not None and stats.high_time is not None and break_time > stats.high_time:
-        reason = "broke_too_late"
-    elif possible_signal_time is not None:
-        reason = "should_have_signaled"
-    else:
+    or_high_pct = pct(replay.or_high, stats.open_price)
+    or_low_pct = pct(replay.or_low, stats.open_price)
+    reason = replay.reason
+    if reason not in {"should_have_signaled", "failed_first5", "failed_first15", "failed_or_range", "price_too_low", "spread_too_wide", "missing_candles", "invalid_open_price"}:
         reason = "unknown"
     return {
         "top100_no_signal_reason": reason,
@@ -416,12 +415,18 @@ def no_signal_diagnostics(
         "first_time_above_8pct": iso_ts(first_time_above(rows, stats.open_price, 8.0)),
         "opening_range_high_pct": or_high_pct,
         "opening_range_low_pct": or_low_pct,
-        "opening_range_break_time": iso_ts(break_time),
-        "did_break_or_high": int(break_time is not None),
-        "had_required_first5": int(had_first5),
-        "had_required_first15": int(had_first15),
-        "had_required_or_range": int(had_or),
-        "possible_signal_time": iso_ts(possible_signal_time),
+        "opening_range_break_time": iso_ts(replay.opening_range_break_time),
+        "did_break_or_high": replay.did_break_or_high,
+        "had_required_first5": replay.had_required_first5,
+        "had_required_first15": replay.had_required_first15,
+        "had_required_or_range": replay.had_required_or_range,
+        "possible_signal_time": iso_ts(replay.possible_signal_time),
+        "live_equivalent_possible_signal_time": iso_ts(replay.possible_signal_time),
+        "earliest_legal_signal_time": iso_ts(replay.earliest_legal_signal_time),
+        "signal_price_source": replay.signal_price_source,
+        "bar_timestamp_semantics": replay.bar_timestamp_semantics,
+        "breakout_gate_used": replay.breakout_gate_used,
+        "offline_signal_model": "live_equivalent_completed_1m",
     }
 
 
@@ -434,9 +439,9 @@ def analyze_missed_runners(
     sqlite_path: Path,
     recorder_dir: Path,
     threshold_pct: float,
-    min_first_5m_high_pct: float = 0.5,
-    min_first_15m_high_pct: float = 1.0,
-    min_or_range_pct: float = 0.5,
+    min_first_5m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT,
+    min_first_15m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT,
+    min_or_range_pct: float = LIVE_SIGNAL_MIN_OR_RANGE_PCT,
     max_symbols: int | None = None,
     progress_every: int = 250,
     output_path: Path | None = None,
@@ -506,6 +511,12 @@ def analyze_missed_runners(
             "had_required_first15": "",
             "had_required_or_range": "",
             "possible_signal_time": "",
+            "live_equivalent_possible_signal_time": "",
+            "earliest_legal_signal_time": "",
+            "signal_price_source": "",
+            "bar_timestamp_semantics": "",
+            "breakout_gate_used": "",
+            "offline_signal_model": "",
         }
         rows.append({
             "date": session_date,
@@ -598,9 +609,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sqlite-path", type=Path, default=DEFAULT_SQLITE_PATH)
     parser.add_argument("--recorder-dir", type=Path, default=DEFAULT_RECORDER_DIR)
     parser.add_argument("--threshold-pct", type=float, default=8.0)
-    parser.add_argument("--min-first-5m-high-pct", type=float, default=0.5)
-    parser.add_argument("--min-first-15m-high-pct", type=float, default=1.0)
-    parser.add_argument("--min-or-range-pct", type=float, default=0.5)
+    parser.add_argument("--min-first-5m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT)
+    parser.add_argument("--min-first-15m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT)
+    parser.add_argument("--min-or-range-pct", type=float, default=LIVE_SIGNAL_MIN_OR_RANGE_PCT)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--max-symbols", type=int, default=None, help="Limit processed universe symbols for quick testing.")
     parser.add_argument("--force", action="store_true", help="Overwrite existing output CSV.")

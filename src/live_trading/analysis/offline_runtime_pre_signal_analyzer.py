@@ -12,10 +12,14 @@ from typing import Any, Iterable
 import pandas as pd
 
 from src.live_trading.analysis.common import (
+    LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT,
+    LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT,
+    LIVE_SIGNAL_MIN_OR_RANGE_PCT,
     calculate_runner_stats,
     first_existing_column,
     fnum,
     iso_ts,
+    live_signal_replay,
     load_session_candles,
     load_top100,
     normalize_symbol,
@@ -90,6 +94,10 @@ CASE_COLUMNS = [
     "offline_first15_pass",
     "offline_or_pass",
     "offline_breakout_pass",
+    "offline_breakout_gate_used",
+    "offline_signal_model",
+    "offline_signal_price_source",
+    "offline_earliest_legal_signal_time",
     "runtime_symbol_present_in_top100",
     "runtime_contract_present",
     "runtime_ticker_present",
@@ -254,29 +262,20 @@ def offline_features_for_target(
         min_first_15m_high_pct=min_first_15m_high_pct,
         min_or_range_pct=min_or_range_pct,
     )
+    replay = live_signal_replay(
+        candles,
+        min_first_5m_high_pct=min_first_5m_high_pct,
+        min_first_15m_high_pct=min_first_15m_high_pct,
+        min_or_range_pct=min_or_range_pct,
+    )
     possible = _ts(target.get("possible_signal_time") or diag.get("possible_signal_time"))
-    current_price = ""
-    candle_ts = ""
-    if possible is not None and not candles.empty:
-        rows = candles.sort_values("timestamp")
-        upto = rows[rows["timestamp"] <= possible]
-        row = upto.iloc[-1] if not upto.empty else rows.iloc[0]
-        current_price = first_existing_column(row.to_dict(), ["close", "high", "open"])
-        candle_ts = iso_ts(row.get("timestamp"))
-    first15 = candles.sort_values("timestamp").head(15) if not candles.empty else pd.DataFrame()
-    first5 = candles.sort_values("timestamp").head(5) if not candles.empty else pd.DataFrame()
-    or_high = fnum(first15["high"].max()) if not first15.empty else None
-    or_low = fnum(first15["low"].min()) if not first15.empty else None
-    first5_high = fnum(first5["high"].max()) if not first5.empty else None
-    first15_high = fnum(first15["high"].max()) if not first15.empty else None
-    score = 0.0
-    for value, weight in [
-        (stats.first_5m_high_pct if stats else None, 2.0),
-        (stats.first_15m_high_pct if stats else None, 2.0),
-        (stats.or_range_pct if stats else None, 1.0),
-    ]:
-        if value is not None:
-            score += float(value) * weight
+    current_price = replay.current_price if replay.current_price is not None else ""
+    candle_ts = iso_ts(replay.candle_timestamp)
+    or_high = replay.or_high
+    or_low = replay.or_low
+    first5_high = replay.first_5m_high
+    first15_high = replay.first_15m_high
+    score = replay.score or 0.0
     return {
         "possible_signal_time": iso_ts(possible),
         "offline_candle_source": str(source_path),
@@ -291,11 +290,15 @@ def offline_features_for_target(
         "offline_or_high": or_high,
         "offline_or_low": or_low,
         "offline_or_range_pct": stats.or_range_pct if stats else "",
-        "offline_score": round(score, 4),
-        "offline_first5_pass": int(bool(stats and (stats.first_5m_high_pct or -999.0) >= min_first_5m_high_pct)),
-        "offline_first15_pass": int(bool(stats and (stats.first_15m_high_pct or -999.0) >= min_first_15m_high_pct)),
-        "offline_or_pass": int(bool(stats and (stats.or_range_pct or -999.0) >= min_or_range_pct)),
-        "offline_breakout_pass": int(bool(diag.get("possible_signal_time"))),
+        "offline_score": round(float(score), 4),
+        "offline_first5_pass": replay.had_required_first5,
+        "offline_first15_pass": replay.had_required_first15,
+        "offline_or_pass": replay.had_required_or_range,
+        "offline_breakout_pass": replay.did_break_or_high,
+        "offline_breakout_gate_used": replay.breakout_gate_used,
+        "offline_signal_model": "live_equivalent_completed_1m",
+        "offline_signal_price_source": replay.signal_price_source,
+        "offline_earliest_legal_signal_time": iso_ts(replay.earliest_legal_signal_time),
     }
 
 
@@ -645,9 +648,9 @@ def investigate_date(
     output_dir: Path,
     force: bool = False,
     max_cases: int | None = None,
-    min_first_5m_high_pct: float = 0.5,
-    min_first_15m_high_pct: float = 1.0,
-    min_or_range_pct: float = 0.5,
+    min_first_5m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT,
+    min_first_15m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT,
+    min_or_range_pct: float = LIVE_SIGNAL_MIN_OR_RANGE_PCT,
 ) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     cases_path = output_dir / f"offline_runtime_pre_signal_cases_{session_date}.csv"
@@ -727,9 +730,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_ANALYSIS_DIR)
     parser.add_argument("--max-cases", type=int, default=None)
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--min-first-5m-high-pct", type=float, default=0.5)
-    parser.add_argument("--min-first-15m-high-pct", type=float, default=1.0)
-    parser.add_argument("--min-or-range-pct", type=float, default=0.5)
+    parser.add_argument("--min-first-5m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT)
+    parser.add_argument("--min-first-15m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT)
+    parser.add_argument("--min-or-range-pct", type=float, default=LIVE_SIGNAL_MIN_OR_RANGE_PCT)
     return parser
 
 
