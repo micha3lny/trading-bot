@@ -33,6 +33,7 @@ DEFAULT_OUTPUT_DIR = Path("data/analysis")
 
 TRADE_COLUMNS = [
     "date",
+    "profile",
     "source",
     "symbol",
     "signal_time",
@@ -51,7 +52,9 @@ TRADE_COLUMNS = [
     "net_pnl",
     "mfe_pct",
     "mae_pct",
+    "causal_valid",
     "matched_live_trade",
+    "divergence_from_live",
     "divergence_type",
 ]
 
@@ -71,6 +74,7 @@ EVENT_COLUMNS = [
 
 COMPARISON_COLUMNS = [
     "date",
+    "profile",
     "symbol",
     "offline_entry_time",
     "live_entry_time",
@@ -80,6 +84,27 @@ COMPARISON_COLUMNS = [
     "matched_live_trade",
     "divergence_type",
     "first_divergence",
+]
+
+PROFILE_COMPARISON_COLUMNS = [
+    "date",
+    "profile",
+    "signals",
+    "entries",
+    "winners",
+    "losers",
+    "win_rate",
+    "gross_pnl",
+    "net_pnl",
+    "max_drawdown",
+    "average_mfe",
+    "average_mae",
+    "max_concurrent_positions",
+    "blocked_candidates_by_reason",
+    "trades_shared_with_live_profile",
+    "trades_unique_to_profile",
+    "symbols_entered_only_because_of_lower_thresholds",
+    "symbols_entered_only_because_of_legacy_non_causal_behavior",
 ]
 
 
@@ -104,6 +129,15 @@ class ReplayPosition:
 
 @dataclass
 class ReplayConfig:
+    profile: str = "live"
+    first5_threshold: float = LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT
+    first15_threshold: float = LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT
+    min_or_range_pct: float = LIVE_SIGNAL_MIN_OR_RANGE_PCT
+    min_price: float = LIVE_SIGNAL_MIN_PRICE
+    max_spread_bps: float = LIVE_SIGNAL_MAX_SPREAD_BPS
+    breakout_mode: str = "live"
+    entry_price_mode: str = "close"
+    commission_model: str = "per_share"
     position_usd: float = 1000.0
     max_open_positions: int = 0
     max_entries_per_cycle: int = 5
@@ -119,6 +153,47 @@ class ReplayConfig:
     commission_per_share: float = 0.005
     min_commission: float = 1.0
     bar_timestamp_semantics: str = "bar_start"
+
+
+def profile_config(profile: str) -> ReplayConfig:
+    if profile == "live":
+        return ReplayConfig(profile="live")
+    if profile == "low_threshold_causal":
+        return ReplayConfig(profile="low_threshold_causal", first5_threshold=0.5, first15_threshold=1.0)
+    if profile == "legacy_offline":
+        return ReplayConfig(
+            profile="legacy_offline",
+            first5_threshold=0.5,
+            first15_threshold=1.0,
+            breakout_mode="legacy_candle_high",
+            bar_timestamp_semantics="bar_end",
+        )
+    raise ValueError(f"unknown replay profile: {profile}")
+
+
+def effective_config_dict(config: ReplayConfig) -> dict[str, Any]:
+    return {
+        "profile": config.profile,
+        "first5_threshold": config.first5_threshold,
+        "first15_threshold": config.first15_threshold,
+        "min_or_range_pct": config.min_or_range_pct,
+        "min_price": config.min_price,
+        "max_spread_bps": config.max_spread_bps,
+        "breakout_mode": config.breakout_mode,
+        "bar_timestamp_semantics": config.bar_timestamp_semantics,
+        "entry_price_mode": config.entry_price_mode,
+        "notional": config.position_usd,
+        "slippage_bps": config.slippage_bps,
+        "commission_model": config.commission_model,
+        "max_positions": config.max_open_positions,
+        "max_entries_per_cycle": config.max_entries_per_cycle,
+        "max_entries_per_minute": config.max_entries_per_minute,
+        "entry_delay_after_open_minutes": config.entry_delay_after_open_minutes,
+        "hard_stop_pct": config.exit_stop_loss_pct,
+        "trailing_activation_pct": config.exit_trailing_activation_pct,
+        "trailing_stop_pct": config.exit_trailing_stop_pct,
+        "causal_valid": config.profile != "legacy_offline" and config.breakout_mode != "legacy_candle_high" and config.bar_timestamp_semantics == "bar_start",
+    }
 
 
 @dataclass
@@ -143,7 +218,7 @@ def _rows(candles: pd.DataFrame, semantics: str) -> pd.DataFrame:
     return rows
 
 
-def _feature_at(rows: pd.DataFrame, timestamp: pd.Timestamp) -> dict[str, Any]:
+def _feature_at(rows: pd.DataFrame, timestamp: pd.Timestamp, config: ReplayConfig) -> dict[str, Any]:
     if rows.empty:
         return {"ready": False, "reason": "missing_candles"}
     start = rows.iloc[0]["timestamp"]
@@ -152,7 +227,7 @@ def _feature_at(rows: pd.DataFrame, timestamp: pd.Timestamp) -> dict[str, Any]:
         return {"ready": False, "reason": "no_completed_bar"}
     open_price = fnum(rows.iloc[0].get("open"))
     current = visible.iloc[-1]
-    price = fnum(current.get("close"), fnum(current.get("open")))
+    price = fnum(current.get(config.entry_price_mode), fnum(current.get("close"), fnum(current.get("open"))))
     if open_price is None or open_price <= 0:
         return {"ready": False, "reason": "invalid_open"}
     first5_end = start + pd.Timedelta(minutes=5)
@@ -173,19 +248,29 @@ def _feature_at(rows: pd.DataFrame, timestamp: pd.Timestamp) -> dict[str, Any]:
     for value, weight in [(first5_pct, 2.0), (first15_pct, 2.0), (or_range, 1.0)]:
         if value is not None:
             score += float(value) * weight
-    if spread is not None and LIVE_SIGNAL_MAX_SPREAD_BPS > 0:
-        score += max(0.0, LIVE_SIGNAL_MAX_SPREAD_BPS - spread) / LIVE_SIGNAL_MAX_SPREAD_BPS * 5.0
+    if spread is not None and config.max_spread_bps > 0:
+        score += max(0.0, config.max_spread_bps - spread) / config.max_spread_bps * 5.0
     reasons = []
-    if first5_pct is None or first5_pct < LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT:
+    if first5_pct is None or first5_pct < config.first5_threshold:
         reasons.append("first_5m_high_too_low")
-    if first15_pct is None or first15_pct < LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT:
+    if first15_pct is None or first15_pct < config.first15_threshold:
         reasons.append("first_15m_high_too_low")
-    if or_range is None or or_range < LIVE_SIGNAL_MIN_OR_RANGE_PCT:
+    if or_range is None or or_range < config.min_or_range_pct:
         reasons.append("or_range_too_low")
-    if price is None or price < LIVE_SIGNAL_MIN_PRICE:
+    if price is None or price < config.min_price:
         reasons.append("price_too_low")
-    if spread is not None and spread > LIVE_SIGNAL_MAX_SPREAD_BPS:
+    if spread is not None and spread > config.max_spread_bps:
         reasons.append("spread_too_wide")
+    breakout_gate_used = 0
+    if config.breakout_mode == "legacy_candle_high":
+        breakout_gate_used = 1
+        current_high = fnum(current.get("high"))
+        if or_high is None or current_high is None or current_high < or_high:
+            reasons.append("legacy_candle_high_breakout_not_met")
+    elif config.breakout_mode == "current_price_or_high":
+        breakout_gate_used = 1
+        if or_high is None or price is None or price < or_high:
+            reasons.append("current_price_breakout_not_met")
     return {
         "ready": not reasons,
         "reason": ";".join(reasons) if reasons else "live_safe_expansion_ready",
@@ -195,6 +280,7 @@ def _feature_at(rows: pd.DataFrame, timestamp: pd.Timestamp) -> dict[str, Any]:
         "first_5m_high_pct": first5_pct,
         "first_15m_high_pct": first15_pct,
         "or_range_pct": or_range,
+        "breakout_gate_used": breakout_gate_used,
     }
 
 
@@ -217,7 +303,7 @@ def _event(result: ReplayResult, session_date: str, timestamp: pd.Timestamp, eve
 def _close_position(pos: ReplayPosition, *, timestamp: pd.Timestamp, price: float, reason: str, config: ReplayConfig) -> dict[str, Any]:
     exit_price = price * (1.0 - config.slippage_bps / 10000.0)
     gross = (exit_price - pos.entry_price) * pos.quantity
-    commission = max(config.min_commission, pos.quantity * config.commission_per_share) * 2.0
+    commission = 0.0 if config.commission_model == "none" else max(config.min_commission, pos.quantity * config.commission_per_share) * 2.0
     net = gross - commission
     pos.exit_time = timestamp
     pos.exit_price = exit_price
@@ -229,6 +315,7 @@ def _close_position(pos: ReplayPosition, *, timestamp: pd.Timestamp, price: floa
     mae = pct(pos.low_price, pos.entry_price)
     return {
         "date": "",
+        "profile": config.profile,
         "source": "offline_replay",
         "symbol": pos.symbol,
         "signal_time": iso_ts(pos.signal_time),
@@ -247,7 +334,9 @@ def _close_position(pos: ReplayPosition, *, timestamp: pd.Timestamp, price: floa
         "net_pnl": net,
         "mfe_pct": mfe,
         "mae_pct": mae,
+        "causal_valid": int(bool(effective_config_dict(config)["causal_valid"])),
         "matched_live_trade": "",
+        "divergence_from_live": "",
         "divergence_type": "",
     }
 
@@ -340,7 +429,7 @@ def replay_session(
                 continue
             if config.max_one_trade_per_symbol_per_day and symbol in traded_symbols:
                 continue
-            features = _feature_at(rows, current)
+            features = _feature_at(rows, current, config)
             if not features.get("ready"):
                 result.skipped[str(features.get("reason") or "not_ready")] = result.skipped.get(str(features.get("reason") or "not_ready"), 0) + 1
                 continue
@@ -399,6 +488,7 @@ def load_live_trades(sqlite_path: Path, session_date: str) -> list[dict[str, Any
         exit_time = parse_dt(row.get("exit_fill_time") or row.get("closed_at"))
         rows.append({
             "date": session_date,
+            "profile": "live_actual",
             "source": "live_sqlite",
             "symbol": normalize_symbol(row.get("symbol")),
             "signal_time": iso_ts(row.get("signal_time") or row.get("ready_since") or entry),
@@ -417,7 +507,9 @@ def load_live_trades(sqlite_path: Path, session_date: str) -> list[dict[str, Any
             "net_pnl": row.get("net_pnl") or row.get("realized_pnl"),
             "mfe_pct": row.get("mfe_pct") or row.get("peak_pct"),
             "mae_pct": row.get("mae_pct"),
+            "causal_valid": "",
             "matched_live_trade": "",
+            "divergence_from_live": "",
             "divergence_type": "",
         })
     return rows
@@ -427,19 +519,19 @@ def compare_trades(session_date: str, offline: list[dict[str, Any]], live: list[
     live_by_symbol: dict[str, list[dict[str, Any]]] = {}
     for row in live:
         live_by_symbol.setdefault(str(row.get("symbol") or ""), []).append(row)
-    used: set[int] = set()
+    used: set[tuple[str, int]] = set()
     out = []
     for off in offline:
         sym = str(off.get("symbol") or "")
         candidates = live_by_symbol.get(sym, [])
         match_idx = None
         for idx, live_row in enumerate(candidates):
-            if idx not in used:
+            if (sym, idx) not in used:
                 match_idx = idx
                 break
         live_row = candidates[match_idx] if match_idx is not None else None
         if match_idx is not None:
-            used.add(match_idx)
+            used.add((sym, match_idx))
         off_entry = parse_dt(off.get("entry_time"))
         live_entry = parse_dt(live_row.get("entry_time")) if live_row else None
         off_net = fnum(off.get("net_pnl"), 0.0) or 0.0
@@ -452,6 +544,7 @@ def compare_trades(session_date: str, offline: list[dict[str, Any]], live: list[
             div = "matched_same_symbol"
         out.append({
             "date": session_date,
+            "profile": off.get("profile", ""),
             "symbol": sym,
             "offline_entry_time": off.get("entry_time"),
             "live_entry_time": live_row.get("entry_time") if live_row else "",
@@ -468,6 +561,7 @@ def compare_trades(session_date: str, offline: list[dict[str, Any]], live: list[
         if sym not in offline_symbols:
             out.append({
                 "date": session_date,
+                "profile": "live_actual",
                 "symbol": sym,
                 "offline_entry_time": "",
                 "live_entry_time": row.get("entry_time"),
@@ -513,7 +607,44 @@ def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> Non
         writer.writerows(rows)
 
 
-def write_summary(path: Path, session_date: str, replay: ReplayResult, live: list[dict[str, Any]], comparison: list[dict[str, Any]], focus_symbols: list[str]) -> None:
+def _avg(rows: list[dict[str, Any]], key: str) -> float:
+    values = [fnum(row.get(key)) for row in rows]
+    values = [float(value) for value in values if value is not None]
+    return sum(values) / len(values) if values else 0.0
+
+
+def profile_comparison_rows(session_date: str, profile_results: dict[str, ReplayResult]) -> list[dict[str, Any]]:
+    live_symbols = {str(row.get("symbol") or "") for row in profile_results.get("live", ReplayResult()).trades}
+    low_symbols = {str(row.get("symbol") or "") for row in profile_results.get("low_threshold_causal", ReplayResult()).trades}
+    legacy_symbols = {str(row.get("symbol") or "") for row in profile_results.get("legacy_offline", ReplayResult()).trades}
+    rows = []
+    for profile, replay in profile_results.items():
+        metrics = summary_metrics(replay.trades)
+        symbols = {str(row.get("symbol") or "") for row in replay.trades}
+        rows.append({
+            "date": session_date,
+            "profile": profile,
+            "signals": len([event for event in replay.events if event.get("event_type") == "ENTRY"]),
+            "entries": metrics["entries"],
+            "winners": metrics["winners"],
+            "losers": metrics["losers"],
+            "win_rate": metrics["win_rate"],
+            "gross_pnl": metrics["gross_pnl"],
+            "net_pnl": metrics["net_pnl"],
+            "max_drawdown": max_drawdown(replay.equity_curve),
+            "average_mfe": _avg(replay.trades, "mfe_pct"),
+            "average_mae": _avg(replay.trades, "mae_pct"),
+            "max_concurrent_positions": replay.max_concurrent_positions,
+            "blocked_candidates_by_reason": json.dumps(replay.skipped, sort_keys=True),
+            "trades_shared_with_live_profile": len(symbols & live_symbols) if profile != "live" else len(symbols),
+            "trades_unique_to_profile": ",".join(sorted(symbols - live_symbols)) if profile != "live" else "",
+            "symbols_entered_only_because_of_lower_thresholds": ",".join(sorted((low_symbols - live_symbols) & symbols)) if profile == "low_threshold_causal" else "",
+            "symbols_entered_only_because_of_legacy_non_causal_behavior": ",".join(sorted((legacy_symbols - live_symbols - low_symbols) & symbols)) if profile == "legacy_offline" else "",
+        })
+    return rows
+
+
+def write_summary(path: Path, session_date: str, replay: ReplayResult, live: list[dict[str, Any]], comparison: list[dict[str, Any]], focus_symbols: list[str], config: ReplayConfig) -> None:
     offline_metrics = summary_metrics(replay.trades)
     live_metrics = summary_metrics(live)
     comp_counts: dict[str, int] = {}
@@ -523,9 +654,11 @@ def write_summary(path: Path, session_date: str, replay: ReplayResult, live: lis
     lines = [
         f"# Full Session v67 Offline Replay {session_date}",
         "",
+        f"Profile: `{config.profile}`",
+        "",
         "FACT: This is a read-only causal replay over completed 1m bars. It does not alter live trading state.",
-        "FACT: Bar-start candles become available one minute after their timestamp.",
-        "FACT: v67 thresholds used here: first5=4.0%, first15=6.5%, OR range=5.0%, min_price=5.0, max_spread_bps=50.",
+        f"FACT: Effective configuration: `{json.dumps(effective_config_dict(config), sort_keys=True)}`",
+        "FACT: live and low_threshold_causal profiles use causal bar-start semantics. legacy_offline is diagnostic and may reproduce historical non-causal behavior.",
         "HYPOTHESIS: Differences versus live can come from intrabar tick prices, real spreads, IBKR permissions/subscriptions, or production blocks not intentionally simulated.",
         "",
         "## Offline Replay",
@@ -534,6 +667,7 @@ def write_summary(path: Path, session_date: str, replay: ReplayResult, live: lis
         f"- gross_pnl={offline_metrics['gross_pnl']:.4f} net_pnl={offline_metrics['net_pnl']:.4f} average_pnl={offline_metrics['average_pnl']:.4f}",
         f"- max_concurrent_positions={replay.max_concurrent_positions}",
         f"- max_drawdown={max_drawdown(replay.equity_curve):.4f}",
+        f"- average_mfe={_avg(replay.trades, 'mfe_pct'):.4f} average_mae={_avg(replay.trades, 'mae_pct'):.4f}",
         f"- skipped_candidates={json.dumps(replay.skipped, sort_keys=True)}",
         "",
         "## Live SQLite",
@@ -554,58 +688,113 @@ def write_summary(path: Path, session_date: str, replay: ReplayResult, live: lis
     path.write_text("\n".join(lines) + "\n")
 
 
-def run(args: argparse.Namespace) -> int:
+def build_effective_config(args: argparse.Namespace, profile: str) -> ReplayConfig:
+    config = profile_config(profile)
+    config.first5_threshold = args.first5_threshold if args.first5_threshold is not None else config.first5_threshold
+    config.first15_threshold = args.first15_threshold if args.first15_threshold is not None else config.first15_threshold
+    config.breakout_mode = args.breakout_mode or config.breakout_mode
+    config.bar_timestamp_semantics = args.bar_timestamp_semantics or config.bar_timestamp_semantics
+    config.entry_price_mode = args.entry_price_mode or config.entry_price_mode
+    config.position_usd = args.notional if args.notional is not None else (args.position_usd if args.position_usd is not None else config.position_usd)
+    config.slippage_bps = args.slippage_bps if args.slippage_bps is not None else config.slippage_bps
+    config.commission_model = args.commission_model or config.commission_model
+    config.max_open_positions = args.max_positions if args.max_positions is not None else (args.max_open_positions if args.max_open_positions is not None else config.max_open_positions)
+    config.exit_stop_loss_pct = args.hard_stop_pct if args.hard_stop_pct is not None else config.exit_stop_loss_pct
+    config.exit_trailing_activation_pct = args.trailing_activation_pct if args.trailing_activation_pct is not None else config.exit_trailing_activation_pct
+    config.exit_trailing_stop_pct = args.trailing_stop_pct if args.trailing_stop_pct is not None else config.exit_trailing_stop_pct
+    config.max_entries_per_cycle = args.max_entries_per_cycle
+    config.max_entries_per_minute = args.max_entries_per_minute
+    config.entry_delay_after_open_minutes = args.entry_delay_after_open_minutes
+    config.min_live_entry_score = args.min_live_entry_score
+    return config
+
+
+def _profile_suffix(profile: str) -> str:
+    return "" if profile == "live" else f"_{profile}"
+
+
+def run_one_profile(args: argparse.Namespace, profile: str, live: list[dict[str, Any]] | None = None) -> tuple[ReplayResult, list[dict[str, Any]]]:
     top100_path = args.top100 or Path(f"data/universe/daily_top100_{args.date}.csv")
-    config = ReplayConfig(
-        position_usd=args.position_usd,
-        max_open_positions=args.max_open_positions,
-        max_entries_per_cycle=args.max_entries_per_cycle,
-        max_entries_per_minute=args.max_entries_per_minute,
-        entry_delay_after_open_minutes=args.entry_delay_after_open_minutes,
-        min_live_entry_score=args.min_live_entry_score,
-        slippage_bps=args.slippage_bps,
-        bar_timestamp_semantics=args.bar_timestamp_semantics,
-    )
+    config = build_effective_config(args, profile)
     replay = replay_session(session_date=args.date, top100_path=top100_path, history_dir=args.history_dir, config=config)
-    live = load_live_trades(args.sqlite_path, args.date)
+    live = live if live is not None else load_live_trades(args.sqlite_path, args.date)
     offline_rows = replay.trades
     for row in offline_rows:
         row["date"] = args.date
-    combined = [*offline_rows, *live]
+        row["profile"] = profile
     comparison = compare_trades(args.date, offline_rows, live)
+    divergence_by_symbol = {str(row.get("symbol") or ""): str(row.get("divergence_type") or "") for row in comparison if row.get("profile") == profile}
+    for row in offline_rows:
+        row["divergence_from_live"] = divergence_by_symbol.get(str(row.get("symbol") or ""), "")
+        row["divergence_type"] = row["divergence_from_live"]
+    combined = [*offline_rows, *live]
     output_dir = args.output_dir
-    trades_path = output_dir / f"full_session_replay_{args.date}.csv"
-    events_path = output_dir / f"full_session_replay_events_{args.date}.csv"
-    comparison_path = output_dir / f"full_session_replay_comparison_{args.date}.csv"
-    summary_path = output_dir / f"full_session_replay_summary_{args.date}.md"
+    suffix = _profile_suffix(profile)
+    trades_path = output_dir / f"full_session_replay{suffix}_{args.date}.csv"
+    events_path = output_dir / f"full_session_replay_events{suffix}_{args.date}.csv"
+    comparison_path = output_dir / f"full_session_replay_comparison{suffix}_{args.date}.csv"
+    summary_path = output_dir / f"full_session_replay_summary{suffix}_{args.date}.md"
+    config_path = output_dir / f"full_session_replay_config{suffix}_{args.date}.json"
     write_csv(trades_path, combined, TRADE_COLUMNS)
     write_csv(events_path, replay.events, EVENT_COLUMNS)
     write_csv(comparison_path, comparison, COMPARISON_COLUMNS)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(effective_config_dict(config), indent=2, sort_keys=True) + "\n")
     focus = [normalize_symbol(s) for s in str(args.focus_symbols or "NUAI,IREN,FBYD").split(",") if normalize_symbol(s)]
-    write_summary(summary_path, args.date, replay, live, comparison, focus)
+    write_summary(summary_path, args.date, replay, live, comparison, focus, config)
     print(
-        f"FULL_SESSION_REPLAY_DONE date={args.date} offline_entries={len(offline_rows)} live_entries={len(live)} "
-        f"output={trades_path} events={events_path} comparison={comparison_path} summary={summary_path}",
+        f"FULL_SESSION_REPLAY_DONE date={args.date} profile={profile} offline_entries={len(offline_rows)} live_entries={len(live)} "
+        f"output={trades_path} events={events_path} comparison={comparison_path} summary={summary_path} config={config_path}",
         flush=True,
     )
+    return replay, comparison
+
+
+def run(args: argparse.Namespace) -> int:
+    profiles = ["live", "low_threshold_causal", "legacy_offline"] if args.profile == "all" else [args.profile]
+    live = load_live_trades(args.sqlite_path, args.date)
+    profile_results: dict[str, ReplayResult] = {}
+    all_comparison: list[dict[str, Any]] = []
+    for profile in profiles:
+        replay, comparison = run_one_profile(args, profile, live)
+        profile_results[profile] = replay
+        all_comparison.extend(comparison)
+    if len(profiles) > 1:
+        output_dir = args.output_dir
+        profile_comparison_path = output_dir / f"full_session_replay_profile_comparison_{args.date}.csv"
+        all_comparison_path = output_dir / f"full_session_replay_comparison_ALL_{args.date}.csv"
+        write_csv(profile_comparison_path, profile_comparison_rows(args.date, profile_results), PROFILE_COMPARISON_COLUMNS)
+        write_csv(all_comparison_path, all_comparison, COMPARISON_COLUMNS)
+        print(f"FULL_SESSION_REPLAY_PROFILE_COMPARISON_DONE date={args.date} profiles={','.join(profiles)} output={profile_comparison_path}", flush=True)
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Read-only full-session causal v67 offline replay.")
     parser.add_argument("--date", required=True)
+    parser.add_argument("--profile", choices=["live", "low_threshold_causal", "legacy_offline", "all"], default="live")
     parser.add_argument("--history-dir", type=Path, default=DEFAULT_HISTORY_DIR)
     parser.add_argument("--sqlite-path", type=Path, default=DEFAULT_SQLITE_PATH)
     parser.add_argument("--top100", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--position-usd", type=float, default=1000.0)
-    parser.add_argument("--max-open-positions", type=int, default=0)
+    parser.add_argument("--first5-threshold", type=float, default=None)
+    parser.add_argument("--first15-threshold", type=float, default=None)
+    parser.add_argument("--breakout-mode", choices=["live", "current_price_or_high", "legacy_candle_high"], default=None)
+    parser.add_argument("--bar-timestamp-semantics", choices=["bar_start", "bar_end"], default=None)
+    parser.add_argument("--entry-price-mode", choices=["open", "high", "low", "close"], default=None)
+    parser.add_argument("--notional", type=float, default=None)
+    parser.add_argument("--position-usd", type=float, default=None, help="Backward-compatible alias for --notional.")
+    parser.add_argument("--slippage-bps", type=float, default=None)
+    parser.add_argument("--commission-model", choices=["per_share", "none"], default=None)
+    parser.add_argument("--max-positions", type=int, default=None)
+    parser.add_argument("--max-open-positions", type=int, default=None, help="Backward-compatible alias for --max-positions.")
+    parser.add_argument("--hard-stop-pct", type=float, default=None)
+    parser.add_argument("--trailing-activation-pct", type=float, default=None)
+    parser.add_argument("--trailing-stop-pct", type=float, default=None)
     parser.add_argument("--max-entries-per-cycle", type=int, default=5)
     parser.add_argument("--max-entries-per-minute", type=int, default=5)
     parser.add_argument("--entry-delay-after-open-minutes", type=float, default=5.0)
     parser.add_argument("--min-live-entry-score", type=float, default=0.0)
-    parser.add_argument("--slippage-bps", type=float, default=5.0)
-    parser.add_argument("--bar-timestamp-semantics", choices=["bar_start", "bar_end"], default="bar_start")
     parser.add_argument("--focus-symbols", default="NUAI,IREN,FBYD")
     return parser
 
