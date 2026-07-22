@@ -44,3 +44,5 @@ At candidate timestamp `T`, offline replay may not use:
 `possible_signal_time` is the live-equivalent signal time from `live_signal_replay(...)`.
 
 `first_time_above_5pct` and `first_time_above_8pct` are diagnostics for large runner moves. They are not the same as the v67 first5/first15 gates.
+
+Current v67 default thresholds: first5=4.0%, first15=6.5%, OR range=5.0%.

@@ -357,11 +357,17 @@ def simulate_v67_exit(
 def load_case_rows(cases_csv: Path | None, symbols: Iterable[str], session_date: str) -> dict[str, dict[str, Any]]:
     out = {str(symbol).upper(): {"symbol": str(symbol).upper(), "date": session_date} for symbol in symbols}
     if cases_csv and cases_csv.exists() and cases_csv.stat().st_size > 1:
+        loaded: dict[str, dict[str, Any]] = {}
         with cases_csv.open(newline="") as f:
             for row in csv.DictReader(f):
                 sym = str(row.get("symbol") or "").upper()
                 if sym:
-                    out[sym] = row
+                    loaded[sym] = row
+        if loaded:
+            if out:
+                out.update({sym: row for sym, row in loaded.items() if sym in out})
+            else:
+                out = loaded
     return out
 
 
@@ -525,9 +531,10 @@ def write_summary(path: Path, cases: list[dict[str, Any]], parity_path: Path) ->
 
 
 def run(args: argparse.Namespace) -> int:
-    symbols = [s.strip().upper() for s in str(args.symbols or "").split(",") if s.strip()] or DEFAULT_SYMBOLS_2026_07_20
+    explicit_symbols = [s.strip().upper() for s in str(args.symbols or "").split(",") if s.strip()]
     cases_csv = args.cases_csv or Path(f"data/analysis/should_have_signaled_cases_{args.date}.csv")
-    cases = load_case_rows(cases_csv, symbols, args.date)
+    cases = load_case_rows(cases_csv, explicit_symbols, args.date)
+    symbols = explicit_symbols or sorted(cases) or DEFAULT_SYMBOLS_2026_07_20
     case_rows: list[dict[str, Any]] = []
     parity_rows: list[dict[str, Any]] = []
     for symbol in symbols:
