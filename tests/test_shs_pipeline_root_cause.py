@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import sqlite3
 import tempfile
 import unittest
 from argparse import Namespace
@@ -13,6 +14,7 @@ import pandas as pd
 from src.live_trading.analysis.shs_pipeline_root_cause import (
     EvidenceItem,
     _iter_recorder_rows,
+    _iter_sqlite_rows,
     classify_root_cause,
     run_symbol,
     row_matches_session,
@@ -31,9 +33,9 @@ class SHSPipelineRootCauseTests(unittest.TestCase):
         self.assertEqual(confidence, "high")
         self.assertIn("Top100", reason)
 
-    def test_no_symbol_specific_evidence_is_data_retention(self) -> None:
+    def test_no_symbol_specific_evidence_is_insufficient_telemetry(self) -> None:
         root, reason, confidence = classify_root_cause({"symbol": "NUAI"}, [], True)
-        self.assertEqual(root, "DATA_RETENTION_PREVENTS_ROOT_CAUSE")
+        self.assertEqual(root, "INSUFFICIENT_SYMBOL_SPECIFIC_RUNTIME_TELEMETRY")
         self.assertEqual(confidence, "medium")
         self.assertIn("no symbol-specific", reason)
 
@@ -105,6 +107,65 @@ class SHSPipelineRootCauseTests(unittest.TestCase):
                 })
             self.assertEqual(_iter_recorder_rows(root, "2026-07-20", "ADVB"), [])
 
+
+    def test_historical_market_data_sessions_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Path(tmpdir) / "runtime.sqlite"
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE market_data_sessions (date TEXT, symbol TEXT, collection_status TEXT, parquet_path TEXT, rows INTEGER)")
+            conn.execute(
+                "INSERT INTO market_data_sessions VALUES (?, ?, ?, ?, ?)",
+                ("2026-02-10", "NUAI", "complete", "data/history/universe_1m/session_type=RTH/symbol=NUAI/year=2026/month=02/day=10.parquet", 390),
+            )
+            conn.commit()
+            conn.close()
+            self.assertEqual(_iter_sqlite_rows(db, "2026-07-20", "NUAI"), [])
+
+    def test_runtime_event_counters_are_ignored_for_symbol_stages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Path(tmpdir) / "runtime.sqlite"
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE runtime_event_counters (date TEXT, event_type TEXT, symbol TEXT, reason TEXT, count INTEGER, first_seen_at TEXT, last_seen_at TEXT)")
+            conn.execute(
+                "INSERT INTO runtime_event_counters VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("2026-07-20", "SIGNAL_READY", "NUAI", "global aggregate", 9, "2026-07-20T13:35:00Z", "2026-07-20T14:00:00Z"),
+            )
+            conn.commit()
+            conn.close()
+            self.assertEqual(_iter_sqlite_rows(db, "2026-07-20", "NUAI"), [])
+
+    def test_sqlite_rows_for_other_date_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Path(tmpdir) / "runtime.sqlite"
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE runtime_events (session_date TEXT, event_time TEXT, event_type TEXT, symbol TEXT, raw_json TEXT)")
+            conn.execute(
+                "INSERT INTO runtime_events VALUES (?, ?, ?, ?, ?)",
+                ("2026-07-21", "2026-07-21T13:45:00Z", "SIGNAL_READY", "NUAI", json.dumps({"symbol": "NUAI"})),
+            )
+            conn.commit()
+            conn.close()
+            self.assertEqual(_iter_sqlite_rows(db, "2026-07-20", "NUAI"), [])
+
+    def test_sqlite_rows_for_other_symbol_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Path(tmpdir) / "runtime.sqlite"
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE runtime_events (session_date TEXT, event_time TEXT, event_type TEXT, symbol TEXT, raw_json TEXT)")
+            conn.execute(
+                "INSERT INTO runtime_events VALUES (?, ?, ?, ?, ?)",
+                ("2026-07-20", "2026-07-20T13:45:00Z", "SIGNAL_READY", "IREN", json.dumps({"symbol": "IREN"})),
+            )
+            conn.commit()
+            conn.close()
+            self.assertEqual(_iter_sqlite_rows(db, "2026-07-20", "NUAI"), [])
+
+    def test_missing_logs_do_not_fabricate_contract_root_cause(self) -> None:
+        root, reason, confidence = classify_root_cause({"symbol": "NUAI"}, [], True)
+        self.assertEqual(root, "INSUFFICIENT_SYMBOL_SPECIFIC_RUNTIME_TELEMETRY")
+        self.assertEqual(confidence, "medium")
+        self.assertNotIn("contract", reason.lower().split("proves", 1)[0])
+
     def test_run_symbol_writes_specific_root_cause_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -125,7 +186,7 @@ class SHSPipelineRootCauseTests(unittest.TestCase):
             with patch("src.live_trading.analysis.shs_pipeline_root_cause.load_session_candles", return_value=pd.DataFrame()):
                 row = run_symbol(args, "NUAI")
             self.assertEqual(row["symbol"], "NUAI")
-            self.assertEqual(row["final_root_cause"], "DATA_RETENTION_PREVENTS_ROOT_CAUSE")
+            self.assertEqual(row["final_root_cause"], "INSUFFICIENT_SYMBOL_SPECIFIC_RUNTIME_TELEMETRY")
             self.assertEqual(row["contract_telemetry_assessment"], "INSUFFICIENT_TELEMETRY")
             self.assertTrue((root / "analysis" / "shs_root_cause_NUAI_2026-07-20.md").exists())
 

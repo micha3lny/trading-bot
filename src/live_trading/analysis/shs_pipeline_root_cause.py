@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,10 @@ FINAL_CLASSIFICATIONS = {
     "SUBSCRIPTION_REQUEST_NOT_SENT",
     "SUBSCRIPTION_REQUEST_SENT_BUT_NOT_RECORDED",
     "INSUFFICIENT_TELEMETRY",
+    "RUNTIME_TOP100_LOADING_MISSING",
+    "CONTRACT_REQUEST_SENT",
+    "MARKET_DATA_SUBSCRIPTION_NOT_SENT",
+    "INSUFFICIENT_SYMBOL_SPECIFIC_RUNTIME_TELEMETRY",
 }
 
 CSV_COLUMNS = [
@@ -127,6 +132,43 @@ def _row_symbol(row: dict[str, Any]) -> str:
             return normalize_symbol(token.split("=", 1)[1])
     return ""
 
+
+
+def _json_contains_symbol(value: Any, symbol: str) -> bool:
+    if isinstance(value, dict):
+        return any(_json_contains_symbol(item, symbol) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_json_contains_symbol(item, symbol) for item in value)
+    if isinstance(value, str):
+        return bool(re.search(rf"(?<![A-Z0-9_.-]){re.escape(symbol)}(?![A-Z0-9_.-])", value.upper()))
+    return False
+
+
+def row_contains_symbol_evidence(row: dict[str, Any], symbol: str) -> bool:
+    """Return True only when the row explicitly names the target symbol.
+
+    Session-level Top100/reload snapshots may contain a symbol inside a list
+    rather than in a dedicated symbol column; those still count only when the
+    raw row text explicitly contains the exact symbol token.
+    """
+    symbol = normalize_symbol(symbol)
+    if not symbol:
+        return False
+    if _row_symbol(row) == symbol:
+        return True
+    raw = _read_json(row.get("raw_json") or row.get("payload") or row.get("details") or row.get("message"))
+    if raw and _json_contains_symbol(raw, symbol):
+        return True
+    text = " ".join(str(v) for v in row.values() if v not in (None, ""))
+    return bool(re.search(rf"(?<![A-Z0-9_.-]){re.escape(symbol)}(?![A-Z0-9_.-])", text.upper()))
+
+
+def _sqlite_table_is_symbol_runtime_evidence(table: str) -> bool:
+    """Filter out non-live or aggregate tables for symbol pipeline forensics."""
+    table = table.lower()
+    if table in {"market_data_sessions", "runtime_event_counters"}:
+        return False
+    return True
 
 def _row_time(row: dict[str, Any]) -> pd.Timestamp | None:
     raw = _read_json(row.get("raw_json") or row.get("payload"))
@@ -258,7 +300,7 @@ def _iter_recorder_rows(recorder_dir: Path, session_date: str, symbol: str) -> l
                     for row in csv.DictReader(f):
                         if not row_matches_session(row, session_date):
                             continue
-                        if _row_symbol(row) != symbol:
+                        if not row_contains_symbol_evidence(row, symbol):
                             continue
                         et = _event_type(row, path.name)
                         payload = _payload(row)
@@ -277,7 +319,7 @@ def _iter_recorder_rows(recorder_dir: Path, session_date: str, symbol: str) -> l
                 row = _read_json(line)
                 if row and not row_matches_session(row, session_date):
                     continue
-                if row and _row_symbol(row) not in {"", symbol}:
+                if row and not row_contains_symbol_evidence(row, symbol):
                     continue
                 et = _event_type(row, path.name) if row else path.name.upper()
                 payload = _payload(row) if row else line[:1000]
@@ -297,7 +339,7 @@ def _iter_journal_rows(log_dir: Path, session_date: str, symbol: str) -> list[Ev
             continue
         for line in lines:
             upper = line.upper()
-            if symbol not in upper:
+            if not re.search(rf"(?<![A-Z0-9_.-]){re.escape(symbol)}(?![A-Z0-9_.-])", upper):
                 continue
             ts = parse_dt(line[:35].strip(" []"))
             if ts is not None and str(ts.date()) != session_date:
@@ -322,6 +364,8 @@ def _iter_sqlite_rows(sqlite_path: Path, session_date: str, symbol: str) -> list
     conn.row_factory = sqlite3.Row
     try:
         for table in _sqlite_tables(conn):
+            if not _sqlite_table_is_symbol_runtime_evidence(table):
+                continue
             cols = [str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
             if not cols:
                 continue
@@ -352,7 +396,7 @@ def _iter_sqlite_rows(sqlite_path: Path, session_date: str, symbol: str) -> list
                 d = dict(row)
                 if not row_matches_session(d, session_date):
                     continue
-                if _row_symbol(d) not in {"", symbol}:
+                if not row_contains_symbol_evidence(d, symbol):
                     continue
                 et = _event_type(d, table)
                 payload = _payload(d)
@@ -455,9 +499,9 @@ def classify_root_cause(top_row: dict[str, Any], evidence: list[EvidenceItem], r
     if not top_row:
         return "TOP100_NOT_LOADED_RUNTIME", "daily Top100 row missing", "high"
     if not evidence:
-        return "DATA_RETENTION_PREVENTS_ROOT_CAUSE", "no symbol-specific runtime/recorder/SQLite/journal evidence retained for this session", "medium"
+        return "INSUFFICIENT_SYMBOL_SPECIFIC_RUNTIME_TELEMETRY", "daily Top100 contains symbol, but no symbol-specific runtime/recorder/SQLite/journal evidence proves runtime loaded, watched, qualified, subscribed, priced, or evaluated it for this session", "medium"
     if not stages["runtime_top100_watchlist_loading"] and not stages["symbol_registration"]:
-        return "WATCHLIST_REGISTRATION_MISSING", "Top100 file contains symbol but runtime watchlist/state evidence is missing", "medium"
+        return "RUNTIME_TOP100_LOADING_MISSING", "daily Top100 contains symbol, but accepted symbol-specific evidence does not prove runtime Top100/watchlist loading included it", "medium"
     contract_failed = any("FAILED" in item.event_type or "NOT_QUALIFIED" in item.payload.upper() for item in evidence if "CONTRACT" in item.payload.upper() or "CONTRACT" in item.event_type)
     if contract_failed:
         return "CONTRACT_REQUEST_FAILED", "contract qualification failure evidence found", "high"
@@ -468,7 +512,7 @@ def classify_root_cause(top_row: dict[str, Any], evidence: list[EvidenceItem], r
     if contract_assessment == "INSUFFICIENT_TELEMETRY":
         return "INSUFFICIENT_TELEMETRY", "symbol reached runtime evidence, but contract request/cache telemetry is not comprehensive enough to prove whether a request was sent", "low"
     if subscription_assessment == "SUBSCRIPTION_REQUEST_NOT_SENT":
-        return "SUBSCRIPTION_REQUEST_NOT_SENT", "positive telemetry says ticker/subscription was absent for this symbol", "high"
+        return "MARKET_DATA_SUBSCRIPTION_NOT_SENT", "positive telemetry says ticker/subscription was absent for this symbol", "high"
     sub_failed = any(any(token in item.payload.upper() for token in ["SUBSCRIBE_ERROR", "DELAYED", "PERMISSION", "NO MARKET DATA"]) for item in evidence)
     if sub_failed:
         return "MARKET_DATA_SUBSCRIPTION_FAILED", "subscription or market-data error evidence found", "high"
@@ -546,6 +590,9 @@ def run_symbol(args: argparse.Namespace, symbol: str) -> dict[str, Any]:
         "SUBSCRIPTION_REQUEST_NOT_SENT": "add an invariant test that every resolved contract produces reqMktData or a symbol-specific skip reason",
         "SUBSCRIPTION_REQUEST_SENT_BUT_NOT_RECORDED": "record reqMktData calls and active ticker map reconciliation per symbol",
         "INSUFFICIENT_TELEMETRY": "add comprehensive symbol-specific Top100 watchlist, contract cache/request/result, reqMktData, ticker-map, and SymbolState telemetry",
+        "INSUFFICIENT_SYMBOL_SPECIFIC_RUNTIME_TELEMETRY": "retain symbol-specific runtime Top100/watchlist, contract cache/request/result, reqMktData, ticker-map, and SymbolState telemetry; do not infer stages from aggregate counters or historical collector metadata",
+        "RUNTIME_TOP100_LOADING_MISSING": "add symbol-specific Top100 reload/watchlist membership evidence and reconcile daily Top100 against runtime entry_symbols",
+        "MARKET_DATA_SUBSCRIPTION_NOT_SENT": "add an invariant test that every resolved contract produces reqMktData or a symbol-specific skip reason",
     }.get(root, "investigate with retained symbol-specific runtime evidence")
     basis = runtime_reach_evidence(evidence)
     contract_assessment = contract_telemetry_assessment(evidence)
@@ -579,10 +626,10 @@ def run_symbol(args: argparse.Namespace, symbol: str) -> dict[str, Any]:
         "subscription_telemetry_assessment": subscription_assessment,
         "could_contract_have_been_cached": int(contract_assessment in {"CONTRACT_REQUEST_SENT_BUT_NOT_RECORDED", "CONTRACT_RESOLVED_FROM_CACHE"}),
         "required_fix": required_fix,
-        "regression_test_needed": int(root in {"WATCHLIST_REGISTRATION_MISSING", "CONTRACT_REQUEST_NOT_SENT", "CONTRACT_REQUEST_SENT_BUT_NOT_RECORDED", "CONTRACT_REQUEST_FAILED", "SUBSCRIPTION_REQUEST_NOT_SENT", "SUBSCRIPTION_REQUEST_SENT_BUT_NOT_RECORDED", "MARKET_DATA_SUBSCRIPTION_FAILED", "NO_TICKER_RECEIVED", "SYMBOL_STATE_NOT_CREATED", "ACTUAL_RUNTIME_PROCESSING_BUG", "INSUFFICIENT_TELEMETRY"}),
+        "regression_test_needed": int(root in {"WATCHLIST_REGISTRATION_MISSING", "CONTRACT_REQUEST_NOT_SENT", "CONTRACT_REQUEST_SENT_BUT_NOT_RECORDED", "CONTRACT_REQUEST_FAILED", "SUBSCRIPTION_REQUEST_NOT_SENT", "SUBSCRIPTION_REQUEST_SENT_BUT_NOT_RECORDED", "MARKET_DATA_SUBSCRIPTION_FAILED", "NO_TICKER_RECEIVED", "SYMBOL_STATE_NOT_CREATED", "ACTUAL_RUNTIME_PROCESSING_BUG", "INSUFFICIENT_TELEMETRY", "INSUFFICIENT_SYMBOL_SPECIFIC_RUNTIME_TELEMETRY", "RUNTIME_TOP100_LOADING_MISSING", "MARKET_DATA_SUBSCRIPTION_NOT_SENT"}),
         "another_symbol_occupied_subscription_slot": "unknown" if not evidence else "not_observed",
         "reconnect_or_rollover_evidence": int(_has_any(evidence, ["RECONNECT", "RECORDER_SESSION_ROTATED", "SESSION_BOUNDARY", "ROLLOVER"])),
-        "could_recur": "yes" if root in {"WATCHLIST_REGISTRATION_MISSING", "CONTRACT_REQUEST_MISSING", "MARKET_DATA_SUBSCRIPTION_MISSING", "NO_TICKER_RECEIVED", "SYMBOL_STATE_NOT_CREATED", "DATA_RETENTION_PREVENTS_ROOT_CAUSE", "ACTUAL_RUNTIME_PROCESSING_BUG"} else "uncertain",
+        "could_recur": "yes" if root in {"WATCHLIST_REGISTRATION_MISSING", "CONTRACT_REQUEST_MISSING", "MARKET_DATA_SUBSCRIPTION_MISSING", "NO_TICKER_RECEIVED", "SYMBOL_STATE_NOT_CREATED", "DATA_RETENTION_PREVENTS_ROOT_CAUSE", "ACTUAL_RUNTIME_PROCESSING_BUG", "INSUFFICIENT_SYMBOL_SPECIFIC_RUNTIME_TELEMETRY", "RUNTIME_TOP100_LOADING_MISSING", "MARKET_DATA_SUBSCRIPTION_NOT_SENT"} else "uncertain",
         "evidence_sources": evidence_sources(evidence),
     }
     write_symbol_markdown(args.output_dir / f"shs_root_cause_{symbol}_{args.date}.md", summary, top, case, evidence, timeline_rows(args.date, symbol, top, evidence, root, reason))
