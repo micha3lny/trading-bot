@@ -189,7 +189,7 @@ class LiveFeatureSessionAnchorTests(unittest.TestCase):
         self.assertEqual(runtime_state["symbol_state_bars_trimmed_total"], 5)
         self.assertAlmostEqual(state.first_5m_high, 14.0)
 
-    def test_session_reset_clears_candle_state_only(self) -> None:
+    def test_session_reset_clears_candle_and_signal_state(self) -> None:
         state = SymbolState("AAA", signal_sent=True)
         runtime_state: dict = {}
         update_state(
@@ -209,7 +209,7 @@ class LiveFeatureSessionAnchorTests(unittest.TestCase):
         self.assertEqual(state.bars, [])
         self.assertIsNone(state.first_price)
         self.assertIsNone(state.first_5m_high)
-        self.assertTrue(state.signal_sent)
+        self.assertFalse(state.signal_sent)
         self.assertEqual(runtime_state["symbol_state_session_reset_count"], 1)
         self.assertEqual(runtime_state["symbol_state_bars_cleared_total"], 1)
 

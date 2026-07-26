@@ -23,7 +23,7 @@ from typing import Any, Iterable
 import pandas as pd
 from ib_insync import IB, Stock, MarketOrder
 
-from src.live_trading.v62_live_data_recorder import LiveDataRecorder
+from src.live_trading.v62_live_data_recorder import LiveDataRecorder, recorder_output_path
 from src.live_trading.control.control_api import process_control_api_commands, process_history_collector_commands, start_control_api
 from src.live_trading.market_calendar import get_us_equity_session, is_us_equity_trading_day, previous_us_equity_trading_day
 from src.live_trading.history_readiness import canonical_history_readiness
@@ -417,7 +417,7 @@ def record_contract_metadata(recorder: LiveDataRecorder, contract: Any, *, sourc
     metadata["recorded_at"] = now_utc()
     metadata["source"] = source
     append_dict_csv(
-        recorder.path("contract_metadata.csv", row=metadata, event_type="contract_metadata", symbol=str(metadata.get("symbol") or "")),
+        recorder_output_path(recorder, "contract_metadata.csv", row=metadata, event_type="contract_metadata", symbol=str(metadata.get("symbol") or "")),
         metadata,
         [
             "recorded_at",
@@ -2392,7 +2392,7 @@ def record_lifecycle(recorder: LiveDataRecorder, event: str, symbol: str, **kwar
     raw = row.get("raw_json")
     if raw and not isinstance(raw, str):
         row["raw_json"] = json.dumps(raw, ensure_ascii=False, default=str)
-    append_dict_csv(recorder.path("trade_lifecycle.csv", row=row, event_type=event, symbol=symbol), row, fields)
+    append_dict_csv(recorder_output_path(recorder, "trade_lifecycle.csv", row=row, event_type=event, symbol=symbol), row, fields)
     if event == "SIGNAL_READY":
         print(
             f"{now_utc()} SIGNAL_READY symbol={symbol} action={kwargs.get('action') or ''} "
@@ -2476,7 +2476,7 @@ def record_formal_lifecycle(
     raw_json: dict[str, Any] | None = None,
 ) -> None:
     try:
-        store = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl", row={"recorded_at": now_utc(), "symbol": symbol, "event_type": str(event_type)}, event_type=str(event_type), symbol=symbol))
+        store = JsonlLifecycleStore(recorder_output_path(recorder, "order_lifecycle.jsonl", row={"recorded_at": now_utc(), "symbol": symbol, "event_type": str(event_type)}, event_type=str(event_type), symbol=symbol))
         store.append_event(
             LifecycleEvent(
                 event_type=event_type,
@@ -2783,7 +2783,7 @@ def persist_managed_positions(
         "strategy": STRATEGY_NAME,
         "positions": active_payloads,
     }
-    recorder.path("managed_positions.json", row=payload, event_type="managed_positions").write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    recorder_output_path(recorder, "managed_positions.json", row=payload, event_type="managed_positions").write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     store = getattr(recorder, "sqlite_store", None)
     for symbol, pos in position_items:
         raw_payload = managed_position_payload(
@@ -2952,7 +2952,7 @@ def record_strategy_equity(recorder: LiveDataRecorder, positions: dict[str, Mana
         "positions_json": json.dumps(rows, ensure_ascii=False, default=str),
     }
     append_dict_csv(
-        recorder.path("strategy_equity.csv", row=row, event_type="strategy_equity"),
+        recorder_output_path(recorder, "strategy_equity.csv", row=row, event_type="strategy_equity"),
         row,
         ["recorded_at", "strategy", "active_positions", "gross_exposure", "unrealized_pnl", "positions_json"],
     )
@@ -3835,7 +3835,7 @@ def write_eod_final_status(
         "pending_eod_flatten": bool(rows),
     }
     runtime_state["eod_final_status"] = summary
-    recorder.path("eod_summary.json", row=summary, event_type="eod_summary").write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    recorder_output_path(recorder, "eod_summary.json", row=summary, event_type="eod_summary").write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     if summary["clean"]:
         safe_sqlite_call(
             getattr(recorder, "sqlite_store", None),
@@ -3925,7 +3925,7 @@ def persist_pending_eod_flatten(
         "sqlite_cleanup_result": sqlite_cleanup_result,
     }
     try:
-        recorder.path("eod_pending.json", row=payload, event_type="eod_pending").write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        recorder_output_path(recorder, "eod_pending.json", row=payload, event_type="eod_pending").write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     except Exception as exc:
         print(f"{now_utc()} EOD_PENDING_PERSIST_FAILED reason={reason} error={exc!r}", flush=True)
 
@@ -6358,7 +6358,7 @@ def enrich_lifecycle_with_fills(recorder: LiveDataRecorder) -> int:
                     commission=safe_float(fill.get("commission")),
                     raw_json={"source": "enrich_lifecycle_with_fills"},
                 )
-                store = JsonlLifecycleStore(recorder.path("order_lifecycle.jsonl", row={"recorded_at": now_utc(), "symbol": execution.symbol, "event_type": str(event_type)}, event_type=str(event_type), symbol=execution.symbol))
+                store = JsonlLifecycleStore(recorder_output_path(recorder, "order_lifecycle.jsonl", row={"recorded_at": now_utc(), "symbol": execution.symbol, "event_type": str(event_type)}, event_type=str(event_type), symbol=execution.symbol))
                 store.append_execution_once(
                     execution,
                     LifecycleEvent(

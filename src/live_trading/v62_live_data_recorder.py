@@ -5,7 +5,7 @@ import csv
 import json
 import os
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Iterable
@@ -83,7 +83,6 @@ def resolved_record_session_date(row: dict[str, Any] | None = None, *, fallback_
         "timestamp",
         "time",
         "bar_time",
-        "recorded_at",
         "executed_at",
         "submitted_at",
         "filled_at",
@@ -94,7 +93,34 @@ def resolved_record_session_date(row: dict[str, Any] | None = None, *, fallback_
         dt = parse_timestamp(row.get(key) or raw.get(key))
         if dt is not None:
             return dt.astimezone(NY_TZ).date().isoformat()
+    recorded_at = parse_timestamp(row.get("recorded_at") or raw.get("recorded_at"))
+    if recorded_at is not None:
+        return recorded_at.astimezone(NY_TZ).date().isoformat()
     return fallback_session_date or session_date_utc()
+
+
+def recorder_output_path(
+    recorder: Any,
+    name: str,
+    *,
+    row: dict[str, Any] | None = None,
+    session_date: str | None = None,
+    event_type: str = "",
+    symbol: str = "",
+) -> Path:
+    """Resolve a recorder path while preserving the legacy path(name) protocol."""
+    try:
+        return recorder.path(
+            name,
+            row=row,
+            session_date=session_date,
+            event_type=event_type,
+            symbol=symbol,
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        return recorder.path(name)
 
 
 def utc_now_iso() -> str:
@@ -434,6 +460,30 @@ class LiveDataRecorder:
     def record_session_for_row(self, row: dict[str, Any] | None = None, *, session_date: str | None = None) -> str:
         explicit_session = session_date or explicit_record_session_date(row)
         record_session = explicit_session or resolved_record_session_date(row, fallback_session_date=self.session_date)
+        row = row or {}
+        raw = parse_jsonish(row.get("raw_json"))
+        authoritative_timestamp = any(
+            parse_timestamp(row.get(key) or raw.get(key)) is not None
+            for key in (
+                "event_time",
+                "timestamp",
+                "time",
+                "bar_time",
+                "executed_at",
+                "submitted_at",
+                "filled_at",
+                "created_at",
+                "updated_at",
+                "closed_at",
+            )
+        )
+        if not explicit_session and not authoritative_timestamp and record_session > self.session_date:
+            try:
+                session_gap_days = (date.fromisoformat(record_session) - date.fromisoformat(self.session_date)).days
+            except ValueError:
+                session_gap_days = 0
+            if session_gap_days > 7:
+                return self.session_date
         if record_session and record_session < self.session_date and not explicit_session:
             return self.session_date
         return record_session

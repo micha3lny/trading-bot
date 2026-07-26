@@ -11,7 +11,7 @@ from typing import Any
 
 from ib_insync import IB, ExecutionFilter
 
-from src.live_trading.v62_live_data_recorder import FillEvent, LiveDataRecorder, PortfolioSnapshot
+from src.live_trading.v62_live_data_recorder import FillEvent, LiveDataRecorder, PortfolioSnapshot, recorder_output_path
 from src.live_trading.storage.sqlite_store import open_sqlite_store, safe_sqlite_call
 from src.live_trading.unified_logger import install_unified_logger
 
@@ -367,7 +367,7 @@ def upsert_fill_row(recorder: LiveDataRecorder, row: dict[str, Any]) -> str:
     execution_id = str(row.get("execution_id") or "").strip()
     if not execution_id:
         raise ValueError("fill row missing execution_id")
-    path = recorder.path("fills.csv", row=row, event_type="fill", symbol=str(row.get("symbol") or ""))
+    path = recorder_output_path(recorder, "fills.csv", row=row, event_type="fill", symbol=str(row.get("symbol") or ""))
     rows = read_csv_rows(path)
     for idx, existing in enumerate(rows):
         if str(existing.get("execution_id") or "").strip() == execution_id:
@@ -452,7 +452,7 @@ def record_commission_report(recorder: LiveDataRecorder, commission_report: Any)
     execution_id = row.get("execution_id")
     if not execution_id:
         return "missing_exec_id"
-    path = recorder.path("fills.csv", row=row, event_type="commission_report", symbol=str(row.get("symbol") or ""))
+    path = recorder_output_path(recorder, "fills.csv", row=row, event_type="commission_report", symbol=str(row.get("symbol") or ""))
     rows = read_csv_rows(path)
     for idx, existing in enumerate(rows):
         if str(existing.get("execution_id") or "").strip() == str(execution_id):

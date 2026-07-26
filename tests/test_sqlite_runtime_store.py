@@ -9,6 +9,7 @@ import unittest
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from scripts.cleanup_runtime_events import cleanup_runtime_events
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore, SQLiteWriteQueue, parse_jsonish, safe_sqlite_call, session_date_utc
@@ -65,6 +66,23 @@ def fake_fill(exec_id: str, commission: float | None = None):
 
 
 class SQLiteRuntimeStoreTests(unittest.TestCase):
+    def test_close_waits_for_scheduled_peak_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            result = {
+                "trade_id": "T1",
+                "peak_data_quality": "RETRY_PENDING",
+                "validation_status": "OK",
+            }
+            with patch.object(SQLiteRuntimeStore, "calculate_and_store_trade_peak", return_value=result):
+                store.schedule_trade_peak_calculation("T1")
+                with store._peak_threads_lock:
+                    worker = next(iter(store._peak_threads))
+
+                store.close()
+
+            self.assertFalse(worker.is_alive())
+
     def test_schema_initializes_and_wal_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")

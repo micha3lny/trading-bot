@@ -27,6 +27,17 @@ def read_csv(path: Path) -> list[dict[str, str]]:
 
 
 class RecorderSessionRotationTests(unittest.TestCase):
+    def test_historical_recorder_keeps_active_session_for_row_with_only_recorded_at(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = LiveDataRecorder(tmp, session_date="2026-05-22")
+            row = {"recorded_at": "2026-07-26T12:00:00+00:00", "symbol": "AAA"}
+
+            path = recorder.path("trade_lifecycle.csv", row=row, event_type="test", symbol="AAA")
+
+            self.assertEqual(recorder.session_date, "2026-05-22")
+            self.assertEqual(path.parent.name, "2026-05-22")
+            self.assertEqual(recorder.rotation_count, 0)
+
     def test_explicit_session_date_takes_precedence_over_top100_source_date(self) -> None:
         row = {
             "symbol": "ADVB",

@@ -36,6 +36,7 @@ SQLITE_WRITER_TIMEOUT_LOG_INTERVAL_SECONDS = float(os.environ.get("TRADING_BOT_S
 SQLITE_WRITER_SLOW_WRITE_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRITER_SLOW_WRITE_SECONDS", "5.0"))
 TRADE_PEAK_ASYNC_CALCULATION_ENABLED = os.environ.get("TRADING_BOT_TRADE_PEAK_ASYNC_CALCULATION", "1").strip().lower() not in {"0", "false", "no", "off"}
 TRADE_PEAK_BACKGROUND_DELAY_SECONDS = float(os.environ.get("TRADING_BOT_TRADE_PEAK_BACKGROUND_DELAY_SECONDS", "0.25"))
+TRADE_PEAK_BACKGROUND_JOIN_TIMEOUT_SECONDS = float(os.environ.get("TRADING_BOT_TRADE_PEAK_BACKGROUND_JOIN_TIMEOUT_SECONDS", "5.0"))
 SQLITE_WRITER_METHOD_ACK_TIMEOUT_SECONDS = {
     "set_broker_net_positions": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_BROKER_POSITIONS", "8.0")),
     "reconcile_active_positions_to_broker_snapshot": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_RECONCILE", "12.0")),
@@ -418,10 +419,17 @@ class SQLiteRuntimeStore:
         self.conn = connect_sqlite(self.path)
         self._transaction_depth = 0
         self._broker_net_positions: dict[str, float] | None = None
+        self._peak_threads: set[threading.Thread] = set()
+        self._peak_threads_lock = threading.Lock()
         if init:
             self.init_schema()
 
     def close(self) -> None:
+        with self._peak_threads_lock:
+            peak_threads = list(self._peak_threads)
+        for thread in peak_threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=max(0.0, TRADE_PEAK_BACKGROUND_JOIN_TIMEOUT_SECONDS))
         self.conn.close()
 
     def calculate_and_store_trade_peak(self, trade_id: str) -> dict[str, Any]:
@@ -494,6 +502,8 @@ class SQLiteRuntimeStore:
         finally:
             if store is not None:
                 store.close()
+            with self._peak_threads_lock:
+                self._peak_threads.discard(threading.current_thread())
 
     def schedule_trade_peak_calculation(self, trade_id: str) -> None:
         if not TRADE_PEAK_ASYNC_CALCULATION_ENABLED or not trade_id:
@@ -504,6 +514,8 @@ class SQLiteRuntimeStore:
             name=f"trade-peak-{str(trade_id)[:32]}",
             daemon=True,
         )
+        with self._peak_threads_lock:
+            self._peak_threads.add(thread)
         thread.start()
 
     def repair_trade_peaks_needing_rebuild(self, session_date: str | None = None, *, limit: int | None = None) -> dict[str, Any]:

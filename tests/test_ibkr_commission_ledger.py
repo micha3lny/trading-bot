@@ -104,10 +104,10 @@ class CountingStore:
         self.upsert_count += 1
         self.rows.append(dict(_row))
 
-    def runtime_pending_counts(self):
+    def runtime_pending_counts(self, session_date=None):
         return dict(self.pending_counts)
 
-    def finalize_pending_trades(self):
+    def finalize_pending_trades(self, session_date=None):
         self.finalize_count += 1
         self.pending_counts = {}
         return {"pending_before": 1, "pending_after": 0, "resolved": 1}
@@ -130,7 +130,7 @@ class CountingStore:
 
 
 class InterruptingPendingCountStore(CountingStore):
-    def runtime_pending_counts(self):
+    def runtime_pending_counts(self, session_date=None):
         raise KeyboardInterrupt
 
 
