@@ -1291,14 +1291,18 @@ class SQLiteRuntimeStore:
             count=repeat_count,
             event_time=str(now),
         )
-        should_persist, persisted_event_type = self._should_persist_runtime_event(
-            event_type=event_type_upper,
-            persisted_event_type=SUMMARY_RUNTIME_EVENT_TYPES.get(event_type_upper, event_type_upper),
-            session_date=str(session_date or ""),
-            symbol=symbol,
-            reason=reason,
-            event_time=str(now),
-        )
+        force_persist = bool(kwargs.get("force_persist"))
+        if force_persist:
+            should_persist, persisted_event_type = True, event_type_upper
+        else:
+            should_persist, persisted_event_type = self._should_persist_runtime_event(
+                event_type=event_type_upper,
+                persisted_event_type=SUMMARY_RUNTIME_EVENT_TYPES.get(event_type_upper, event_type_upper),
+                session_date=str(session_date or ""),
+                symbol=symbol,
+                reason=reason,
+                event_time=str(now),
+            )
         if not should_persist:
             return 0
         raw_json = kwargs.get("raw_json")

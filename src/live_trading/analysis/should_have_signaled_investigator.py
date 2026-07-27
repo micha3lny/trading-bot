@@ -33,6 +33,7 @@ from src.live_trading.analysis.signal_replay_analyzer import (
     row_text,
     row_time,
 )
+from src.live_trading.symbol_pipeline_telemetry import SYMBOL_PIPELINE_EVENT_TYPES
 from src.live_trading.analysis.symbol_subscription_inspector import (
     line_time,
     parse_key_values,
@@ -74,6 +75,13 @@ CASE_COLUMNS = [
     "position_limit_reached",
     "already_open",
     "unknown_reason",
+    "pipeline_event_count",
+    "pipeline_last_event",
+    "pipeline_first_missing_event",
+    "pipeline_terminal_event",
+    "pipeline_complete",
+    "pipeline_telemetry_sources",
+    "pipeline_trace_json",
     "final_classification",
 ]
 
@@ -233,6 +241,48 @@ def build_symbol_index(sources: dict[str, pd.DataFrame], target_symbols: set[str
     }
 
 
+def pipeline_event_name(row: dict[str, Any]) -> str:
+    raw = row.get("raw_json")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    return str(
+        first_existing_column(row, ["event_type", "event"])
+        or raw.get("event_type")
+        or raw.get("event")
+        or ""
+    ).strip().upper().replace(" ", "_")
+
+
+def build_pipeline_symbol_index(
+    sources: dict[str, pd.DataFrame],
+    target_symbols: set[str],
+    session_date: str,
+) -> dict[str, dict[str, pd.DataFrame]]:
+    indexed: dict[str, dict[str, list[dict[str, Any]]]] = {
+        source: {symbol: [] for symbol in target_symbols}
+        for source in sources
+    }
+    for source, df in sources.items():
+        for row in df.to_dict("records") if not df.empty else []:
+            if not row_belongs_to_session(row, session_date):
+                continue
+            symbol = row_symbol(row)
+            if symbol not in target_symbols:
+                continue
+            if pipeline_event_name(row) not in SYMBOL_PIPELINE_EVENT_TYPES:
+                continue
+            indexed[source][symbol].append(row)
+    return {
+        source: {symbol: pd.DataFrame(rows) for symbol, rows in symbol_map.items()}
+        for source, symbol_map in indexed.items()
+    }
+
+
 def build_heartbeat_index(lines: list[str]) -> list[tuple[pd.Timestamp, dict[str, str]]]:
     out: list[tuple[pd.Timestamp, dict[str, str]]] = []
     for line in lines:
@@ -252,16 +302,17 @@ def load_evidence_bundle(
     journal_log: Path | None,
     target_symbols: set[str],
 ) -> EvidenceBundle:
-    sqlite_sources = read_sqlite_sources(sqlite_path, session_date)
-    recorder_sources = load_recorder_sources(recorder_dir, session_date)
-    journal = read_text_lines(journal_log or default_journal_path(session_date))
+    all_sqlite_sources = read_sqlite_sources(sqlite_path, session_date)
+    all_recorder_sources = load_recorder_sources(recorder_dir, session_date)
+    sqlite_sources = {"runtime_events": all_sqlite_sources.get("runtime_events", pd.DataFrame())}
+    recorder_sources = {"trade_lifecycle": all_recorder_sources.get("trade_lifecycle", pd.DataFrame())}
     return EvidenceBundle(
         sqlite_sources=sqlite_sources,
         recorder_sources=recorder_sources,
-        sqlite_by_symbol=build_symbol_index(sqlite_sources, target_symbols, session_date),
-        recorder_by_symbol=build_symbol_index(recorder_sources, target_symbols, session_date),
-        journal_lines=journal,
-        heartbeat_states=build_heartbeat_index(journal),
+        sqlite_by_symbol=build_pipeline_symbol_index(sqlite_sources, target_symbols, session_date),
+        recorder_by_symbol=build_pipeline_symbol_index(recorder_sources, target_symbols, session_date),
+        journal_lines=[],
+        heartbeat_states=[],
     )
 
 
@@ -291,9 +342,124 @@ def runtime_signal_ready_seen(timeline: list[dict[str, Any]], symbol_journal: st
         details = str(event.get("details") or "")
         if event_type in {"SIGNAL_READY", "ENTRY_SIGNAL"}:
             return 1
+        if event_type == "SIGNAL_EVALUATED" and re.search(r"(?:outcome|status)[=:]\s*ready\b", details, re.IGNORECASE):
+            return 1
         if event_keyword_seen(details, "SIGNAL_READY") or event_keyword_seen(details, "ENTRY_SIGNAL"):
             return 1
     return int(event_keyword_seen(symbol_journal, "SIGNAL_READY") or event_keyword_seen(symbol_journal, "ENTRY_SIGNAL"))
+
+
+def pipeline_event_payload(row: dict[str, Any]) -> dict[str, Any]:
+    raw = row.get("raw_json")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raw = {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def pipeline_records(*source_maps: dict[str, pd.DataFrame]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+    for source_map in source_maps:
+        for source, df in source_map.items():
+            for row in df.to_dict("records") if not df.empty else []:
+                payload = pipeline_event_payload(row)
+                event = pipeline_event_name(row)
+                key = (
+                    event,
+                    str(row_time(row) or payload.get("timestamp") or ""),
+                    row_symbol(row),
+                    str(payload.get("scan_id") or ""),
+                    str(payload.get("status") or payload.get("outcome") or ""),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                records.append({"source": source, "row": row, "payload": payload, "event": event})
+    return sorted(records, key=lambda item: row_time(item["row"]) or pd.Timestamp.max.tz_localize("UTC"))
+
+
+def pipeline_has_event(records: list[dict[str, Any]], event: str, *statuses: str) -> bool:
+    expected = {str(status).lower() for status in statuses if status}
+    for item in records:
+        if item["event"] != event:
+            continue
+        payload = item["payload"]
+        observed = {
+            str(payload.get("status") or "").lower(),
+            str(payload.get("outcome") or "").lower(),
+        }
+        if not expected or expected.intersection(observed):
+            return True
+    return False
+
+
+def pipeline_reason_text(records: list[dict[str, Any]]) -> str:
+    return "\n".join(
+        str(item["payload"].get("reason") or item["row"].get("reason") or "")
+        for item in records
+    ).upper()
+
+
+def summarize_symbol_pipeline(records: list[dict[str, Any]]) -> dict[str, Any]:
+    observed = [item["event"] for item in records]
+    observed_set = set(observed)
+    first_missing = ""
+    for required in [
+        "TOP100_SYMBOL_LOAD",
+        "SYMBOL_REGISTERED",
+        "CONTRACT_REQUESTED",
+    ]:
+        if required not in observed_set:
+            first_missing = required
+            break
+    contract_terminal = observed_set.intersection({
+        "CONTRACT_RESOLVED", "CONTRACT_REQUEST_FAILED", "CONTRACT_RESOLVED_FROM_CACHE",
+    })
+    if not first_missing and not contract_terminal:
+        first_missing = "CONTRACT_RESOLUTION_OUTCOME"
+    if not first_missing and "CONTRACT_REQUEST_FAILED" not in observed_set:
+        for required in ["MKT_DATA_REQUESTED", "MKT_DATA_SUBSCRIBED", "FIRST_TICK_RECEIVED", "STATE_CREATED", "SIGNAL_EVALUATED"]:
+            if required not in observed_set:
+                first_missing = required
+                break
+    terminal_candidates = [
+        item for item in records
+        if item["event"] in {"CONTRACT_REQUEST_FAILED", "SIGNAL_REJECTED", "BUY_BLOCKED", "BUY_DECISION"}
+    ]
+    terminal = terminal_candidates[-1]["event"] if terminal_candidates else ""
+    terminal_status = ""
+    if terminal_candidates:
+        payload = terminal_candidates[-1]["payload"]
+        terminal_status = str(payload.get("status") or payload.get("outcome") or "")
+    complete = bool(
+        "CONTRACT_REQUEST_FAILED" in observed_set
+        or "SIGNAL_REJECTED" in observed_set
+        or "BUY_BLOCKED" in observed_set
+        or pipeline_has_event(records, "BUY_DECISION", "dispatch_attempt", "order_submitted", "submitted")
+    )
+    trace = [
+        {
+            "timestamp": iso_ts(row_time(item["row"]) or item["payload"].get("timestamp")),
+            "source": item["source"],
+            "event_type": item["event"],
+            "scan_id": item["payload"].get("scan_id"),
+            "status": item["payload"].get("status") or item["payload"].get("outcome"),
+            "reason": item["payload"].get("reason") or item["row"].get("reason"),
+        }
+        for item in records
+    ]
+    return {
+        "pipeline_event_count": len(records),
+        "pipeline_last_event": observed[-1] if observed else "",
+        "pipeline_first_missing_event": first_missing,
+        "pipeline_terminal_event": f"{terminal}:{terminal_status}".rstrip(":"),
+        "pipeline_complete": int(complete),
+        "pipeline_telemetry_sources": ",".join(sorted({item["source"] for item in records})),
+        "pipeline_trace_json": json.dumps(trace, ensure_ascii=False, default=str),
+    }
 
 
 def buy_details(symbol: str, sqlite_sources: dict[str, pd.DataFrame], recorder_sources: dict[str, pd.DataFrame]) -> tuple[str, str]:
@@ -356,8 +522,6 @@ def duplicate_trade_diagnostics(sqlite_path: Path, session_date: str) -> dict[st
 
 
 def classify_case(flags: dict[str, int]) -> str:
-    if flags["was_bought"] and flags.get("buy_time"):
-        return "bought_late"
     if flags["buy_fill_seen"]:
         return "bought_late"
     if flags["restart_blocked"]:
@@ -393,56 +557,60 @@ def investigate_case(
         or target.get("opening_range_break_time")
         or target.get("first_time_above_8pct")
     )
-    sqlite_sources = sources_for_symbol(evidence.sqlite_by_symbol, symbol, center)
-    recorder_sources = sources_for_symbol(evidence.recorder_by_symbol, symbol, center)
+    sqlite_sources = {
+        source: symbol_map.get(symbol, pd.DataFrame())
+        for source, symbol_map in evidence.sqlite_by_symbol.items()
+    }
+    recorder_sources = {
+        source: symbol_map.get(symbol, pd.DataFrame())
+        for source, symbol_map in evidence.recorder_by_symbol.items()
+    }
     timeline, raw_counts = build_symbol_timeline(
         row=target,
         sqlite_sources=sqlite_sources,
         recorder_sources=recorder_sources,
         center=center,
     )
-    text = event_text(timeline)
-    symbol_journal = journal_text_for_symbol(evidence.journal_lines, symbol, center)
-    heartbeat = nearest_heartbeat_state_from_index(evidence.heartbeat_states, center)
-    heartbeat_text = json.dumps(heartbeat, default=str).upper()
-    combined = "\n".join([text, symbol_journal])
-    global_combined = "\n".join([combined, heartbeat_text])
-
-    buy_time, buy_order_id = buy_details(symbol, sqlite_sources, recorder_sources)
-    runtime_count = sum(
-        int(raw_counts.get(key, 0) or 0)
-        for key in [
-            "runtime_events_count",
-            "risk_events_count",
-            "orders_count",
-            "trades_count",
-            "executions_count",
-            "trade_lifecycle_count",
-            "order_lifecycle_count",
-            "fills_count",
-        ]
-    )
+    del raw_counts
+    records = pipeline_records(sqlite_sources, recorder_sources)
+    reasons = pipeline_reason_text(records)
+    submitted = [
+        item for item in records
+        if item["event"] == "BUY_DECISION"
+        and str(item["payload"].get("status") or item["payload"].get("outcome") or "").lower()
+        in {"dispatch_attempt", "order_submitted", "submitted", "approved"}
+    ]
+    submitted_event = submitted[0] if submitted else None
+    buy_time = iso_ts(row_time(submitted_event["row"])) if submitted_event else ""
+    buy_order_id = str(submitted_event["payload"].get("order_id") or "") if submitted_event else ""
+    signal_ready_seen = int(pipeline_has_event(records, "SIGNAL_EVALUATED", "ready"))
+    buy_attempt_seen = int(bool(submitted))
+    blocked_seen = pipeline_has_event(records, "BUY_BLOCKED", "blocked")
     flags: dict[str, Any] = {
         "was_bought": int(pd.to_numeric(pd.Series([target.get("was_bought")]), errors="coerce").fillna(0).iloc[0] == 1),
         "buy_time": buy_time,
-        "runtime_evidence_found": int(runtime_count > 0 or bool(symbol_journal)),
-        "ready_candidate_seen": bool_text(combined, "READY_CANDIDATES", "LIVE_READY_CANDIDATES"),
-        "signal_ready_seen": runtime_signal_ready_seen(timeline, symbol_journal),
-        "buy_attempt_seen": bool_text(combined, "PAPER BUY", "PAPER_BUY", "BUY_ORDER_SENT", "ORDER_SUBMITTED"),
-        "buy_fill_seen": bool_text(combined, "FILL", "EXECUTION", "BOT", "BOUGHT"),
-        "risk_guard_blocked": bool_text(combined, "RISK_GUARD_BLOCK_ENTRY", "RISK_GUARD"),
-        "max_positions_blocked": bool_text(combined, "MAX_POSITION", "MAX_POSITIONS"),
-        "restart_blocked": bool_text(global_combined, "RESTART_BLOCK", "SIGNAL_BEFORE_LAST_UNBLOCK"),
-        "top100_blocked": bool_text(global_combined, "TOP100_BLOCK"),
-        "spread_blocked": bool_text(combined, "SPREAD"),
-        "price_missing_blocked": bool_text(combined, "NO_USABLE_TICKER_PRICE", "NO_MARKET_DATA", "MISSING_MARKET_DATA", "PRICE_MISSING"),
-        "subscription_missing_blocked": bool_text(combined, "SUBSCRIPTION", "NO_CONTRACT", "CONTRACT_FAILED", "NOT_SUBSCRIBED"),
-        "stale_candidate": bool_text(combined, "STALE_CANDIDATE", "CANDIDATE_AGE", "STALE_OR_BACKFILL"),
-        "candidate_replaced_by_higher_rank": bool_text(combined, "REPLACED_BY_HIGHER", "LOWER_RANK", "COMPETING_CANDIDATE"),
-        "position_limit_reached": bool_text(combined, "POSITION_LIMIT", "MAX_SINGLE_POSITION", "MAX_POSITIONS"),
-        "already_open": bool_text(combined, "ALREADY_OPEN", "DUPLICATE_POSITION"),
+        "runtime_evidence_found": int(bool(records)),
+        "ready_candidate_seen": signal_ready_seen,
+        "signal_ready_seen": signal_ready_seen,
+        "buy_attempt_seen": buy_attempt_seen,
+        "buy_fill_seen": int(pipeline_has_event(records, "BUY_DECISION", "order_submitted", "submitted")),
+        "risk_guard_blocked": int(blocked_seen and "RISK" in reasons),
+        "max_positions_blocked": int(blocked_seen and ("MAX_POSITION" in reasons or "MAX_ENTRIES" in reasons)),
+        "restart_blocked": int(blocked_seen and ("RESTART" in reasons or "LAST_UNBLOCK" in reasons)),
+        "top100_blocked": int(blocked_seen and "TOP100" in reasons),
+        "spread_blocked": int(blocked_seen and "SPREAD" in reasons),
+        "price_missing_blocked": int(blocked_seen and ("PRICE" in reasons or "MARKET_DATA" in reasons)),
+        "subscription_missing_blocked": int(
+            pipeline_has_event(records, "CONTRACT_REQUEST_FAILED", "failed", "error", "not_qualified")
+            or pipeline_has_event(records, "MKT_DATA_SUBSCRIBED", "failed", "error")
+        ),
+        "stale_candidate": int(blocked_seen and ("STALE" in reasons or "BACKFILL" in reasons)),
+        "candidate_replaced_by_higher_rank": int(blocked_seen and ("RANK" in reasons or "MAX_ENTRIES_PER_CYCLE" in reasons)),
+        "position_limit_reached": int(blocked_seen and ("POSITION" in reasons or "MAX_ENTRIES" in reasons)),
+        "already_open": int("ALREADY_OPEN" in reasons or "DUPLICATE_POSITION" in reasons),
     }
     final = classify_case(flags)
+    pipeline_summary = summarize_symbol_pipeline(records)
     flags["unknown_reason"] = int(final == "unknown")
     return {
         "date": session_date,
@@ -458,6 +626,7 @@ def investigate_case(
         "buy_time": buy_time,
         "buy_order_id": buy_order_id,
         **{key: int(value) for key, value in flags.items() if key not in {"buy_time"}},
+        **pipeline_summary,
         "final_classification": final,
     }
 
