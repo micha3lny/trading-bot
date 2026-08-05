@@ -1216,6 +1216,356 @@ def build_pre_signal_runtime_snapshot(
     }
 
 
+def _candidate_ticker_age_seconds(ticker: Any, observed_at: datetime) -> float | None:
+    raw = ticker_time_value(ticker) if ticker is not None else ""
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, (observed_at - parsed.astimezone(timezone.utc)).total_seconds())
+
+
+def start_candidate_scan_collector(
+    *,
+    writer: Any,
+    runtime_state: dict[str, Any],
+    session_date: str,
+    scan_id: int,
+    scan_started_at: str,
+    expected_symbols: Iterable[str],
+    contract_by_symbol: dict[str, Any],
+    tickers: dict[str, Any],
+    states: dict[str, SymbolState],
+    managed_positions: dict[str, ManagedPosition],
+    ib: IB,
+    args: argparse.Namespace,
+    entries_blocked: bool,
+    manual_block: bool,
+    entry_delay_block: bool,
+    restart_block: bool,
+    reconnect_block: bool,
+    disk_block: bool,
+    top100_block: bool,
+    observed_at: datetime,
+) -> Any | None:
+    if writer is None:
+        return None
+    from src.live_trading.candidate_snapshot_telemetry import CandidateScanCollector
+
+    normalized_symbols = tuple(dict.fromkeys(str(symbol or "").upper() for symbol in expected_symbols if str(symbol or "").strip()))
+    collector = CandidateScanCollector(
+        session_date=session_date,
+        run_id=str(runtime_state.get("top100_pipeline_run_id") or ""),
+        process_start_id=str(runtime_state.get("candidate_snapshot_process_start_id") or ""),
+        scan_id=scan_id,
+        scan_started_at=scan_started_at,
+        expected_symbols=normalized_symbols,
+    )
+    writer.note_expected_batch(
+        session_date,
+        process_start_id=collector.process_start_id,
+        scan_id=scan_id,
+        scan_uid=collector.scan_uid,
+        expected_symbols=len(normalized_symbols),
+    )
+    top100_metadata = _runtime_dict(runtime_state, "top100_entry_metadata_by_symbol")
+    first_tick_symbols = _runtime_set(runtime_state, "first_tick_received_symbols")
+    contract_sources = _runtime_dict(runtime_state, "contract_source_by_symbol")
+    open_positions = active_position_count(managed_positions)
+    pending_orders = len(open_ibkr_order_trades(ib))
+    max_open_positions = int(getattr(args, "max_open_positions", 0) or 0)
+    available_slots = None if max_open_positions <= 0 else max(0, max_open_positions - open_positions)
+    source_path = str(runtime_state.get("top100_reload_path") or getattr(args, "alpha_rank_csv", "") or "")
+    for symbol in normalized_symbols:
+        meta = dict(top100_metadata.get(symbol, {}))
+        ticker = tickers.get(symbol)
+        state = states.get(symbol)
+        has_active_position = bool(
+            symbol in managed_positions
+            and managed_positions[symbol].active
+            and not managed_positions[symbol].exit_sent
+        )
+        collector.update(
+            symbol,
+            top100_rank=meta.get("top100_rank"),
+            top100_score=meta.get("top100_score"),
+            top100_source=source_path,
+            ranking_source_date=meta.get("top100_source_date"),
+            contract_present=int(symbol in contract_by_symbol),
+            contract_source=contract_sources.get(symbol),
+            ticker_present=int(ticker is not None),
+            state_present=int(state is not None),
+            first_tick_received=int(symbol in first_tick_symbols),
+            last_live_update=state.last_live_update_utc if state is not None else None,
+            ticker_age_seconds=_candidate_ticker_age_seconds(ticker, observed_at),
+            signal_sent=int(bool(state.signal_sent)) if state is not None else 0,
+            ready_since=state.ready_since_utc if state is not None else None,
+            entry_symbol_allowed=int(symbol in _runtime_set(runtime_state, "entry_symbols")),
+            symbol_ineligible=int(symbol in _runtime_set(runtime_state, "ineligible_symbols")),
+            entries_blocked=int(bool(entries_blocked)),
+            entries_blocked_reason=str(runtime_state.get("entries_blocked_reason") or ""),
+            manual_block=int(bool(manual_block)),
+            entry_delay_block=int(bool(entry_delay_block)),
+            restart_block=int(bool(restart_block)),
+            reconnect_block=int(bool(reconnect_block)),
+            disk_block=int(bool(disk_block)),
+            top100_block=int(bool(top100_block)),
+            open_positions=open_positions,
+            pending_orders=pending_orders,
+            max_open_positions=max_open_positions,
+            available_slots=available_slots,
+            max_entries_per_cycle=int(getattr(args, "max_entries_per_cycle", 0) or 0),
+            max_entries_per_minute=int(getattr(args, "max_entries_per_minute", 0) or 0),
+            already_open=int(has_active_position),
+            volume_semantics_assessment="UNKNOWN",
+        )
+    return collector
+
+
+def update_candidate_scan_from_pre_signal(
+    collector: Any | None,
+    snapshot: dict[str, Any],
+    *,
+    snap: dict[str, Any] | None = None,
+    ticker: Any = None,
+    observed_at: datetime | None = None,
+) -> None:
+    if collector is None:
+        return
+    symbol = str(snapshot.get("symbol") or "").upper()
+    if not symbol:
+        return
+    snap = snap or {}
+    current_price = safe_float(snapshot.get("current_price"))
+    or_high = safe_float(snapshot.get("or_high"))
+    collector.update(
+        symbol,
+        in_runtime_top100=snapshot.get("in_top100"),
+        contract_present=snapshot.get("contract_present"),
+        ticker_present=snapshot.get("ticker_present"),
+        usable_price=snapshot.get("usable_price"),
+        state_present=snapshot.get("state_present"),
+        current_price=snapshot.get("current_price"),
+        bid=snapshot.get("bid"),
+        ask=snapshot.get("ask"),
+        spread_bps=snapshot.get("spread_bps"),
+        last_live_update=snapshot.get("last_live_update"),
+        ticker_age_seconds=(
+            _candidate_ticker_age_seconds(ticker, observed_at)
+            if ticker is not None and observed_at is not None
+            else None
+        ),
+        stale_reason=snapshot.get("stale_reason"),
+        first_price_initialized=snapshot.get("first_price_initialized"),
+        first5_initialized=snapshot.get("first5_initialized"),
+        first15_initialized=snapshot.get("first15_initialized"),
+        first_5m_complete=snapshot.get("first_5m_complete"),
+        first_15m_complete=snapshot.get("first_15m_complete"),
+        first_5m_high_pct=snapshot.get("first_5m_high_pct"),
+        first_15m_high_pct=snapshot.get("first_15m_high_pct"),
+        rth_open=snapshot.get("rth_open"),
+        first_5m_high=snapshot.get("first_5m_high"),
+        first_15m_high=snapshot.get("first_15m_high"),
+        or_high=snapshot.get("or_high"),
+        or_low=snapshot.get("or_low"),
+        or_range_pct=snapshot.get("or_range_pct"),
+        distance_from_or_high_pct=pct_from(or_high, current_price),
+        premarket_data_quality=snapshot.get("premarket_data_quality"),
+        premarket_open=snapshot.get("premarket_open"),
+        premarket_high=snapshot.get("premarket_high"),
+        premarket_low=snapshot.get("premarket_low"),
+        premarket_last=snapshot.get("premarket_last"),
+        premarket_range_pct=snapshot.get("premarket_range_pct"),
+        premarket_change_pct=snapshot.get("premarket_change_pct"),
+        raw_ticker_volume=snap.get("volume"),
+        premarket_volume=snapshot.get("premarket_volume"),
+        premarket_volume_accumulator=snapshot.get("premarket_volume"),
+        premarket_vwap=snapshot.get("premarket_vwap"),
+        distance_from_premarket_high_pct=snapshot.get("distance_from_premarket_high_pct"),
+        distance_from_premarket_low_pct=snapshot.get("distance_from_premarket_low_pct"),
+        distance_from_premarket_vwap_pct=snapshot.get("distance_from_premarket_vwap_pct"),
+        gap_from_previous_close_pct=snapshot.get("gap_from_previous_close_pct"),
+        ranking_position=snapshot.get("ranking_position"),
+        live_rank=snapshot.get("ranking_position"),
+        live_entry_score=snapshot.get("live_entry_score"),
+        ready=snapshot.get("ready"),
+        ready_since=snapshot.get("ready_since"),
+        signal_sent=snapshot.get("signal_sent"),
+        would_emit_signal_ready=snapshot.get("would_emit_signal_ready"),
+        signal_ready_reason=snapshot.get("signal_ready_reason"),
+        rejection_reason=snapshot.get("rejection_reason"),
+        entry_symbol_allowed=snapshot.get("entry_symbol_allowed"),
+        symbol_ineligible=snapshot.get("symbol_ineligible"),
+        candidate_age_seconds=snapshot.get("candidate_age_seconds"),
+        entries_blocked=snapshot.get("entries_blocked"),
+        entries_blocked_reason=snapshot.get("entries_blocked_reason"),
+        already_open=snapshot.get("already_open"),
+        quantity=snapshot.get("quantity"),
+        quantity_reason=snapshot.get("quantity_reason"),
+    )
+
+
+def maybe_add_candidate_full_snapshot(
+    collector: Any | None,
+    tracker: Any,
+    *,
+    symbol: str,
+    state: SymbolState,
+    features: dict[str, Any],
+    snap: dict[str, Any],
+    completed_bar: dict[str, Any] | None,
+    completed_feature_state: dict[str, Any] | None,
+    checkpoint_seconds: float,
+    now_monotonic: float,
+) -> None:
+    if collector is None or tracker is None:
+        return
+    base_state = completed_feature_state if completed_bar is not None and completed_feature_state is not None else {
+        "first_price": state.first_price,
+        "open_price": state.open_price,
+        "first_5m_high": state.first_5m_high,
+        "first_15m_high": state.first_15m_high,
+        "or_high": state.or_high,
+        "or_low": state.or_low,
+        "premarket_open": state.premarket_open,
+        "premarket_high": state.premarket_high,
+        "premarket_low": state.premarket_low,
+        "premarket_last": state.premarket_last,
+        "premarket_volume": state.premarket_volume,
+        "premarket_vwap_numerator": state.premarket_vwap_numerator,
+        "premarket_vwap_denominator": state.premarket_vwap_denominator,
+    }
+    initialization_flags = (
+        int(base_state.get("first_price") is not None),
+        int(base_state.get("first_5m_high") is not None),
+        int(base_state.get("first_15m_high") is not None),
+    )
+    completion_flags = (
+        int(bool(features.get("first_5m_complete"))),
+        int(bool(features.get("first_15m_complete"))),
+    )
+    premarket_vwap = None
+    if base_state.get("premarket_vwap_denominator"):
+        premarket_vwap = (
+            (safe_float(base_state.get("premarket_vwap_numerator")) or 0.0)
+            / float(base_state["premarket_vwap_denominator"])
+        )
+    feature_values = (
+        *initialization_flags,
+        *completion_flags,
+        base_state.get("open_price"),
+        base_state.get("first_5m_high"),
+        base_state.get("first_15m_high"),
+        base_state.get("or_high"),
+        base_state.get("or_low"),
+        base_state.get("premarket_open"),
+        base_state.get("premarket_high"),
+        base_state.get("premarket_low"),
+        base_state.get("premarket_last"),
+        base_state.get("premarket_volume"),
+        base_state.get("premarket_vwap_numerator"),
+        base_state.get("premarket_vwap_denominator"),
+    )
+    candle_timestamp = str((completed_bar or {}).get("bucket_utc") or (completed_bar or {}).get("bar_time_utc") or "")
+    decision = tracker.consider(
+        symbol,
+        feature_values=feature_values,
+        initialization_flags=initialization_flags,
+        completion_flags=completion_flags,
+        candle_timestamp=candle_timestamp,
+        now_monotonic=now_monotonic,
+        checkpoint_seconds=checkpoint_seconds,
+    )
+    if decision is None:
+        return
+    bar = completed_bar or {}
+    collector.update(symbol, full_snapshot_ref=decision.get("full_snapshot_ref"))
+    collector.add_full({
+        "session_date": collector.session_date,
+        "trading_session_date": collector.session_date,
+        "timestamp": collector.scan_started_at,
+        "scan_started_at": collector.scan_started_at,
+        "run_id": collector.run_id,
+        "process_start_id": collector.process_start_id,
+        "scan_id": collector.scan_id,
+        "scan_uid": collector.scan_uid,
+        "symbol": symbol,
+        "source": "live_runtime",
+        **decision,
+        "candle_timestamp": candle_timestamp or None,
+        "candle_open": bar.get("open"),
+        "candle_high": bar.get("high"),
+        "candle_low": bar.get("low"),
+        "candle_close": bar.get("close"),
+        "candle_volume": bar.get("volume"),
+        "candle_samples": bar.get("samples"),
+        "candle_source": bar.get("source"),
+        "candle_is_completed": int(bool(completed_bar)),
+        "session_phase": bar.get("session_phase"),
+        "first_price_initialized": initialization_flags[0],
+        "first5_initialized": initialization_flags[1],
+        "first15_initialized": initialization_flags[2],
+        "first_5m_complete": completion_flags[0],
+        "first_15m_complete": completion_flags[1],
+        "rth_open": base_state.get("open_price"),
+        "first_5m_high": base_state.get("first_5m_high"),
+        "first_15m_high": base_state.get("first_15m_high"),
+        "or_high": base_state.get("or_high"),
+        "or_low": base_state.get("or_low"),
+        "premarket_open": base_state.get("premarket_open"),
+        "premarket_high": base_state.get("premarket_high"),
+        "premarket_low": base_state.get("premarket_low"),
+        "premarket_last": base_state.get("premarket_last"),
+        "raw_ticker_volume": snap.get("volume"),
+        "premarket_volume": base_state.get("premarket_volume"),
+        "premarket_volume_accumulator": base_state.get("premarket_volume"),
+        "premarket_vwap_numerator": base_state.get("premarket_vwap_numerator"),
+        "premarket_vwap_denominator": base_state.get("premarket_vwap_denominator"),
+        "premarket_vwap": premarket_vwap,
+        "premarket_data_quality": features.get("premarket_data_quality"),
+        "volume_semantics_assessment": "UNKNOWN",
+    })
+
+
+def candidate_feature_state_checkpoint(state: SymbolState) -> dict[str, Any]:
+    return {
+        "first_price": state.first_price,
+        "open_price": state.open_price,
+        "first_5m_high": state.first_5m_high,
+        "first_15m_high": state.first_15m_high,
+        "or_high": state.or_high,
+        "or_low": state.or_low,
+        "premarket_open": state.premarket_open,
+        "premarket_high": state.premarket_high,
+        "premarket_low": state.premarket_low,
+        "premarket_last": state.premarket_last,
+        "premarket_volume": state.premarket_volume,
+        "premarket_vwap_numerator": state.premarket_vwap_numerator,
+        "premarket_vwap_denominator": state.premarket_vwap_denominator,
+    }
+
+
+def finalize_candidate_scan_telemetry(
+    writer: Any,
+    collector: Any | None,
+    *,
+    scan_started_monotonic: float,
+    scan_completed_at: str | None = None,
+) -> bool | None:
+    if writer is None or collector is None:
+        return None
+    completed_at = scan_completed_at or now_utc()
+    duration_ms = max(0.0, (time.monotonic() - scan_started_monotonic) * 1000.0)
+    try:
+        return bool(writer.enqueue(collector.finalize(completed_at, duration_ms)))
+    except Exception:
+        return False
+
+
 def emit_pre_signal_runtime_snapshot(
     recorder: LiveDataRecorder,
     runtime_state: dict[str, Any],
@@ -6166,6 +6516,8 @@ def reload_top100_universe_if_requested(
         for symbol in sorted(previous_symbol_set - subscription_symbol_set):
             ticker = tickers.pop(symbol, None)
             _runtime_dict(runtime_state, "subscription_started_monotonic_by_symbol").pop(symbol, None)
+            if bool(getattr(args, "candidate_snapshot_telemetry_enabled", False)):
+                _runtime_dict(runtime_state, "contract_source_by_symbol").pop(symbol, None)
             contract = getattr(ticker, "contract", None) or contract_by_symbol.get(symbol)
             if contract is not None:
                 unsubscribed_symbols.append(symbol)
@@ -6208,6 +6560,8 @@ def reload_top100_universe_if_requested(
                         print(f"{now_utc()} TOP100_RELOAD_CONTRACT_FAILED symbol={symbol} reason=not_qualified", flush=True)
                         continue
                     contract = qualified[0]
+                    if bool(getattr(args, "candidate_snapshot_telemetry_enabled", False)):
+                        _runtime_dict(runtime_state, "contract_source_by_symbol")[symbol] = "qualified"
                     record_contract_metadata(recorder, contract, source="top100_reload")
                     emit_top100_symbol_pipeline_event(
                         recorder,
@@ -6256,6 +6610,8 @@ def reload_top100_universe_if_requested(
                     print(f"{now_utc()} TOP100_RELOAD_CONTRACT_FAILED symbol={symbol} error={exc!r}", flush=True)
                     continue
             else:
+                if bool(getattr(args, "candidate_snapshot_telemetry_enabled", False)):
+                    _runtime_dict(runtime_state, "contract_source_by_symbol")[symbol] = "cache"
                 emit_top100_symbol_pipeline_event(
                     recorder,
                     runtime_state,
@@ -7632,6 +7988,11 @@ def main() -> int:
     parser.add_argument("--duration-seconds", type=int, default=28800)
     parser.add_argument("--interval-seconds", type=float, default=5.0)
     parser.add_argument("--portfolio-interval-seconds", type=float, default=10.0)
+    parser.add_argument("--candidate-snapshot-telemetry-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--candidate-snapshot-dir", default="")
+    parser.add_argument("--candidate-snapshot-queue-size", type=int, default=16)
+    parser.add_argument("--candidate-snapshot-chunk-rows", type=int, default=5_000)
+    parser.add_argument("--candidate-full-state-checkpoint-seconds", type=float, default=60.0)
     parser.add_argument("--market-data-type", type=int, default=1)
     parser.add_argument("--opening-range-seconds", type=int, default=15 * 60)
     parser.add_argument("--min-first-5m-high-pct", type=float, default=4.0)
@@ -7890,6 +8251,12 @@ def main() -> int:
         "ibkr_disconnect_reason": "",
         "ibkr_disconnect_at": "",
     }
+    process_start_id = f"{recorder.session_date}:{os.getpid()}:{int(time.time() * 1000)}"
+    runtime_state["candidate_snapshot_process_start_id"] = process_start_id
+    if bool(args.candidate_snapshot_telemetry_enabled):
+        runtime_state["contract_source_by_symbol"] = {}
+    candidate_snapshot_writer = None
+    candidate_full_snapshot_tracker = None
     startup_ranking_date = latest_completed_trading_day(datetime.now(timezone.utc), getattr(args, "market_close_utc", "20:00"))
     runtime_state["history_collector_default_date"] = startup_ranking_date.isoformat()
     runtime_state["history_collector_start_date"] = startup_ranking_date.isoformat()
@@ -7930,6 +8297,21 @@ def main() -> int:
     )
 
     try:
+        if bool(args.candidate_snapshot_telemetry_enabled):
+            try:
+                from src.live_trading.candidate_snapshot_telemetry import CandidateSnapshotWriter, FullSnapshotTracker
+
+                candidate_snapshot_writer = CandidateSnapshotWriter(
+                    args.candidate_snapshot_dir or args.recorder_dir,
+                    process_start_id=process_start_id,
+                    queue_size=int(args.candidate_snapshot_queue_size),
+                    chunk_rows=int(args.candidate_snapshot_chunk_rows),
+                )
+                candidate_full_snapshot_tracker = FullSnapshotTracker()
+            except Exception as exc:
+                candidate_snapshot_writer = None
+                candidate_full_snapshot_tracker = None
+                print(f"{now_utc()} CANDIDATE_SNAPSHOT_TELEMETRY_START_FAILED error={exc!r}", flush=True)
         startup_subscribed_symbols: list[str] = []
         for symbol in symbols:
             contract = Stock(symbol, "SMART", "USD")
@@ -7991,6 +8373,8 @@ def main() -> int:
                 continue
             contracts.append((symbol, q))
             contract_by_symbol[symbol] = q
+            if candidate_snapshot_writer is not None:
+                _runtime_dict(runtime_state, "contract_source_by_symbol")[symbol] = "qualified"
             emit_top100_symbol_pipeline_event(
                 recorder,
                 runtime_state,
@@ -8291,6 +8675,7 @@ def main() -> int:
                     time.sleep(float(args.reconnect_wait_seconds))
                 continue
             loop_now = time.time()
+            candidate_scan_started_monotonic = time.monotonic() if candidate_snapshot_writer is not None else 0.0
             runtime_state["runtime_scan_id"] = int(safe_int(runtime_state.get("runtime_scan_id")) or 0) + 1
             runtime_scan_id = int(runtime_state["runtime_scan_id"])
             observed_at = datetime.now(timezone.utc)
@@ -8463,6 +8848,34 @@ def main() -> int:
                 )
 
             mark_entry_block_state(runtime_state, entries_blocked, loop_now)
+            candidate_scan_collector = None
+            if candidate_snapshot_writer is not None:
+                expected_runtime_top100 = list(
+                    runtime_state.get("top100_reload_symbols")
+                    or sorted(_runtime_set(runtime_state, "entry_symbols"))
+                )
+                candidate_scan_collector = start_candidate_scan_collector(
+                    writer=candidate_snapshot_writer,
+                    runtime_state=runtime_state,
+                    session_date=timing.session_date,
+                    scan_id=runtime_scan_id,
+                    scan_started_at=observed_at.isoformat(),
+                    expected_symbols=expected_runtime_top100,
+                    contract_by_symbol=contract_by_symbol,
+                    tickers=tickers,
+                    states=states,
+                    managed_positions=managed_positions,
+                    ib=ib,
+                    args=args,
+                    entries_blocked=entries_blocked,
+                    manual_block=manual_entries_blocked,
+                    entry_delay_block=entry_delay_active,
+                    restart_block=restart_entries_blocked,
+                    reconnect_block=reconnect_entries_blocked,
+                    disk_block=disk_entries_blocked,
+                    top100_block=top100_entries_blocked,
+                    observed_at=observed_at,
+                )
             entry_candidates: list[dict[str, Any]] = []
             pre_signal_snapshots: list[dict[str, Any]] = []
             symbols_with_price: list[str] = []
@@ -8473,6 +8886,19 @@ def main() -> int:
                 snap = snapshot_from_ticker(symbol, ticker)
                 if snap.get("price") is None:
                     symbols_without_price.append(symbol)
+                    if candidate_scan_collector is not None:
+                        candidate_scan_collector.update(
+                            symbol,
+                            ticker_present=int(ticker is not None),
+                            usable_price=0,
+                            current_price=None,
+                            bid=snap.get("bid"),
+                            ask=snap.get("ask"),
+                            raw_ticker_volume=snap.get("volume"),
+                            rejection_reason="no_usable_ticker_price",
+                            signal_ready_reason="no_usable_ticker_price",
+                            selection_rejected_reason="no_usable_ticker_price",
+                        )
                     log_no_usable_ticker_price(runtime_state, symbol, ticker, snap, q, now_ts=time.monotonic())
                     emit_top100_symbol_pipeline_event(
                         recorder,
@@ -8518,6 +8944,11 @@ def main() -> int:
                         ask=snap.get("ask"),
                     )
                 state = states[symbol]
+                completed_feature_state = (
+                    candidate_feature_state_checkpoint(state)
+                    if candidate_scan_collector is not None
+                    else None
+                )
                 completed_bar = update_state(
                     state,
                     snap,
@@ -8531,6 +8962,18 @@ def main() -> int:
                 if recorded_candle_rows:
                     runtime_state["live_candle_rows_recorded_total"] = int(runtime_state.get("live_candle_rows_recorded_total") or 0) + recorded_candle_rows
                 features = compute_live_safe_features(state, snap, args)
+                maybe_add_candidate_full_snapshot(
+                    candidate_scan_collector,
+                    candidate_full_snapshot_tracker,
+                    symbol=symbol,
+                    state=state,
+                    features=features,
+                    snap=snap,
+                    completed_bar=completed_bar,
+                    completed_feature_state=completed_feature_state,
+                    checkpoint_seconds=float(args.candidate_full_state_checkpoint_seconds),
+                    now_monotonic=candidate_scan_started_monotonic,
+                )
                 if features_are_all_zeroish(features):
                     zeroish_feature_count += 1
                 if symbol == debug_symbol:
@@ -8665,6 +9108,8 @@ def main() -> int:
                             "candidate_age_seconds": candidate_age,
                         }
                     )
+                    if candidate_scan_collector is not None:
+                        candidate_scan_collector.update(symbol, eligible_for_entry_selection=1)
                 pre_signal_snapshots.append(
                     build_pre_signal_runtime_snapshot(
                         symbol=symbol,
@@ -8691,6 +9136,14 @@ def main() -> int:
                 )
                 if features["ready"] and not state.signal_sent and not has_active_position and entry_symbol_allowed and entries_blocked:
                     blocked_reason = str(runtime_state.get("entries_blocked_reason") or "entries_blocked_manual_or_time_window")
+                    if candidate_scan_collector is not None:
+                        candidate_scan_collector.update(
+                            symbol,
+                            buy_decision_created=1,
+                            buy_blocked=1,
+                            buy_block_reason=blocked_reason,
+                            selection_rejected_reason=blocked_reason,
+                        )
                     emit_top100_symbol_pipeline_event(
                         recorder,
                         runtime_state,
@@ -8754,6 +9207,14 @@ def main() -> int:
             for snapshot in pre_signal_snapshots:
                 snapshot["ranking_position"] = ranking_position_by_symbol.get(str(snapshot.get("symbol") or ""))
                 emit_pre_signal_runtime_snapshot(recorder, runtime_state, snapshot, now_ts=loop_now)
+                snapshot_symbol = str(snapshot.get("symbol") or "")
+                update_candidate_scan_from_pre_signal(
+                    candidate_scan_collector,
+                    snapshot,
+                    snap=latest_snapshots.get(snapshot_symbol),
+                    ticker=tickers.get(snapshot_symbol),
+                    observed_at=observed_at,
+                )
             ready_candidates_total = len(entry_candidates)
             candidate_rejection_reasons = {
                 candidate["symbol"]: ready_candidate_rejection_reason(
@@ -8783,6 +9244,8 @@ def main() -> int:
                     reverse=True,
                 )
                 for candidate in ordered_entry_candidates:
+                    if candidate_scan_collector is not None:
+                        candidate_scan_collector.update(candidate["symbol"], buy_decision_created=1)
                     emit_top100_symbol_pipeline_event(
                         recorder,
                         runtime_state,
@@ -8805,6 +9268,12 @@ def main() -> int:
                     snap = candidate["snap"]
                     features = candidate["features"]
                     ranking_position = ranking_position_by_symbol.get(symbol)
+                    if candidate_scan_collector is not None:
+                        candidate_scan_collector.update(
+                            symbol,
+                            selected_for_entry=1,
+                            selection_rank=candidate_index + 1,
+                        )
                     diagnostics = ready_candidate_diagnostics(
                         state,
                         features,
@@ -8814,6 +9283,13 @@ def main() -> int:
                     )
                     skip_reason = candidate_rejection_reasons.get(symbol) or ""
                     if skip_reason:
+                        if candidate_scan_collector is not None:
+                            candidate_scan_collector.update(
+                                symbol,
+                                buy_blocked=1,
+                                buy_block_reason=skip_reason,
+                                selection_rejected_reason=skip_reason,
+                            )
                         emit_top100_symbol_pipeline_event(
                             recorder,
                             runtime_state,
@@ -8854,6 +9330,14 @@ def main() -> int:
                     max_per_cycle = int(args.max_entries_per_cycle or 0)
                     if max_per_cycle > 0 and entries_submitted_this_cycle >= max_per_cycle:
                         for blocked_candidate in ordered_entry_candidates[candidate_index:]:
+                            if candidate_scan_collector is not None:
+                                candidate_scan_collector.update(
+                                    blocked_candidate["symbol"],
+                                    buy_decision_created=1,
+                                    buy_blocked=1,
+                                    buy_block_reason="max_entries_per_cycle",
+                                    selection_rejected_reason="max_entries_per_cycle",
+                                )
                             emit_top100_symbol_pipeline_event(
                                 recorder,
                                 runtime_state,
@@ -8872,6 +9356,14 @@ def main() -> int:
                     minute_capacity = entry_minute_capacity(runtime_state, int(args.max_entries_per_minute or 0), loop_now)
                     if minute_capacity <= 0:
                         for blocked_candidate in ordered_entry_candidates[candidate_index:]:
+                            if candidate_scan_collector is not None:
+                                candidate_scan_collector.update(
+                                    blocked_candidate["symbol"],
+                                    buy_decision_created=1,
+                                    buy_blocked=1,
+                                    buy_block_reason="max_entries_per_minute",
+                                    selection_rejected_reason="max_entries_per_minute",
+                                )
                             emit_top100_symbol_pipeline_event(
                                 recorder,
                                 runtime_state,
@@ -8913,6 +9405,13 @@ def main() -> int:
                     min_live_entry_score = float(getattr(args, "min_live_entry_score", 0.0) or 0.0)
                     live_entry_score = safe_float(features.get("score")) or 0.0
                     if low_live_entry_score_blocked(live_entry_score, min_live_entry_score):
+                        if candidate_scan_collector is not None:
+                            candidate_scan_collector.update(
+                                symbol,
+                                buy_blocked=1,
+                                buy_block_reason="live_entry_score_too_low",
+                                selection_rejected_reason="live_entry_score_too_low",
+                            )
                         emit_top100_symbol_pipeline_event(
                             recorder,
                             runtime_state,
@@ -8958,8 +9457,21 @@ def main() -> int:
                         candidate_notional=candidate_notional,
                     )
                     runtime_state["risk_guard_last_status"] = risk_status
+                    if candidate_scan_collector is not None:
+                        candidate_scan_collector.update(
+                            symbol,
+                            risk_guard_block=int(bool(risk_status.get("blocked"))),
+                            risk_guard_reason=str(risk_status.get("reason") or ""),
+                        )
                     if risk_status.get("blocked"):
                         reason = str(risk_status.get("reason") or "risk_guard")
+                        if candidate_scan_collector is not None:
+                            candidate_scan_collector.update(
+                                symbol,
+                                buy_blocked=1,
+                                buy_block_reason=reason,
+                                selection_rejected_reason=reason,
+                            )
                         emit_top100_symbol_pipeline_event(
                             recorder,
                             runtime_state,
@@ -9048,6 +9560,8 @@ def main() -> int:
                         order = MarketOrder("BUY", qty)
                         order.tif = "DAY"
                         order.outsideRth = False
+                        if candidate_scan_collector is not None:
+                            candidate_scan_collector.update(symbol, order_created=1)
                         entry_dispatch_stage = "ib_place_order"
                         trade = ib.placeOrder(q, order)
                         order_obj = getattr(trade, "order", None)
@@ -9083,6 +9597,14 @@ def main() -> int:
                             qty=qty,
                             price=price,
                         )
+                        if candidate_scan_collector is not None:
+                            candidate_scan_collector.update(
+                                symbol,
+                                order_submitted=1,
+                                order_id=order_id_for_entry,
+                                perm_id=entry_perm_id,
+                                order_status=trade_status,
+                            )
                         emit_top100_symbol_pipeline_event(
                             recorder,
                             runtime_state,
@@ -9339,6 +9861,14 @@ def main() -> int:
                             flush=True,
                         )
                     except Exception as exc:
+                        if candidate_scan_collector is not None:
+                            candidate_scan_collector.update(
+                                symbol,
+                                buy_blocked=1,
+                                buy_block_reason=f"dispatch_exception:{entry_dispatch_stage}",
+                                selection_rejected_reason=f"dispatch_exception:{entry_dispatch_stage}",
+                                order_id=order_id_for_entry,
+                            )
                         log_entry_order_exception(
                             recorder,
                             symbol,
@@ -9350,8 +9880,42 @@ def main() -> int:
                             live_entry_score=live_entry_score,
                             ranking_position=ranking_position,
                         )
+                        finalize_candidate_scan_telemetry(
+                            candidate_snapshot_writer,
+                            candidate_scan_collector,
+                            scan_started_monotonic=candidate_scan_started_monotonic,
+                        )
                         raise
                     state.signal_sent = True
+                    if candidate_scan_collector is not None:
+                        candidate_scan_collector.update(symbol, signal_sent=1)
+
+            candidate_snapshot_enqueued = finalize_candidate_scan_telemetry(
+                candidate_snapshot_writer,
+                candidate_scan_collector,
+                scan_started_monotonic=candidate_scan_started_monotonic,
+            )
+            if candidate_snapshot_writer is not None:
+                health_last = float(runtime_state.get("candidate_snapshot_health_last_ts") or 0.0)
+                if loop_now - health_last >= 60.0:
+                    runtime_state["candidate_snapshot_health_last_ts"] = loop_now
+                    try:
+                        health = candidate_snapshot_writer.health(timing.session_date)
+                        print(
+                            f"{now_utc()} CANDIDATE_SNAPSHOT_HEALTH "
+                            f"session_date={timing.session_date} queue_depth={health.get('queue_depth')} "
+                            f"queue_high_watermark={health.get('queue_high_watermark')} "
+                            f"written_batches={health.get('written_scan_batches')} dropped_batches={health.get('dropped_scan_batches')} "
+                            f"written_rows={health.get('written_rows')} dropped_rows={health.get('dropped_rows')} "
+                            f"last_write_latency_ms={health.get('last_write_latency_ms')} "
+                            f"writer_error_count={health.get('writer_error_count')} "
+                            f"last_write_error={health.get('last_write_error')!r} "
+                            f"session_completeness={health.get('session_completeness')} "
+                            f"last_enqueue_ok={1 if candidate_snapshot_enqueued else 0}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
 
             adopted_count = 0
             if args.adopt_existing_positions and not adopted_once and data_count > 0:
@@ -9647,6 +10211,11 @@ def main() -> int:
             emit_session_diff=True,
         )
         persist_managed_positions(recorder, managed_positions)
+        if candidate_snapshot_writer is not None:
+            try:
+                candidate_snapshot_writer.stop(timeout=15.0)
+            except Exception as exc:
+                print(f"{now_utc()} CANDIDATE_SNAPSHOT_TELEMETRY_STOP_FAILED error={exc!r}", flush=True)
         if sqlite_store is not None:
             sqlite_store.close()
         for ticker in tickers.values():
