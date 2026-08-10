@@ -20,6 +20,7 @@ def args_for(**overrides: object) -> argparse.Namespace:
         "skip_shs": False,
         "skip_nbas": False,
         "skip_offline_runtime_pre_signal": False,
+        "skip_top100_buy": False,
         "only": [],
         "skip": [],
         "sqlite_path": Path("data/runtime/trading_runtime.sqlite"),
@@ -46,18 +47,20 @@ class RunDailyAnalysisTests(unittest.TestCase):
                 "shs",
                 "nbas",
                 "offline_runtime_pre_signal",
+                "top100_buy",
             ],
         )
         self.assertIn("scripts/early_loser_exit_analyzer.py", steps[3][1])
         self.assertIn("scripts/stop_loss_strategy_analyzer.py", steps[4][1])
         self.assertIn("scripts/investigate_no_buy_after_signal.py", steps[6][1])
         self.assertIn("scripts/investigate_offline_runtime_pre_signal.py", steps[7][1])
+        self.assertIn("scripts/analyze_top100_buy.py", steps[8][1])
 
     def test_force_is_passed_to_supported_steps_by_default(self) -> None:
         steps = runner.build_steps("2026-07-09", args_for())
         commands = {name: command for name, command, _skipped in steps}
 
-        for name in ("coverage", "missed", "shs", "nbas", "offline_runtime_pre_signal"):
+        for name in ("coverage", "missed", "shs", "nbas", "offline_runtime_pre_signal", "top100_buy"):
             self.assertIn("--force", commands[name])
         self.assertNotIn("--force", commands["bad_entries"])
 
@@ -82,6 +85,12 @@ class RunDailyAnalysisTests(unittest.TestCase):
         self.assertIn("offline_runtime_pre_signal_summary_ALL.csv", outputs)
         self.assertIn("early_loser_rules_2026-07-09.csv", outputs)
         self.assertIn("stop_loss_fixed_grid_2026-07-09.csv", outputs)
+        self.assertIn("top100_buy_symbol_day_2026-07-09.csv", outputs)
+        self.assertIn("top100_buy_data_quality_2026-07-09.json", outputs)
+
+    def test_skip_top100_buy(self) -> None:
+        steps = runner.build_steps("2026-07-09", args_for(skip_top100_buy=True))
+        self.assertNotIn("top100_buy", [name for name, _command, _skipped in steps])
 
     def test_daily_summary_includes_offline_runtime_pre_signal_summary(self) -> None:
         original_analysis_dir = runner.DEFAULT_ANALYSIS_DIR

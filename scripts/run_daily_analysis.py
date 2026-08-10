@@ -138,6 +138,29 @@ ANALYZER_REGISTRY: tuple[AnalyzerSpec, ...] = (
         output_dir_arg="--output-dir",
         category="forensic",
     ),
+    AnalyzerSpec(
+        name="top100_buy",
+        script="scripts/analyze_top100_buy.py",
+        outputs=(
+            "top100_buy_symbol_day_{date}.csv",
+            "top100_buy_snapshots_{date}.parquet",
+            "top100_buy_feature_analysis_{date}.csv",
+            "top100_buy_filter_simulation_{date}.csv",
+            "top100_buy_portfolio_replay_{date}.csv",
+            "top100_buy_summary_{date}.md",
+            "top100_buy_data_quality_{date}.json",
+        ),
+        summary_targets=(
+            "top100_buy_summary_{date}.md",
+            "top100_buy_filter_simulation_{date}.csv",
+            "top100_buy_data_quality_{date}.json",
+        ),
+        supports_force=True,
+        pass_sqlite_path=True,
+        pass_history_dir=True,
+        output_dir_arg="--output-dir",
+        category="strategy",
+    ),
 )
 
 
@@ -311,6 +334,7 @@ def selected_specs(args: argparse.Namespace) -> list[AnalyzerSpec]:
         "shs": args.skip_shs,
         "nbas": args.skip_nbas,
         "offline_runtime_pre_signal": args.skip_offline_runtime_pre_signal,
+        "top100_buy": getattr(args, "skip_top100_buy", False),
     }
     skips |= {name for name, enabled in legacy_skips.items() if enabled}
     if only:
@@ -549,6 +573,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-shs", action="store_true")
     parser.add_argument("--skip-nbas", action="store_true")
     parser.add_argument("--skip-offline-runtime-pre-signal", action="store_true")
+    parser.add_argument("--skip-top100-buy", action="store_true")
     return parser
 
 
