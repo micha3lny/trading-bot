@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from src.live_trading.analysis.common import (
@@ -242,6 +245,42 @@ def effective_config_dict(config: ReplayConfig) -> dict[str, Any]:
     }
 
 
+PREPARED_CAUSAL_SCHEMA_VERSION = "causal_session_v1"
+
+
+@dataclass
+class ReplayPerformanceCounters:
+    prepared_session_builds: int = 0
+    prepared_session_cache_hits: int = 0
+    prepared_session_cache_misses: int = 0
+    causal_cursor_advances: int = 0
+    legacy_full_frame_feature_calls: int = 0
+    completed_bar_full_frame_calls: int = 0
+    replay_session_calls: int = 0
+    replay_snapshots_calls: int = 0
+    prepared_session_build_seconds: float = 0.0
+
+
+_REPLAY_PERFORMANCE = ReplayPerformanceCounters()
+
+
+def reset_replay_performance_counters() -> None:
+    global _REPLAY_PERFORMANCE
+    _REPLAY_PERFORMANCE = ReplayPerformanceCounters()
+
+
+def replay_performance_counters() -> dict[str, Any]:
+    return dict(vars(_REPLAY_PERFORMANCE))
+
+
+def record_completed_bar_full_frame_call() -> None:
+    _REPLAY_PERFORMANCE.completed_bar_full_frame_calls += 1
+
+
+def record_replay_snapshots_call() -> None:
+    _REPLAY_PERFORMANCE.replay_snapshots_calls += 1
+
+
 @dataclass
 class ReplayResult:
     trades: list[dict[str, Any]] = field(default_factory=list)
@@ -265,16 +304,20 @@ def _rows(candles: pd.DataFrame, semantics: str) -> pd.DataFrame:
     return rows
 
 
-def _feature_at(rows: pd.DataFrame, timestamp: pd.Timestamp, config: ReplayConfig) -> dict[str, Any]:
-    if rows.empty:
-        return {"ready": False, "reason": "missing_candles"}
-    start = rows.iloc[0]["timestamp"]
-    visible = rows[rows["available_at"] <= timestamp]
-    if visible.empty:
-        return {"ready": False, "reason": "no_completed_bar"}
-    open_price = fnum(rows.iloc[0].get("open"))
-    current = visible.iloc[-1]
-    price = fnum(current.get(config.entry_price_mode), fnum(current.get("close"), fnum(current.get("open"))))
+def _feature_result(
+    *,
+    timestamp: pd.Timestamp,
+    config: ReplayConfig,
+    open_price: float | None,
+    price: float | None,
+    spread: float | None,
+    current_high: float | None,
+    first5_high: float | None,
+    first15_high: float | None,
+    or_high: float | None,
+    or_low: float | None,
+    start: pd.Timestamp,
+) -> dict[str, Any]:
     if open_price is None or open_price <= 0:
         return {"ready": False, "reason": "invalid_open"}
     first5_end = start + pd.Timedelta(minutes=5)
@@ -284,21 +327,14 @@ def _feature_at(rows: pd.DataFrame, timestamp: pd.Timestamp, config: ReplayConfi
     first15_complete = timestamp >= first15_end
     or_complete = timestamp >= or_end
     if config.window_availability_mode == "finalized_windows":
-        first5 = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < first5_end)] if first5_complete else pd.DataFrame()
-        first15 = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < first15_end)] if first15_complete else pd.DataFrame()
-        or_rows = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < or_end)] if or_complete else pd.DataFrame()
-    else:
-        first5 = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < first5_end)]
-        first15 = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < first15_end)]
-        or_rows = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < or_end)]
-    first5_high = fnum(first5["high"].max()) if not first5.empty else None
-    first15_high = fnum(first15["high"].max()) if not first15.empty else None
-    or_high = fnum(or_rows["high"].max()) if not or_rows.empty else None
-    or_low = fnum(or_rows["low"].min()) if not or_rows.empty else None
+        first5_high = first5_high if first5_complete else None
+        first15_high = first15_high if first15_complete else None
+        if not or_complete:
+            or_high = None
+            or_low = None
     first5_pct = pct(first5_high, open_price)
     first15_pct = pct(first15_high, open_price)
     or_range = (or_high / or_low - 1.0) * 100.0 if or_high is not None and or_low is not None and or_low > 0 else None
-    spread = fnum(current.get("spread_bps")) if "spread_bps" in visible.columns else None
     score = 0.0
     for value, weight in [(first5_pct, 2.0), (first15_pct, 2.0), (or_range, 1.0)]:
         if value is not None:
@@ -319,7 +355,6 @@ def _feature_at(rows: pd.DataFrame, timestamp: pd.Timestamp, config: ReplayConfi
     breakout_gate_used = 0
     if config.breakout_mode == "legacy_candle_high":
         breakout_gate_used = 1
-        current_high = fnum(current.get("high"))
         if or_high is None or current_high is None or current_high < or_high:
             reasons.append("legacy_candle_high_breakout_not_met")
     elif config.breakout_mode == "current_price_or_high":
@@ -341,6 +376,381 @@ def _feature_at(rows: pd.DataFrame, timestamp: pd.Timestamp, config: ReplayConfi
         "or_low": or_low,
         "breakout_gate_used": breakout_gate_used,
     }
+
+
+def _prefix_extreme(values: np.ndarray, included: np.ndarray, *, maximum: bool) -> list[float | None]:
+    output: list[float | None] = []
+    current: float | None = None
+    for raw_value, use_value in zip(values, included):
+        value = fnum(raw_value) if bool(use_value) else None
+        if value is not None:
+            current = value if current is None else (max(current, value) if maximum else min(current, value))
+        output.append(current)
+    return output
+
+
+def _as_utc_timestamp(value: Any) -> pd.Timestamp | None:
+    if isinstance(value, pd.Timestamp):
+        return value.tz_localize("UTC") if value.tzinfo is None else value.tz_convert("UTC")
+    return parse_dt(value)
+
+
+class PreparedReplayFeatures:
+    """Config-aware causal feature lookup over one pre-normalized candle frame."""
+
+    def __init__(self, rows: pd.DataFrame, config: ReplayConfig):
+        self.rows = rows
+        self.config = config
+        self._visible_index_cache: dict[int, int] = {}
+        self._feature_cache: dict[int, dict[str, Any]] = {}
+        self.start = rows.iloc[0]["timestamp"] if not rows.empty else None
+        if rows.empty:
+            self._available_ns = np.array([], dtype=np.int64)
+            self._entry_values = np.array([], dtype=float)
+            self._close_values = np.array([], dtype=float)
+            self._open_values = np.array([], dtype=float)
+            self._high_values = np.array([], dtype=float)
+            self._spread_values = np.array([], dtype=float)
+            self._has_spread = False
+            return
+        self._available_ns = rows["available_at"].astype("int64").to_numpy()
+        timestamps = rows["timestamp"]
+        timestamp_ns = timestamps.astype("int64").to_numpy()
+        highs = rows["high"].to_numpy() if "high" in rows.columns else np.full(len(rows), np.nan)
+        first5_end_ns = int((self.start + pd.Timedelta(minutes=5)).value)
+        first15_end_ns = int((self.start + pd.Timedelta(minutes=15)).value)
+        or_end_ns = int((self.start + pd.Timedelta(seconds=LIVE_SIGNAL_OPENING_RANGE_SECONDS)).value)
+        self._first5_high = _prefix_extreme(highs, timestamp_ns < first5_end_ns, maximum=True)
+        self._first15_high = _prefix_extreme(highs, timestamp_ns < first15_end_ns, maximum=True)
+        self._or_high = _prefix_extreme(highs, timestamp_ns < or_end_ns, maximum=True)
+        lows = rows["low"].to_numpy() if "low" in rows.columns else np.full(len(rows), np.nan)
+        self._or_low = _prefix_extreme(lows, timestamp_ns < or_end_ns, maximum=False)
+        self._open_price = fnum(rows.iloc[0].get("open"))
+        self._entry_values = rows[config.entry_price_mode].to_numpy() if config.entry_price_mode in rows.columns else np.full(len(rows), np.nan)
+        self._close_values = rows["close"].to_numpy() if "close" in rows.columns else np.full(len(rows), np.nan)
+        self._open_values = rows["open"].to_numpy() if "open" in rows.columns else np.full(len(rows), np.nan)
+        self._high_values = highs
+        self._has_spread = "spread_bps" in rows.columns
+        self._spread_values = rows["spread_bps"].to_numpy() if self._has_spread else np.full(len(rows), np.nan)
+
+    def visible_index(self, timestamp: pd.Timestamp) -> int:
+        if not len(self._available_ns):
+            return -1
+        when = _as_utc_timestamp(timestamp)
+        if when is None:
+            return -1
+        key = int(when.value)
+        if key not in self._visible_index_cache:
+            self._visible_index_cache[key] = int(np.searchsorted(self._available_ns, key, side="right") - 1)
+        return self._visible_index_cache[key]
+
+    def latest_row(self, timestamp: pd.Timestamp) -> pd.Series | None:
+        index = self.visible_index(timestamp)
+        return None if index < 0 else self.rows.iloc[index]
+
+    def at(self, timestamp: pd.Timestamp) -> dict[str, Any]:
+        if self.rows.empty:
+            return {"ready": False, "reason": "missing_candles"}
+        when = _as_utc_timestamp(timestamp)
+        index = -1 if when is None else self.visible_index(when)
+        if when is None or index < 0:
+            return {"ready": False, "reason": "no_completed_bar"}
+        return self.at_index(index, when)
+
+    def at_index(self, index: int, timestamp: pd.Timestamp) -> dict[str, Any]:
+        when = _as_utc_timestamp(timestamp)
+        if when is None or index < 0 or index >= len(self.rows):
+            return {"ready": False, "reason": "no_completed_bar"}
+        return self._at_prepared_index(index, when, int(when.value))
+
+    def _at_prepared_index(self, index: int, when: pd.Timestamp, key: int) -> dict[str, Any]:
+        cached = self._feature_cache.get(key)
+        if cached is not None:
+            return cached
+        def array_value(values: np.ndarray, fallback: float | None = None) -> float | None:
+            value = float(values[index])
+            return fallback if np.isnan(value) else value
+
+        open_value = array_value(self._open_values)
+        close_value = array_value(self._close_values, open_value)
+        price = array_value(self._entry_values, close_value)
+        spread = array_value(self._spread_values) if self._has_spread else None
+        result = _feature_result(
+            timestamp=when,
+            config=self.config,
+            open_price=self._open_price,
+            price=price,
+            spread=spread,
+            current_high=array_value(self._high_values),
+            first5_high=self._first5_high[index],
+            first15_high=self._first15_high[index],
+            or_high=self._or_high[index],
+            or_low=self._or_low[index],
+            start=self.start,
+        )
+        self._feature_cache[key] = result
+        return result
+
+    @property
+    def approximate_bytes(self) -> int:
+        arrays = (
+            self._available_ns, self._entry_values, self._close_values, self._open_values,
+            self._high_values, self._spread_values,
+        )
+        return int(sum(value.nbytes for value in arrays if isinstance(value, np.ndarray)))
+
+
+class PreparedCompletedBarFeatures:
+    """Vectorized causal completed-bar features over normalized bar-start rows."""
+
+    def __init__(self, rows: pd.DataFrame):
+        self.rows = rows
+        if rows.empty:
+            self._completed_ns = np.array([], dtype=np.int64)
+            self._values: dict[str, np.ndarray] = {}
+            return
+        self._completed_ns = (rows["timestamp"] + pd.Timedelta(minutes=1)).astype("int64").to_numpy()
+        open_values = rows["open"].to_numpy(dtype=float) if "open" in rows.columns else np.full(len(rows), np.nan)
+        high_values = rows["high"].to_numpy(dtype=float) if "high" in rows.columns else np.full(len(rows), np.nan)
+        low_values = rows["low"].to_numpy(dtype=float) if "low" in rows.columns else np.full(len(rows), np.nan)
+        close_values = rows["close"].to_numpy(dtype=float) if "close" in rows.columns else np.full(len(rows), np.nan)
+        volume_values = rows["volume"].to_numpy(dtype=float) if "volume" in rows.columns else np.zeros(len(rows))
+        close = pd.Series(close_values, copy=False)
+        high = pd.Series(high_values, copy=False)
+        low = pd.Series(low_values, copy=False)
+        volume = pd.Series(volume_values, copy=False)
+        green = pd.Series((close_values > open_values).astype(np.int64), copy=False)
+        bar_range = high_values - low_values
+        close_location = np.divide(
+            close_values - low_values,
+            bar_range,
+            out=np.full(len(rows), np.nan),
+            where=bar_range > 0,
+        )
+        recent_high = high.rolling(5, min_periods=1).max().to_numpy()
+        recent_low = low.rolling(5, min_periods=1).min().to_numpy()
+        prior_volume = volume.shift(1).rolling(5, min_periods=1).mean().to_numpy()
+        volume_acceleration = np.divide(
+            volume_values,
+            prior_volume,
+            out=np.full(len(rows), np.nan),
+            where=np.isfinite(prior_volume) & (prior_volume > 0),
+        )
+
+        def returns(periods: int) -> np.ndarray:
+            previous = close.shift(periods).to_numpy()
+            ratio = np.divide(
+                close_values,
+                previous,
+                out=np.full(len(rows), np.nan),
+                where=np.isfinite(previous) & (previous != 0),
+            )
+            return (ratio - 1.0) * 100.0
+
+        recent_high_ratio = np.divide(
+            close_values,
+            recent_high,
+            out=np.full(len(rows), np.nan),
+            where=np.isfinite(recent_high) & (recent_high != 0),
+        )
+        recent_low_ratio = np.divide(
+            close_values,
+            recent_low,
+            out=np.full(len(rows), np.nan),
+            where=np.isfinite(recent_low) & (recent_low != 0),
+        )
+
+        self._values = {
+            "return_1m": returns(1),
+            "return_3m": returns(3),
+            "return_5m": returns(5),
+            "green_bars_last_3": green.rolling(3, min_periods=1).sum().to_numpy(dtype=np.int64),
+            "green_bars_last_5": green.rolling(5, min_periods=1).sum().to_numpy(dtype=np.int64),
+            "close_location_value": close_location,
+            "pullback_from_recent_high_pct": (recent_high_ratio - 1.0) * 100.0,
+            "recent_low_distance_pct": (recent_low_ratio - 1.0) * 100.0,
+            "volume_acceleration": volume_acceleration,
+        }
+
+    def at(self, timestamp: Any) -> dict[str, Any]:
+        when = _as_utc_timestamp(timestamp)
+        if when is None or not len(self._completed_ns):
+            return {}
+        index = int(np.searchsorted(self._completed_ns, int(when.value), side="right") - 1)
+        if index < 0:
+            return {}
+        return self.at_index(index)
+
+    def at_index(self, index: int) -> dict[str, Any]:
+        if index < 0 or index >= len(self._completed_ns):
+            return {}
+        def value(name: str) -> float | None:
+            raw = self._values[name][index]
+            return None if np.isnan(raw) else float(raw)
+
+        return {
+            "return_1m": value("return_1m"),
+            "return_3m": value("return_3m"),
+            "return_5m": value("return_5m"),
+            "green_bars_last_3": int(self._values["green_bars_last_3"][index]),
+            "green_bars_last_5": int(self._values["green_bars_last_5"][index]),
+            "close_location_value": value("close_location_value"),
+            "pullback_from_recent_high_pct": value("pullback_from_recent_high_pct"),
+            "recent_low_distance_pct": value("recent_low_distance_pct"),
+            "volume_acceleration": value("volume_acceleration"),
+        }
+
+    @property
+    def approximate_bytes(self) -> int:
+        return int(self._completed_ns.nbytes + sum(value.nbytes for value in self._values.values()))
+
+
+class PreparedCausalSession:
+    """One normalized symbol/session shared by snapshot and portfolio replay paths."""
+
+    def __init__(self, symbol: str, session_date: str, rows: pd.DataFrame, config: ReplayConfig):
+        started = time.perf_counter()
+        self.symbol = normalize_symbol(symbol)
+        self.session_date = session_date
+        self.rows = rows
+        self.config = config
+        self.config_identity = json.dumps(effective_config_dict(config), sort_keys=True)
+        self.replay_features = PreparedReplayFeatures(rows, config)
+        self.completed_bar_features = PreparedCompletedBarFeatures(rows)
+        self.available_timestamps = (
+            pd.DatetimeIndex(rows["available_at"].dropna().unique()).sort_values()
+            if not rows.empty
+            else pd.DatetimeIndex([])
+        )
+        available_ns = self.available_timestamps.astype("int64").to_numpy()
+        self._available_timestamp_ns = available_ns
+        self._visible_indices = np.searchsorted(
+            self.replay_features._available_ns, available_ns, side="right"
+        ) - 1
+        self._completed_indices = np.searchsorted(
+            self.completed_bar_features._completed_ns, available_ns, side="right"
+        ) - 1
+        _REPLAY_PERFORMANCE.prepared_session_builds += 1
+        _REPLAY_PERFORMANCE.prepared_session_build_seconds += time.perf_counter() - started
+
+    def iter_features(self):
+        for timestamp, timestamp_ns, visible_index, completed_index in zip(
+            self.available_timestamps,
+            self._available_timestamp_ns,
+            self._visible_indices,
+            self._completed_indices,
+        ):
+            _REPLAY_PERFORMANCE.causal_cursor_advances += 1
+            when = pd.Timestamp(timestamp)
+            yield (
+                when,
+                self.replay_features._at_prepared_index(int(visible_index), when, int(timestamp_ns)),
+                self.completed_bar_features.at_index(int(completed_index)),
+            )
+
+    @property
+    def approximate_bytes(self) -> int:
+        frame_bytes = int(self.rows.memory_usage(index=True, deep=True).sum()) if not self.rows.empty else 0
+        return (
+            frame_bytes
+            + int(getattr(self.replay_features, "approximate_bytes", 0))
+            + int(getattr(self.completed_bar_features, "approximate_bytes", 0))
+        )
+
+
+class PreparedSessionCache:
+    """Bounded cache keyed by symbol, session, schema and full replay configuration."""
+
+    def __init__(self, *, max_entries: int = 128, max_bytes: int = 256 * 1024 * 1024):
+        self.max_entries = max(1, max_entries)
+        self.max_bytes = max(1, max_bytes)
+        self._entries: OrderedDict[tuple[str, str, str, str, str], PreparedCausalSession] = OrderedDict()
+        self.approximate_bytes = 0
+
+    @staticmethod
+    def key(symbol: str, session_date: str, session_type: str, config: ReplayConfig) -> tuple[str, str, str, str, str]:
+        return (
+            normalize_symbol(symbol),
+            session_date,
+            session_type.upper(),
+            PREPARED_CAUSAL_SCHEMA_VERSION,
+            json.dumps(effective_config_dict(config), sort_keys=True),
+        )
+
+    def get_or_build(
+        self,
+        symbol: str,
+        session_date: str,
+        rows: pd.DataFrame,
+        config: ReplayConfig,
+        *,
+        session_type: str = "RTH",
+    ) -> PreparedCausalSession:
+        key = self.key(symbol, session_date, session_type, config)
+        cached = self._entries.pop(key, None)
+        if cached is not None and cached.rows is rows:
+            self._entries[key] = cached
+            _REPLAY_PERFORMANCE.prepared_session_cache_hits += 1
+            return cached
+        if cached is not None:
+            self.approximate_bytes -= cached.approximate_bytes
+        _REPLAY_PERFORMANCE.prepared_session_cache_misses += 1
+        prepared = PreparedCausalSession(symbol, session_date, rows, config)
+        self._entries[key] = prepared
+        self.approximate_bytes += prepared.approximate_bytes
+        while len(self._entries) > self.max_entries or self.approximate_bytes > self.max_bytes:
+            _old_key, old = self._entries.popitem(last=False)
+            self.approximate_bytes -= old.approximate_bytes
+        return prepared
+
+    @property
+    def frame_count(self) -> int:
+        return len(self._entries)
+
+
+def _feature_at(rows: pd.DataFrame, timestamp: pd.Timestamp, config: ReplayConfig) -> dict[str, Any]:
+    _REPLAY_PERFORMANCE.legacy_full_frame_feature_calls += 1
+    if rows.empty:
+        return {"ready": False, "reason": "missing_candles"}
+    start = rows.iloc[0]["timestamp"]
+    visible = rows[rows["available_at"] <= timestamp]
+    if visible.empty:
+        return {"ready": False, "reason": "no_completed_bar"}
+    open_price = fnum(rows.iloc[0].get("open"))
+    current = visible.iloc[-1]
+    price = fnum(current.get(config.entry_price_mode), fnum(current.get("close"), fnum(current.get("open"))))
+    first5_end = start + pd.Timedelta(minutes=5)
+    first15_end = start + pd.Timedelta(minutes=15)
+    or_end = start + pd.Timedelta(seconds=LIVE_SIGNAL_OPENING_RANGE_SECONDS)
+    first5_complete = timestamp >= first5_end
+    first15_complete = timestamp >= first15_end
+    or_complete = timestamp >= or_end
+    if config.window_availability_mode == "finalized_windows":
+        first5 = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < first5_end)] if first5_complete else pd.DataFrame()
+        first15 = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < first15_end)] if first15_complete else pd.DataFrame()
+        or_rows = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < or_end)] if or_complete else pd.DataFrame()
+    else:
+        first5 = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < first5_end)]
+        first15 = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < first15_end)]
+        or_rows = visible[(visible["timestamp"] >= start) & (visible["timestamp"] < or_end)]
+    first5_high = fnum(first5["high"].max()) if not first5.empty else None
+    first15_high = fnum(first15["high"].max()) if not first15.empty else None
+    or_high = fnum(or_rows["high"].max()) if not or_rows.empty else None
+    or_low = fnum(or_rows["low"].min()) if not or_rows.empty else None
+    spread = fnum(current.get("spread_bps")) if "spread_bps" in visible.columns else None
+    return _feature_result(
+        timestamp=timestamp,
+        config=config,
+        open_price=open_price,
+        price=price,
+        spread=spread,
+        current_high=fnum(current.get("high")),
+        first5_high=first5_high,
+        first15_high=first15_high,
+        or_high=or_high,
+        or_low=or_low,
+        start=start,
+    )
 
 
 def _event(result: ReplayResult, session_date: str, timestamp: pd.Timestamp, event_type: str, symbol: str = "", **kwargs: Any) -> None:
@@ -449,7 +859,11 @@ def replay_session(
     top100_path: Path,
     history_dir: Path,
     config: ReplayConfig,
+    prepared_rows_by_symbol: dict[str, pd.DataFrame] | None = None,
+    prepared_features_by_symbol: dict[str, PreparedReplayFeatures] | None = None,
+    prepared_sessions_by_symbol: dict[str, PreparedCausalSession] | None = None,
 ) -> ReplayResult:
+    _REPLAY_PERFORMANCE.replay_session_calls += 1
     result = ReplayResult()
     config_json = json.dumps(effective_config_dict(config), sort_keys=True)
     result.effective_config_json = config_json
@@ -457,7 +871,16 @@ def replay_session(
     if top100.empty:
         return result
     symbols = [normalize_symbol(value) for value in top100["symbol"].tolist() if normalize_symbol(value)]
-    rows_by_symbol = {symbol: _rows(load_session_candles(history_dir, symbol, session_date, "RTH"), config.bar_timestamp_semantics) for symbol in symbols}
+    if prepared_sessions_by_symbol is not None:
+        rows_by_symbol = {
+            symbol: prepared_sessions_by_symbol[symbol].rows
+            for symbol in symbols
+            if symbol in prepared_sessions_by_symbol
+        }
+    elif prepared_rows_by_symbol is None:
+        rows_by_symbol = {symbol: _rows(load_session_candles(history_dir, symbol, session_date, "RTH"), config.bar_timestamp_semantics) for symbol in symbols}
+    else:
+        rows_by_symbol = {symbol: prepared_rows_by_symbol.get(symbol, pd.DataFrame()) for symbol in symbols}
     rows_by_symbol = {symbol: rows for symbol, rows in rows_by_symbol.items() if not rows.empty}
     if not rows_by_symbol:
         return result
@@ -469,16 +892,29 @@ def replay_session(
         end = min(end, eod)
     entry_delay_until = min(rows["timestamp"].min() for rows in non_empty) + pd.Timedelta(minutes=config.entry_delay_after_open_minutes)
     open_positions: dict[str, ReplayPosition] = {}
+    feature_lookups: dict[str, PreparedReplayFeatures] = {}
+    for symbol, rows in rows_by_symbol.items():
+        prepared_session = prepared_sessions_by_symbol.get(symbol) if prepared_sessions_by_symbol is not None else None
+        prepared = (
+            prepared_session.replay_features
+            if prepared_session is not None and prepared_session.config == config and prepared_session.rows is rows
+            else (prepared_features_by_symbol.get(symbol) if prepared_features_by_symbol is not None else None)
+        )
+        feature_lookups[symbol] = (
+            prepared
+            if prepared is not None and prepared.config == config and prepared.rows is rows
+            else PreparedReplayFeatures(rows, config)
+        )
     traded_symbols: set[str] = set()
     signaled_symbols: set[str] = set()
     realized = 0.0
     current = start.floor("min")
     while current <= end.ceil("min"):
         candle_by_symbol = {}
-        for symbol, rows in rows_by_symbol.items():
-            visible = rows[rows["available_at"] <= current]
-            if not visible.empty:
-                candle_by_symbol[symbol] = visible.iloc[-1]
+        for symbol, lookup in feature_lookups.items():
+            latest = lookup.latest_row(current)
+            if latest is not None:
+                candle_by_symbol[symbol] = latest
         _manage_positions(result, session_date, current, open_positions, candle_by_symbol, config)
         if eod is not None and current >= eod:
             for symbol, pos in list(open_positions.items()):
@@ -490,12 +926,12 @@ def replay_session(
                 del open_positions[symbol]
             break
         candidates = []
-        for symbol, rows in rows_by_symbol.items():
+        for symbol, lookup in feature_lookups.items():
             if symbol in open_positions:
                 continue
             if config.max_one_trade_per_symbol_per_day and symbol in traded_symbols:
                 continue
-            features = _feature_at(rows, current, config)
+            features = lookup.at(current)
             if not features.get("ready"):
                 result.skipped[str(features.get("reason") or "not_ready")] = result.skipped.get(str(features.get("reason") or "not_ready"), 0) + 1
                 continue

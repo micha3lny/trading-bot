@@ -11,7 +11,18 @@ import numpy as np
 import pandas as pd
 
 from src.live_trading.analysis.common import fnum, load_session_candles, normalize_symbol, parse_dt, pct
-from src.live_trading.analysis.full_session_replay_v67 import ReplayConfig, _feature_at, _rows, profile_config, replay_session
+from src.live_trading.analysis.full_session_replay_v67 import (
+    PreparedCausalSession,
+    PreparedCompletedBarFeatures,
+    PreparedSessionCache,
+    ReplayConfig,
+    _feature_at,
+    _rows,
+    profile_config,
+    record_completed_bar_full_frame_call,
+    record_replay_snapshots_call,
+    replay_session,
+)
 from src.live_trading.analysis.top100_analysis_common import (
     load_top100_source,
     read_snapshot_chunks,
@@ -88,6 +99,7 @@ def enrich_light_snapshots(light: pd.DataFrame) -> pd.DataFrame:
 
 
 def completed_bar_features(candles: pd.DataFrame, timestamp: Any) -> dict[str, Any]:
+    record_completed_bar_full_frame_call()
     when = parse_dt(timestamp)
     if candles.empty or when is None:
         return {}
@@ -122,18 +134,32 @@ def completed_bar_features(candles: pd.DataFrame, timestamp: Any) -> dict[str, A
     }
 
 
-def replay_snapshots(session_date: str, top100: pd.DataFrame, history_dir: Path, config: ReplayConfig) -> pd.DataFrame:
+def replay_snapshots(
+    session_date: str,
+    top100: pd.DataFrame,
+    history_dir: Path,
+    config: ReplayConfig,
+    *,
+    prepared_rows_by_symbol: dict[str, pd.DataFrame] | None = None,
+    prepared_sessions_by_symbol: dict[str, PreparedCausalSession] | None = None,
+) -> pd.DataFrame:
+    record_replay_snapshots_call()
     records: list[dict[str, Any]] = []
     for row in top100.to_dict("records"):
         symbol = normalize_symbol(row.get("symbol"))
-        candles = load_session_candles(history_dir, symbol, session_date)
-        bars = _rows(candles, config.bar_timestamp_semantics)
+        prepared_session = prepared_sessions_by_symbol.get(symbol) if prepared_sessions_by_symbol is not None else None
+        if prepared_session is not None:
+            bars = prepared_session.rows
+        elif prepared_rows_by_symbol is None:
+            candles = load_session_candles(history_dir, symbol, session_date)
+            bars = _rows(candles, config.bar_timestamp_semantics)
+        else:
+            bars = prepared_rows_by_symbol.get(symbol, pd.DataFrame())
         if bars.empty:
             records.append({"session_date": session_date, "symbol": symbol, "snapshot_source": "replay", "runtime_observed": 0, "causal_valid": 0, "rejection_reason": "missing_history"})
             continue
-        for timestamp in sorted(bars["available_at"].dropna().unique()):
-            when = pd.Timestamp(timestamp)
-            feature = _feature_at(bars, when, config)
+        prepared_session = prepared_session or PreparedCausalSession(symbol, session_date, bars, config)
+        for when, feature, completed in prepared_session.iter_features():
             records.append({
                 "session_date": session_date, "symbol": symbol, "timestamp": when,
                 "snapshot_source": "replay", "runtime_observed": 0,
@@ -148,7 +174,7 @@ def replay_snapshots(session_date: str, top100: pd.DataFrame, history_dir: Path,
                 "first_5m_complete": feature.get("first_5m_complete"), "first_15m_complete": feature.get("first_15m_complete"),
                 "or_range_pct": feature.get("or_range_pct"), "or_high": feature.get("or_high"), "or_low": feature.get("or_low"),
                 "data_quality_flags": "replay_only;spread_and_broker_state_unavailable",
-            } | completed_bar_features(candles, when))
+            } | completed)
     return enrich_light_snapshots(pd.DataFrame(records)) if records else pd.DataFrame()
 
 
@@ -401,8 +427,26 @@ def analyze_session(
     top100 = top100.copy()
     top100["session_date"] = session_date
     top100["ranking_source_date"] = ranking_source_date
+    candles_by_symbol: dict[str, pd.DataFrame] = {}
+    prepared_rows_by_symbol: dict[str, pd.DataFrame] = {}
+    prepared_sessions_by_symbol: dict[str, PreparedCausalSession] = {}
+    prepared_cache = PreparedSessionCache(max_entries=max(1, len(top100)), max_bytes=256 * 1024 * 1024)
+    for symbol in top100["symbol"].map(normalize_symbol):
+        candles = load_session_candles(history_dir, symbol, session_date)
+        candles_by_symbol[symbol] = candles
+        rows = _rows(candles, config.bar_timestamp_semantics)
+        prepared_rows_by_symbol[symbol] = rows
+        if not rows.empty:
+            prepared_sessions_by_symbol[symbol] = prepared_cache.get_or_build(symbol, session_date, rows, config)
     if light.empty:
-        snapshots = replay_snapshots(session_date, top100, history_dir, config)
+        snapshots = replay_snapshots(
+            session_date,
+            top100,
+            history_dir,
+            config,
+            prepared_rows_by_symbol=prepared_rows_by_symbol,
+            prepared_sessions_by_symbol=prepared_sessions_by_symbol,
+        )
     else:
         snapshots = light
         for symbol in top100["symbol"].map(normalize_symbol):
@@ -422,7 +466,7 @@ def analyze_session(
     hypothetical: list[dict[str, Any]] = []
     history_symbols: set[str] = set()
     for _, row in symbol_day.iterrows():
-        candles = load_session_candles(history_dir, row["symbol"], session_date)
+        candles = candles_by_symbol.get(normalize_symbol(row["symbol"]), pd.DataFrame())
         if not candles.empty:
             history_symbols.add(row["symbol"])
         hypothetical.append(_hypothetical(row, candles, config))
@@ -456,6 +500,8 @@ def analyze_session(
                 top100_path=replay_top100_path,
                 history_dir=history_dir,
                 config=config,
+                prepared_rows_by_symbol=prepared_rows_by_symbol,
+                prepared_sessions_by_symbol=prepared_sessions_by_symbol,
             )
     full_replay_rows = pd.DataFrame([
         {

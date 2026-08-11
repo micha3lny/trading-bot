@@ -8,7 +8,20 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from src.live_trading.analysis.full_session_replay_v67 import ReplayConfig, build_effective_config, build_parser, profile_comparison_rows, profile_config, replay_session
+from src.live_trading.analysis.full_session_replay_v67 import (
+    PreparedReplayFeatures,
+    PreparedSessionCache,
+    ReplayConfig,
+    _feature_at,
+    _rows,
+    build_effective_config,
+    build_parser,
+    profile_comparison_rows,
+    profile_config,
+    replay_performance_counters,
+    replay_session,
+    reset_replay_performance_counters,
+)
 from src.live_trading.analysis.signal_opportunity_forensics import load_case_rows, run as run_signal_opportunity, build_parser as build_signal_parser
 
 
@@ -108,6 +121,107 @@ class FullSessionReplayTests(unittest.TestCase):
             if row.get("symbol")
         }
         self.assertEqual(observed_symbols, {"AAA"})
+
+    def test_prepared_features_match_reference_for_all_profiles(self) -> None:
+        frame = ready_candles(11.0, spread=12.5)
+        for profile in ("live", "low_threshold_causal", "legacy_offline"):
+            config = profile_config(profile)
+            rows = _rows(frame, config.bar_timestamp_semantics)
+            prepared = PreparedReplayFeatures(rows, config)
+            timestamps = pd.date_range("2026-07-20T13:29:00Z", "2026-07-20T13:50:00Z", freq="min")
+            for timestamp in timestamps:
+                expected = _feature_at(rows, timestamp, config)
+                actual = prepared.at(timestamp)
+                self.assertEqual(actual.keys(), expected.keys())
+                for key, expected_value in expected.items():
+                    actual_value = actual[key]
+                    if isinstance(expected_value, float):
+                        self.assertAlmostEqual(actual_value, expected_value, places=12, msg=f"{profile=} {timestamp=} {key=}")
+                    else:
+                        self.assertEqual(actual_value, expected_value, f"{profile=} {timestamp=} {key=}")
+
+    def test_prepared_session_cache_key_includes_full_config_and_is_bounded(self) -> None:
+        rows = _rows(ready_candles(11.0), "bar_start")
+        live = profile_config("live")
+        low = profile_config("low_threshold_causal")
+        reset_replay_performance_counters()
+        cache = PreparedSessionCache(max_entries=1, max_bytes=64 * 1024 * 1024)
+        first = cache.get_or_build("AAA", "2026-07-20", rows, live)
+        second = cache.get_or_build("AAA", "2026-07-20", rows, live)
+        third = cache.get_or_build("AAA", "2026-07-20", rows, low)
+        counters = replay_performance_counters()
+        self.assertIs(first, second)
+        self.assertIsNot(first, third)
+        self.assertEqual(cache.frame_count, 1)
+        self.assertGreater(cache.approximate_bytes, 0)
+        self.assertEqual(counters["prepared_session_cache_hits"], 1)
+        self.assertEqual(counters["prepared_session_cache_misses"], 2)
+
+    def test_prepared_session_cache_handles_empty_rows(self) -> None:
+        cache = PreparedSessionCache(max_entries=1, max_bytes=1024)
+        prepared = cache.get_or_build("EMPTY", "2026-07-20", pd.DataFrame(), profile_config("live"))
+        self.assertTrue(prepared.rows.empty)
+        self.assertEqual(cache.frame_count, 1)
+        self.assertEqual(cache.approximate_bytes, 0)
+
+    def test_fast_replay_exposes_zero_legacy_full_frame_calls(self) -> None:
+        reset_replay_performance_counters()
+        result = self.replay_with({"AAA": ready_candles(11.0)})
+        counters = replay_performance_counters()
+        self.assertTrue(any(event["event_type"] == "ENTRY" for event in result.events))
+        self.assertEqual(counters["legacy_full_frame_feature_calls"], 0)
+        self.assertEqual(counters["replay_session_calls"], 1)
+
+    def test_replay_session_does_not_call_full_frame_feature_function(self) -> None:
+        with patch("src.live_trading.analysis.full_session_replay_v67._feature_at", side_effect=AssertionError("full-frame feature path used")):
+            result = self.replay_with({"AAA": ready_candles(11.0)})
+        self.assertTrue(any(event["event_type"] == "ENTRY" for event in result.events))
+
+    def test_optimized_replay_matches_full_frame_reference_exactly(self) -> None:
+        data = {"READY": ready_candles(11.0), "NEVER": ready_candles(5.1)}
+        optimized = self.replay_with(data, max_open_positions=1)
+
+        class ReferenceFeatures:
+            def __init__(self, rows, config):
+                self.rows = rows
+                self.config = config
+
+            def latest_row(self, timestamp):
+                visible = self.rows[self.rows["available_at"] <= timestamp]
+                return None if visible.empty else visible.iloc[-1]
+
+            def at(self, timestamp):
+                return _feature_at(self.rows, timestamp, self.config)
+
+        with patch("src.live_trading.analysis.full_session_replay_v67.PreparedReplayFeatures", ReferenceFeatures):
+            reference = self.replay_with(data, max_open_positions=1)
+        self.assertEqual(optimized, reference)
+
+    def test_golden_stop_and_trailing_exit_paths(self) -> None:
+        common = [
+            ("2026-07-20T13:30:00Z", 10.0, 10.8, 9.8, 10.7),
+            ("2026-07-20T13:31:00Z", 10.7, 10.9, 10.5, 10.8),
+            ("2026-07-20T13:32:00Z", 10.8, 11.0, 10.6, 10.9),
+            ("2026-07-20T13:33:00Z", 10.9, 11.1, 10.7, 11.0),
+            ("2026-07-20T13:34:00Z", 11.0, 11.2, 10.8, 11.1),
+        ]
+        stop = candles(common + [
+            ("2026-07-20T13:35:00Z", 11.1, 11.2, 9.0, 9.5),
+            ("2026-07-20T13:36:00Z", 9.5, 9.7, 9.2, 9.4),
+        ])
+        trailing = candles(common + [
+            ("2026-07-20T13:35:00Z", 11.1, 11.5, 11.2, 11.4),
+            ("2026-07-20T13:36:00Z", 11.4, 11.4, 11.0, 11.1),
+        ])
+        result = self.replay_with({"STOP": stop, "TRAIL": trailing}, entry_delay_after_open_minutes=5.0)
+        trades = {trade["symbol"]: trade for trade in result.trades}
+
+        self.assertEqual(trades["STOP"]["entry_time"], "2026-07-20T13:35:00+00:00")
+        self.assertEqual(trades["STOP"]["exit_time"], "2026-07-20T13:36:00+00:00")
+        self.assertEqual(trades["STOP"]["exit_reason"], "v46_wide_trail_stop_loss")
+        self.assertEqual(trades["TRAIL"]["entry_time"], "2026-07-20T13:35:00+00:00")
+        self.assertEqual(trades["TRAIL"]["exit_time"], "2026-07-20T13:37:00+00:00")
+        self.assertEqual(trades["TRAIL"]["exit_reason"], "v46_wide_trail_trailing_stop")
 
     def test_live_profile_defaults_match_v67_thresholds(self) -> None:
         config = profile_config("live")

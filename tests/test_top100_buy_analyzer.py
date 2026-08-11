@@ -5,15 +5,23 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
-from src.live_trading.analysis.full_session_replay_v67 import profile_config
+from src.live_trading.analysis.full_session_replay_v67 import (
+    _rows,
+    profile_config,
+    replay_performance_counters,
+    reset_replay_performance_counters,
+)
 from src.live_trading.analysis.top100_buy_analyzer import (
+    PreparedCompletedBarFeatures,
     analyze_session,
     completed_bar_features,
     enrich_light_snapshots,
     portfolio_filter_simulation,
+    replay_snapshots,
 )
 from src.live_trading.ranking.daily_top100_builder import parquet_path
 
@@ -33,6 +41,173 @@ class Top100BuyAnalyzerTests(unittest.TestCase):
         self.assertAlmostEqual(result["return_1m"], 10.0)
         self.assertLess(result["pullback_from_recent_high_pct"], 0)
         self.assertNotEqual(result["return_1m"], (50 / 11 - 1) * 100)
+
+    def test_prepared_completed_features_match_reference(self) -> None:
+        frame = candles("2026-07-31T13:30:00Z", [10, 11, 10.5, 12, 11.5, 13, 12.5])
+        prepared = PreparedCompletedBarFeatures(_rows(frame, "bar_start"))
+        for timestamp in pd.date_range("2026-07-31T13:29:00Z", "2026-07-31T13:40:00Z", freq="min"):
+            expected = completed_bar_features(frame, timestamp)
+            actual = prepared.at(timestamp)
+            self.assertEqual(actual.keys(), expected.keys())
+            for key, expected_value in expected.items():
+                actual_value = actual[key]
+                if isinstance(expected_value, float):
+                    self.assertAlmostEqual(actual_value, expected_value, places=12, msg=f"{timestamp=} {key=}")
+                else:
+                    self.assertEqual(actual_value, expected_value, f"{timestamp=} {key=}")
+
+    def test_replay_snapshots_avoids_repeated_full_frame_processing(self) -> None:
+        frame = candles("2026-07-31T13:30:00Z", [10 + index * 0.1 for index in range(30)])
+        rows = _rows(frame, "bar_start")
+        top100 = pd.DataFrame({"symbol": ["AAA"], "rank": [1], "score": [100]})
+        reset_replay_performance_counters()
+        with patch("src.live_trading.analysis.top100_buy_analyzer._feature_at", side_effect=AssertionError("full-frame replay feature path used")), patch(
+            "src.live_trading.analysis.top100_buy_analyzer.completed_bar_features",
+            side_effect=AssertionError("full-frame completed-bar path used"),
+        ):
+            snapshots = replay_snapshots(
+                "2026-07-31",
+                top100,
+                Path("unused"),
+                profile_config("live"),
+                prepared_rows_by_symbol={"AAA": rows},
+            )
+        self.assertEqual(len(snapshots), len(rows))
+        counters = replay_performance_counters()
+        self.assertEqual(counters["legacy_full_frame_feature_calls"], 0)
+        self.assertEqual(counters["completed_bar_full_frame_calls"], 0)
+        self.assertEqual(counters["replay_snapshots_calls"], 1)
+        self.assertEqual(counters["causal_cursor_advances"], len(rows))
+
+    def test_optimized_snapshots_match_full_frame_reference_exactly(self) -> None:
+        frame = candles("2026-07-31T13:30:00Z", [10 + index * 0.1 for index in range(30)])
+        rows = _rows(frame, "bar_start")
+        top100 = pd.DataFrame({"symbol": ["AAA"], "rank": [1], "score": [100]})
+        kwargs = {
+            "session_date": "2026-07-31",
+            "top100": top100,
+            "history_dir": Path("unused"),
+            "config": profile_config("live"),
+            "prepared_rows_by_symbol": {"AAA": rows},
+        }
+        optimized = replay_snapshots(**kwargs)
+
+        class ReferenceReplayFeatures:
+            def __init__(self, prepared, config):
+                self.rows = prepared
+                self.config = config
+
+            def at(self, timestamp):
+                from src.live_trading.analysis.full_session_replay_v67 import _feature_at
+                return _feature_at(self.rows, timestamp, self.config)
+
+        class ReferenceCompletedFeatures:
+            def __init__(self, prepared):
+                self.rows = prepared
+
+            def at(self, timestamp):
+                return completed_bar_features(self.rows, timestamp)
+
+        class ReferenceSession:
+            def __init__(self, symbol, session_date, prepared, config):
+                self.symbol = symbol
+                self.session_date = session_date
+                self.rows = prepared
+                self.config = config
+                self.replay_features = ReferenceReplayFeatures(prepared, config)
+                self.completed_bar_features = ReferenceCompletedFeatures(prepared)
+
+            def iter_features(self):
+                for timestamp in sorted(self.rows["available_at"].dropna().unique()):
+                    when = pd.Timestamp(timestamp)
+                    yield when, self.replay_features.at(when), self.completed_bar_features.at(when)
+
+        with patch("src.live_trading.analysis.top100_buy_analyzer.PreparedCausalSession", ReferenceSession):
+            reference = replay_snapshots(**kwargs)
+        pd.testing.assert_frame_equal(optimized, reference, check_exact=True)
+
+    def test_end_to_end_outputs_match_full_frame_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            top100_dir = root / "top100"
+            history = root / "history"
+            recorder = root / "recorder"
+            optimized_output = root / "optimized"
+            reference_output = root / "reference"
+            top100_dir.mkdir()
+            pd.DataFrame({"rank": [1, 2, 3], "symbol": ["READY", "NEVER", "MISSING"], "score": [100, 80, 60]}).to_csv(
+                top100_dir / "daily_top100_2026-07-30.csv", index=False
+            )
+            for symbol, closes in {
+                "READY": [10 + index * 0.1 for index in range(30)],
+                "NEVER": [10 + index * 0.005 for index in range(30)],
+            }.items():
+                path = parquet_path(history, symbol, pd.Timestamp("2026-07-31").date(), "RTH")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                candles("2026-07-31T13:30:00Z", closes).to_parquet(path, index=False)
+            db = root / "runtime.sqlite"
+            with sqlite3.connect(db) as conn:
+                conn.execute("CREATE TABLE trades (trade_id TEXT, session_date TEXT, symbol TEXT, status TEXT, entry_fill_time TEXT, exit_fill_time TEXT, closed_at TEXT, entry_price REAL, exit_price REAL, quantity REAL, net_pnl REAL, exit_reason TEXT)")
+
+            kwargs = {
+                "session_date": "2026-07-31",
+                "sqlite_path": db,
+                "history_dir": history,
+                "recorder_dir": recorder,
+                "top100_dir": top100_dir,
+            }
+            optimized = analyze_session(output_dir=optimized_output, **kwargs)
+
+            class ReferenceReplayFeatures:
+                def __init__(self, prepared, config):
+                    self.rows = prepared
+                    self.config = config
+
+                def latest_row(self, timestamp):
+                    visible = self.rows[self.rows["available_at"] <= timestamp]
+                    return None if visible.empty else visible.iloc[-1]
+
+                def at(self, timestamp):
+                    from src.live_trading.analysis.full_session_replay_v67 import _feature_at
+                    return _feature_at(self.rows, timestamp, self.config)
+
+            class ReferenceCompletedFeatures:
+                def __init__(self, prepared):
+                    self.rows = prepared
+
+                def at(self, timestamp):
+                    return completed_bar_features(self.rows, timestamp)
+
+            class ReferenceSession:
+                def __init__(self, symbol, session_date, prepared, config):
+                    self.symbol = symbol
+                    self.session_date = session_date
+                    self.rows = prepared
+                    self.config = config
+                    self.replay_features = ReferenceReplayFeatures(prepared, config)
+                    self.completed_bar_features = ReferenceCompletedFeatures(prepared)
+
+                def iter_features(self):
+                    for timestamp in sorted(self.rows["available_at"].dropna().unique()):
+                        when = pd.Timestamp(timestamp)
+                        yield when, self.replay_features.at(when), self.completed_bar_features.at(when)
+
+            class ReferenceCache:
+                def __init__(self, **_kwargs):
+                    pass
+
+                def get_or_build(self, symbol, session_date, prepared, config, **_kwargs):
+                    return ReferenceSession(symbol, session_date, prepared, config)
+
+            with patch("src.live_trading.analysis.top100_buy_analyzer.PreparedSessionCache", ReferenceCache):
+                reference = analyze_session(output_dir=reference_output, **kwargs)
+
+            for key in ("symbol_day", "snapshots", "feature_analysis", "filter_simulation", "portfolio_replay"):
+                optimized_frame = pd.read_parquet(optimized[key]) if optimized[key].suffix == ".parquet" else pd.read_csv(optimized[key])
+                reference_frame = pd.read_parquet(reference[key]) if reference[key].suffix == ".parquet" else pd.read_csv(reference[key])
+                pd.testing.assert_frame_equal(optimized_frame, reference_frame, check_exact=True)
+            self.assertEqual(json.loads(optimized["data_quality"].read_text()), json.loads(reference["data_quality"].read_text()))
+            self.assertEqual(optimized["summary"].read_text(), reference["summary"].read_text())
 
     def test_light_dedupe_and_restart_identity(self) -> None:
         frame = pd.DataFrame([
