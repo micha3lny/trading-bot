@@ -458,9 +458,10 @@ def replay_session(
         return result
     symbols = [normalize_symbol(value) for value in top100["symbol"].tolist() if normalize_symbol(value)]
     rows_by_symbol = {symbol: _rows(load_session_candles(history_dir, symbol, session_date, "RTH"), config.bar_timestamp_semantics) for symbol in symbols}
-    non_empty = [rows for rows in rows_by_symbol.values() if not rows.empty]
-    if not non_empty:
+    rows_by_symbol = {symbol: rows for symbol, rows in rows_by_symbol.items() if not rows.empty}
+    if not rows_by_symbol:
         return result
+    non_empty = list(rows_by_symbol.values())
     start = min(rows["available_at"].min() for rows in non_empty)
     end = max(rows["available_at"].max() for rows in non_empty)
     eod = _eod_timestamp(rows_by_symbol, config)

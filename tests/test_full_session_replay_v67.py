@@ -92,6 +92,23 @@ class FullSessionReplayTests(unittest.TestCase):
         two = self.replay_with(data).events
         self.assertEqual(one, two)
 
+    def test_missing_empty_and_invalid_candles_are_skipped_without_changing_replay(self) -> None:
+        complete = {"AAA": ready_candles(11.0)}
+        baseline = self.replay_with(complete)
+        mixed = self.replay_with({
+            **complete,
+            "NO_HISTORY": pd.DataFrame(),
+            "INVALID": pd.DataFrame({"open": [10.0], "close": [10.1]}),
+        })
+
+        self.assertEqual(mixed, baseline)
+        observed_symbols = {
+            str(row.get("symbol") or "")
+            for row in [*mixed.events, *mixed.trades]
+            if row.get("symbol")
+        }
+        self.assertEqual(observed_symbols, {"AAA"})
+
     def test_live_profile_defaults_match_v67_thresholds(self) -> None:
         config = profile_config("live")
         self.assertEqual(config.first5_threshold, 4.0)
