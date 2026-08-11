@@ -4,7 +4,9 @@ import argparse
 import json
 import math
 import tempfile
-from dataclasses import dataclass
+import time
+from collections import OrderedDict
+from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -13,13 +15,20 @@ import numpy as np
 import pandas as pd
 
 from src.live_trading.analysis.common import load_session_candles, normalize_symbol, pct
-from src.live_trading.analysis.full_session_replay_v67 import profile_config, replay_session
+from src.live_trading.analysis.full_session_replay_v67 import PreparedSessionCache, _rows, profile_config, replay_session
 from src.live_trading.analysis.top100_analysis_common import find_dated_top100, load_top100_source, safe_json, session_dates, write_dataframe
 from src.live_trading.ranking.daily_top100_builder import (
     DEFAULT_UNIVERSE,
     DEFAULT_PRIOR_SESSIONS,
+    analyze_symbol,
     build_daily_top,
+    combined_ineligible_symbols,
     load_universe,
+    normalize_history_df,
+    parquet_path,
+    parse_partition_date,
+    prior_session_paths,
+    ranking_to_row,
 )
 from src.live_trading.market_calendar import previous_us_equity_trading_day
 
@@ -39,6 +48,163 @@ class BaselineSettings:
     min_volume: float = 100_000.0
     min_dollar_volume: float = 500_000.0
     prior_sessions: int = DEFAULT_PRIOR_SESSIONS
+
+
+@dataclass
+class PerformanceDiagnostics:
+    parquet_files_read: int = 0
+    parquet_bytes_read: int = 0
+    parquet_read_operations: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    replay_session_calls: int = 0
+    production_baseline_builds: int = 0
+    matrix_rows: int = 0
+
+
+class SessionHistoryCache:
+    """Process-scoped, bounded cache for one requested P2 analysis window."""
+
+    def __init__(
+        self,
+        history_dir: Path,
+        *,
+        max_feature_date: date,
+        feature_dates: set[date],
+        outcome_dates: set[date],
+        baseline_prior_sessions: int,
+        max_lookback: int = 252,
+        max_session_frames: int = 512,
+    ):
+        self.history_dir = history_dir
+        self.max_feature_date = max_feature_date
+        self.feature_dates = set(feature_dates)
+        self.outcome_dates = set(outcome_dates)
+        self.baseline_prior_sessions = max(0, baseline_prior_sessions)
+        self.max_lookback = max_lookback
+        self.max_session_frames = max(1, max_session_frames)
+        self.diagnostics = PerformanceDiagnostics()
+        self.daily_histories: dict[str, pd.DataFrame] = {}
+        self.daily_metrics: dict[tuple[str, date], dict[str, Any]] = {}
+        self._session_frames: OrderedDict[tuple[str, date], pd.DataFrame] = OrderedDict()
+
+    def _record_paths(self, paths: list[Path]) -> None:
+        self.diagnostics.parquet_files_read += len(paths)
+        self.diagnostics.parquet_bytes_read += sum(path.stat().st_size for path in paths if path.exists())
+        self.diagnostics.parquet_read_operations += 1
+
+    def _read_batch(self, paths: list[Path]) -> dict[date, pd.DataFrame]:
+        if not paths:
+            return {}
+        self._record_paths(paths)
+        try:
+            combined = normalize_history_df(pd.read_parquet(paths))
+            observed_dates = set(combined["timestamp"].dt.date) if not combined.empty else set()
+            expected_dates = {parse_partition_date(path) for path in paths}
+            expected_dates.discard(None)
+            if not observed_dates.issubset(expected_dates):
+                raise ValueError("history timestamp date does not match requested partitions")
+            return {
+                current: group.sort_values("timestamp").reset_index(drop=True)
+                for current, group in combined.groupby(combined["timestamp"].dt.date, sort=True)
+            }
+        except Exception:
+            frames: dict[date, pd.DataFrame] = {}
+            for path in paths:
+                current = parse_partition_date(path)
+                if current is None:
+                    continue
+                self._record_paths([path])
+                frame = load_session_candles(self.history_dir, path.parts[-4].split("=", 1)[1], current)
+                if not frame.empty:
+                    frames[current] = frame
+            return frames
+
+    def prepare_symbol(self, symbol: str) -> tuple[pd.DataFrame, dict[date, pd.DataFrame]]:
+        symbol = normalize_symbol(symbol)
+        if symbol in self.daily_histories:
+            self.diagnostics.cache_hits += 1
+            return self.daily_histories[symbol], {}
+        self.diagnostics.cache_misses += 1
+        history_dates = _available_dates(self.history_dir, symbol, self.max_feature_date)[-self.max_lookback:]
+        required_dates = set(history_dates) | self.outcome_dates | self.feature_dates
+        for current in self.feature_dates:
+            required_dates.update(
+                parse_partition_date(path)
+                for path in prior_session_paths(
+                    self.history_dir, symbol, current, "RTH", limit=self.baseline_prior_sessions
+                )
+            )
+        paths = []
+        for current in sorted(value for value in required_dates if value is not None):
+            path = parquet_path(self.history_dir, symbol, current, "RTH")
+            if path.exists():
+                paths.append(path)
+        frames = self._read_batch(paths)
+        for current in self.outcome_dates:
+            frame = frames.get(current)
+            if frame is not None:
+                self._remember_session((symbol, current), frame)
+        sessions: list[dict[str, Any]] = []
+        for current, frame in frames.items():
+            metrics = _daily_metrics(frame)
+            if not metrics:
+                continue
+            self.daily_metrics[(symbol, current)] = metrics
+            if current in history_dates:
+                sessions.append({"date": current, **metrics})
+        daily = pd.DataFrame(sessions).sort_values("date").reset_index(drop=True) if sessions else pd.DataFrame()
+        self.daily_histories[symbol] = daily
+        return daily, frames
+
+    def _remember_session(self, key: tuple[str, date], frame: pd.DataFrame) -> None:
+        self._session_frames.pop(key, None)
+        self._session_frames[key] = frame
+        while len(self._session_frames) > self.max_session_frames:
+            self._session_frames.popitem(last=False)
+
+    def get_daily_history(self, symbol: str) -> pd.DataFrame:
+        symbol = normalize_symbol(symbol)
+        if symbol in self.daily_histories:
+            self.diagnostics.cache_hits += 1
+            return self.daily_histories[symbol]
+        return self.prepare_symbol(symbol)[0]
+
+    def get_daily_metrics(self, symbol: str, session_date: date) -> dict[str, Any]:
+        key = (normalize_symbol(symbol), session_date)
+        if key in self.daily_metrics:
+            self.diagnostics.cache_hits += 1
+            return self.daily_metrics[key]
+        frame = self.get_session(symbol, session_date)
+        metrics = _daily_metrics(frame)
+        if metrics:
+            self.daily_metrics[key] = metrics
+        return metrics
+
+    def get_session(self, symbol: str, session_date: date) -> pd.DataFrame:
+        key = (normalize_symbol(symbol), session_date)
+        if key in self._session_frames:
+            self.diagnostics.cache_hits += 1
+            frame = self._session_frames.pop(key)
+            self._session_frames[key] = frame
+            return frame
+        self.diagnostics.cache_misses += 1
+        path = parquet_path(self.history_dir, key[0], session_date, "RTH")
+        if path.exists():
+            self._record_paths([path])
+        frame = load_session_candles(self.history_dir, key[0], session_date)
+        self._remember_session(key, frame)
+        return frame
+
+    def prior_closes(self, symbol: str, feature_date: date, limit: int) -> list[float]:
+        closes: list[float] = []
+        for path in prior_session_paths(self.history_dir, symbol, feature_date, "RTH", limit=max(0, limit)):
+            current = parse_partition_date(path)
+            metrics = self.daily_metrics.get((normalize_symbol(symbol), current), {}) if current is not None else {}
+            close = metrics.get("close")
+            if close is not None and close > 0:
+                closes.append(close)
+        return closes
 
 
 def _daily_metrics(candles: pd.DataFrame) -> dict[str, Any]:
@@ -157,6 +323,48 @@ def reproduce_baseline(
     return pd.DataFrame(rows)
 
 
+def reproduce_baselines_from_cache(
+    ranking_dates: list[date],
+    *,
+    symbols: list[str],
+    cache: SessionHistoryCache,
+    settings: BaselineSettings,
+) -> dict[date, pd.DataFrame]:
+    """Reproduce production baselines while sharing history reads across dates."""
+    requested = list(dict.fromkeys(ranking_dates))
+    ranked_by_date: dict[date, list[Any]] = {current: [] for current in requested}
+    ineligible = combined_ineligible_symbols()
+    for symbol in symbols:
+        _daily, frames = cache.prepare_symbol(symbol)
+        if symbol in ineligible:
+            continue
+        for current in requested:
+            frame = frames.get(current)
+            if frame is None or frame.empty:
+                continue
+            item, _reason = analyze_symbol(
+                symbol,
+                frame,
+                cache.prior_closes(symbol, current, settings.prior_sessions),
+                min_price=settings.min_price,
+                min_bars=settings.min_bars,
+                min_volume=settings.min_volume,
+                min_dollar_volume=settings.min_dollar_volume,
+            )
+            if item is not None:
+                ranked_by_date[current].append(item)
+    result: dict[date, pd.DataFrame] = {}
+    for current in requested:
+        ranked = ranked_by_date[current]
+        ranked.sort(key=lambda item: (item.score, item.dollar_volume, item.intraday_high_pct), reverse=True)
+        result[current] = pd.DataFrame([
+            ranking_to_row(rank, item)
+            for rank, item in enumerate(ranked[: max(0, settings.top_n)], 1)
+        ])
+    cache.diagnostics.production_baseline_builds += len(requested)
+    return result
+
+
 def compare_baseline(reproduced: pd.DataFrame, saved: pd.DataFrame) -> dict[str, Any]:
     reproduced_symbols = [normalize_symbol(value) for value in reproduced.get("symbol", pd.Series(dtype=str))]
     saved_symbols = [normalize_symbol(value) for value in saved.get("symbol", pd.Series(dtype=str))]
@@ -209,11 +417,21 @@ def score_variants(matrix: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def attach_outcomes(matrix: pd.DataFrame, history_dir: Path, session_date: str) -> pd.DataFrame:
+def attach_outcomes(
+    matrix: pd.DataFrame,
+    history_dir: Path,
+    session_date: str,
+    *,
+    history_cache: SessionHistoryCache | None = None,
+) -> pd.DataFrame:
     out = matrix.copy()
     metrics: list[dict[str, Any]] = []
     for symbol in out["symbol"]:
-        daily = _daily_metrics(load_session_candles(history_dir, symbol, session_date))
+        daily = (
+            history_cache.get_daily_metrics(symbol, date.fromisoformat(session_date))
+            if history_cache is not None
+            else _daily_metrics(load_session_candles(history_dir, symbol, session_date))
+        )
         metrics.append({
             "outcome_open_to_high_pct": daily.get("high_open_pct"), "outcome_return_pct": daily.get("close_open_pct"),
             "outcome_dollar_volume": daily.get("dollar_volume"), "outcome_runner_5": int((daily.get("high_open_pct") or -999) >= 5),
@@ -293,14 +511,52 @@ def comparison_metrics(matrix: pd.DataFrame, *, session_date: str, top_n: int, b
     return pd.DataFrame(daily), pd.DataFrame(threshold_rows), pd.DataFrame(turnover), pd.DataFrame(opportunity)
 
 
-def portfolio_replays(matrix: pd.DataFrame, *, session_date: str, history_dir: Path, output_dir: Path, top_n: int, baseline_comparable: bool) -> pd.DataFrame:
+def portfolio_replays(
+    matrix: pd.DataFrame,
+    *,
+    session_date: str,
+    history_dir: Path,
+    output_dir: Path,
+    top_n: int,
+    baseline_comparable: bool,
+    history_cache: SessionHistoryCache | None = None,
+) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
+    symbols_by_variant = {variant: _variant_symbols(matrix, variant, top_n) for variant in VARIANTS}
+    config = profile_config("live")
+    prepared_rows_by_symbol: dict[str, pd.DataFrame] | None = None
+    if history_cache is not None:
+        trading_date = date.fromisoformat(session_date)
+        prepared_rows_by_symbol = {
+            symbol: _rows(history_cache.get_session(symbol, trading_date), config.bar_timestamp_semantics)
+            for symbol in sorted({symbol for values in symbols_by_variant.values() for symbol in values})
+        }
+    prepared_sessions_by_symbol = None
+    if prepared_rows_by_symbol is not None:
+        prepared_cache = PreparedSessionCache(
+            max_entries=max(1, len(prepared_rows_by_symbol)),
+            max_bytes=256 * 1024 * 1024,
+        )
+        prepared_sessions_by_symbol = {
+            symbol: prepared_cache.get_or_build(symbol, session_date, frame, config)
+            for symbol, frame in prepared_rows_by_symbol.items()
+            if not frame.empty
+        }
     with tempfile.TemporaryDirectory(prefix="top100-ranking-") as temp:
         for variant in VARIANTS:
-            symbols = _variant_symbols(matrix, variant, top_n)
+            symbols = symbols_by_variant[variant]
             path = Path(temp) / f"{variant}.csv"
             pd.DataFrame({"rank": range(1, len(symbols) + 1), "symbol": symbols, "score": range(len(symbols), 0, -1)}).to_csv(path, index=False)
-            replay = replay_session(session_date=session_date, top100_path=path, history_dir=history_dir, config=profile_config("live"))
+            replay = replay_session(
+                session_date=session_date,
+                top100_path=path,
+                history_dir=history_dir,
+                config=config,
+                prepared_rows_by_symbol=prepared_rows_by_symbol,
+                prepared_sessions_by_symbol=prepared_sessions_by_symbol,
+            )
+            if history_cache is not None:
+                history_cache.diagnostics.replay_session_calls += 1
             pnl = pd.to_numeric(pd.Series([row.get("net_pnl") for row in replay.trades]), errors="coerce").fillna(0)
             equity = pd.Series([value for _timestamp, value in replay.equity_curve], dtype=float)
             drawdown = float((equity - equity.cummax()).min()) if not equity.empty else 0.0
@@ -316,6 +572,7 @@ def portfolio_replays(matrix: pd.DataFrame, *, session_date: str, history_dir: P
 def analyze_range(
     dates: list[str], *, history_dir: Path, top100_dir: Path, universe_path: Path, output_dir: Path, settings: BaselineSettings,
 ) -> dict[str, Path]:
+    analysis_started = time.perf_counter()
     matrices: list[pd.DataFrame] = []
     daily_frames: list[pd.DataFrame] = []
     threshold_frames: list[pd.DataFrame] = []
@@ -325,10 +582,17 @@ def analyze_range(
     quality_sessions: list[dict[str, Any]] = []
     symbols = load_universe(universe_path)
     max_feature_date = previous_us_equity_trading_day(date.fromisoformat(dates[-1]))
-    daily_history_cache = {
-        symbol: load_symbol_daily_history(history_dir, symbol, max_feature_date)
-        for symbol in symbols
-    }
+    feature_dates = [previous_us_equity_trading_day(date.fromisoformat(value)) for value in dates]
+    history_cache = SessionHistoryCache(
+        history_dir,
+        max_feature_date=max_feature_date,
+        feature_dates=set(feature_dates),
+        outcome_dates={date.fromisoformat(value) for value in dates},
+        baseline_prior_sessions=settings.prior_sessions,
+        max_session_frames=max(512, settings.top_n * 2),
+    )
+    reproduced_by_date: dict[date, pd.DataFrame] | None = None
+    phase_timings: dict[str, dict[str, float]] = {}
     first_feature_date = previous_us_equity_trading_day(date.fromisoformat(dates[0]))
     prior_feature_date = previous_us_equity_trading_day(first_feature_date)
     prior_top100, _prior_path, _prior_source = load_top100_source(
@@ -349,13 +613,35 @@ def analyze_range(
     previous_variant_sets: dict[str, set[str]] = {}
     variant_streaks: dict[str, dict[str, int]] = {variant: {} for variant in VARIANTS}
     for session_date in dates:
+        session_started = time.perf_counter()
+        print(f"P2_SESSION_START date={session_date}", flush=True)
         trading_date = date.fromisoformat(session_date)
         feature_date = previous_us_equity_trading_day(trading_date)
+
+        baseline_started = time.perf_counter()
+        print(f"BASELINE_START date={session_date} feature_date={feature_date.isoformat()}", flush=True)
+        if reproduced_by_date is None:
+            reproduced_by_date = reproduce_baselines_from_cache(
+                feature_dates,
+                symbols=symbols,
+                cache=history_cache,
+                settings=settings,
+            )
         saved, saved_path, saved_source = load_top100_source(top100_dir, session_date, feature_date.isoformat())
-        reproduced = reproduce_baseline(feature_date, universe_path=universe_path, history_dir=history_dir, settings=settings)
+        reproduced = reproduced_by_date[feature_date]
         comparison = compare_baseline(reproduced, saved)
+        baseline_elapsed = time.perf_counter() - baseline_started
+        print(
+            f"BASELINE_DONE date={session_date} elapsed_seconds={baseline_elapsed:.3f} "
+            f"rows={len(reproduced)} reused_existing=0 reuse_reason=artifact_identity_unverifiable "
+            f"production_baseline_builds={history_cache.diagnostics.production_baseline_builds}",
+            flush=True,
+        )
+
+        matrix_started = time.perf_counter()
+        print(f"FEATURE_MATRIX_START date={session_date} symbols={len(symbols)}", flush=True)
         features = pd.DataFrame([
-            build_symbol_features(history_dir, symbol, feature_date, daily_history=daily_history_cache[symbol])
+            build_symbol_features(history_dir, symbol, feature_date, daily_history=history_cache.get_daily_history(symbol))
             for symbol in symbols
         ])
         production_scores = reproduced[[column for column in ["symbol", "score", "rank", "components_json"] if column in reproduced.columns]].copy()
@@ -373,8 +659,19 @@ def analyze_range(
         matrix["rank_delta"] = pd.to_numeric(matrix["production_rank"], errors="coerce") - pd.to_numeric(matrix["previous_rank"], errors="coerce")
         matrix["score_delta"] = pd.to_numeric(matrix["production_score"], errors="coerce") - pd.to_numeric(matrix["previous_score"], errors="coerce")
         matrix["recently_added_symbol"] = ((matrix["production_rank"].notna()) & matrix["previous_top100_membership"].eq(0)).astype(int)
-        matrix = attach_outcomes(score_variants(matrix), history_dir, session_date)
+        matrix = attach_outcomes(score_variants(matrix), history_dir, session_date, history_cache=history_cache)
+        history_cache.diagnostics.matrix_rows += len(matrix)
         matrices.append(matrix)
+        matrix_elapsed = time.perf_counter() - matrix_started
+        print(
+            f"FEATURE_MATRIX_DONE date={session_date} elapsed_seconds={matrix_elapsed:.3f} "
+            f"matrix_rows={len(matrix)} cache_hits={history_cache.diagnostics.cache_hits} "
+            f"cache_misses={history_cache.diagnostics.cache_misses}",
+            flush=True,
+        )
+
+        comparison_started = time.perf_counter()
+        print(f"VARIANT_COMPARISON_START date={session_date} variants={len(VARIANTS)}", flush=True)
         daily, thresholds, _turnover_vs_baseline, opportunity = comparison_metrics(matrix, session_date=session_date, top_n=settings.top_n, baseline_comparable=bool(comparison["baseline_match"]))
         daily["validation_segment"] = matrix["validation_segment"].iloc[0]
         daily_frames.append(daily); threshold_frames.append(thresholds); opportunity_frames.append(opportunity)
@@ -393,13 +690,65 @@ def analyze_range(
             })
             previous_variant_sets[variant] = current_set
         turnover_frames.append(pd.DataFrame(daily_turnover))
-        portfolio_frames.append(portfolio_replays(matrix, session_date=session_date, history_dir=history_dir, output_dir=output_dir, top_n=settings.top_n, baseline_comparable=bool(comparison["baseline_match"])))
-        quality_sessions.append({"trading_session_date": session_date, "feature_date": feature_date.isoformat(), "ranking_source_date": saved_source, "saved_top100_path": str(saved_path or ""), **comparison, "leakage_rows": int(matrix["leakage_check_passed"].eq(0).sum()), "symbols_with_features": int(matrix["history_sessions"].gt(0).sum())})
+        comparison_elapsed = time.perf_counter() - comparison_started
+        print(
+            f"VARIANT_COMPARISON_DONE date={session_date} elapsed_seconds={comparison_elapsed:.3f} "
+            f"variants={len(VARIANTS)}",
+            flush=True,
+        )
+
+        replay_started = time.perf_counter()
+        print(f"PORTFOLIO_REPLAY_START date={session_date} variants={len(VARIANTS)}", flush=True)
+        portfolio_frames.append(portfolio_replays(
+            matrix,
+            session_date=session_date,
+            history_dir=history_dir,
+            output_dir=output_dir,
+            top_n=settings.top_n,
+            baseline_comparable=bool(comparison["baseline_match"]),
+            history_cache=history_cache,
+        ))
+        replay_elapsed = time.perf_counter() - replay_started
+        print(
+            f"PORTFOLIO_REPLAY_DONE date={session_date} elapsed_seconds={replay_elapsed:.3f} "
+            f"replay_session_calls={history_cache.diagnostics.replay_session_calls}",
+            flush=True,
+        )
+        phase_timings[session_date] = {
+            "baseline_seconds": baseline_elapsed,
+            "feature_matrix_seconds": matrix_elapsed,
+            "variant_comparison_seconds": comparison_elapsed,
+            "portfolio_replay_seconds": replay_elapsed,
+        }
+        quality_sessions.append({
+            "trading_session_date": session_date,
+            "feature_date": feature_date.isoformat(),
+            "ranking_source_date": saved_source,
+            "saved_top100_path": str(saved_path or ""),
+            **comparison,
+            "leakage_rows": int(matrix["leakage_check_passed"].eq(0).sum()),
+            "symbols_with_features": int(matrix["history_sessions"].gt(0).sum()),
+            "baseline_artifact_reuse": False,
+            "baseline_artifact_reuse_reason": "artifact_identity_unverifiable",
+        })
         selected = reproduced.head(settings.top_n)
         selected_symbols = set(selected.get("symbol", pd.Series(dtype=str)).map(normalize_symbol))
         previous_membership = {symbol: previous_membership.get(symbol, 0) + 1 for symbol in selected_symbols}
         previous_rank = {normalize_symbol(row.get("symbol")): int(row.get("rank")) for row in selected.to_dict("records")}
         previous_score = {normalize_symbol(row.get("symbol")): float(row.get("score")) for row in selected.to_dict("records")}
+        session_elapsed = time.perf_counter() - session_started
+        phase_timings[session_date]["total_seconds"] = session_elapsed
+        print(
+            f"P2_SESSION_DONE date={session_date} elapsed_seconds={session_elapsed:.3f} "
+            f"parquet_files_read={history_cache.diagnostics.parquet_files_read} "
+            f"parquet_bytes_read={history_cache.diagnostics.parquet_bytes_read} "
+            f"parquet_read_operations={history_cache.diagnostics.parquet_read_operations} "
+            f"cache_hits={history_cache.diagnostics.cache_hits} cache_misses={history_cache.diagnostics.cache_misses} "
+            f"matrix_rows={history_cache.diagnostics.matrix_rows} "
+            f"replay_session_calls={history_cache.diagnostics.replay_session_calls} "
+            f"production_baseline_builds={history_cache.diagnostics.production_baseline_builds}",
+            flush=True,
+        )
     start, end = dates[0], dates[-1]
     suffix = start if start == end else f"{start}_to_{end}"
     paths = {
@@ -422,7 +771,16 @@ def analyze_range(
     }
     for name, frame in frames.items():
         write_dataframe(frame, paths[name])
-    quality = {"sessions": quality_sessions, "all_baselines_match": all(item["baseline_match"] for item in quality_sessions), "all_leakage_checks_pass": all(item["leakage_rows"] == 0 for item in quality_sessions), "validation": "BASELINE ONLY" if len(dates) < 20 else "predefined_variants_walk_forward_reporting", "sample_warning": "REQUIRES MULTI-DAY VALIDATION" if len(dates) < 20 else "POSSIBLE OVERFITTING; validate on later period"}
+    quality = {
+        "sessions": quality_sessions,
+        "all_baselines_match": all(item["baseline_match"] for item in quality_sessions),
+        "all_leakage_checks_pass": all(item["leakage_rows"] == 0 for item in quality_sessions),
+        "validation": "BASELINE ONLY" if len(dates) < 20 else "predefined_variants_walk_forward_reporting",
+        "sample_warning": "REQUIRES MULTI-DAY VALIDATION" if len(dates) < 20 else "POSSIBLE OVERFITTING; validate on later period",
+        "performance_diagnostics": asdict(history_cache.diagnostics),
+        "phase_timings": phase_timings,
+        "total_elapsed_seconds": time.perf_counter() - analysis_started,
+    }
     paths["data_quality"].write_text(json.dumps(quality, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
     paths["summary"].write_text("\n".join([
         f"# Multiday Top100 Ranking Analysis {suffix}", "",
