@@ -208,6 +208,7 @@ class ReplayConfig:
     min_commission: float = 1.0
     bar_timestamp_semantics: str = "bar_start"
     window_availability_mode: str = "live_partial"
+    disabled_entry_filters: tuple[str, ...] = ()
     config_source: str = "profile_definition"
 
 
@@ -261,6 +262,8 @@ def effective_config_dict(config: ReplayConfig) -> dict[str, Any]:
         "trailing_stop_pct": config.exit_trailing_stop_pct,
         "causal_valid": config.profile != "legacy_offline" and config.breakout_mode != "legacy_candle_high" and config.bar_timestamp_semantics == "bar_start",
     }
+    if config.disabled_entry_filters:
+        values["disabled_entry_filters"] = sorted(config.disabled_entry_filters)
     return values
 
 
@@ -360,25 +363,26 @@ def _feature_result(
             score += float(value) * weight
     if spread is not None and config.max_spread_bps > 0:
         score += max(0.0, config.max_spread_bps - spread) / config.max_spread_bps * 5.0
+    disabled = set(config.disabled_entry_filters)
     reasons = []
-    if first5_pct is None or first5_pct < config.first5_threshold:
+    if "first_5m_high_too_low" not in disabled and (first5_pct is None or first5_pct < config.first5_threshold):
         reasons.append("first_5m_high_too_low")
-    if first15_pct is None or first15_pct < config.first15_threshold:
+    if "first_15m_high_too_low" not in disabled and (first15_pct is None or first15_pct < config.first15_threshold):
         reasons.append("first_15m_high_too_low")
-    if or_range is None or or_range < config.min_or_range_pct:
+    if "or_range_too_low" not in disabled and (or_range is None or or_range < config.min_or_range_pct):
         reasons.append("or_range_too_low")
-    if price is None or price < config.min_price:
+    if "price_too_low" not in disabled and (price is None or price < config.min_price):
         reasons.append("price_too_low")
-    if spread is not None and spread > config.max_spread_bps:
+    if "spread_too_wide" not in disabled and spread is not None and spread > config.max_spread_bps:
         reasons.append("spread_too_wide")
     breakout_gate_used = 0
     if config.breakout_mode == "legacy_candle_high":
         breakout_gate_used = 1
-        if or_high is None or current_high is None or current_high < or_high:
+        if "legacy_candle_high_breakout_not_met" not in disabled and (or_high is None or current_high is None or current_high < or_high):
             reasons.append("legacy_candle_high_breakout_not_met")
     elif config.breakout_mode == "current_price_or_high":
         breakout_gate_used = 1
-        if or_high is None or price is None or price < or_high:
+        if "current_price_breakout_not_met" not in disabled and (or_high is None or price is None or price < or_high):
             reasons.append("current_price_breakout_not_met")
     return {
         "ready": not reasons,
