@@ -7986,7 +7986,7 @@ def main() -> int:
         default=False,
         help="Legacy fallback: allow managed_positions.json to recreate active in-memory positions on startup.",
     )
-    parser.add_argument("--duration-seconds", type=int, default=28800)
+    parser.add_argument("--duration-seconds", type=int, default=0, help="0 = run forever")
     parser.add_argument("--interval-seconds", type=float, default=5.0)
     parser.add_argument("--portfolio-interval-seconds", type=float, default=10.0)
     parser.add_argument("--candidate-snapshot-telemetry-enabled", action=argparse.BooleanOptionalAction, default=False)
@@ -8468,7 +8468,7 @@ def main() -> int:
                 flush=True,
             )
             _runtime_set(runtime_state, "market_closed_logged_dates").add(today_session.session_date.isoformat())
-        if today_session.is_trading_day and state_rebuild_count == 0 and current_session_candle_count(recorder, args) == 0:
+        if today_session.is_trading_day:
             current_session_backfilled_rows = backfill_current_session_1m(ib, recorder, contracts, args)
             if current_session_backfilled_rows:
                 state_rebuild_count = rebuild_symbol_states_from_1m_candles(recorder, states, args, runtime_state)
@@ -8601,7 +8601,7 @@ def main() -> int:
         )
 
         start = time.time()
-        while time.time() - start < args.duration_seconds:
+        while args.duration_seconds <= 0 or time.time() - start < args.duration_seconds:
             try:
                 if not ibkr_connection_alive(ib):
                     recovery = handle_ibkr_disconnect_and_recover(
