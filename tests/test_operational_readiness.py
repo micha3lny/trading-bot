@@ -8,6 +8,9 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import pandas as pd
+import pyarrow as pa
+
 
 def _cache_data(*_args, **_kwargs):
     def decorator(func):
@@ -20,11 +23,17 @@ sys.modules.setdefault(
     "streamlit",
     SimpleNamespace(set_page_config=lambda **_kwargs: None, cache_data=_cache_data),
 )
-from src.dashboard.runtime_dashboard import infer_top100_source_date, load_eod_readiness
+from src.dashboard.runtime_dashboard import display_optional_number, infer_top100_source_date, load_eod_readiness
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
 
 class OperationalReadinessTests(unittest.TestCase):
+    def test_optional_numeric_display_is_arrow_safe_with_missing_values(self) -> None:
+        rendered = pd.DataFrame({"Peak %": pd.Series([1.25, None]).map(display_optional_number)})
+        self.assertEqual(rendered["Peak %"].tolist(), ["1.25", "MISSING"])
+        table = pa.Table.from_pandas(rendered, preserve_index=False)
+        self.assertEqual(str(table.schema.field("Peak %").type), "string")
+
     def test_top100_source_date_prefers_matching_latest_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

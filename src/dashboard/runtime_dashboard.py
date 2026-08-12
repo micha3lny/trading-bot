@@ -150,7 +150,7 @@ def display_time(value) -> str:
     return ts.tz_convert(ZoneInfo("America/New_York")).strftime("%d-%m-%Y %H:%M:%S ET")
 
 
-def display_optional_number(value) -> object:
+def display_optional_number(value) -> str:
     if value in (None, ""):
         return "MISSING"
     try:
@@ -158,7 +158,7 @@ def display_optional_number(value) -> object:
             return "MISSING"
     except Exception:
         pass
-    return value
+    return str(value)
 
 
 def display_number_or_missing(value, *, decimals: int = 6) -> str:
