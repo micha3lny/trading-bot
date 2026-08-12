@@ -26,6 +26,9 @@ def args_for(**overrides: object) -> argparse.Namespace:
         "sqlite_path": Path("data/runtime/trading_runtime.sqlite"),
         "history_dir": Path("data/history/universe_1m"),
         "output_dir": runner.DEFAULT_ANALYSIS_DIR,
+        "min_first_5m_high_pct": None,
+        "min_first_15m_high_pct": None,
+        "min_or_range_pct": None,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -69,6 +72,40 @@ class RunDailyAnalysisTests(unittest.TestCase):
 
         for _name, command, _skipped in steps:
             self.assertNotIn("--force", command)
+
+    def test_complete_signal_threshold_override_is_passed_to_live_session_analyzers(self) -> None:
+        steps = runner.build_steps(
+            "2026-07-09",
+            args_for(
+                min_first_5m_high_pct=0.5,
+                min_first_15m_high_pct=1.0,
+                min_or_range_pct=5.0,
+            ),
+        )
+        commands = {name: command for name, command, _skipped in steps}
+
+        for name in ("coverage", "missed", "offline_runtime_pre_signal", "top100_buy"):
+            self.assertIn("--min-first-5m-high-pct", commands[name])
+            self.assertIn("0.5", commands[name])
+            self.assertIn("--min-first-15m-high-pct", commands[name])
+            self.assertIn("1.0", commands[name])
+            self.assertIn("--min-or-range-pct", commands[name])
+            self.assertIn("5.0", commands[name])
+
+        for name in ("bad_entries", "early_loser", "stop_loss", "shs", "nbas"):
+            self.assertNotIn("--min-first-5m-high-pct", commands[name])
+
+    def test_no_signal_threshold_override_is_passed_when_session_metadata_should_resolve_it(self) -> None:
+        steps = runner.build_steps("2026-07-09", args_for())
+        for _name, command, _skipped in steps:
+            self.assertNotIn("--min-first-5m-high-pct", command)
+
+    def test_partial_signal_threshold_override_is_rejected(self) -> None:
+        with self.assertRaises(SystemExit):
+            runner.main([
+                "--date", "2026-07-09",
+                "--min-first-5m-high-pct", "0.5",
+            ])
 
     def test_skip_offline_runtime_pre_signal_marks_only_that_step_skipped(self) -> None:
         steps = runner.build_steps("2026-07-09", args_for(skip_offline_runtime_pre_signal=True))

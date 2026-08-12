@@ -46,6 +46,7 @@ from src.live_trading.analysis.symbol_subscription_inspector import (
     read_text_lines,
 )
 from src.live_trading.ranking.daily_top100_builder import parquet_path
+from src.live_trading.analysis.strategy_config_parity import add_threshold_cli, output_has_config_provenance, resolve_threshold_args
 
 
 DEFAULT_HISTORY_DIR = Path("data/history/universe_1m")
@@ -139,11 +140,19 @@ CASE_COLUMNS = [
     "likely_live_impact",
     "restart_could_explain",
     "restart_mechanism",
+    "effective_min_first5",
+    "effective_min_first15",
+    "effective_min_or_range",
+    "config_source",
 ]
 
 SUMMARY_COLUMNS = [
     "date",
     "total_cases",
+    "effective_min_first5",
+    "effective_min_first15",
+    "effective_min_or_range",
+    "config_source",
     *DIVERGENCE_STAGES,
 ]
 
@@ -628,9 +637,25 @@ def analyze_case(
     }
 
 
-def summary_for_cases(cases: pd.DataFrame, session_date: str) -> pd.DataFrame:
+def summary_for_cases(
+    cases: pd.DataFrame,
+    session_date: str,
+    *,
+    effective_min_first5: float | None = None,
+    effective_min_first15: float | None = None,
+    effective_min_or_range: float | None = None,
+    config_source: str = "",
+) -> pd.DataFrame:
     counts = Counter(cases.get("first_divergence_stage", pd.Series(dtype=str)).fillna("runtime evidence unavailable").astype(str)) if not cases.empty else Counter()
     row: dict[str, Any] = {"date": session_date, "total_cases": int(len(cases))}
+    defaults = {
+        "effective_min_first5": effective_min_first5,
+        "effective_min_first15": effective_min_first15,
+        "effective_min_or_range": effective_min_or_range,
+        "config_source": config_source,
+    }
+    for column, fallback in defaults.items():
+        row[column] = cases.iloc[0].get(column) if not cases.empty else fallback
     for stage in DIVERGENCE_STAGES:
         row[stage] = int(counts.get(stage, 0))
     return pd.DataFrame([row], columns=SUMMARY_COLUMNS)
@@ -651,11 +676,12 @@ def investigate_date(
     min_first_5m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT,
     min_first_15m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT,
     min_or_range_pct: float = LIVE_SIGNAL_MIN_OR_RANGE_PCT,
+    config_source: str = "programmatic_explicit_or_historical_default",
 ) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     cases_path = output_dir / f"offline_runtime_pre_signal_cases_{session_date}.csv"
     summary_path = output_dir / f"offline_runtime_pre_signal_summary_{session_date}.csv"
-    if cases_path.exists() and summary_path.exists() and not force:
+    if cases_path.exists() and summary_path.exists() and not force and output_has_config_provenance(cases_path):
         print(f"PRE_SIGNAL_SKIPPED_EXISTING date={session_date} output={cases_path}", flush=True)
         return cases_path, summary_path
 
@@ -682,8 +708,7 @@ def investigate_date(
     )
     rows: list[dict[str, Any]] = []
     for idx, target in enumerate(targets.to_dict("records"), start=1):
-        rows.append(
-            analyze_case(
+        case = analyze_case(
                 target=target,
                 session_date=session_date,
                 history_dir=history_dir,
@@ -693,11 +718,24 @@ def investigate_date(
                 min_first_15m_high_pct=min_first_15m_high_pct,
                 min_or_range_pct=min_or_range_pct,
             )
-        )
+        case.update({
+            "effective_min_first5": min_first_5m_high_pct,
+            "effective_min_first15": min_first_15m_high_pct,
+            "effective_min_or_range": min_or_range_pct,
+            "config_source": config_source,
+        })
+        rows.append(case)
         if idx % 10 == 0 or idx == len(targets):
             print(f"PRE_SIGNAL_PROGRESS date={session_date} processed={idx}/{len(targets)} elapsed={time.monotonic() - started:.1f}", flush=True)
     cases = pd.DataFrame(rows, columns=CASE_COLUMNS) if rows else pd.DataFrame(columns=CASE_COLUMNS)
-    summary = summary_for_cases(cases, session_date)
+    summary = summary_for_cases(
+        cases,
+        session_date,
+        effective_min_first5=min_first_5m_high_pct,
+        effective_min_first15=min_first_15m_high_pct,
+        effective_min_or_range=min_or_range_pct,
+        config_source=config_source,
+    )
     cases.to_csv(cases_path, index=False)
     summary.to_csv(summary_path, index=False)
     print(f"PRE_SIGNAL_DONE date={session_date} elapsed_seconds={time.monotonic() - started:.1f} output={cases_path}", flush=True)
@@ -730,9 +768,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_ANALYSIS_DIR)
     parser.add_argument("--max-cases", type=int, default=None)
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--min-first-5m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT)
-    parser.add_argument("--min-first-15m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT)
-    parser.add_argument("--min-or-range-pct", type=float, default=LIVE_SIGNAL_MIN_OR_RANGE_PCT)
+    add_threshold_cli(parser)
     return parser
 
 
@@ -742,6 +778,7 @@ def main(argv: list[str] | None = None) -> int:
     dates = [args.date] if args.date else list(iter_dates(args.start_date, args.end_date or args.start_date))
     summaries: list[Path] = []
     for session_date in dates:
+        effective = resolve_threshold_args(args, session_date)
         _cases, summary = investigate_date(
             session_date=session_date,
             cases_csv=args.cases_csv if args.date else None,
@@ -753,9 +790,10 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output_dir,
             force=args.force,
             max_cases=args.max_cases,
-            min_first_5m_high_pct=args.min_first_5m_high_pct,
-            min_first_15m_high_pct=args.min_first_15m_high_pct,
-            min_or_range_pct=args.min_or_range_pct,
+            min_first_5m_high_pct=effective.min_first5,
+            min_first_15m_high_pct=effective.min_first15,
+            min_or_range_pct=effective.min_or_range,
+            config_source=effective.config_source,
         )
         summaries.append(summary)
     all_path = update_all_summary(args.output_dir, summaries)

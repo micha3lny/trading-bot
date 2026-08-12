@@ -53,6 +53,7 @@ from src.live_trading.order_lifecycle.store import JsonlLifecycleStore
 from src.live_trading.order_lifecycle.reducer import reduce_lifecycle_events
 from src.live_trading.order_lifecycle.reconciliation import build_reconciliation_report, log_reconciliation_report
 from src.live_trading.storage.sqlite_store import open_sqlite_store, safe_sqlite_call
+from src.live_trading.analysis.strategy_config_parity import runtime_threshold_metadata
 from src.live_trading.symbol_pipeline_telemetry import SYMBOL_PIPELINE_EVENT_TYPES
 from src.live_trading.unified_logger import (
     current_git_commit,
@@ -8576,8 +8577,11 @@ def main() -> int:
         enqueue_startup_history_repair_if_needed(runtime_state, args)
 
         recorder.record_run_metadata({
+            "session_date": today_session.session_date.isoformat(),
             "module": "v67_live_top100_expansion_paper_trader",
             "strategy": STRATEGY_NAME,
+            **runtime_threshold_metadata(args),
+            "metadata_reason": "startup",
             "client_id": args.client_id,
             "top_n": args.top_n,
             "seen_fills_loaded": len(seen_fills),
@@ -8587,6 +8591,7 @@ def main() -> int:
             "current_session_backfilled_1m_rows": current_session_backfilled_rows,
             "startup_reconciliation": startup_reconciliation,
         })
+        runtime_state["strategy_config_metadata_session_date"] = today_session.session_date.isoformat()
         run_dry_run_reconciliation_report(
             ib,
             recorder,
@@ -8732,6 +8737,17 @@ def main() -> int:
                             previous_session_date=previous_boundary,
                             current_session_date=boundary_key,
                         )
+                    if runtime_state.get("strategy_config_metadata_session_date") != boundary_key:
+                        recorder.record_run_metadata({
+                            "session_date": boundary_key,
+                            "module": "v67_live_top100_expansion_paper_trader",
+                            "strategy": STRATEGY_NAME,
+                            **runtime_threshold_metadata(args),
+                            "metadata_reason": "session_boundary",
+                            "client_id": args.client_id,
+                            "top_n": args.top_n,
+                        })
+                        runtime_state["strategy_config_metadata_session_date"] = boundary_key
                     emit_runtime_state_session_boundary_check(
                         runtime_state=runtime_state,
                         states=states,

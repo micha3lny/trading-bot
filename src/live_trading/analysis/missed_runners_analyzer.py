@@ -29,6 +29,11 @@ from src.live_trading.analysis.common import (
 )
 from src.live_trading.market_calendar import previous_us_equity_trading_day
 from src.live_trading.ranking.daily_top100_builder import normalize_history_df
+from src.live_trading.analysis.strategy_config_parity import (
+    add_threshold_cli,
+    output_has_config_provenance,
+    resolve_threshold_args,
+)
 
 
 DEFAULT_HISTORY_DIR = Path("data/history/universe_1m")
@@ -97,6 +102,10 @@ OUTPUT_COLUMNS = [
     "bar_timestamp_semantics",
     "breakout_gate_used",
     "offline_signal_model",
+    "effective_min_first5",
+    "effective_min_first15",
+    "effective_min_or_range",
+    "config_source",
 ]
 
 
@@ -442,6 +451,7 @@ def analyze_missed_runners(
     min_first_5m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT,
     min_first_15m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT,
     min_or_range_pct: float = LIVE_SIGNAL_MIN_OR_RANGE_PCT,
+    config_source: str = "programmatic_explicit_or_historical_default",
     max_symbols: int | None = None,
     progress_every: int = 250,
     output_path: Path | None = None,
@@ -547,6 +557,10 @@ def analyze_missed_runners(
             "or_range_pct": first_existing_column(sig, ["or_range_pct"]) or stats.or_range_pct,
             **prior,
             **no_signal,
+            "effective_min_first5": min_first_5m_high_pct,
+            "effective_min_first15": min_first_15m_high_pct,
+            "effective_min_or_range": min_or_range_pct,
+            "config_source": config_source,
         })
     out = pd.DataFrame(rows)
     if total and total % progress_every:
@@ -609,9 +623,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sqlite-path", type=Path, default=DEFAULT_SQLITE_PATH)
     parser.add_argument("--recorder-dir", type=Path, default=DEFAULT_RECORDER_DIR)
     parser.add_argument("--threshold-pct", type=float, default=8.0)
-    parser.add_argument("--min-first-5m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT)
-    parser.add_argument("--min-first-15m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT)
-    parser.add_argument("--min-or-range-pct", type=float, default=LIVE_SIGNAL_MIN_OR_RANGE_PCT)
+    add_threshold_cli(parser)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--max-symbols", type=int, default=None, help="Limit processed universe symbols for quick testing.")
     parser.add_argument("--force", action="store_true", help="Overwrite existing output CSV.")
@@ -623,10 +635,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     top100 = args.top100 or Path(f"data/universe/daily_top100_{args.date}.csv")
     output = args.output or Path(f"data/analysis/missed_runners_{args.date}.csv")
-    if output.exists() and not args.force:
+    if output.exists() and not args.force and output_has_config_provenance(output):
         print(f"MISSED_SKIPPED_EXISTING date={args.date} output={output}", flush=True)
         return 0
     started = time.monotonic()
+    effective = resolve_threshold_args(args, args.date)
     df = analyze_missed_runners(
         session_date=args.date,
         history_dir=args.history_dir,
@@ -635,9 +648,10 @@ def main(argv: list[str] | None = None) -> int:
         sqlite_path=args.sqlite_path,
         recorder_dir=args.recorder_dir,
         threshold_pct=args.threshold_pct,
-        min_first_5m_high_pct=args.min_first_5m_high_pct,
-        min_first_15m_high_pct=args.min_first_15m_high_pct,
-        min_or_range_pct=args.min_or_range_pct,
+        min_first_5m_high_pct=effective.min_first5,
+        min_first_15m_high_pct=effective.min_first15,
+        min_or_range_pct=effective.min_or_range,
+        config_source=effective.config_source,
         max_symbols=args.max_symbols,
         output_path=output,
     )

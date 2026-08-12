@@ -21,6 +21,7 @@ from src.live_trading.analysis.common import (
     parse_dt,
     safe_read_csv,
 )
+from src.live_trading.analysis.strategy_config_parity import add_threshold_cli, resolve_threshold_args
 from src.live_trading.analysis.missed_runners_analyzer import no_signal_diagnostics
 from src.live_trading.analysis.signal_case_trace import DEFAULT_TRADER_SOURCE, static_line_refs
 from src.live_trading.analysis.signal_replay_analyzer import (
@@ -72,6 +73,10 @@ SUMMARY_COLUMNS = [
     "competing_buy_symbols",
     "last_restart_unblock_time",
     "signal_before_last_unblock",
+    "effective_min_first5",
+    "effective_min_first15",
+    "effective_min_or_range",
+    "config_source",
     "summary_verdict",
 ]
 
@@ -348,6 +353,7 @@ def trace_buy_decision(
     min_first_5m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT,
     min_first_15m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT,
     min_or_range_pct: float = LIVE_SIGNAL_MIN_OR_RANGE_PCT,
+    config_source: str = "programmatic_explicit_or_historical_default",
 ) -> tuple[str, dict[str, Any]]:
     symbol = normalize_symbol(symbol)
     offline = offline_signal_details(
@@ -411,6 +417,10 @@ def trace_buy_decision(
         "last_restart_unblock_time": iso_ts(last_unblock),
         "signal_before_last_unblock": int(center is not None and last_unblock is not None and center < last_unblock),
         "summary_verdict": verdict,
+        "effective_min_first5": min_first_5m_high_pct,
+        "effective_min_first15": min_first_15m_high_pct,
+        "effective_min_or_range": min_or_range_pct,
+        "config_source": config_source,
     }
     lines: list[str] = [
         f"BUY DECISION TRACE date={session_date} symbol={symbol}",
@@ -435,6 +445,7 @@ def trace_buy_decision(
         f"- top100_row={offline['top100_row']}",
         "",
         "2. Market Data / Offline Signal",
+        f"- effective_min_first5={min_first_5m_high_pct} effective_min_first15={min_first_15m_high_pct} effective_min_or_range={min_or_range_pct} config_source={config_source}",
         f"- parquet_path={offline['parquet_path']}",
         f"- candle_rows={len(candles)}",
         f"- candles_min_time_utc={iso_ts(candles['timestamp'].min()) if not candles.empty else ''}",
@@ -526,6 +537,7 @@ def write_trace_outputs(
     min_first_5m_high_pct: float,
     min_first_15m_high_pct: float,
     min_or_range_pct: float,
+    config_source: str,
 ) -> pd.DataFrame:
     summaries: list[dict[str, Any]] = []
     for symbol in symbols:
@@ -542,6 +554,7 @@ def write_trace_outputs(
             min_first_5m_high_pct=min_first_5m_high_pct,
             min_first_15m_high_pct=min_first_15m_high_pct,
             min_or_range_pct=min_or_range_pct,
+            config_source=config_source,
         )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(text, encoding="utf-8")
@@ -570,9 +583,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--summary-output", type=Path, default=None)
     parser.add_argument("--no-summary-all", action="store_true", help="Only trace requested symbol(s), without building all post-unblock no-signal summary.")
-    parser.add_argument("--min-first-5m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT)
-    parser.add_argument("--min-first-15m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT)
-    parser.add_argument("--min-or-range-pct", type=float, default=LIVE_SIGNAL_MIN_OR_RANGE_PCT)
+    add_threshold_cli(parser)
     return parser
 
 
@@ -586,6 +597,7 @@ def parse_symbols(args: argparse.Namespace) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    effective = resolve_threshold_args(args, args.date)
     symbols = parse_symbols(args)
     if not symbols:
         parser.error("--symbol or --symbols is required")
@@ -600,9 +612,10 @@ def main(argv: list[str] | None = None) -> int:
         recorder_dir=args.recorder_dir,
         top100_path=top100,
         output=args.output,
-        min_first_5m_high_pct=args.min_first_5m_high_pct,
-        min_first_15m_high_pct=args.min_first_15m_high_pct,
-        min_or_range_pct=args.min_or_range_pct,
+        min_first_5m_high_pct=effective.min_first5,
+        min_first_15m_high_pct=effective.min_first15,
+        min_or_range_pct=effective.min_or_range,
+        config_source=effective.config_source,
     )
     summary_path = args.summary_output or Path(f"data/analysis/buy_decision_trace_summary_{args.date}.csv")
     summary_symbols = symbols
@@ -619,9 +632,10 @@ def main(argv: list[str] | None = None) -> int:
             recorder_dir=args.recorder_dir,
             top100_path=top100,
             output=None,
-            min_first_5m_high_pct=args.min_first_5m_high_pct,
-            min_first_15m_high_pct=args.min_first_15m_high_pct,
-            min_or_range_pct=args.min_or_range_pct,
+            min_first_5m_high_pct=effective.min_first5,
+            min_first_15m_high_pct=effective.min_first15,
+            min_or_range_pct=effective.min_or_range,
+            config_source=effective.config_source,
         )
     else:
         summary_df = requested_df

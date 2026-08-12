@@ -37,6 +37,7 @@ from src.live_trading.analysis.signal_replay_analyzer import (
     symbol_rows,
 )
 from src.live_trading.ranking.daily_top100_builder import parquet_path
+from src.live_trading.analysis.strategy_config_parity import add_threshold_cli, resolve_threshold_args
 
 
 DEFAULT_SQLITE_PATH = Path("data/runtime/trading_runtime.sqlite")
@@ -170,6 +171,7 @@ def trace_signal_case(
     min_first_5m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT,
     min_first_15m_high_pct: float = LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT,
     min_or_range_pct: float = LIVE_SIGNAL_MIN_OR_RANGE_PCT,
+    config_source: str = "programmatic_explicit_or_historical_default",
 ) -> str:
     symbol = normalize_symbol(symbol)
     top100 = load_top100(top100_path)
@@ -229,6 +231,7 @@ def trace_signal_case(
     lines.append(f"- possible_signal_time={diag.get('possible_signal_time')}")
     lines.append("")
     lines.append("3. Offline Rule Check")
+    lines.append(f"- effective_min_first5={min_first_5m_high_pct} effective_min_first15={min_first_15m_high_pct} effective_min_or_range={min_or_range_pct} config_source={config_source}")
     lines.append(f"- top100 {pass_fail(top100_ok)}")
     lines.append(f"- first5 >= {min_first_5m_high_pct}% {pass_fail(first5_ok)}")
     lines.append(f"- first15 >= {min_first_15m_high_pct}% {pass_fail(first15_ok)}")
@@ -273,15 +276,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top100", type=Path, default=None)
     parser.add_argument("--universe", type=Path, default=DEFAULT_UNIVERSE)
     parser.add_argument("--output", type=Path, default=None)
-    parser.add_argument("--min-first-5m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT)
-    parser.add_argument("--min-first-15m-high-pct", type=float, default=LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT)
-    parser.add_argument("--min-or-range-pct", type=float, default=LIVE_SIGNAL_MIN_OR_RANGE_PCT)
+    add_threshold_cli(parser)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    effective = resolve_threshold_args(args, args.date)
     top100 = args.top100 or Path(f"data/universe/daily_top100_{args.date}.csv")
     output = args.output or Path(f"data/analysis/signal_trace_{normalize_symbol(args.symbol)}_{args.date}.txt")
     text = trace_signal_case(
@@ -292,9 +294,10 @@ def main(argv: list[str] | None = None) -> int:
         recorder_dir=args.recorder_dir,
         top100_path=top100,
         universe_path=args.universe,
-        min_first_5m_high_pct=args.min_first_5m_high_pct,
-        min_first_15m_high_pct=args.min_first_15m_high_pct,
-        min_or_range_pct=args.min_or_range_pct,
+        min_first_5m_high_pct=effective.min_first5,
+        min_first_15m_high_pct=effective.min_first15,
+        min_or_range_pct=effective.min_or_range,
+        config_source=effective.config_source,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(text, encoding="utf-8")

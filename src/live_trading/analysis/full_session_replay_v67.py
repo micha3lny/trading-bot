@@ -28,16 +28,21 @@ from src.live_trading.analysis.common import (
     pct,
     read_sql_table,
 )
+from src.live_trading.analysis.strategy_config_parity import resolve_signal_thresholds
 from src.live_trading.analysis.signal_opportunity_forensics import bar_available_at
 
 DEFAULT_HISTORY_DIR = Path("data/history/universe_1m")
 DEFAULT_SQLITE_PATH = Path("data/runtime/trading_runtime.sqlite")
 DEFAULT_OUTPUT_DIR = Path("data/analysis")
+CONFIG_PROVENANCE_COLUMNS = [
+    "effective_min_first5", "effective_min_first15", "effective_min_or_range", "config_source",
+]
 
 TRADE_COLUMNS = [
     "date",
     "profile",
     "effective_config_json",
+    *CONFIG_PROVENANCE_COLUMNS,
     "source",
     "symbol",
     "signal_time",
@@ -66,6 +71,7 @@ EVENT_COLUMNS = [
     "date",
     "profile",
     "effective_config_json",
+    *CONFIG_PROVENANCE_COLUMNS,
     "timestamp",
     "event_type",
     "symbol",
@@ -82,6 +88,7 @@ COMPARISON_COLUMNS = [
     "date",
     "profile",
     "effective_config_json",
+    *CONFIG_PROVENANCE_COLUMNS,
     "symbol",
     "offline_entry_time",
     "live_entry_time",
@@ -97,6 +104,7 @@ PROFILE_COMPARISON_COLUMNS = [
     "date",
     "profile",
     "effective_config_json",
+    *CONFIG_PROVENANCE_COLUMNS,
     "signals",
     "entries",
     "winners",
@@ -150,6 +158,7 @@ PARITY_TRACE_COLUMNS = [
     "first_divergence",
     "window_availability_mode",
     "effective_config_json",
+    *CONFIG_PROVENANCE_COLUMNS,
 ]
 
 
@@ -199,13 +208,17 @@ class ReplayConfig:
     min_commission: float = 1.0
     bar_timestamp_semantics: str = "bar_start"
     window_availability_mode: str = "live_partial"
+    config_source: str = "profile_definition"
 
 
 def profile_config(profile: str) -> ReplayConfig:
     if profile == "live":
-        return ReplayConfig(profile="live")
+        return ReplayConfig(profile="live", config_source="profile:live_static_definition")
     if profile == "low_threshold_causal":
-        return ReplayConfig(profile="low_threshold_causal", first5_threshold=0.5, first15_threshold=1.0)
+        return ReplayConfig(
+            profile="low_threshold_causal", first5_threshold=0.5, first15_threshold=1.0,
+            config_source="profile:low_threshold_causal",
+        )
     if profile == "legacy_offline":
         return ReplayConfig(
             profile="legacy_offline",
@@ -214,17 +227,22 @@ def profile_config(profile: str) -> ReplayConfig:
             breakout_mode="legacy_candle_high",
             bar_timestamp_semantics="bar_end",
             window_availability_mode="finalized_windows",
+            config_source="profile:legacy_offline_historical",
         )
     raise ValueError(f"unknown replay profile: {profile}")
 
 
 def effective_config_dict(config: ReplayConfig) -> dict[str, Any]:
-    return {
+    values = {
         "profile": config.profile,
         "first5_threshold": config.first5_threshold,
         "first15_threshold": config.first15_threshold,
         "or_max_range_pct": config.min_or_range_pct,
         "min_or_range_pct": config.min_or_range_pct,
+        "effective_min_first5": config.first5_threshold,
+        "effective_min_first15": config.first15_threshold,
+        "effective_min_or_range": config.min_or_range_pct,
+        "config_source": config.config_source,
         "min_price": config.min_price,
         "max_spread_bps": config.max_spread_bps,
         "breakout_mode": config.breakout_mode,
@@ -243,6 +261,7 @@ def effective_config_dict(config: ReplayConfig) -> dict[str, Any]:
         "trailing_stop_pct": config.exit_trailing_stop_pct,
         "causal_valid": config.profile != "legacy_offline" and config.breakout_mode != "legacy_candle_high" and config.bar_timestamp_semantics == "bar_start",
     }
+    return values
 
 
 PREPARED_CAUSAL_SCHEMA_VERSION = "causal_session_v1"
@@ -1228,7 +1247,19 @@ def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> Non
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        enriched = []
+        for source in rows:
+            row = dict(source)
+            try:
+                config = json.loads(str(row.get("effective_config_json") or "{}"))
+            except Exception:
+                config = {}
+            row.setdefault("effective_min_first5", config.get("effective_min_first5", config.get("first5_threshold")))
+            row.setdefault("effective_min_first15", config.get("effective_min_first15", config.get("first15_threshold")))
+            row.setdefault("effective_min_or_range", config.get("effective_min_or_range", config.get("min_or_range_pct")))
+            row.setdefault("config_source", config.get("config_source", "actual_runtime_trade_without_embedded_thresholds" if row.get("source") == "live_sqlite" else ""))
+            enriched.append(row)
+        writer.writerows(enriched)
 
 
 def _avg(rows: list[dict[str, Any]], key: str) -> float:
@@ -1328,9 +1359,27 @@ def write_summary(path: Path, session_date: str, replay: ReplayResult, live: lis
 
 def build_effective_config(args: argparse.Namespace, profile: str) -> ReplayConfig:
     config = profile_config(profile)
-    config.first5_threshold = args.first5_threshold if args.first5_threshold is not None else config.first5_threshold
-    config.first15_threshold = args.first15_threshold if args.first15_threshold is not None else config.first15_threshold
-    config.min_or_range_pct = args.or_max_range_pct if args.or_max_range_pct is not None else config.min_or_range_pct
+    if profile == "live":
+        effective = resolve_signal_thresholds(
+            session_date=args.date,
+            recorder_dir=Path(args.recorder_dir),
+            min_first5=args.first5_threshold,
+            min_first15=args.first15_threshold,
+            min_or_range=args.or_max_range_pct,
+        )
+        config.first5_threshold = effective.min_first5
+        config.first15_threshold = effective.min_first15
+        config.min_or_range_pct = effective.min_or_range
+        config.config_source = effective.config_source
+    else:
+        overrides = (args.first5_threshold, args.first15_threshold, args.or_max_range_pct)
+        if any(value is not None for value in overrides):
+            if not all(value is not None for value in overrides):
+                raise ValueError("all three signal threshold overrides must be supplied together")
+            config.first5_threshold = float(args.first5_threshold)
+            config.first15_threshold = float(args.first15_threshold)
+            config.min_or_range_pct = float(args.or_max_range_pct)
+            config.config_source = "cli_explicit"
     config.breakout_mode = args.breakout_mode or config.breakout_mode
     config.bar_timestamp_semantics = args.bar_timestamp_semantics or config.bar_timestamp_semantics
     config.window_availability_mode = args.window_availability_mode or config.window_availability_mode
@@ -1425,6 +1474,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--date", required=True)
     parser.add_argument("--profile", choices=["live", "low_threshold_causal", "legacy_offline", "all"], default="live")
     parser.add_argument("--history-dir", type=Path, default=DEFAULT_HISTORY_DIR)
+    parser.add_argument("--recorder-dir", type=Path, default=Path("data/live/recorder"))
     parser.add_argument("--sqlite-path", type=Path, default=DEFAULT_SQLITE_PATH)
     parser.add_argument("--top100", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)

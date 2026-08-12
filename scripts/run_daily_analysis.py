@@ -25,6 +25,7 @@ class AnalyzerSpec:
     supports_force: bool = False
     pass_sqlite_path: bool = False
     pass_history_dir: bool = False
+    pass_signal_thresholds: bool = False
     output_dir_arg: str | None = None
     output_file_pattern: str | None = None
     category: str = "strategy"
@@ -41,6 +42,7 @@ ANALYZER_REGISTRY: tuple[AnalyzerSpec, ...] = (
         supports_force=True,
         pass_sqlite_path=True,
         pass_history_dir=True,
+        pass_signal_thresholds=True,
         output_dir_arg="--output-dir",
     ),
     AnalyzerSpec(
@@ -51,6 +53,7 @@ ANALYZER_REGISTRY: tuple[AnalyzerSpec, ...] = (
         supports_force=True,
         pass_sqlite_path=True,
         pass_history_dir=True,
+        pass_signal_thresholds=True,
         output_file_pattern="missed_runners_{date}.csv",
     ),
     AnalyzerSpec(
@@ -135,6 +138,7 @@ ANALYZER_REGISTRY: tuple[AnalyzerSpec, ...] = (
         supports_force=True,
         pass_sqlite_path=True,
         pass_history_dir=True,
+        pass_signal_thresholds=True,
         output_dir_arg="--output-dir",
         category="forensic",
     ),
@@ -158,6 +162,7 @@ ANALYZER_REGISTRY: tuple[AnalyzerSpec, ...] = (
         supports_force=True,
         pass_sqlite_path=True,
         pass_history_dir=True,
+        pass_signal_thresholds=True,
         output_dir_arg="--output-dir",
         category="strategy",
     ),
@@ -305,6 +310,19 @@ def command_for(spec: AnalyzerSpec, session_date: str, args: argparse.Namespace)
         command.extend(["--sqlite-path", str(args.sqlite_path)])
     if spec.pass_history_dir:
         command.extend(["--history-dir", str(args.history_dir)])
+    thresholds = (
+        getattr(args, "min_first_5m_high_pct", None),
+        getattr(args, "min_first_15m_high_pct", None),
+        getattr(args, "min_or_range_pct", None),
+    )
+    if spec.pass_signal_thresholds and all(value is not None for value in thresholds):
+        command.extend(
+            [
+                "--min-first-5m-high-pct", str(thresholds[0]),
+                "--min-first-15m-high-pct", str(thresholds[1]),
+                "--min-or-range-pct", str(thresholds[2]),
+            ]
+        )
     if spec.name == "shs":
         command.extend(["--missed-runners-csv", str(args.output_dir / f"missed_runners_{session_date}.csv")])
     if spec.name == "nbas":
@@ -431,6 +449,12 @@ def write_manifest(session_date: str, results: list[StepResult], *, args: argpar
         "git_commit": git_commit(),
         "sqlite_path": str(args.sqlite_path),
         "history_dir": str(args.history_dir),
+        "signal_threshold_cli_override": {
+            "effective_min_first5": getattr(args, "min_first_5m_high_pct", None),
+            "effective_min_first15": getattr(args, "min_first_15m_high_pct", None),
+            "effective_min_or_range": getattr(args, "min_or_range_pct", None),
+            "config_source": "cli_explicit" if getattr(args, "min_first_5m_high_pct", None) is not None else "session_run_metadata",
+        },
         "status": "FAILED" if final_failed else "OK",
         "successful_steps": [result.name for result in results if result.status == "ok"],
         "failed_steps": [result.name for result in results if result.status == "failed"],
@@ -559,6 +583,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sqlite-path", type=Path, default=Path("data/runtime/trading_runtime.sqlite"))
     parser.add_argument("--history-dir", type=Path, default=Path("data/history/universe_1m"))
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_ANALYSIS_DIR)
+    parser.add_argument("--min-first-5m-high-pct", type=float, default=None)
+    parser.add_argument("--min-first-15m-high-pct", type=float, default=None)
+    parser.add_argument("--min-or-range-pct", type=float, default=None)
     parser.add_argument("--only", action="append", help="Run only the named analyzer. Can be repeated.")
     parser.add_argument("--skip", action="append", help="Skip the named analyzer. Can be repeated.")
     parser.add_argument("--list", action="store_true", help="List registered analyzers and exit.")
@@ -586,6 +613,16 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 0
     if not args.date:
         parser.error("--date is required unless --list is used")
+    threshold_override = (
+        args.min_first_5m_high_pct,
+        args.min_first_15m_high_pct,
+        args.min_or_range_pct,
+    )
+    if any(value is not None for value in threshold_override) and not all(value is not None for value in threshold_override):
+        parser.error(
+            "--min-first-5m-high-pct, --min-first-15m-high-pct and "
+            "--min-or-range-pct must be supplied together"
+        )
     session_date = args.date
     args.output_dir.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now(timezone.utc).isoformat()

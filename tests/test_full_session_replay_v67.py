@@ -350,7 +350,11 @@ class FullSessionReplayTests(unittest.TestCase):
                 symbol = kwargs["symbol"]
                 return {"date": "2026-07-20", "symbol": symbol, "classification": "MISSING_CANDLES"}, []
 
-            args = build_signal_parser().parse_args(["--date", "2026-07-20", "--cases-csv", str(cases), "--output-dir", str(tmp_path)])
+            args = build_signal_parser().parse_args([
+                "--date", "2026-07-20", "--cases-csv", str(cases), "--output-dir", str(tmp_path),
+                "--min-first-5m-high-pct", "4.0", "--min-first-15m-high-pct", "6.5",
+                "--min-or-range-pct", "5.0",
+            ])
             with patch("src.live_trading.analysis.signal_opportunity_forensics.analyze_symbol", side_effect=fake_analyze):
                 run_signal_opportunity(args)
             with (tmp_path / "signal_opportunity_cases_2026-07-20.csv").open(newline="") as f:

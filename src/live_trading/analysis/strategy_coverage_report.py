@@ -29,6 +29,7 @@ from src.live_trading.analysis.missed_runners_analyzer import (
     no_signal_diagnostics,
 )
 from src.live_trading.ranking.daily_top100_builder import normalize_history_df
+from src.live_trading.analysis.strategy_config_parity import add_threshold_cli, output_has_config_provenance, resolve_threshold_args
 
 
 DEFAULT_OUTPUT_DIR = Path("data/analysis")
@@ -174,6 +175,9 @@ def build_runner_rows(
     thresholds: Iterable[float] = DEFAULT_THRESHOLDS,
     max_symbols: int | None = None,
     progress_every: int = 250,
+    min_first_5m_high_pct: float = DEFAULT_MIN_FIRST_5M_HIGH_PCT,
+    min_first_15m_high_pct: float = DEFAULT_MIN_FIRST_15M_HIGH_PCT,
+    min_or_range_pct: float = DEFAULT_MIN_OR_RANGE_PCT,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     started = time.monotonic()
     universe_symbols = set(load_universe_symbols(universe_path))
@@ -200,9 +204,9 @@ def build_runner_rows(
             no_signal = (
                 no_signal_diagnostics(
                     candles,
-                    min_first_5m_high_pct=DEFAULT_MIN_FIRST_5M_HIGH_PCT,
-                    min_first_15m_high_pct=DEFAULT_MIN_FIRST_15M_HIGH_PCT,
-                    min_or_range_pct=DEFAULT_MIN_OR_RANGE_PCT,
+                    min_first_5m_high_pct=min_first_5m_high_pct,
+                    min_first_15m_high_pct=min_first_15m_high_pct,
+                    min_or_range_pct=min_or_range_pct,
                 )
                 if symbol in top100_symbols and symbol not in bought_symbols
                 else {}
@@ -348,6 +352,10 @@ def build_coverage_report(
     recorder_dir: Path = DEFAULT_RECORDER_DIR,
     thresholds: Iterable[float] = DEFAULT_THRESHOLDS,
     max_symbols: int | None = None,
+    min_first_5m_high_pct: float = DEFAULT_MIN_FIRST_5M_HIGH_PCT,
+    min_first_15m_high_pct: float = DEFAULT_MIN_FIRST_15M_HIGH_PCT,
+    min_or_range_pct: float = DEFAULT_MIN_OR_RANGE_PCT,
+    config_source: str = "programmatic_explicit_or_historical_default",
 ) -> pd.DataFrame:
     del recorder_dir
     thresholds = tuple(float(value) for value in thresholds)
@@ -360,11 +368,20 @@ def build_coverage_report(
         sqlite_path=sqlite_path,
         thresholds=thresholds,
         max_symbols=max_symbols,
+        min_first_5m_high_pct=min_first_5m_high_pct,
+        min_first_15m_high_pct=min_first_15m_high_pct,
+        min_or_range_pct=min_or_range_pct,
     )
     summary = summarize_coverage_from_missed(runners, session_date=session_date, thresholds=thresholds)
     summary.update(diagnostics)
     summary["universe_symbols_count"] = diagnostics.get("processed_symbols", diagnostics.get("universe_files_found", 0))
     summary["bot_bought_trade_count"] = diagnostics.get("bought_trade_count", "")
+    summary.update({
+        "effective_min_first5": min_first_5m_high_pct,
+        "effective_min_first15": min_first_15m_high_pct,
+        "effective_min_or_range": min_or_range_pct,
+        "config_source": config_source,
+    })
     return pd.DataFrame([summary])
 
 
@@ -411,7 +428,7 @@ def write_coverage_report(
     **kwargs: object,
 ) -> Path:
     path = output or report_path(output_dir, session_date)
-    if path.exists() and not force:
+    if path.exists() and not force and output_has_config_provenance(path):
         print(f"COVERAGE_SKIPPED_EXISTING date={session_date} output={path}", flush=True)
         return path
     started = time.monotonic()
@@ -453,6 +470,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=None, help="Single-date output path override.")
     parser.add_argument("--max-symbols", type=int, default=None, help="Limit processed symbols for quick testing.")
     parser.add_argument("--force", action="store_true", help="Overwrite existing coverage_report_YYYY-MM-DD.csv.")
+    add_threshold_cli(parser)
     return parser
 
 
@@ -462,6 +480,7 @@ def main(argv: list[str] | None = None) -> int:
     dates = [args.date] if args.date else list(iter_dates(args.start_date, args.end_date or args.start_date))
     written: list[Path] = []
     for session_date in dates:
+        effective = resolve_threshold_args(args, session_date)
         output = args.output if args.date else None
         path = write_coverage_report(
             session_date=session_date,
@@ -474,6 +493,10 @@ def main(argv: list[str] | None = None) -> int:
             sqlite_path=args.sqlite_path,
             recorder_dir=args.recorder_dir,
             max_symbols=args.max_symbols,
+            min_first_5m_high_pct=effective.min_first5,
+            min_first_15m_high_pct=effective.min_first15,
+            min_or_range_pct=effective.min_or_range,
+            config_source=effective.config_source,
         )
         written.append(path)
         print(f"STRATEGY_COVERAGE_REPORT_WRITTEN date={session_date} output={path}", flush=True)

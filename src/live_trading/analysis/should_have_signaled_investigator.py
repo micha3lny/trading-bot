@@ -21,6 +21,7 @@ from src.live_trading.analysis.common import (
     read_sql_table,
     safe_read_csv,
 )
+from src.live_trading.analysis.strategy_config_parity import output_has_config_provenance
 from src.live_trading.analysis.signal_replay_analyzer import (
     build_symbol_timeline,
     event_keyword_seen,
@@ -55,6 +56,10 @@ CASE_COLUMNS = [
     "first_time_above_5pct",
     "first_time_above_8pct",
     "opening_range_break_time",
+    "effective_min_first5",
+    "effective_min_first15",
+    "effective_min_or_range",
+    "config_source",
     "was_bought",
     "buy_time",
     "buy_order_id",
@@ -622,6 +627,10 @@ def investigate_case(
         "first_time_above_5pct": target.get("first_time_above_5pct"),
         "first_time_above_8pct": target.get("first_time_above_8pct"),
         "opening_range_break_time": target.get("opening_range_break_time"),
+        "effective_min_first5": target.get("effective_min_first5"),
+        "effective_min_first15": target.get("effective_min_first15"),
+        "effective_min_or_range": target.get("effective_min_or_range"),
+        "config_source": target.get("config_source"),
         "was_bought": flags["was_bought"],
         "buy_time": buy_time,
         "buy_order_id": buy_order_id,
@@ -634,6 +643,8 @@ def investigate_case(
 def summary_for_cases(cases: pd.DataFrame, session_date: str, duplicate_diag: dict[str, int] | None = None) -> pd.DataFrame:
     counts = Counter(cases.get("final_classification", pd.Series(dtype=str)).fillna("unknown").astype(str)) if not cases.empty else Counter()
     row: dict[str, Any] = {"date": session_date, "total_should_have_signaled": int(len(cases))}
+    for column in ("effective_min_first5", "effective_min_first15", "effective_min_or_range", "config_source"):
+        row[column] = cases.iloc[0].get(column) if not cases.empty else None
     for name in SUMMARY_CLASSIFICATIONS:
         row[name] = int(counts.get(name, 0))
     row.update(duplicate_diag or {
@@ -658,7 +669,7 @@ def investigate_date(
 ) -> tuple[Path, Path]:
     cases_path = output_dir / f"should_have_signaled_cases_{session_date}.csv"
     summary_path = output_dir / f"should_have_signaled_summary_{session_date}.csv"
-    if cases_path.exists() and summary_path.exists() and not force:
+    if cases_path.exists() and summary_path.exists() and not force and output_has_config_provenance(cases_path):
         print(f"SHS_SKIPPED_EXISTING date={session_date} output={cases_path}", flush=True)
         return cases_path, summary_path
 
@@ -700,6 +711,10 @@ def investigate_date(
     output_dir.mkdir(parents=True, exist_ok=True)
     cases = pd.DataFrame(rows, columns=CASE_COLUMNS) if rows else pd.DataFrame(columns=CASE_COLUMNS)
     summary = summary_for_cases(cases, session_date, duplicate_diag)
+    if not targets.empty:
+        for column in ("effective_min_first5", "effective_min_first15", "effective_min_or_range", "config_source"):
+            if column in targets.columns:
+                summary.loc[:, column] = targets.iloc[0].get(column)
     cases.to_csv(cases_path, index=False)
     summary.to_csv(summary_path, index=False)
     elapsed = time.monotonic() - started
@@ -710,7 +725,11 @@ def investigate_date(
 def update_all_summary(output_dir: Path, summaries: list[Path]) -> Path:
     frames = [pd.read_csv(path) for path in summaries if path.exists()]
     if not frames:
-        out = pd.DataFrame(columns=["date", "total_should_have_signaled", *SUMMARY_CLASSIFICATIONS])
+        out = pd.DataFrame(columns=[
+            "date", "total_should_have_signaled",
+            "effective_min_first5", "effective_min_first15", "effective_min_or_range", "config_source",
+            *SUMMARY_CLASSIFICATIONS,
+        ])
     else:
         out = pd.concat(frames, ignore_index=True).drop_duplicates("date", keep="last").sort_values("date")
     path = output_dir / "should_have_signaled_summary_ALL.csv"

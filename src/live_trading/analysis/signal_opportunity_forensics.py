@@ -24,6 +24,7 @@ from src.live_trading.analysis.common import (
     parse_dt,
 )
 from src.live_trading.ranking.daily_top100_builder import parquet_path
+from src.live_trading.analysis.strategy_config_parity import EffectiveSignalThresholds, add_threshold_cli, resolve_threshold_args
 
 DEFAULT_HISTORY_DIR = Path("data/history/universe_1m")
 DEFAULT_ANALYSIS_DIR = Path("data/analysis")
@@ -88,6 +89,10 @@ CASE_COLUMNS = [
     "v67_net_return_pct",
     "v67_quantity",
     "parity_first_divergence",
+    "effective_min_first5",
+    "effective_min_first15",
+    "effective_min_or_range",
+    "config_source",
     "notes",
 ]
 
@@ -117,6 +122,10 @@ PARITY_COLUMNS = [
     "offline_decision",
     "live_equivalent_decision",
     "first_divergence",
+    "effective_min_first5",
+    "effective_min_first15",
+    "effective_min_or_range",
+    "config_source",
 ]
 
 
@@ -182,7 +191,8 @@ def legacy_breakout_time(candles: pd.DataFrame, opening_range_seconds: int = LIV
     return broke.iloc[0]["timestamp"]
 
 
-def _window_features(rows: pd.DataFrame, timestamp: pd.Timestamp, *, opening_range_seconds: int, semantics: str) -> dict[str, Any]:
+def _window_features(rows: pd.DataFrame, timestamp: pd.Timestamp, *, opening_range_seconds: int, semantics: str, effective: EffectiveSignalThresholds | None = None) -> dict[str, Any]:
+    effective = effective or EffectiveSignalThresholds(4.0, 6.5, 5.0, "programmatic_historical_strict_default")
     if rows.empty:
         return {}
     data = rows.copy()
@@ -225,9 +235,9 @@ def _window_features(rows: pd.DataFrame, timestamp: pd.Timestamp, *, opening_ran
         "or_range_pct": or_range,
         "spread_bps": spread,
         "score": round(score, 4),
-        "first5_gate": int((pct(first5_high, open_price) or -999.0) >= LIVE_SIGNAL_MIN_FIRST_5M_HIGH_PCT),
-        "first15_gate": int((pct(first15_high, open_price) or -999.0) >= LIVE_SIGNAL_MIN_FIRST_15M_HIGH_PCT),
-        "or_gate": int((or_range or -999.0) >= LIVE_SIGNAL_MIN_OR_RANGE_PCT),
+        "first5_gate": int((pct(first5_high, open_price) or -999.0) >= effective.min_first5),
+        "first15_gate": int((pct(first15_high, open_price) or -999.0) >= effective.min_first15),
+        "or_gate": int((or_range or -999.0) >= effective.min_or_range),
         "price_gate": int(current_price is not None and current_price >= LIVE_SIGNAL_MIN_PRICE),
         "spread_gate": int(spread is None or spread <= LIVE_SIGNAL_MAX_SPREAD_BPS),
     }
@@ -241,6 +251,7 @@ def build_parity_rows(
     center: pd.Timestamp | None,
     semantics: str = "bar_start",
     opening_range_seconds: int = LIVE_SIGNAL_OPENING_RANGE_SECONDS,
+    effective: EffectiveSignalThresholds | None = None,
 ) -> list[dict[str, Any]]:
     rows = _rows(candles)
     if rows.empty:
@@ -255,7 +266,7 @@ def build_parity_rows(
     out = []
     current = begin.floor("min")
     while current <= end.ceil("min"):
-        feats = _window_features(rows, current, opening_range_seconds=opening_range_seconds, semantics=semantics)
+        feats = _window_features(rows, current, opening_range_seconds=opening_range_seconds, semantics=semantics, effective=effective)
         available = rows.copy()
         available["available_at"] = bar_available_at(available, semantics)
         visible = available[available["available_at"] <= current]
@@ -290,6 +301,7 @@ def build_parity_rows(
             "offline_decision": int(legacy_ready),
             "live_equivalent_decision": int(live_ready),
             "first_divergence": divergence,
+            **(effective or EffectiveSignalThresholds(4.0, 6.5, 5.0, "programmatic_historical_strict_default")).output_fields(),
         })
         current += pd.Timedelta(minutes=1)
     return out
@@ -396,12 +408,25 @@ def analyze_symbol(
     notional: float,
     slippage_bps: float,
     semantics: str,
+    effective: EffectiveSignalThresholds | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    effective = effective or EffectiveSignalThresholds(4.0, 6.5, 5.0, "programmatic_historical_strict_default")
     candles = load_session_candles(history_dir, symbol, session_date, "RTH")
     rows = _rows(candles)
     if rows.empty:
-        return {"date": session_date, "symbol": symbol, "classification": "MISSING_CANDLES", "notes": f"missing {parquet_path(history_dir, symbol, pd.Timestamp(session_date).date(), 'RTH')}"}, []
-    replay = live_signal_replay(candles, bar_timestamp_semantics=semantics)
+        return {
+            "date": session_date,
+            "symbol": symbol,
+            "classification": "MISSING_CANDLES",
+            **effective.output_fields(),
+            "notes": f"missing {parquet_path(history_dir, symbol, pd.Timestamp(session_date).date(), 'RTH')}",
+        }, []
+    replay = live_signal_replay(
+        candles, bar_timestamp_semantics=semantics,
+        min_first_5m_high_pct=effective.min_first5,
+        min_first_15m_high_pct=effective.min_first15,
+        min_or_range_pct=effective.min_or_range,
+    )
     source_time = parse_dt(case.get("possible_signal_time")) or replay.possible_signal_time
     signal_time = source_time or replay.possible_signal_time
     open_price = fnum(rows.iloc[0].get("open"))
@@ -424,7 +449,7 @@ def analyze_symbol(
     to_close = pct(close_price, entry_price)
     time_to_mfe = (post_high_time - signal_time).total_seconds() if post_high_time is not None and signal_time is not None else None
     sim = simulate_v67_exit(candles, entry_time=signal_time, entry_price=entry_price, notional=notional, slippage_bps=slippage_bps, bar_timestamp_semantics=semantics)
-    parity = build_parity_rows(session_date=session_date, symbol=symbol, candles=candles, center=signal_time, semantics=semantics)
+    parity = build_parity_rows(session_date=session_date, symbol=symbol, candles=candles, center=signal_time, semantics=semantics, effective=effective)
     first_divergence = next((row["first_divergence"] for row in parity if row.get("first_divergence")), "")
     classification, opportunity = classify_case(replay_time=replay.possible_signal_time, source_time=source_time, mfe_pct=mfe, net_pnl=sim.net_pnl, divergence=first_divergence)
     return {
@@ -473,6 +498,7 @@ def analyze_symbol(
         "v67_net_return_pct": sim.net_return_pct,
         "v67_quantity": sim.quantity,
         "parity_first_divergence": first_divergence,
+        **effective.output_fields(),
         "notes": "high is max RTH high; current price uses completed candle close as live-equivalent last price",
     }, parity
 
@@ -501,6 +527,10 @@ def write_summary(path: Path, cases: list[dict[str, Any]], parity_path: Path) ->
         "FACT: live-equivalent current price is the completed 1-minute candle close, standing in for live last/tick price.",
         "FACT: v67 has no extra breakout-above-OR-high entry gate; breakout is diagnostic only.",
         "FACT: `first_time_above_5pct` is a runner diagnostic, not a required live gate.",
+        "FACT: effective thresholds=" + (
+            f"{cases[0].get('effective_min_first5')}/{cases[0].get('effective_min_first15')}/{cases[0].get('effective_min_or_range')} "
+            f"config_source={cases[0].get('config_source')}" if cases else "not available"
+        ),
         "",
         f"cases={total}",
         f"causally_valid_live_signals={valid}",
@@ -531,6 +561,7 @@ def write_summary(path: Path, cases: list[dict[str, Any]], parity_path: Path) ->
 
 
 def run(args: argparse.Namespace) -> int:
+    effective = resolve_threshold_args(args, args.date)
     explicit_symbols = [s.strip().upper() for s in str(args.symbols or "").split(",") if s.strip()]
     cases_csv = args.cases_csv or Path(f"data/analysis/should_have_signaled_cases_{args.date}.csv")
     cases = load_case_rows(cases_csv, explicit_symbols, args.date)
@@ -546,6 +577,7 @@ def run(args: argparse.Namespace) -> int:
             notional=args.notional,
             slippage_bps=args.slippage_bps,
             semantics=args.bar_timestamp_semantics,
+            effective=effective,
         )
         case_rows.append(row)
         parity_rows.extend(parity)
@@ -566,10 +598,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--symbols", default="", help="Comma-separated symbols. Defaults to the 12 2026-07-20 SHS symbols.")
     parser.add_argument("--cases-csv", type=Path, default=None)
     parser.add_argument("--history-dir", type=Path, default=DEFAULT_HISTORY_DIR)
+    parser.add_argument("--recorder-dir", type=Path, default=Path("data/live/recorder"))
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_ANALYSIS_DIR)
     parser.add_argument("--notional", type=float, default=1000.0)
     parser.add_argument("--slippage-bps", type=float, default=5.0)
     parser.add_argument("--bar-timestamp-semantics", choices=["bar_start", "bar_end"], default="bar_start")
+    add_threshold_cli(parser)
     return parser
 
 

@@ -23,6 +23,7 @@ from src.live_trading.analysis.full_session_replay_v67 import (
     record_replay_snapshots_call,
     replay_session,
 )
+from src.live_trading.analysis.strategy_config_parity import add_threshold_cli, output_has_config_provenance, resolve_threshold_args
 from src.live_trading.analysis.top100_analysis_common import (
     load_top100_source,
     read_snapshot_chunks,
@@ -332,7 +333,8 @@ def feature_analysis(symbol_day: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _filter_specs(df: pd.DataFrame) -> list[tuple[str, Callable[[pd.DataFrame], pd.Series]]]:
+def _filter_specs(df: pd.DataFrame, config: ReplayConfig | None = None) -> list[tuple[str, Callable[[pd.DataFrame], pd.Series]]]:
+    config = config or profile_config("live")
     eligible = lambda x: pd.to_numeric(_column(x, "potential_entry_eligible", 0), errors="coerce").fillna(0).gt(0)
     specs: list[tuple[str, Callable[[pd.DataFrame], pd.Series]]] = [("baseline", eligible)]
     for threshold in (10, 15, 20, 30, 40, 50):
@@ -352,18 +354,19 @@ def _filter_specs(df: pd.DataFrame) -> list[tuple[str, Callable[[pd.DataFrame], 
         ("top10_persistent_2", lambda x: eligible(x) & (pd.to_numeric(_column(x, "consecutive_scans_top10"), errors="coerce") >= 2)),
         ("top20_persistent_3", lambda x: eligible(x) & (pd.to_numeric(_column(x, "consecutive_scans_top20"), errors="coerce") >= 3)),
         ("completed_bar_confirmation_positive", lambda x: eligible(x) & (pd.to_numeric(_column(x, "return_1m"), errors="coerce") > 0)),
-        ("current_early_momentum_thresholds", lambda x: eligible(x) & (pd.to_numeric(_column(x, "first_5m_high_pct"), errors="coerce") >= 4.0) & (pd.to_numeric(_column(x, "first_15m_high_pct"), errors="coerce") >= 6.5)),
+        ("current_early_momentum_thresholds", lambda x: eligible(x) & (pd.to_numeric(_column(x, "first_5m_high_pct"), errors="coerce") >= config.first5_threshold) & (pd.to_numeric(_column(x, "first_15m_high_pct"), errors="coerce") >= config.first15_threshold)),
+        # Historical comparison scenario; it intentionally keeps its original 0.5/1.0/<4.0 definition.
         ("late_bloomer_separate_setup", lambda x: eligible(x) & (pd.to_numeric(_column(x, "first_5m_high_pct"), errors="coerce") >= 0.5) & (pd.to_numeric(_column(x, "first_15m_high_pct"), errors="coerce") >= 1.0) & (pd.to_numeric(_column(x, "first_5m_high_pct"), errors="coerce") < 4.0)),
         ("top20_and_near_or_high", lambda x: eligible(x) & (pd.to_numeric(_column(x, "top100_rank"), errors="coerce") <= 20) & (pd.to_numeric(_column(x, "distance_from_or_high_pct"), errors="coerce") >= -0.5)),
     ]
     return specs
 
 
-def portfolio_filter_simulation(symbol_day: pd.DataFrame, max_positions: int = 5) -> tuple[pd.DataFrame, pd.DataFrame]:
+def portfolio_filter_simulation(symbol_day: pd.DataFrame, max_positions: int = 5, config: ReplayConfig | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     simulation: list[dict[str, Any]] = []
     replay_rows: list[dict[str, Any]] = []
     baseline_symbols: set[str] = set()
-    for name, predicate in _filter_specs(symbol_day):
+    for name, predicate in _filter_specs(symbol_day, config):
         try:
             eligible = symbol_day[predicate(symbol_day).fillna(False)].copy()
         except Exception:
@@ -487,7 +490,7 @@ def analyze_session(
         if source in symbol_day.columns:
             symbol_day[target] = symbol_day[source]
     features = feature_analysis(symbol_day)
-    filters, portfolio = portfolio_filter_simulation(symbol_day, config.max_open_positions or 5)
+    filters, portfolio = portfolio_filter_simulation(symbol_day, config.max_open_positions or 5, config)
     replay_top100 = top100[top100["symbol"].isin(history_symbols)].copy()
     if replay_top100.empty:
         full_replay = None
@@ -548,7 +551,20 @@ def analyze_session(
         "runtime_observed_symbols": int(pd.to_numeric(_column(symbol_day, "runtime_observed", 0), errors="coerce").fillna(0).gt(0).sum()),
         "causal_valid_count": int(pd.to_numeric(_column(symbol_day, "causal_valid", 0), errors="coerce").fillna(0).gt(0).sum()),
         "recommendation_strength": "insufficient" if len(symbol_day) < 300 else "exploratory",
+        "effective_min_first5": config.first5_threshold,
+        "effective_min_first15": config.first15_threshold,
+        "effective_min_or_range": config.min_or_range_pct,
+        "config_source": config.config_source,
     }
+    provenance = {
+        "effective_min_first5": config.first5_threshold,
+        "effective_min_first15": config.first15_threshold,
+        "effective_min_or_range": config.min_or_range_pct,
+        "config_source": config.config_source,
+    }
+    for frame in (symbol_day, snapshots, features, filters, portfolio):
+        for column, value in provenance.items():
+            frame[column] = value
     prefix = output_dir / f"top100_buy_{{name}}_{session_date}"
     paths = {
         "symbol_day": Path(str(prefix).format(name="symbol_day") + ".csv"),
@@ -567,6 +583,7 @@ def analyze_session(
         f"# Top100 BUY Analysis {session_date}", "",
         f"FACT: dated_top100={top100_path} symbols={len(top100)} runtime_observed={quality['runtime_observed_symbols']} replay_only={quality['replay_only_symbols']}",
         f"FACT: actual_bought={int(symbol_day['actually_bought'].sum())} baseline_replay_entries={baseline.get('entries_selected', 0)} baseline_replay_net_pnl={baseline.get('net_pnl', 0)}",
+        f"FACT: effective_min_first5={config.first5_threshold} effective_min_first15={config.first15_threshold} effective_min_or_range={config.min_or_range_pct} config_source={config.config_source}",
         "INFERENCE: Feature buckets describe associations, not causal strategy improvements.",
         "HYPOTHESIS: Filter variants are experiments using replay_sell_model and portfolio slots.",
         "BASELINE ONLY: A single session cannot support production threshold changes.",
@@ -588,6 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top100-dir", default="data/universe")
     parser.add_argument("--output-dir", default="data/analysis")
     parser.add_argument("--force", action="store_true")
+    add_threshold_cli(parser)
     return parser
 
 
@@ -597,11 +615,18 @@ def main(argv: list[str] | None = None) -> int:
     completed: list[dict[str, Path]] = []
     for session_date in dates:
         summary = Path(args.output_dir) / f"top100_buy_summary_{session_date}.md"
-        if summary.exists() and not args.force:
+        quality_path = Path(args.output_dir) / f"top100_buy_data_quality_{session_date}.json"
+        if summary.exists() and not args.force and output_has_config_provenance(quality_path):
             print(f"TOP100_BUY_SKIP date={session_date} reason=output_exists", flush=True)
             continue
         print(f"TOP100_BUY_START date={session_date}", flush=True)
-        paths = analyze_session(session_date, sqlite_path=Path(args.sqlite_path), history_dir=Path(args.history_dir), recorder_dir=Path(args.recorder_dir), top100_dir=Path(args.top100_dir), output_dir=Path(args.output_dir))
+        effective = resolve_threshold_args(args, session_date)
+        config = profile_config("live")
+        config.first5_threshold = effective.min_first5
+        config.first15_threshold = effective.min_first15
+        config.min_or_range_pct = effective.min_or_range
+        config.config_source = effective.config_source
+        paths = analyze_session(session_date, sqlite_path=Path(args.sqlite_path), history_dir=Path(args.history_dir), recorder_dir=Path(args.recorder_dir), top100_dir=Path(args.top100_dir), output_dir=Path(args.output_dir), config=config)
         completed.append(paths)
         print(f"TOP100_BUY_DONE date={session_date} output={paths['symbol_day']}", flush=True)
     if len(completed) > 1:
