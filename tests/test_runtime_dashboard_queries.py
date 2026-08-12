@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -21,6 +22,10 @@ from src.dashboard.runtime_queries import (
     load_dashboard_snapshot,
     load_diagnostics,
     load_executions,
+    load_lifecycle_dashboard_evidence,
+    load_runtime_peak_evidence,
+    load_runtime_peak_map,
+    load_runtime_symbol_peak_map,
     log_dashboard_snapshot_memory,
     utc_today,
 )
@@ -28,6 +33,119 @@ from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore
 
 
 class RuntimeDashboardQueriesTests(unittest.TestCase):
+    def test_combined_runtime_peak_evidence_matches_existing_maps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.record_runtime_event(
+                    session_date="2026-08-11",
+                    strategy_name="v67",
+                    event_type="PEAK_UPDATED",
+                    symbol="AAA",
+                    trade_id="T1",
+                    raw_json={"entry_price": 10.0, "peak_price": 10.8},
+                )
+                store.execute(
+                    """
+                    INSERT INTO runtime_events (
+                        event_time, severity, event_type, strategy_name, session_date, symbol, trade_id, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "2026-08-11T13:40:00+00:00", "INFO", "POSITION_CLOSED", "v67", None,
+                        "AAA", "T1", '{"entry_price": 10.0, "peak_price": 10.8, "exit_price": 10.5}',
+                    ),
+                )
+                window = DateWindow("2026-08-11", "2026-08-11")
+                combined = load_runtime_peak_evidence(store.conn, window, "v67")
+                self.assertEqual(combined.trade_peak_map, load_runtime_peak_map(store.conn, window, "v67"))
+                self.assertEqual(combined.symbol_peak_map, load_runtime_symbol_peak_map(store.conn, window, "v67"))
+            finally:
+                store.close()
+
+    def test_lifecycle_dashboard_evidence_builds_all_maps_in_one_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "2026-08-11"
+            session.mkdir()
+            with (session / "trade_lifecycle.csv").open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=[
+                    "timestamp", "session_date", "symbol", "event", "peak_gain_pct",
+                    "entry_price", "peak_price", "top100_rank", "raw_json",
+                ])
+                writer.writeheader()
+                writer.writerow({
+                    "timestamp": "2026-08-11T13:35:00+00:00",
+                    "session_date": "2026-08-11",
+                    "symbol": "AAA",
+                    "event": "BUY_ORDER_SENT",
+                    "peak_gain_pct": "5.0",
+                    "entry_price": "10",
+                    "peak_price": "10.5",
+                    "top100_rank": "3",
+                    "raw_json": json.dumps({"live_entry_score": 77}),
+                })
+                writer.writerow({
+                    "timestamp": "2026-08-11T13:36:00+00:00",
+                    "session_date": "2026-08-11",
+                    "symbol": "AAA",
+                    "event": "POSITION_PEAK_UPDATED",
+                    "peak_gain_pct": "8.0",
+                    "entry_price": "10",
+                    "peak_price": "10.8",
+                    "top100_rank": "",
+                    "raw_json": "{}",
+                })
+            (session / "order_lifecycle.jsonl").write_text(
+                "not-json\n" + json.dumps({
+                    "event_type": "ENTRY_ORDER_SUBMITTED",
+                    "event_time": "2026-08-11T13:35:01+00:00",
+                    "symbol": "AAA",
+                    "order_id": "42",
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            evidence = load_lifecycle_dashboard_evidence(
+                DateWindow("2026-08-11", "2026-08-11"), root
+            )
+
+            self.assertEqual(evidence.rows_scanned, 4)
+            self.assertEqual(evidence.files_read, 2)
+            self.assertEqual(evidence.peak_map[("2026-08-11", "AAA")][0], 8.0)
+            self.assertAlmostEqual(evidence.symbol_peak_map[("2026-08-11", "AAA")]["peak_pct"], 8.0)
+            self.assertEqual(len(evidence.entry_metadata_by_symbol["AAA"]), 2)
+
+    def test_complete_canonical_snapshot_does_not_read_lifecycle_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(db)
+            try:
+                store.upsert_trade({
+                    "trade_id": "T_COMPLETE",
+                    "session_date": "2026-08-11",
+                    "strategy_name": "v67",
+                    "symbol": "AAA",
+                    "status": "CLOSED",
+                    "entry_fill_time": "2026-08-11T13:35:00+00:00",
+                    "exit_fill_time": "2026-08-11T14:00:00+00:00",
+                    "entry_price": 10,
+                    "exit_price": 11,
+                    "quantity": 10,
+                    "mfe_pct": 12,
+                    "peak_data_quality": "EXACT",
+                })
+            finally:
+                store.close()
+            with patch(
+                "src.dashboard.runtime_queries.load_lifecycle_dashboard_evidence",
+                side_effect=AssertionError("complete canonical rows must not read recorder fallback"),
+            ):
+                snapshot = load_dashboard_snapshot(
+                    db, DateWindow("2026-08-11", "2026-08-11"), "v67"
+                )
+            self.assertEqual(len(snapshot["closed_positions"]), 1)
+
     def insert_execution_direct(self, store: SQLiteRuntimeStore, row: dict) -> None:
         payload = dict(row)
         store.conn.execute(

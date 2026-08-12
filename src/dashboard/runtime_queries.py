@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import resource
+import re
 import sqlite3
 import sys
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -50,6 +54,97 @@ AND UPPER(COALESCE(p.status, '')) NOT LIKE '%ORPHAN_STALE_POSITION%'
 class DateWindow:
     start_date: str
     end_date: str
+
+
+@dataclass
+class LifecycleDashboardEvidence:
+    peak_map: dict[tuple[str, str], tuple[float, str]]
+    symbol_peak_map: dict[tuple[str, str], dict[str, Any]]
+    entry_metadata_by_symbol: dict[str, list[dict[str, Any]]]
+    files_read: int = 0
+    rows_scanned: int = 0
+
+
+@dataclass
+class RuntimePeakEvidence:
+    trade_peak_map: dict[tuple[str, str, str, str], tuple[float, str]]
+    symbol_peak_map: dict[tuple[str, str, str], dict[str, Any]]
+    rows_scanned: int = 0
+
+
+@dataclass
+class DashboardPerformanceTrace:
+    phases: list[dict[str, Any]]
+    queries: list[dict[str, Any]]
+
+    def summary(self) -> dict[str, Any]:
+        repeated: dict[str, int] = {}
+        rows_by_table: dict[str, int] = {}
+        for query in self.queries:
+            fingerprint = str(query.get("fingerprint") or "")
+            repeated[fingerprint] = repeated.get(fingerprint, 0) + 1
+            table = str(query.get("table") or "unknown")
+            rows_by_table[table] = rows_by_table.get(table, 0) + int(query.get("rows") or 0)
+        return {
+            "phases": list(self.phases),
+            "query_count": len(self.queries),
+            "repeated_identical_query_count": sum(count - 1 for count in repeated.values() if count > 1),
+            "rows_read_by_table": rows_by_table,
+            "queries": list(self.queries),
+        }
+
+
+_DASHBOARD_TRACE: ContextVar[DashboardPerformanceTrace | None] = ContextVar("dashboard_performance_trace", default=None)
+
+
+@contextmanager
+def capture_dashboard_performance():
+    trace = DashboardPerformanceTrace(phases=[], queries=[])
+    token = _DASHBOARD_TRACE.set(trace)
+    try:
+        yield trace
+    finally:
+        _DASHBOARD_TRACE.reset(token)
+
+
+def _row_count(value: Any) -> int:
+    if isinstance(value, pd.DataFrame):
+        return len(value)
+    if isinstance(value, tuple) and value and isinstance(value[0], pd.DataFrame):
+        return len(value[0])
+    if isinstance(value, (dict, list, tuple, set)):
+        return len(value)
+    return 0
+
+
+def log_dashboard_phase(phase: str, started: float, value: Any = None, *, rows: int | None = None) -> None:
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    row_count = _row_count(value) if rows is None else int(rows)
+    record = {"phase": phase, "duration_ms": duration_ms, "rows": row_count}
+    trace = _DASHBOARD_TRACE.get()
+    if trace is not None:
+        trace.phases.append(record)
+    print(
+        f"{datetime.now(timezone.utc).isoformat()} DASHBOARD_PHASE_TIMING "
+        f"phase={phase} duration_ms={duration_ms:.3f} rows={row_count}",
+        flush=True,
+    )
+
+
+def dashboard_phase_call(phase: str, callback: Callable[[], Any], *, rows: Callable[[Any], int] | None = None) -> Any:
+    started = time.perf_counter()
+    value = callback()
+    log_dashboard_phase(phase, started, value, rows=rows(value) if rows is not None else None)
+    return value
+
+
+def _sql_fingerprint(sql: str) -> str:
+    return " ".join(sql.split())
+
+
+def _sql_table(sql: str) -> str:
+    match = re.search(r"\bFROM\s+([A-Za-z_][A-Za-z0-9_]*)", sql, flags=re.IGNORECASE)
+    return match.group(1).lower() if match else "unknown"
 
 
 def execution_day_sql(alias: str = "e") -> str:
@@ -190,17 +285,29 @@ def utc_today() -> str:
     return datetime.now(timezone.utc).strftime("%F")
 
 
-def connect(sqlite_path: str | Path | None = None) -> sqlite3.Connection:
+def connect(sqlite_path: str | Path | None = None, *, migrate_schema: bool = True) -> sqlite3.Connection:
     path = Path(resolve_sqlite_path(sqlite_path or DEFAULT_SQLITE_PATH))
     key = str(path)
-    if key not in _MIGRATED_SQLITE_PATHS:
+    if migrate_schema and key not in _MIGRATED_SQLITE_PATHS:
         migrate_runtime_schema(path)
         _MIGRATED_SQLITE_PATHS.add(key)
     return connect_sqlite(path, read_only=True)
 
 
 def read_sql(conn: sqlite3.Connection, sql: str, params: list[Any] | tuple[Any, ...] = ()) -> pd.DataFrame:
-    return pd.read_sql_query(sql, conn, params=params)
+    started = time.perf_counter()
+    rows = pd.read_sql_query(sql, conn, params=params)
+    trace = _DASHBOARD_TRACE.get()
+    if trace is not None:
+        trace.queries.append({
+            "fingerprint": _sql_fingerprint(sql),
+            "table": _sql_table(sql),
+            "duration_ms": (time.perf_counter() - started) * 1000.0,
+            "rows": len(rows),
+            "sql": sql,
+            "params": list(params),
+        })
+    return rows
 
 
 def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -1048,6 +1155,73 @@ def merge_symbol_peak(
     out[key] = current
 
 
+def load_runtime_peak_evidence(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> RuntimePeakEvidence:
+    clause, params = strategy_clause("r", strategy)
+    start_ts, end_ts = date_window_bounds(window)
+    rows = read_sql(
+        conn,
+        f"""
+        SELECT
+            r.trade_id,
+            COALESCE(r.strategy_name, 'unknown') AS strategy,
+            COALESCE(r.session_date, substr(r.event_time, 1, 10)) AS session_date,
+            r.symbol,
+            r.event_type,
+            r.raw_json
+        FROM runtime_events r
+        WHERE (
+            r.session_date BETWEEN ? AND ?
+            OR (
+                r.session_date IS NULL
+                AND r.event_time >= ? AND r.event_time < ?
+            )
+        ) {clause}
+        ORDER BY r.event_time
+        """,
+        [window.start_date, window.end_date, start_ts, end_ts, *params],
+    )
+    evidence = RuntimePeakEvidence(trade_peak_map={}, symbol_peak_map={}, rows_scanned=len(rows))
+    for row in rows.to_dict("records"):
+        raw = parse_raw_json(row.get("raw_json"))
+        peak_pct = raw_json_peak_value(raw)
+        if peak_pct is None:
+            peak_pct = to_float(raw.get("peak_gain_pct") or raw.get("mfe_pct"), None)
+        trade_key = (
+            str(row.get("trade_id") or ""),
+            str(row.get("session_date") or ""),
+            str(row.get("strategy") or "unknown"),
+            str(row.get("symbol") or "").upper(),
+        )
+        if peak_pct is not None:
+            previous = evidence.trade_peak_map.get(trade_key)
+            if previous is None or peak_pct > previous[0]:
+                evidence.trade_peak_map[trade_key] = (peak_pct, "runtime_events")
+        session_date = trade_key[1]
+        symbol = trade_key[3]
+        if not session_date or not symbol:
+            continue
+        event_type = str(row.get("event_type") or "").upper()
+        peak_price = raw_price_value(raw, ("peak_price", "high_watermark", "mfe_price")) if "PEAK" in event_type or raw.get("peak_price") is not None else None
+        entry_price = raw_price_value(raw, ("entry_price", "buy", "buy_price"))
+        exit_price = raw_price_value(raw, ("exit_price", "sell_price", "decision_price", "price")) if event_type in {"SELL_ORDER_SENT", "POSITION_VERIFIED_CLOSED", "POSITION_CLOSED"} else None
+        if peak_price is None and entry_price is not None and peak_pct is not None:
+            peak_price = entry_price * (1.0 + peak_pct / 100.0)
+        if peak_price is None and peak_pct is None and exit_price is None and entry_price is None:
+            continue
+        strategy_name = trade_key[2]
+        for key_strategy in (strategy_name, ""):
+            merge_symbol_peak(
+                evidence.symbol_peak_map,
+                (session_date, key_strategy, symbol),
+                peak_price=peak_price,
+                peak_pct=peak_pct,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                source="runtime_events_symbol_session",
+            )
+    return evidence
+
+
 def load_runtime_symbol_peak_map(conn: sqlite3.Connection, window: DateWindow, strategy: str | None) -> dict[tuple[str, str, str], dict[str, Any]]:
     clause, params = strategy_clause("r", strategy)
     rows = read_sql(
@@ -1811,6 +1985,113 @@ def load_order_entry_metadata(conn: sqlite3.Connection, window: DateWindow, stra
     for rows_for_symbol in by_symbol.values():
         rows_for_symbol.sort(key=lambda item: parse_dt(item.get("event_time")) or datetime.min.replace(tzinfo=timezone.utc))
     return by_order_id, by_symbol
+
+
+def load_lifecycle_dashboard_evidence(window: DateWindow, root: Path | None = None) -> LifecycleDashboardEvidence:
+    """Build all dashboard lifecycle maps in one bounded pass over each recorder file."""
+    base = root or recorder_root()
+    evidence = LifecycleDashboardEvidence(peak_map={}, symbol_peak_map={}, entry_metadata_by_symbol={})
+    entry_events = {"BUY_ORDER_SENT", "PAPER_BUY_SENT", "SIGNAL_READY", "ENTRY_ORDER_SUBMITTED", "BUY_SUBMITTED"}
+    csv_field_limit = sys.maxsize
+    while csv_field_limit:
+        try:
+            csv.field_size_limit(csv_field_limit)
+            break
+        except OverflowError:
+            csv_field_limit //= 10
+    for session_dir in sorted(base.glob("*")):
+        if not session_dir.is_dir():
+            continue
+        session_date = session_dir.name
+        if session_date < window.start_date or session_date > window.end_date:
+            continue
+        csv_path = session_dir / "trade_lifecycle.csv"
+        if csv_path.exists():
+            evidence.files_read += 1
+            try:
+                with csv_path.open("r", newline="", errors="replace") as handle:
+                    reader = csv.DictReader(handle)
+                    for row in reader:
+                        evidence.rows_scanned += 1
+                        symbol = str(row.get("symbol") or "").upper()
+                        if not symbol:
+                            continue
+                        event_type = str(row.get("event") or row.get("event_type") or "").upper()
+                        peak_pct = to_float(row.get("peak_gain_pct") or row.get("mfe_pct") or row.get("peak_pct"), None)
+                        entry_price = to_float(row.get("entry_price") or row.get("buy") or row.get("buy_price"), None)
+                        peak_price = to_float(row.get("peak_price") or row.get("high_watermark") or row.get("mfe_price"), None)
+                        if peak_pct is None and entry_price and peak_price is not None:
+                            peak_pct = ((peak_price / entry_price) - 1.0) * 100.0
+                        if peak_pct is not None:
+                            peak_key = (session_date, symbol)
+                            previous = evidence.peak_map.get(peak_key)
+                            if previous is None or peak_pct > previous[0]:
+                                evidence.peak_map[peak_key] = (peak_pct, "trade_lifecycle.csv")
+                        if peak_price is None and entry_price is not None and peak_pct is not None:
+                            peak_price = entry_price * (1.0 + peak_pct / 100.0)
+                        exit_price = None
+                        if event_type in {"SELL_ORDER_SENT", "POSITION_VERIFIED_CLOSED", "POSITION_CLOSED"}:
+                            exit_price = to_float(
+                                row.get("exit_price") or row.get("sell_price") or row.get("decision_price") or row.get("price"),
+                                None,
+                            )
+                        if peak_price is not None or peak_pct is not None or entry_price is not None or exit_price is not None:
+                            merge_symbol_peak(
+                                evidence.symbol_peak_map,
+                                (session_date, symbol),
+                                peak_price=peak_price,
+                                peak_pct=peak_pct,
+                                entry_price=entry_price,
+                                exit_price=exit_price,
+                                source="trade_lifecycle_symbol_session",
+                            )
+                        if event_type in entry_events:
+                            metadata_row = dict(row)
+                            for key in (
+                                "top100_rank", "rank", "ranking_position", "top100_score", "score",
+                                "live_entry_score", "entry_score", "live_entry_rank", "entry_order_id",
+                                "entry_perm_id", "order_id", "perm_id", "ib_order_id",
+                            ):
+                                value = metadata_row.get(key)
+                                if value in (None, ""):
+                                    continue
+                                text = str(value).strip()
+                                try:
+                                    metadata_row[key] = int(text) if re.fullmatch(r"[+-]?\d+", text) else float(text)
+                                except (TypeError, ValueError):
+                                    pass
+                            meta = compact_entry_metadata(metadata_row, source="trade_lifecycle.csv", confidence="medium")
+                            meta["event_time"] = row.get("recorded_at") or row.get("event_time") or row.get("timestamp")
+                            evidence.entry_metadata_by_symbol.setdefault(symbol, []).append(meta)
+            except Exception:
+                pass
+        jsonl_path = session_dir / "order_lifecycle.jsonl"
+        if jsonl_path.exists():
+            evidence.files_read += 1
+            try:
+                with jsonl_path.open("r", errors="replace") as handle:
+                    for line in handle:
+                        evidence.rows_scanned += 1
+                        try:
+                            row = json.loads(line)
+                        except Exception:
+                            continue
+                        event_type = str(
+                            row.get("legacy_event") or row.get("event_type") or row.get("type") or row.get("event") or ""
+                        ).upper()
+                        if event_type not in entry_events:
+                            continue
+                        symbol = str(row.get("symbol") or "").upper()
+                        if not symbol:
+                            continue
+                        meta = compact_entry_metadata(row, source="order_lifecycle.jsonl", confidence="medium")
+                        meta["event_time"] = row.get("event_time") or row.get("recorded_at") or row.get("timestamp")
+                        evidence.entry_metadata_by_symbol.setdefault(symbol, []).append(meta)
+            except Exception:
+                pass
+    for rows_for_symbol in evidence.entry_metadata_by_symbol.values():
+        rows_for_symbol.sort(key=lambda item: parse_dt(item.get("event_time")) or datetime.min.replace(tzinfo=timezone.utc))
+    return evidence
 
 
 def load_lifecycle_entry_metadata(window: DateWindow, root: Path | None = None) -> dict[str, list[dict[str, Any]]]:
@@ -2812,35 +3093,48 @@ def load_closed_positions(
     include_reconstructed: bool = False,
     current_executions: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
+    total_started = time.perf_counter()
     lookup_window = expanded_lookup_window(window)
-    runtime_peak_map = load_runtime_peak_map(conn, window, strategy)
-    runtime_symbol_peak_map = load_runtime_symbol_peak_map(conn, window, strategy)
-    lifecycle_peak_map = load_lifecycle_peak_map(window)
-    lifecycle_symbol_peak_map = load_lifecycle_symbol_peak_map(window)
-    order_metadata_by_id, order_metadata_by_symbol = load_order_entry_metadata(conn, window, strategy)
-    lifecycle_metadata_by_symbol = load_lifecycle_entry_metadata(window)
-    top100_metadata = load_top100_metadata(window)
+    runtime_peak_evidence = dashboard_phase_call(
+        "closed.runtime_peak_evidence",
+        lambda: load_runtime_peak_evidence(conn, window, strategy),
+        rows=lambda value: value.rows_scanned,
+    )
+    runtime_peak_map = runtime_peak_evidence.trade_peak_map
+    runtime_symbol_peak_map = runtime_peak_evidence.symbol_peak_map
+    lifecycle_peak_map: dict[tuple[str, str], tuple[float, str]] = {}
+    lifecycle_symbol_peak_map: dict[tuple[str, str], dict[str, Any]] = {}
+    lifecycle_metadata_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    order_metadata_by_id: dict[str, dict[str, Any]] = {}
+    order_metadata_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    top100_metadata: dict[tuple[str, str], dict[str, Any]] = {}
     candle_rows: dict[tuple[str, str], pd.DataFrame] = {}
-    trades = closed_from_trades(
-        conn,
-        window,
-        strategy,
-        executions,
-        runtime_peak_map,
-        lifecycle_peak_map,
-        candle_rows,
-        runtime_exit_reason_map={},
-        lifecycle_exit_reason_map={},
+    trades = dashboard_phase_call(
+        "closed.persisted_trades",
+        lambda: closed_from_trades(
+            conn,
+            window,
+            strategy,
+            executions,
+            runtime_peak_map,
+            lifecycle_peak_map,
+            candle_rows,
+            runtime_exit_reason_map={},
+            lifecycle_exit_reason_map={},
+        ),
     )
     reconstructed = pd.DataFrame()
     reconstructed_count = 0
     if include_reconstructed:
-        reconstructed = closed_from_executions(
-            executions,
-            window,
-            trade_entry_times=trade_entry_map(conn, lookup_window, strategy),
-            position_entry_times=position_entry_map(conn, lookup_window, strategy),
-            runtime_entry_times=runtime_entry_event_map(conn, lookup_window, strategy),
+        reconstructed = dashboard_phase_call(
+            "closed.execution_reconstruction",
+            lambda: closed_from_executions(
+                executions,
+                window,
+                trade_entry_times=trade_entry_map(conn, lookup_window, strategy),
+                position_entry_times=position_entry_map(conn, lookup_window, strategy),
+                runtime_entry_times=runtime_entry_event_map(conn, lookup_window, strategy),
+            ),
         )
         reconstructed_count = int(len(reconstructed))
     if include_reconstructed and not trades.empty and not reconstructed.empty:
@@ -2855,15 +3149,52 @@ def load_closed_positions(
             )
         ]
     persisted_count = int(len(trades))
-    execution_closed = closed_from_execution_realized_pnl(
-        current_executions if current_executions is not None else pd.DataFrame(),
-        trades,
-        order_metadata_by_id=order_metadata_by_id,
-        order_metadata_by_symbol=order_metadata_by_symbol,
-        lifecycle_metadata_by_symbol=lifecycle_metadata_by_symbol,
-        top100_metadata=top100_metadata,
+    peak_values = pd.to_numeric(trades.get("peak_pct", pd.Series(dtype=float)), errors="coerce") if not trades.empty else pd.Series(dtype=float)
+    peak_qualities = (
+        trades.get("peak_data_quality", pd.Series("", index=trades.index)).fillna("").astype(str).str.upper()
+        if not trades.empty
+        else pd.Series(dtype=str)
     )
-    fifo_diag = reconstructed_fifo_diagnostics(trades, execution_closed)
+    needs_peak_fallback = bool(
+        not trades.empty
+        and (peak_values.isna() & ~peak_qualities.isin(INVALID_CANONICAL_PEAK_QUALITIES)).any()
+    )
+    needs_execution_metadata = persisted_count == 0 and current_executions is not None and not current_executions.empty
+    needs_lifecycle_evidence = needs_peak_fallback or needs_execution_metadata or (include_reconstructed and not reconstructed.empty)
+    if needs_lifecycle_evidence:
+        lifecycle_evidence = dashboard_phase_call(
+            "closed.lifecycle_evidence",
+            lambda: load_lifecycle_dashboard_evidence(window),
+            rows=lambda value: value.rows_scanned,
+        )
+        lifecycle_peak_map = lifecycle_evidence.peak_map
+        lifecycle_symbol_peak_map = lifecycle_evidence.symbol_peak_map
+        lifecycle_metadata_by_symbol = lifecycle_evidence.entry_metadata_by_symbol
+    else:
+        log_dashboard_phase("closed.lifecycle_evidence_skipped", time.perf_counter(), rows=0)
+    if needs_execution_metadata:
+        order_metadata_by_id, order_metadata_by_symbol = dashboard_phase_call(
+            "closed.order_entry_metadata",
+            lambda: load_order_entry_metadata(conn, window, strategy),
+            rows=lambda value: len(value[0]) + sum(len(items) for items in value[1].values()),
+        )
+        top100_metadata = dashboard_phase_call(
+            "closed.top100_metadata", lambda: load_top100_metadata(window)
+        )
+    execution_closed = dashboard_phase_call(
+        "closed.execution_realized_rows",
+        lambda: closed_from_execution_realized_pnl(
+            current_executions if current_executions is not None else pd.DataFrame(),
+            trades,
+            order_metadata_by_id=order_metadata_by_id,
+            order_metadata_by_symbol=order_metadata_by_symbol,
+            lifecycle_metadata_by_symbol=lifecycle_metadata_by_symbol,
+            top100_metadata=top100_metadata,
+        ),
+    )
+    fifo_diag = dashboard_phase_call(
+        "closed.fifo_diagnostics", lambda: reconstructed_fifo_diagnostics(trades, execution_closed)
+    )
     displayed_frames = [trades]
     if include_reconstructed:
         displayed_frames.append(reconstructed)
@@ -2882,17 +3213,24 @@ def load_closed_positions(
         and not execution_closed.empty
     )
     if prefer_execution_closed:
+        fallback_started = time.perf_counter()
         closed = apply_symbol_session_peak_fallbacks(execution_closed, runtime_symbol_peak_map, lifecycle_symbol_peak_map)
         closed = closed.sort_values(["net_actual", "symbol"], na_position="last").reset_index(drop=True)
+        log_dashboard_phase("closed.peak_fallback_and_sort", fallback_started, closed)
         diag["displayed_closed_trades_count"] = int(len(closed))
         diag["runtime_closed_source"] = "executions_realized_pnl"
+        log_dashboard_phase("load_closed_positions", total_started, closed)
         return closed, diag
     if not frames:
+        log_dashboard_phase("load_closed_positions", total_started, trades)
         return pd.DataFrame(), diag
+    combine_started = time.perf_counter()
     closed = pd.concat(frames, ignore_index=True, sort=False)
     closed = apply_symbol_session_peak_fallbacks(closed, runtime_symbol_peak_map, lifecycle_symbol_peak_map)
     closed = closed.sort_values(["net_actual", "symbol"], na_position="last").reset_index(drop=True)
+    log_dashboard_phase("closed.combine_peak_fallback_and_sort", combine_started, closed)
     diag["displayed_closed_trades_count"] = int(len(closed))
+    log_dashboard_phase("load_closed_positions", total_started, closed)
     return closed, diag
 
 
@@ -4000,6 +4338,7 @@ def load_dashboard_snapshot(
     *,
     include_reconstructed: bool = False,
     broker_portfolio: pd.DataFrame | None = None,
+    read_only: bool = False,
 ) -> dict[str, Any]:
     path = Path(resolve_sqlite_path(sqlite_path))
     if not path.exists():
@@ -4018,49 +4357,83 @@ def load_dashboard_snapshot(
             "loaded_at": datetime.now(timezone.utc).isoformat(),
             "source": str(path),
         }
-    conn = connect(path)
+    conn = connect(path, migrate_schema=not read_only)
     try:
         conn.execute("BEGIN")
         snapshot_started = time.perf_counter()
         memory_frames: list[dict[str, Any]] = []
-        executions = load_executions(conn, window, strategy, query_name="load_executions_table")
+        executions = dashboard_phase_call(
+            "load_executions",
+            lambda: load_executions(conn, window, strategy, query_name="load_executions_table"),
+        )
         memory_frames.append(log_dashboard_dataframe_memory("snapshot.executions", executions))
-        execution_pnl = load_execution_pnl_summary(conn, window, strategy)
-        execution_lookup = load_executions(
-            conn,
-            expanded_lookup_window(window),
-            strategy,
-            limit=None,
-            include_raw_json=True,
-            query_name="load_executions_lookup",
+        execution_pnl = dashboard_phase_call(
+            "load_execution_pnl_summary", lambda: load_execution_pnl_summary(conn, window, strategy), rows=lambda _value: 1
+        )
+        execution_lookup = dashboard_phase_call(
+            "load_execution_lookup",
+            lambda: load_executions(
+                conn,
+                expanded_lookup_window(window),
+                strategy,
+                limit=None,
+                include_raw_json=True,
+                query_name="load_executions_lookup",
+            ),
         )
         memory_frames.append(log_dashboard_dataframe_memory("snapshot.execution_lookup", execution_lookup))
-        raw_closed_rows = load_raw_closed_trade_rows(conn, window, strategy)
+        raw_closed_rows = dashboard_phase_call(
+            "load_raw_closed_trade_rows", lambda: load_raw_closed_trade_rows(conn, window, strategy)
+        )
         memory_frames.append(log_dashboard_dataframe_memory("snapshot.raw_closed_rows", raw_closed_rows))
-        closed, closed_diag = load_closed_positions(
-            conn,
-            window,
-            strategy,
-            execution_lookup,
-            include_reconstructed=include_reconstructed,
-            current_executions=executions,
+        closed, closed_diag = dashboard_phase_call(
+            "load_closed_positions_total",
+            lambda: load_closed_positions(
+                conn,
+                window,
+                strategy,
+                execution_lookup,
+                include_reconstructed=include_reconstructed,
+                current_executions=executions,
+            ),
         )
         memory_frames.append(log_dashboard_dataframe_memory("snapshot.closed_positions", closed))
-        open_positions = load_open_positions(conn, window, strategy, executions, execution_lookup, broker_portfolio)
+        open_positions = dashboard_phase_call(
+            "load_open_positions",
+            lambda: load_open_positions(conn, window, strategy, executions, execution_lookup, broker_portfolio),
+        )
         memory_frames.append(log_dashboard_dataframe_memory("snapshot.open_positions", open_positions))
-        pending_trades = load_pending_trades(conn, window, strategy)
+        pending_trades = dashboard_phase_call(
+            "load_pending_trades", lambda: load_pending_trades(conn, window, strategy)
+        )
         memory_frames.append(log_dashboard_dataframe_memory("snapshot.pending_trades", pending_trades))
-        raw_active_positions = load_raw_active_positions(conn, strategy)
+        raw_active_positions = dashboard_phase_call(
+            "load_raw_active_positions", lambda: load_raw_active_positions(conn, strategy)
+        )
         memory_frames.append(log_dashboard_dataframe_memory("snapshot.raw_active_positions", raw_active_positions))
-        orphan_stale_positions = load_orphan_stale_positions(conn, window, strategy)
+        orphan_stale_positions = dashboard_phase_call(
+            "load_orphan_stale_positions", lambda: load_orphan_stale_positions(conn, window, strategy)
+        )
         memory_frames.append(log_dashboard_dataframe_memory("snapshot.orphan_stale_positions", orphan_stale_positions))
-        excluded_open_positions = load_excluded_open_positions(conn, window, strategy, open_positions, orphan_stale_positions)
+        excluded_open_positions = dashboard_phase_call(
+            "load_excluded_open_positions",
+            lambda: load_excluded_open_positions(conn, window, strategy, open_positions, orphan_stale_positions),
+        )
         memory_frames.append(log_dashboard_dataframe_memory("snapshot.excluded_open_positions", excluded_open_positions))
-        rejected_entries = load_rejected_entries(conn, window, strategy)
+        rejected_entries = dashboard_phase_call(
+            "load_rejected_entries", lambda: load_rejected_entries(conn, window, strategy)
+        )
         memory_frames.append(log_dashboard_dataframe_memory("snapshot.rejected_entries", rejected_entries))
-        diagnostics = load_diagnostics(conn, window, strategy)
+        diagnostics = dashboard_phase_call(
+            "load_diagnostics", lambda: load_diagnostics(conn, window, strategy)
+        )
         diagnostics.update(closed_diag)
-        diagnostics.update(load_position_row_diagnostics(conn, window, strategy, len(open_positions)))
+        position_row_diagnostics = dashboard_phase_call(
+            "load_position_row_diagnostics",
+            lambda: load_position_row_diagnostics(conn, window, strategy, len(open_positions)),
+        )
+        diagnostics.update(position_row_diagnostics)
+        diagnostic_aggregation_started = time.perf_counter()
         diagnostics["active_positions_raw_count"] = int(len(raw_active_positions))
         diagnostics["raw_active_sqlite_count"] = int(len(raw_active_positions))
         raw_open_symbols = {
@@ -4113,7 +4486,9 @@ def load_dashboard_snapshot(
             quality_series = closed.get("data_quality", pd.Series("", index=closed.index)).fillna("").astype(str)
             source_series = closed.get("source", pd.Series("", index=closed.index)).fillna("").astype(str).str.lower()
             attribution_series = closed.get("attribution_status", pd.Series("", index=closed.index)).fillna("").astype(str)
-            exported_view = aggregate_closed_positions(closed)
+            exported_view = dashboard_phase_call(
+                "aggregate_closed_positions", lambda: aggregate_closed_positions(closed)
+            )
             exported_pnl = float(pd.to_numeric(exported_view.get("net_actual", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not exported_view.empty else 0.0
             all_execution_pnl = float(execution_pnl.get("net_actual_pnl") or 0.0)
             diagnostics["attributed_closed_count"] = int((attribution_series == "attributed").sum())
@@ -4205,7 +4580,8 @@ def load_dashboard_snapshot(
             f"reconstructed={diagnostics.get('reconstructed_trades_count', 0)};"
             f"last_reducer={diagnostics.get('last_reducer_run_at', '')}"
         )
-        exit_sim = exit_simulation(closed)
+        log_dashboard_phase("diagnostic_aggregation", diagnostic_aggregation_started, diagnostics)
+        exit_sim = dashboard_phase_call("exit_simulation", lambda: exit_simulation(closed))
         memory_frames.append(log_dashboard_dataframe_memory("snapshot.exit_simulation", exit_sim))
         memory_diagnostics = log_dashboard_snapshot_memory(
             window=window,
@@ -4215,9 +4591,15 @@ def load_dashboard_snapshot(
         )
         diagnostics.update(memory_diagnostics)
         diagnostics["dashboard_snapshot_build_duration_ms"] = (time.perf_counter() - snapshot_started) * 1000.0
+        summary = dashboard_phase_call(
+            "build_summary", lambda: build_summary(open_positions, closed, execution_pnl), rows=lambda _value: 1
+        )
+        data_quality_summary = dashboard_phase_call(
+            "build_data_quality_summary", lambda: build_data_quality_summary(closed), rows=lambda _value: 1
+        )
         snapshot = {
-            "summary": build_summary(open_positions, closed, execution_pnl),
-            "data_quality_summary": build_data_quality_summary(closed),
+            "summary": summary,
+            "data_quality_summary": data_quality_summary,
             "open_positions": open_positions,
             "raw_active_positions": raw_active_positions,
             "orphan_stale_positions": orphan_stale_positions,
@@ -4234,6 +4616,9 @@ def load_dashboard_snapshot(
             "source": str(path),
         }
         conn.commit()
+        log_dashboard_phase("full_snapshot_total", snapshot_started, rows=sum(
+            len(value) for value in snapshot.values() if isinstance(value, pd.DataFrame)
+        ))
         return snapshot
     except Exception:
         conn.rollback()
