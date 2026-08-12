@@ -19,6 +19,8 @@ from src.live_trading.analysis.candidate_lifetime_analyzer import (
     event_is_buy,
     future_outcome,
     load_sqlite_events,
+    load_light_events,
+    load_session_evidence,
     portfolio_counterfactuals,
 )
 from src.live_trading.analysis.full_session_replay_v67 import (
@@ -27,6 +29,7 @@ from src.live_trading.analysis.full_session_replay_v67 import (
     _rows,
     effective_config_dict,
 )
+from src.live_trading.analysis.top100_analysis_common import read_snapshot_chunks
 
 
 SESSION = "2026-08-11"
@@ -68,6 +71,127 @@ def candles(start: str = "2026-08-11T13:30:00Z", periods: int = 90) -> pd.DataFr
 
 
 class CandidateLifetimeAnalyzerTests(unittest.TestCase):
+    @staticmethod
+    def _write_light_chunk(path: Path, rows: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_parquet(path, index=False)
+
+    @staticmethod
+    def _legacy_light_events(root: Path, session_date: str) -> list[dict]:
+        from src.live_trading.analysis.candidate_lifetime_analyzer import _canonical_event
+
+        light = read_snapshot_chunks(root, session_date, "light")
+        events = []
+        for row in light.to_dict("records"):
+            raw = dict(row)
+            raw["event_type"] = "SIGNAL_EVALUATED"
+            ready = bool(row.get("ready") if pd.notna(row.get("ready")) else row.get("would_emit_signal_ready", 0))
+            raw["outcome"] = "ready" if ready else "rejected"
+            raw["reason"] = "" if ready else str(row.get("rejection_reason") or row.get("selection_rejected_reason") or "")
+            event_row = _canonical_event(raw, "p1:light_snapshot", session_date)
+            if event_row is not None:
+                events.append(event_row)
+        return events
+
+    def test_streamed_light_loader_matches_legacy_output_across_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            chunk_dir = root / SESSION / "top100_candidate_snapshots" / "light"
+            base = {
+                "session_date": SESSION, "process_start_id": "p1", "timestamp": f"{SESSION}T13:35:00Z",
+                "ready": 0, "would_emit_signal_ready": 0, "rejection_reason": "first_5m_high_too_low",
+                "top100_rank": 1, "top100_score": 100.0, "live_entry_score": 10.0, "current_price": 10.0,
+                "unused_large_payload": "x" * 10_000,
+            }
+            self._write_light_chunk(chunk_dir / "0001.parquet", [
+                {**base, "scan_id": 1, "symbol": "aaa"},
+                {**base, "scan_id": 2, "symbol": "BBB", "timestamp": f"{SESSION}T13:35:05Z"},
+            ])
+            self._write_light_chunk(chunk_dir / "0002.parquet", [
+                # Same snapshot key: legacy keep-last semantics must be preserved across chunk boundaries.
+                {**base, "scan_id": 1, "symbol": "AAA", "live_entry_score": 11.0},
+                {**base, "scan_id": 3, "symbol": "WRONG", "session_date": "2026-08-12", "timestamp": "2026-08-12T13:35:00Z"},
+            ])
+            expected = self._legacy_light_events(root, SESSION)
+            actual, scanned, stats = load_light_events(root, SESSION, batch_size=1)
+            candle_map = {"AAA": candles(), "BBB": candles()}
+            expected_lifetimes, expected_cache = build_lifetimes(
+                SESSION, expected, candle_map, missed_threshold_pct=3.0,
+            )
+            actual_lifetimes, actual_cache = build_lifetimes(
+                SESSION, actual, candle_map, missed_threshold_pct=3.0,
+            )
+            expected_counterfactual = counterfactual_filter_rows(
+                SESSION, expected, candle_map, missed_threshold_pct=3.0,
+                outcome_cache=expected_cache,
+            )
+            actual_counterfactual = counterfactual_filter_rows(
+                SESSION, actual, candle_map, missed_threshold_pct=3.0,
+                outcome_cache=actual_cache,
+            )
+        self.assertEqual(actual, expected)
+        pd.testing.assert_frame_equal(actual_lifetimes, expected_lifetimes)
+        pd.testing.assert_frame_equal(actual_counterfactual, expected_counterfactual)
+        self.assertEqual(scanned, 4)
+        self.assertEqual(stats["rows_session_scoped"], 3)
+        self.assertEqual({row["symbol"] for row in actual}, {"AAA", "BBB"})
+        self.assertTrue(all("unused_large_payload" not in row["raw_json"] for row in actual))
+
+    def test_streamed_light_loader_drops_exact_lower_priority_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            chunk = root / SESSION / "top100_candidate_snapshots" / "light" / "0001.parquet"
+            row = {
+                "session_date": SESSION, "process_start_id": "p1", "scan_id": "scan-1", "symbol": "AAA",
+                "timestamp": f"{SESSION}T13:35:00Z", "ready": 0,
+                "rejection_reason": "first_5m_high_too_low", "current_price": 10.0,
+            }
+            self._write_light_chunk(chunk, [row])
+            higher = event(
+                "AAA", f"{SESSION}T13:35:00Z", "SIGNAL_EVALUATED",
+                reason="first_5m_high_too_low", outcome="rejected",
+            )
+            higher["source"] = "sqlite:runtime_events"
+            actual, _scanned, stats = load_light_events(root, SESSION, higher_priority_keys={
+                (higher["session_date"], higher["symbol"], higher["event_type"], higher["timestamp"].isoformat(),
+                 higher["scan_id"], higher["reason"], higher["outcome"])
+            })
+        self.assertEqual(actual, [])
+        self.assertEqual(stats["higher_priority_duplicates_skipped"], 1)
+
+    def test_session_evidence_keeps_sqlite_priority_over_identical_light_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sqlite_path = root / "runtime.sqlite"
+            raw = {
+                "session_date": SESSION, "symbol": "AAA", "scan_id": "scan-1",
+                "outcome": "rejected", "reason": "first_5m_high_too_low", "current_price": 10.0,
+            }
+            with sqlite3.connect(sqlite_path) as conn:
+                conn.execute(
+                    "CREATE TABLE runtime_events (event_time TEXT, event_type TEXT, session_date TEXT, symbol TEXT, raw_json TEXT)"
+                )
+                conn.execute(
+                    "INSERT INTO runtime_events VALUES (?, ?, ?, ?, ?)",
+                    (f"{SESSION}T13:35:00Z", "SIGNAL_EVALUATED", SESSION, "AAA", json.dumps(raw)),
+                )
+            self._write_light_chunk(
+                root / "recorder" / SESSION / "top100_candidate_snapshots" / "light" / "0001.parquet",
+                [{
+                    **raw, "process_start_id": "p1", "timestamp": f"{SESSION}T13:35:00Z",
+                    "ready": 0, "rejection_reason": "first_5m_high_too_low",
+                }],
+            )
+            rows, quality = load_session_evidence(sqlite_path, root / "recorder", SESSION)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source"], "sqlite:runtime_events")
+        self.assertEqual(quality["p1_light_higher_priority_duplicates_skipped"], 1)
+        self.assertEqual(
+            [item["subphase"] for item in quality["evidence_timings"]],
+            ["sqlite_runtime_events", "recorder_lifecycle", "p1_light_snapshots", "merge_dedup"],
+        )
+        self.assertGreater(quality["evidence_peak_rss_mb"], 0)
+
     def test_observed_172_evaluated_30_ready_30_bought_pattern(self) -> None:
         events = []
         candle_map = {}

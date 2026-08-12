@@ -4,7 +4,9 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
+import resource
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -15,6 +17,7 @@ from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from src.live_trading.analysis.common import (
     fnum,
@@ -37,10 +40,10 @@ from src.live_trading.analysis.full_session_replay_v67 import (
 )
 from src.live_trading.analysis.top100_analysis_common import (
     load_top100_source,
-    read_snapshot_chunks,
     session_dates,
     write_dataframe,
 )
+from src.live_trading.candidate_snapshot_telemetry import snapshot_chunk_paths
 from src.live_trading.analysis.strategy_config_parity import (
     EffectiveSignalThresholds,
     add_threshold_cli,
@@ -71,6 +74,20 @@ SUPPORTED_REPLAY_FILTERS = {
     "current_price_breakout_not_met",
 }
 NON_FILTER_READY_REASONS = {"", "ready", "live_safe_expansion_ready", "would_emit_signal_ready"}
+
+LIGHT_REQUIRED_COLUMNS = {
+    "session_date", "trading_session_date", "trade_session_date", "timestamp", "event_time", "recorded_at",
+    "process_start_id", "scan_id", "ranking_generation", "symbol", "ready", "would_emit_signal_ready",
+    "rejection_reason", "selection_rejected_reason", "signal_ready_reason", "top100_rank", "rank",
+    "top100_score", "live_entry_score", "score", "current_price", "price", "last", "decision_price",
+    "entries_blocked", "entries_blocked_reason", "blocking_reason", "already_open",
+}
+EVENT_SOURCE_PRIORITY = {
+    "sqlite:runtime_events": 3,
+    "recorder:trade_lifecycle.csv": 2,
+    "recorder:order_lifecycle.jsonl": 2,
+    "p1:light_snapshot": 1,
+}
 
 LIFETIME_COLUMNS = [
     "session_date", "symbol", "top100_rank", "top100_score",
@@ -105,6 +122,55 @@ PORTFOLIO_COLUMNS = [
 @dataclass
 class PhaseCounter:
     phases: list[dict[str, Any]]
+
+
+def _rss_mb() -> float | None:
+    status = Path(f"/proc/{os.getpid()}/status")
+    if status.exists():
+        try:
+            for line in status.read_text(errors="replace").splitlines():
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+        except Exception:
+            pass
+    try:
+        value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        return value / (1024.0 * 1024.0) if value > 10_000_000 else value / 1024.0
+    except Exception:
+        return None
+
+
+def _peak_rss_mb() -> float | None:
+    try:
+        value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        return value / (1024.0 * 1024.0) if value > 10_000_000 else value / 1024.0
+    except Exception:
+        return None
+
+
+@contextmanager
+def evidence_timing(name: str, records: list[dict[str, Any]], **fields: Any):
+    started = time.perf_counter()
+    before = _rss_mb()
+    try:
+        yield fields
+    finally:
+        after = _rss_mb()
+        record = {
+            "subphase": name,
+            "elapsed_seconds": time.perf_counter() - started,
+            "rss_before_mb": before,
+            "rss_after_mb": after,
+            "rss_delta_mb": (after - before) if before is not None and after is not None else None,
+            "peak_rss_mb": _peak_rss_mb(),
+            **fields,
+        }
+        records.append(record)
+        print(
+            "CANDIDATE_LIFETIME_EVIDENCE_TIMING "
+            + " ".join(f"{key}={value if value is not None else ''}" for key, value in record.items()),
+            flush=True,
+        )
 
 
 @contextmanager
@@ -186,6 +252,13 @@ def _canonical_event(row: dict[str, Any], source: str, requested_date: str) -> d
     }
 
 
+def _event_key(event: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        event["session_date"], event["symbol"], event["event_type"], event["timestamp"].isoformat(),
+        event.get("scan_id") or "", event.get("reason") or "", event.get("outcome") or "",
+    )
+
+
 def load_sqlite_events(sqlite_path: Path, session_date: str) -> list[dict[str, Any]]:
     if not sqlite_path.exists():
         return []
@@ -260,24 +333,97 @@ def load_recorder_events(recorder_dir: Path, session_date: str) -> tuple[list[di
     return events, rows_used
 
 
-def load_light_events(recorder_dir: Path, session_date: str) -> tuple[list[dict[str, Any]], int]:
-    light = read_snapshot_chunks(recorder_dir, session_date, "light")
-    if light.empty:
-        return [], 0
+def _light_snapshot_key(row: dict[str, Any], key_columns: tuple[str, ...]) -> tuple[Any, ...]:
+    return tuple(normalize_symbol(row.get(column)) if column == "symbol" else row.get(column) for column in key_columns)
+
+
+def _light_event(row: dict[str, Any], session_date: str) -> dict[str, Any] | None:
+    raw = dict(row)
+    raw["event_type"] = "SIGNAL_EVALUATED"
+    ready_value = fnum(row.get("ready"))
+    if ready_value is None:
+        ready_value = fnum(row.get("would_emit_signal_ready"), 0)
+    ready = bool(ready_value)
+    raw["outcome"] = "ready" if ready else "rejected"
+    raw["reason"] = "" if ready else str(row.get("rejection_reason") or row.get("selection_rejected_reason") or "")
+    return _canonical_event(raw, "p1:light_snapshot", session_date)
+
+
+def load_light_events(
+    recorder_dir: Path,
+    session_date: str,
+    *,
+    higher_priority_keys: set[tuple[Any, ...]] | None = None,
+    batch_size: int = 4096,
+) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
+    paths = snapshot_chunk_paths(recorder_dir, session_date, "light")
+    if not paths:
+        return [], 0, {"chunks": 0, "rows_session_scoped": 0, "higher_priority_duplicates_skipped": 0}
+
+    schema_names: set[str] = set()
+    for path in paths:
+        try:
+            schema_names.update(pq.ParquetFile(path).schema_arrow.names)
+        except Exception:
+            continue
+    key_columns = tuple(
+        column for column in ("session_date", "process_start_id", "scan_id", "symbol")
+        if column in schema_names
+    )
+    selected_by_snapshot: dict[tuple[Any, ...], dict[str, Any]] = {}
+    rows_scanned = 0
+    rows_session_scoped = 0
+    for path in paths:
+        try:
+            parquet = pq.ParquetFile(path)
+            columns = sorted(LIGHT_REQUIRED_COLUMNS.intersection(parquet.schema_arrow.names))
+            if not columns:
+                continue
+            for batch in parquet.iter_batches(batch_size=batch_size, columns=columns):
+                py_rows = batch.to_pylist()
+                timestamp_column = next(
+                    (name for name in ("timestamp", "event_time", "recorded_at") if name in batch.schema.names),
+                    None,
+                )
+                parsed_timestamps = (
+                    pd.to_datetime(batch.column(batch.schema.get_field_index(timestamp_column)).to_pandas(), errors="coerce", utc=True).tolist()
+                    if timestamp_column else [None] * len(py_rows)
+                )
+                for row, parsed_timestamp in zip(py_rows, parsed_timestamps):
+                    rows_scanned += 1
+                    if timestamp_column and parsed_timestamp is not None and not pd.isna(parsed_timestamp):
+                        row[timestamp_column] = parsed_timestamp
+                    raw_session = str(
+                        row.get("session_date") or row.get("trading_session_date")
+                        or row.get("trade_session_date") or ""
+                    )[:10]
+                    if raw_session and raw_session != session_date:
+                        continue
+                    event = _light_event(row, session_date)
+                    if event is None:
+                        continue
+                    rows_session_scoped += 1
+                    key = _light_snapshot_key(row, key_columns) if key_columns else (rows_scanned,)
+                    # Matches read_snapshot_chunks(...).drop_duplicates(..., keep="last").
+                    selected_by_snapshot[key] = event
+        except Exception:
+            continue
+
+    higher = higher_priority_keys or set()
     events: list[dict[str, Any]] = []
-    for row in light.to_dict("records"):
-        raw = dict(row)
-        raw["event_type"] = "SIGNAL_EVALUATED"
-        ready_value = fnum(row.get("ready"))
-        if ready_value is None:
-            ready_value = fnum(row.get("would_emit_signal_ready"), 0)
-        ready = bool(ready_value)
-        raw["outcome"] = "ready" if ready else "rejected"
-        raw["reason"] = "" if ready else str(row.get("rejection_reason") or row.get("selection_rejected_reason") or "")
-        event = _canonical_event(raw, "p1:light_snapshot", session_date)
-        if event is not None:
-            events.append(event)
-    return events, len(light)
+    skipped = 0
+    for event in selected_by_snapshot.values():
+        if _event_key(event) in higher:
+            skipped += 1
+            continue
+        events.append(event)
+    events.sort(key=lambda item: (item["timestamp"], item["symbol"], item["event_type"]))
+    stats = {
+        "chunks": len(paths),
+        "rows_session_scoped": rows_session_scoped,
+        "higher_priority_duplicates_skipped": skipped,
+    }
+    return events, rows_scanned, stats
 
 
 def enrich_event_ranking(events: list[dict[str, Any]], top100: pd.DataFrame) -> None:
@@ -296,20 +442,32 @@ def enrich_event_ranking(events: list[dict[str, Any]], top100: pd.DataFrame) -> 
 
 
 def deduplicate_events(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    priority = {"sqlite:runtime_events": 3, "recorder:trade_lifecycle.csv": 2, "recorder:order_lifecycle.jsonl": 2, "p1:light_snapshot": 1}
     selected: dict[tuple[Any, ...], dict[str, Any]] = {}
     duplicates = 0
-    for event in sorted(events, key=lambda item: (item["timestamp"], -priority.get(item["source"], 0))):
-        key = (
-            event["session_date"], event["symbol"], event["event_type"], event["timestamp"].isoformat(),
-            event.get("scan_id") or "", event.get("reason") or "", event.get("outcome") or "",
-        )
+    for event in sorted(events, key=lambda item: (item["timestamp"], -EVENT_SOURCE_PRIORITY.get(item["source"], 0))):
+        key = _event_key(event)
         if key in selected:
             duplicates += 1
-            if priority.get(event["source"], 0) > priority.get(selected[key]["source"], 0):
+            if EVENT_SOURCE_PRIORITY.get(event["source"], 0) > EVENT_SOURCE_PRIORITY.get(selected[key]["source"], 0):
                 selected[key] = event
         else:
             selected[key] = event
+    return sorted(selected.values(), key=lambda item: (item["timestamp"], item["symbol"], item["event_type"])), duplicates
+
+
+def deduplicate_event_sources(*sources: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    selected: dict[tuple[Any, ...], dict[str, Any]] = {}
+    duplicates = 0
+    for source in sources:
+        for event in source:
+            key = _event_key(event)
+            previous = selected.get(key)
+            if previous is None:
+                selected[key] = event
+                continue
+            duplicates += 1
+            if EVENT_SOURCE_PRIORITY.get(event["source"], 0) > EVENT_SOURCE_PRIORITY.get(previous["source"], 0):
+                selected[key] = event
     return sorted(selected.values(), key=lambda item: (item["timestamp"], item["symbol"], item["event_type"])), duplicates
 
 
@@ -640,10 +798,31 @@ def portfolio_counterfactuals(
 
 
 def load_session_evidence(sqlite_path: Path, recorder_dir: Path, session_date: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    sqlite_events = load_sqlite_events(sqlite_path, session_date)
-    recorder_events, recorder_rows = load_recorder_events(recorder_dir, session_date)
-    light_events, light_rows = load_light_events(recorder_dir, session_date)
-    combined, duplicate_count = deduplicate_events([*sqlite_events, *recorder_events, *light_events])
+    evidence_timings: list[dict[str, Any]] = []
+    with evidence_timing("sqlite_runtime_events", evidence_timings) as metrics:
+        sqlite_events = load_sqlite_events(sqlite_path, session_date)
+        metrics["rows"] = len(sqlite_events)
+    with evidence_timing("recorder_lifecycle", evidence_timings) as metrics:
+        recorder_events, recorder_rows = load_recorder_events(recorder_dir, session_date)
+        metrics["rows_scanned"] = recorder_rows
+        metrics["rows"] = len(recorder_events)
+
+    higher_priority, higher_duplicate_count = deduplicate_event_sources(sqlite_events, recorder_events)
+    higher_keys = {_event_key(event) for event in higher_priority}
+    with evidence_timing("p1_light_snapshots", evidence_timings) as metrics:
+        light_events, light_rows, light_stats = load_light_events(
+            recorder_dir, session_date, higher_priority_keys=higher_keys,
+        )
+        metrics["rows_scanned"] = light_rows
+        metrics["rows"] = len(light_events)
+        metrics.update(light_stats)
+    with evidence_timing("merge_dedup", evidence_timings) as metrics:
+        combined, merge_duplicate_count = deduplicate_event_sources(higher_priority, light_events)
+        metrics["rows"] = len(combined)
+    duplicate_count = (
+        higher_duplicate_count + merge_duplicate_count
+        + int(light_stats.get("higher_priority_duplicates_skipped", 0))
+    )
     quality = {
         "sqlite_event_rows_used": len(sqlite_events),
         "recorder_rows_scanned": recorder_rows,
@@ -652,6 +831,11 @@ def load_session_evidence(sqlite_path: Path, recorder_dir: Path, session_date: s
         "p1_light_rows_used": len(light_events),
         "candidate_event_rows_after_dedupe": len(combined),
         "duplicate_event_count": duplicate_count,
+        "evidence_timings": evidence_timings,
+        "evidence_peak_rss_mb": _peak_rss_mb(),
+        "p1_light_chunks": light_stats.get("chunks", 0),
+        "p1_light_rows_session_scoped": light_stats.get("rows_session_scoped", 0),
+        "p1_light_higher_priority_duplicates_skipped": light_stats.get("higher_priority_duplicates_skipped", 0),
     }
     return combined, quality
 
@@ -675,7 +859,10 @@ def analyze_session(
         events, quality = load_session_evidence(sqlite_path, recorder_dir, session_date)
     if not events:
         raise RuntimeError(f"no candidate evaluation evidence for {session_date}")
-    top100, top100_path, ranking_source_date = load_top100_source(top100_dir, session_date)
+    evidence_timings = quality.setdefault("evidence_timings", [])
+    with evidence_timing("top100", evidence_timings) as metrics:
+        top100, top100_path, ranking_source_date = load_top100_source(top100_dir, session_date)
+        metrics["rows"] = len(top100)
     if top100_path is None:
         raise RuntimeError(f"dated Top100 unavailable for {session_date}")
     enrich_event_ranking(events, top100)
@@ -686,9 +873,12 @@ def analyze_session(
     }
     history_symbols = sorted(set(evidence_symbols) | top100_symbols)
     with phase("load_history", timings, date=session_date, symbols=len(history_symbols)):
-        candles_by_symbol = {
-            symbol: load_session_candles(history_dir, symbol, session_date) for symbol in history_symbols
-        }
+        with evidence_timing("history_candles", evidence_timings) as metrics:
+            candles_by_symbol = {
+                symbol: load_session_candles(history_dir, symbol, session_date) for symbol in history_symbols
+            }
+            metrics["symbols"] = len(history_symbols)
+            metrics["rows"] = sum(len(frame) for frame in candles_by_symbol.values())
     with phase("candidate_lifetimes", timings, date=session_date, symbols=len(evidence_symbols)):
         lifetimes, outcome_cache = build_lifetimes(
             session_date, events, candles_by_symbol, missed_threshold_pct=missed_threshold_pct,
