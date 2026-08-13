@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 from datetime import date
 from pathlib import Path
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.cleanup_runtime_events import cleanup_runtime_events
+from src.live_trading.storage import sqlite_store as sqlite_store_module
 from src.live_trading.storage.sqlite_store import SQLiteRuntimeStore, SQLiteWriteQueue, parse_jsonish, safe_sqlite_call, session_date_utc
 from src.live_trading.v62_live_data_recorder import LiveDataRecorder
 from src.live_trading.v66_ibkr_account_recorder import record_recent_fills
@@ -128,6 +130,9 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 self.assertIn("ack_timeouts_total", queue_store.status())
                 self.assertIn("ack_timeouts_by_method", queue_store.status())
                 self.assertIn("max_queue_depth", queue_store.status())
+                self.assertIn("write_latency_p50_ms", queue_store.status())
+                self.assertIn("write_latency_p95_ms", queue_store.status())
+                self.assertIn("write_latency_p99_ms", queue_store.status())
             finally:
                 queue_store.close()
 
@@ -1146,6 +1151,206 @@ class SQLiteRuntimeStoreTests(unittest.TestCase):
                 self.assertAlmostEqual(suppressed[0]["quantity"], 7)
             finally:
                 store.close()
+
+    def test_identical_broker_snapshot_does_not_rebuild_canonical_history(self) -> None:
+        today = date.today().isoformat()
+        previous_async = sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED
+        sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED = False
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                store.upsert_execution({
+                    "execution_id": "B_STABLE_OLD", "strategy_name": "v67", "session_date": today,
+                    "symbol": "STABLE", "side": "BOT", "quantity": 5, "price": 8,
+                    "executed_at": f"{today}T13:20:00+00:00", "commission": 0.1, "commission_source": "ibkr",
+                })
+                store.upsert_execution({
+                    "execution_id": "S_STABLE_OLD", "strategy_name": "v67", "session_date": today,
+                    "symbol": "STABLE", "side": "SLD", "quantity": 5, "price": 9,
+                    "executed_at": f"{today}T13:25:00+00:00", "commission": 0.1,
+                    "commission_source": "ibkr", "realized_pnl": 5,
+                })
+                store.upsert_execution({
+                    "execution_id": "B_STABLE", "strategy_name": "v67", "session_date": today,
+                    "symbol": "STABLE", "side": "BOT", "quantity": 20, "price": 10,
+                    "executed_at": f"{today}T13:30:00+00:00",
+                })
+                old_trade_id = store.query("SELECT trade_id FROM trades WHERE symbol = 'STABLE'")[0]["trade_id"]
+                store.execute("UPDATE trades SET peak_price = 10, updated_at = 'stable-marker' WHERE trade_id = ?", [old_trade_id])
+                with patch.object(store, "rebuild_positions_from_executions", wraps=store.rebuild_positions_from_executions) as rebuild:
+                    first = store.reconcile_active_positions_to_broker_snapshot({"STABLE": 20})
+                    second = store.reconcile_active_positions_to_broker_snapshot({"STABLE": 20})
+
+                self.assertEqual(rebuild.call_count, 0)
+                self.assertEqual(first["symbols_changed"], 0)
+                self.assertEqual(second["closed_trades_rebuilt"], 0)
+                self.assertEqual(second["symbols_skipped_unchanged"], 1)
+                old_trade = store.query("SELECT peak_price, updated_at FROM trades WHERE trade_id = ?", [old_trade_id])[0]
+                self.assertEqual(old_trade, {"peak_price": 10.0, "updated_at": "stable-marker"})
+            finally:
+                store.close()
+                sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED = previous_async
+
+    def test_changed_broker_snapshot_rebuilds_only_drifted_symbol(self) -> None:
+        today = date.today().isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                for symbol in ("KEEP", "DRIFT"):
+                    store.upsert_execution({
+                        "execution_id": f"B_{symbol}", "strategy_name": "v67", "session_date": today,
+                        "symbol": symbol, "side": "BOT", "quantity": 20, "price": 10,
+                        "executed_at": f"{today}T13:30:00+00:00",
+                    })
+                result = store.reconcile_active_positions_to_broker_snapshot({"KEEP": 20, "DRIFT": 10})
+
+                self.assertEqual(result["symbols_inspected"], 2)
+                self.assertEqual(result["symbols_changed"], 1)
+                self.assertEqual(result["symbols_rebuilt"], ["DRIFT"])
+                active = store.query("SELECT quantity FROM positions WHERE symbol = 'DRIFT' AND active = 1")
+                self.assertAlmostEqual(active[0]["quantity"], 10)
+            finally:
+                store.close()
+
+    def test_broker_only_symbol_without_execution_is_reported_without_empty_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                with patch.object(store, "rebuild_positions_from_executions") as rebuild:
+                    result = store.reconcile_active_positions_to_broker_snapshot({"BROKERONLY": 10})
+
+                rebuild.assert_not_called()
+                self.assertEqual(result["symbols_changed"], 0)
+                self.assertEqual(result["broker_symbols_without_execution"], 1)
+                self.assertEqual(result["closed_trades_rebuilt"], 0)
+            finally:
+                store.close()
+
+    def test_peak_scheduler_deduplicates_jobs_and_uses_one_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            release = threading.Event()
+            started = threading.Event()
+
+            def calculate(_trade_id: str) -> dict:
+                started.set()
+                release.wait(timeout=2)
+                return {"peak_data_quality": "EXACT", "validation_status": "OK"}
+
+            try:
+                with patch.object(sqlite_store_module, "TRADE_PEAK_BACKGROUND_DELAY_SECONDS", 0), patch.object(
+                    SQLiteRuntimeStore, "calculate_and_store_trade_peak", side_effect=calculate,
+                ):
+                    self.assertTrue(store.schedule_trade_peak_calculation("T_DEDUPE"))
+                    self.assertTrue(started.wait(timeout=1))
+                    self.assertFalse(store.schedule_trade_peak_calculation("T_DEDUPE"))
+                    self.assertTrue(store.schedule_trade_peak_calculation("T_SECOND"))
+                    status = store.peak_job_status()
+                    self.assertEqual(status["peak_jobs_queued"], 2)
+                    self.assertEqual(status["peak_jobs_deduplicated"], 1)
+                    self.assertEqual(len(store._peak_threads), 1)
+                    release.set()
+                    store._peak_queue.join()
+            finally:
+                release.set()
+                store.close()
+
+    def test_late_commission_updates_only_affected_round_trip_and_preserves_peaks(self) -> None:
+        today = date.today().isoformat()
+        previous_async = sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED
+        sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED = False
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                executions = [
+                    ("B_OLD", "BOT", 10.0, 10.0, 30, 0.5, "ibkr", None),
+                    ("S_OLD", "SLD", 10.0, 11.0, 35, 0.5, "ibkr", 10.0),
+                    ("B_NEW", "BOT", 5.0, 20.0, 40, 0.25, "ibkr", None),
+                    ("S_NEW", "SLD", 5.0, 21.0, 45, None, "missing", 5.0),
+                ]
+                for exec_id, side, qty, price, minute, commission, source, pnl in executions:
+                    store.upsert_execution({
+                        "execution_id": exec_id, "strategy_name": "v67", "session_date": today,
+                        "symbol": "ROUND", "side": side, "quantity": qty, "price": price,
+                        "executed_at": f"{today}T13:{minute}:00+00:00", "commission": commission,
+                        "commission_source": source, "realized_pnl": pnl,
+                    })
+                trades = store.query("SELECT * FROM trades WHERE symbol = 'ROUND' ORDER BY entry_fill_time")
+                self.assertEqual(len(trades), 2)
+                old_id, affected_id = trades[0]["trade_id"], trades[1]["trade_id"]
+                old_raw = parse_jsonish(trades[0]["raw_json"])
+                old_raw.update({"peak_data_quality": "EXACT", "peak_rebuild_status": "rebuilt_from_candles"})
+                store.execute(
+                    "UPDATE trades SET peak_price = 12, mfe_pct = 20, raw_json = ?, updated_at = 'old-trade-marker' WHERE trade_id = ?",
+                    [json.dumps(old_raw, sort_keys=True), old_id],
+                )
+                old_components = store.query(
+                    "SELECT component_id, updated_at FROM trade_components WHERE trade_id = ? ORDER BY component_id",
+                    [old_id],
+                )
+                unchanged_broker = store.reconcile_active_positions_to_broker_snapshot({})
+                self.assertEqual(unchanged_broker["symbols_changed"], 0)
+
+                with patch.object(store, "schedule_trade_peak_calculation", wraps=store.schedule_trade_peak_calculation) as peak_schedule, patch.object(
+                    store, "reconcile_active_positions_to_broker_snapshot",
+                    wraps=store.reconcile_active_positions_to_broker_snapshot,
+                ) as broker_reconcile:
+                    store.upsert_execution({
+                        "execution_id": "S_NEW", "strategy_name": "v67", "session_date": today,
+                        "symbol": "ROUND", "side": "SLD", "quantity": 5, "price": 21,
+                        "executed_at": f"{today}T13:45:00+00:00", "commission": 0.25,
+                        "commission_source": "ibkr", "realized_pnl": 5,
+                    })
+
+                old = store.query("SELECT peak_price, mfe_pct, updated_at, raw_json FROM trades WHERE trade_id = ?", [old_id])[0]
+                affected = store.query("SELECT status, commission, net_pnl FROM trades WHERE trade_id = ?", [affected_id])[0]
+                self.assertEqual(old["peak_price"], 12.0)
+                self.assertEqual(old["mfe_pct"], 20.0)
+                self.assertEqual(old["updated_at"], "old-trade-marker")
+                self.assertEqual(parse_jsonish(old["raw_json"])["peak_data_quality"], "EXACT")
+                self.assertEqual(
+                    old_components,
+                    store.query(
+                        "SELECT component_id, updated_at FROM trade_components WHERE trade_id = ? ORDER BY component_id",
+                        [old_id],
+                    ),
+                )
+                self.assertEqual(affected["status"], "CLOSED")
+                self.assertAlmostEqual(affected["commission"], 0.5)
+                self.assertAlmostEqual(affected["net_pnl"], 4.5)
+                peak_schedule.assert_not_called()
+                broker_reconcile.assert_not_called()
+            finally:
+                store.close()
+                sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED = previous_async
+
+    def test_new_execution_on_existing_symbol_leaves_old_round_trip_untouched(self) -> None:
+        today = date.today().isoformat()
+        previous_async = sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED
+        sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED = False
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteRuntimeStore(Path(tmp) / "runtime.sqlite")
+            try:
+                for row in (
+                    {"execution_id": "B_FIRST", "side": "BOT", "quantity": 2, "price": 10, "executed_at": f"{today}T13:30:00+00:00"},
+                    {"execution_id": "S_FIRST", "side": "SLD", "quantity": 2, "price": 11, "executed_at": f"{today}T13:31:00+00:00", "realized_pnl": 2},
+                ):
+                    store.upsert_execution({**row, "strategy_name": "v67", "session_date": today, "symbol": "NEWCYCLE", "commission": 0.1, "commission_source": "ibkr"})
+                first = store.query("SELECT trade_id FROM trades WHERE symbol = 'NEWCYCLE'")[0]["trade_id"]
+                store.execute("UPDATE trades SET peak_price = 12, updated_at = 'first-cycle-marker' WHERE trade_id = ?", [first])
+
+                for row in (
+                    {"execution_id": "B_SECOND", "side": "BOT", "quantity": 3, "price": 20, "executed_at": f"{today}T13:40:00+00:00"},
+                    {"execution_id": "S_SECOND", "side": "SLD", "quantity": 3, "price": 22, "executed_at": f"{today}T13:41:00+00:00", "realized_pnl": 6},
+                ):
+                    store.upsert_execution({**row, "strategy_name": "v67", "session_date": today, "symbol": "NEWCYCLE", "commission": 0.1, "commission_source": "ibkr"})
+
+                trades = store.query("SELECT trade_id, peak_price, updated_at FROM trades WHERE symbol = 'NEWCYCLE' ORDER BY entry_fill_time")
+                self.assertEqual(len(trades), 2)
+                self.assertEqual(trades[0], {"trade_id": first, "peak_price": 12.0, "updated_at": "first-cycle-marker"})
+            finally:
+                store.close()
+                sqlite_store_module.TRADE_PEAK_ASYNC_CALCULATION_ENABLED = previous_async
 
     def test_runtime_state_status_and_pending_counts(self) -> None:
         today = date.today().isoformat()

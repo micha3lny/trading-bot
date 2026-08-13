@@ -1928,6 +1928,13 @@ def runtime_state_growth_current_metrics(
         "sqlite_dropped_writes": int(sqlite_status.get("dropped_writes") or 0),
         "sqlite_current_write_method": str(sqlite_status.get("current_write_method") or ""),
         "sqlite_current_write_duration_seconds": sqlite_status.get("current_write_duration_seconds") or 0,
+        "sqlite_write_latency_p50_ms": sqlite_status.get("write_latency_p50_ms"),
+        "sqlite_write_latency_p95_ms": sqlite_status.get("write_latency_p95_ms"),
+        "sqlite_write_latency_p99_ms": sqlite_status.get("write_latency_p99_ms"),
+        "sqlite_peak_jobs_queued": int(sqlite_status.get("peak_jobs_queued") or 0),
+        "sqlite_peak_jobs_deduplicated": int(sqlite_status.get("peak_jobs_deduplicated") or 0),
+        "sqlite_peak_jobs_skipped": int(sqlite_status.get("peak_jobs_skipped") or 0),
+        "sqlite_peak_queue_depth": int(sqlite_status.get("peak_queue_depth") or 0),
         "pending_sqlite_requests_count": int(sqlite_status.get("queue_depth") or 0),
         "rate_limit_state_count": len(_runtime_dict_readonly(runtime_state, "rate_limited_log_state")),
         "log_throttle_key_count": sum(_len_safe(item.get("keys")) for item in _runtime_dict_readonly(runtime_state, "rate_limited_log_state").values() if isinstance(item, dict)),
@@ -10161,6 +10168,13 @@ def main() -> int:
                 f"sqlite_ack_timeouts_total={int(sqlite_writer_status.get('ack_timeouts_total') or 0)} "
                 f"sqlite_ack_timeouts_by_method={sqlite_ack_timeouts_by_method} "
                 f"sqlite_last_write_latency_ms={sqlite_writer_status.get('last_write_latency_ms') or ''} "
+                f"sqlite_write_latency_p50_ms={sqlite_writer_status.get('write_latency_p50_ms') or ''} "
+                f"sqlite_write_latency_p95_ms={sqlite_writer_status.get('write_latency_p95_ms') or ''} "
+                f"sqlite_write_latency_p99_ms={sqlite_writer_status.get('write_latency_p99_ms') or ''} "
+                f"sqlite_peak_jobs_queued={int(sqlite_writer_status.get('peak_jobs_queued') or 0)} "
+                f"sqlite_peak_jobs_deduplicated={int(sqlite_writer_status.get('peak_jobs_deduplicated') or 0)} "
+                f"sqlite_peak_jobs_skipped={int(sqlite_writer_status.get('peak_jobs_skipped') or 0)} "
+                f"sqlite_peak_queue_depth={int(sqlite_writer_status.get('peak_queue_depth') or 0)} "
                 f"sqlite_last_write_error={sqlite_last_error} "
                 f"ineligible_symbols={len(_runtime_set(runtime_state, 'ineligible_symbols'))} "
                 f"entry_rejected_count={int(runtime_state.get('entry_rejected_count') or 0)} "

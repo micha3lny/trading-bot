@@ -174,6 +174,12 @@ class SQLiteTradePeakRebuilderTests(unittest.TestCase):
                 first = store.calculate_and_store_trade_peak(trade["trade_id"])
                 self.assertEqual(first["peak_data_quality"], "RETRY_PENDING")
 
+                first_repair = store.repair_trade_peaks_needing_rebuild("2026-07-16")
+                immediate_retry = store.repair_trade_peaks_needing_rebuild("2026-07-16")
+                self.assertEqual(first_repair["eligible"], 1)
+                self.assertEqual(immediate_retry["eligible"], 0)
+                self.assertEqual(immediate_retry["skipped_backoff"], 1)
+
                 write_history(
                     history_dir,
                     "LATEPEAK",
@@ -183,6 +189,15 @@ class SQLiteTradePeakRebuilderTests(unittest.TestCase):
                         ("2026-07-16T13:31:00+00:00", 11.0, 10.2),
                         ("2026-07-16T13:32:00+00:00", 10.7, 10.4),
                     ],
+                )
+                retry_raw = json.loads(store.query(
+                    "SELECT raw_json FROM trades WHERE trade_id = ?", [trade["trade_id"]]
+                )[0]["raw_json"])
+                retry_raw["peak_repair_attempts"] = sqlite_store_module.TRADE_PEAK_REPAIR_MAX_ATTEMPTS
+                retry_raw["peak_repair_next_eligible_at"] = "2026-07-16T00:00:00+00:00"
+                store.execute(
+                    "UPDATE trades SET raw_json = ? WHERE trade_id = ?",
+                    [json.dumps(retry_raw, sort_keys=True), trade["trade_id"]],
                 )
                 retry = store.repair_trade_peaks_needing_rebuild("2026-07-16")
                 row = store.query("SELECT mfe_pct, mae_pct, peak_price, raw_json FROM trades WHERE trade_id = ?", [trade["trade_id"]])[0]

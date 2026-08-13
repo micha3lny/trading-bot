@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -37,6 +38,17 @@ SQLITE_WRITER_SLOW_WRITE_SECONDS = float(os.environ.get("TRADING_BOT_SQLITE_WRIT
 TRADE_PEAK_ASYNC_CALCULATION_ENABLED = os.environ.get("TRADING_BOT_TRADE_PEAK_ASYNC_CALCULATION", "1").strip().lower() not in {"0", "false", "no", "off"}
 TRADE_PEAK_BACKGROUND_DELAY_SECONDS = float(os.environ.get("TRADING_BOT_TRADE_PEAK_BACKGROUND_DELAY_SECONDS", "0.25"))
 TRADE_PEAK_BACKGROUND_JOIN_TIMEOUT_SECONDS = float(os.environ.get("TRADING_BOT_TRADE_PEAK_BACKGROUND_JOIN_TIMEOUT_SECONDS", "5.0"))
+TRADE_PEAK_QUEUE_MAXSIZE = int(os.environ.get("TRADING_BOT_TRADE_PEAK_QUEUE_MAXSIZE", "256"))
+TRADE_PEAK_REPAIR_MAX_ATTEMPTS = int(os.environ.get("TRADING_BOT_TRADE_PEAK_REPAIR_MAX_ATTEMPTS", "3"))
+TRADE_PEAK_REPAIR_BACKOFF_SECONDS = float(os.environ.get("TRADING_BOT_TRADE_PEAK_REPAIR_BACKOFF_SECONDS", "900"))
+TRADE_PEAK_RAW_FIELDS = {
+    "peak_rebuild_status", "peak_data_quality", "peak_source", "peak_version", "peak_calculated_at",
+    "peak_error", "peak_time", "peak_pct", "peak_gain_pct", "peak_unrealized_pct",
+    "drop_from_peak_pct", "giveback_pct", "giveback_usd", "peak_position_key",
+    "validation_status", "validation_reason",
+    "peak_repair_attempts", "peak_repair_last_attempt_at", "peak_repair_last_error",
+    "peak_repair_next_eligible_at",
+}
 SQLITE_WRITER_METHOD_ACK_TIMEOUT_SECONDS = {
     "set_broker_net_positions": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_BROKER_POSITIONS", "8.0")),
     "reconcile_active_positions_to_broker_snapshot": float(os.environ.get("TRADING_BOT_SQLITE_ACK_TIMEOUT_RECONCILE", "12.0")),
@@ -421,12 +433,31 @@ class SQLiteRuntimeStore:
         self._broker_net_positions: dict[str, float] | None = None
         self._peak_threads: set[threading.Thread] = set()
         self._peak_threads_lock = threading.Lock()
+        self._peak_queue: queue.Queue[str | None] = queue.Queue(maxsize=max(1, TRADE_PEAK_QUEUE_MAXSIZE))
+        self._peak_pending: set[str] = set()
+        self._peak_worker: threading.Thread | None = None
+        self._peak_status: dict[str, Any] = {
+            "peak_jobs_queued": 0,
+            "peak_jobs_skipped": 0,
+            "peak_jobs_deduplicated": 0,
+            "peak_jobs_completed": 0,
+            "peak_jobs_failed": 0,
+            "peak_queue_high_watermark": 0,
+        }
         if init:
             self.init_schema()
 
     def close(self) -> None:
         with self._peak_threads_lock:
             peak_threads = list(self._peak_threads)
+            worker = self._peak_worker
+        if worker is not None and worker.is_alive():
+            try:
+                self._peak_queue.put(None, timeout=max(0.0, TRADE_PEAK_BACKGROUND_JOIN_TIMEOUT_SECONDS))
+            except queue.Full:
+                log_sqlite_line(
+                    f"{utc_now_iso()} TRADE_PEAK_WORKER_CLOSE_TIMEOUT queue_depth={self._peak_queue.qsize()}"
+                )
         for thread in peak_threads:
             if thread is not threading.current_thread():
                 thread.join(timeout=max(0.0, TRADE_PEAK_BACKGROUND_JOIN_TIMEOUT_SECONDS))
@@ -450,7 +481,7 @@ class SQLiteRuntimeStore:
             "peak_pct": result.peak_pct,
         }
 
-    def _calculate_and_store_trade_peak_background(self, trade_id: str) -> None:
+    def _calculate_and_store_trade_peak_background(self, trade_id: str) -> bool:
         if TRADE_PEAK_BACKGROUND_DELAY_SECONDS > 0:
             time.sleep(TRADE_PEAK_BACKGROUND_DELAY_SECONDS)
         store: SQLiteRuntimeStore | None = None
@@ -463,6 +494,7 @@ class SQLiteRuntimeStore:
                 f"peak_data_quality={result.get('peak_data_quality')} "
                 f"validation_status={result.get('validation_status')}"
             )
+            return True
         except Exception as exc:
             log_sqlite_line(f"{utc_now_iso()} TRADE_PEAK_CALCULATION_FAILED trade_id={trade_id} error={exc!r}")
             try:
@@ -499,26 +531,81 @@ class SQLiteRuntimeStore:
                     )
             except Exception as mark_exc:
                 log_sqlite_line(f"{utc_now_iso()} TRADE_PEAK_MARK_NEEDS_REBUILD_FAILED trade_id={trade_id} error={mark_exc!r}")
+            return False
         finally:
             if store is not None:
                 store.close()
-            with self._peak_threads_lock:
-                self._peak_threads.discard(threading.current_thread())
 
-    def schedule_trade_peak_calculation(self, trade_id: str) -> None:
-        if not TRADE_PEAK_ASYNC_CALCULATION_ENABLED or not trade_id:
-            return
-        thread = threading.Thread(
-            target=self._calculate_and_store_trade_peak_background,
-            args=(trade_id,),
-            name=f"trade-peak-{str(trade_id)[:32]}",
-            daemon=True,
-        )
+    def _trade_peak_worker_loop(self) -> None:
+        while True:
+            trade_id = self._peak_queue.get()
+            if trade_id is None:
+                self._peak_queue.task_done()
+                break
+            try:
+                succeeded = self._calculate_and_store_trade_peak_background(trade_id)
+                with self._peak_threads_lock:
+                    self._peak_status["peak_jobs_completed" if succeeded else "peak_jobs_failed"] += 1
+            except BaseException:
+                with self._peak_threads_lock:
+                    self._peak_status["peak_jobs_failed"] += 1
+            finally:
+                with self._peak_threads_lock:
+                    self._peak_pending.discard(trade_id)
+                self._peak_queue.task_done()
         with self._peak_threads_lock:
-            self._peak_threads.add(thread)
-        thread.start()
+            self._peak_threads.discard(threading.current_thread())
 
-    def repair_trade_peaks_needing_rebuild(self, session_date: str | None = None, *, limit: int | None = None) -> dict[str, Any]:
+    def _ensure_trade_peak_worker(self) -> None:
+        if self._peak_worker is not None and self._peak_worker.is_alive():
+            return
+        worker = threading.Thread(target=self._trade_peak_worker_loop, name="trade-peak-worker", daemon=True)
+        self._peak_worker = worker
+        self._peak_threads.add(worker)
+        worker.start()
+
+    def peak_job_status(self) -> dict[str, Any]:
+        with self._peak_threads_lock:
+            return {
+                **self._peak_status,
+                "peak_queue_depth": self._peak_queue.qsize(),
+                "peak_jobs_pending": len(self._peak_pending),
+                "peak_worker_alive": int(bool(self._peak_worker and self._peak_worker.is_alive())),
+            }
+
+    def schedule_trade_peak_calculation(self, trade_id: str) -> bool:
+        if not TRADE_PEAK_ASYNC_CALCULATION_ENABLED or not trade_id:
+            return False
+        trade_id = str(trade_id)
+        with self._peak_threads_lock:
+            if trade_id in self._peak_pending:
+                self._peak_status["peak_jobs_deduplicated"] += 1
+                return False
+            self._peak_pending.add(trade_id)
+            try:
+                self._peak_queue.put_nowait(trade_id)
+            except queue.Full:
+                self._peak_pending.discard(trade_id)
+                self._peak_status["peak_jobs_skipped"] += 1
+                log_sqlite_line(
+                    f"{utc_now_iso()} TRADE_PEAK_JOB_SKIPPED trade_id={trade_id} reason=queue_full "
+                    f"queue_depth={self._peak_queue.qsize()}"
+                )
+                return False
+            self._ensure_trade_peak_worker()
+            self._peak_status["peak_jobs_queued"] += 1
+            self._peak_status["peak_queue_high_watermark"] = max(
+                int(self._peak_status["peak_queue_high_watermark"]), self._peak_queue.qsize()
+            )
+        return True
+
+    def repair_trade_peaks_needing_rebuild(
+        self,
+        session_date: str | None = None,
+        *,
+        limit: int | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
         clauses = [
             "UPPER(COALESCE(status, '')) IN ('CLOSED', 'COMMISSION_PENDING', 'PNL_PENDING')",
             "entry_fill_time IS NOT NULL",
@@ -545,16 +632,33 @@ class SQLiteRuntimeStore:
         if session_date:
             clauses.append("(session_date = ? OR substr(COALESCE(exit_fill_time, closed_at, ''), 1, 10) = ?)")
             params.extend([session_date, session_date])
-        sql = f"SELECT trade_id FROM trades WHERE {' AND '.join(clauses)} ORDER BY exit_fill_time, trade_id"
+        sql = f"SELECT trade_id, raw_json FROM trades WHERE {' AND '.join(clauses)} ORDER BY exit_fill_time, trade_id"
         if limit is not None:
             sql += " LIMIT ?"
             params.append(int(limit))
         rows = self.query(sql, params)
-        summary = {"scanned": len(rows), "exact": 0, "partial": 0, "retry_pending": 0, "missing_final": 0, "needs_rebuild": 0, "errors": 0}
+        summary = {
+            "scanned": len(rows), "eligible": 0, "exact": 0, "partial": 0, "retry_pending": 0,
+            "missing_final": 0, "needs_rebuild": 0, "errors": 0,
+            "skipped_backoff": 0, "skipped_attempt_limit": 0,
+        }
+        now = datetime.now(timezone.utc)
         for row in rows:
             trade_id = str(row.get("trade_id") or "")
             if not trade_id:
                 continue
+            previous_raw = parse_jsonish(row.get("raw_json"))
+            attempts = safe_int(previous_raw.get("peak_repair_attempts")) or 0
+            next_eligible = parse_utc_datetime(previous_raw.get("peak_repair_next_eligible_at"))
+            if not force and attempts >= TRADE_PEAK_REPAIR_MAX_ATTEMPTS:
+                if next_eligible is not None and next_eligible > now:
+                    summary["skipped_attempt_limit"] += 1
+                    continue
+                attempts = 0
+            if not force and next_eligible is not None and next_eligible > now:
+                summary["skipped_backoff"] += 1
+                continue
+            summary["eligible"] += 1
             try:
                 result = calculate_and_store_trade_peak_on_connection(
                     self.conn,
@@ -583,13 +687,34 @@ class SQLiteRuntimeStore:
                     summary["missing_final"] += 1
                 else:
                     summary["needs_rebuild"] += 1
-            except Exception:
+                updated_rows = self.query("SELECT raw_json FROM trades WHERE trade_id = ?", [trade_id])
+                updated_raw = parse_jsonish(updated_rows[0].get("raw_json")) if updated_rows else previous_raw
+                updated_raw["peak_repair_attempts"] = attempts + 1
+                updated_raw["peak_repair_last_attempt_at"] = now.isoformat()
+                if quality == "EXACT":
+                    updated_raw.pop("peak_repair_next_eligible_at", None)
+                else:
+                    updated_raw["peak_repair_next_eligible_at"] = (
+                        now + timedelta(seconds=TRADE_PEAK_REPAIR_BACKOFF_SECONDS * max(1, attempts + 1))
+                    ).isoformat()
+                self.execute("UPDATE trades SET raw_json = ? WHERE trade_id = ?", [safe_json(updated_raw), trade_id])
+            except Exception as exc:
                 summary["errors"] += 1
+                failed_raw = dict(previous_raw)
+                failed_raw["peak_repair_attempts"] = attempts + 1
+                failed_raw["peak_repair_last_attempt_at"] = now.isoformat()
+                failed_raw["peak_repair_last_error"] = repr(exc)
+                failed_raw["peak_repair_next_eligible_at"] = (
+                    now + timedelta(seconds=TRADE_PEAK_REPAIR_BACKOFF_SECONDS * max(1, attempts + 1))
+                ).isoformat()
+                self.execute("UPDATE trades SET raw_json = ? WHERE trade_id = ?", [safe_json(failed_raw), trade_id])
         log_sqlite_line(
             f"{utc_now_iso()} TRADE_PEAK_EOD_REPAIR_DONE session_date={session_date or ''} "
             f"scanned={summary['scanned']} exact={summary['exact']} partial={summary['partial']} "
             f"retry_pending={summary['retry_pending']} missing_final={summary['missing_final']} "
-            f"needs_rebuild={summary['needs_rebuild']} errors={summary['errors']}"
+            f"needs_rebuild={summary['needs_rebuild']} errors={summary['errors']} "
+            f"skipped_backoff={summary['skipped_backoff']} "
+            f"skipped_attempt_limit={summary['skipped_attempt_limit']}"
         )
         return summary
 
@@ -611,32 +736,99 @@ class SQLiteRuntimeStore:
         ingested yet; those should not be synthesized here. The goal is to clear
         or trim stale active rows once broker truth says they are flat/reduced.
         """
+        started = time.monotonic()
         self.set_broker_net_positions(positions)
         if self._broker_net_positions is None:
             return {"broker_constrained": False, "symbols_processed": 0}
         rows = self.query(
             """
-            SELECT DISTINCT UPPER(symbol) AS symbol
+            SELECT UPPER(symbol) AS symbol, SUM(COALESCE(quantity, 0)) AS sqlite_quantity
             FROM positions
             WHERE COALESCE(active, 0) = 1
               AND COALESCE(symbol, '') != ''
+              AND UPPER(COALESCE(status, '')) IN ('OPEN', 'EXIT_ORDER')
+            GROUP BY UPPER(symbol)
             ORDER BY UPPER(symbol)
             """
         )
-        symbols = {str(row.get("symbol") or "").upper() for row in rows if row.get("symbol")}
-        symbols.update(
+        sqlite_quantities = {
+            str(row.get("symbol") or "").upper(): safe_float(row.get("sqlite_quantity")) or 0.0
+            for row in rows if row.get("symbol")
+        }
+        symbols = set(sqlite_quantities)
+        broker_only_symbols = {
             symbol
             for symbol, quantity in self._broker_net_positions.items()
-            if symbol and abs(float(quantity or 0.0)) > 1e-9
-        )
+            if symbol not in sqlite_quantities and abs(safe_float(quantity) or 0.0) > 1e-9
+        }
+        if broker_only_symbols:
+            placeholders = ",".join("?" for _ in broker_only_symbols)
+            execution_rows = self.query(
+                f"SELECT DISTINCT UPPER(symbol) AS symbol FROM executions "
+                f"WHERE UPPER(symbol) IN ({placeholders})",
+                sorted(broker_only_symbols),
+            )
+            symbols.update(
+                str(row.get("symbol") or "").upper()
+                for row in execution_rows
+                if row.get("symbol")
+            )
         if not symbols:
             return {
                 "broker_constrained": True,
                 "symbols_processed": 0,
+                "symbols_inspected": 0,
+                "symbols_changed": 0,
+                "symbols_skipped_unchanged": 0,
+                "symbols_rebuilt": [],
+                "execution_rows_inspected": 0,
+                "closed_trades_inspected": 0,
+                "closed_trades_rebuilt": 0,
+                "broker_symbols_without_execution": len(broker_only_symbols),
                 "open_symbols_count": 0,
                 "suppressed_historical_open_symbols_count": 0,
+                "duration_seconds": round(time.monotonic() - started, 6),
             }
-        return self.rebuild_positions_from_executions(sorted(symbols), broker_net_positions=self._broker_net_positions)
+        changed = sorted(
+            symbol for symbol in symbols
+            if abs(
+                (safe_float(self._broker_net_positions.get(symbol)) or 0.0)
+                - (safe_float(sqlite_quantities.get(symbol)) or 0.0)
+            ) > 1e-9
+        )
+        if changed:
+            result = self.rebuild_positions_from_executions(
+                changed, broker_net_positions=self._broker_net_positions,
+            )
+        else:
+            result = {
+                "symbols_processed": 0,
+                "open_symbols": sorted(symbol for symbol, quantity in sqlite_quantities.items() if abs(quantity) > 1e-9),
+                "open_symbols_count": sum(1 for quantity in sqlite_quantities.values() if abs(quantity) > 1e-9),
+                "suppressed_historical_open_symbols": [],
+                "suppressed_historical_open_symbols_count": 0,
+                "broker_constrained": True,
+                "execution_rows_inspected": 0,
+                "closed_trades_inspected": 0,
+                "closed_trades_rebuilt": 0,
+            }
+        result.update({
+            "symbols_inspected": len(symbols),
+            "symbols_changed": len(changed),
+            "symbols_skipped_unchanged": len(symbols) - len(changed),
+            "symbols_rebuilt": changed,
+            "broker_symbols_without_execution": len(broker_only_symbols - symbols),
+            "duration_seconds": round(time.monotonic() - started, 6),
+        })
+        log_sqlite_line(
+            f"{utc_now_iso()} SQLITE_POSITION_RECONCILE_DONE "
+            f"duration_seconds={result['duration_seconds']} symbols_inspected={len(symbols)} "
+            f"symbols_changed={len(changed)} symbols_skipped_unchanged={len(symbols) - len(changed)} "
+            f"execution_rows_inspected={result.get('execution_rows_inspected', 0)} "
+            f"closed_trades_inspected={result.get('closed_trades_inspected', 0)} "
+            f"closed_trades_rebuilt={result.get('closed_trades_rebuilt', 0)}"
+        )
+        return result
 
     @contextmanager
     def transaction(self):
@@ -787,6 +979,8 @@ class SQLiteRuntimeStore:
             CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
             CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
             CREATE INDEX IF NOT EXISTS idx_trades_strategy_name ON trades(strategy_name);
+            CREATE INDEX IF NOT EXISTS idx_trades_symbol_status_session
+                ON trades(UPPER(symbol), status, session_date);
 
             CREATE TABLE IF NOT EXISTS trade_components (
                 component_id TEXT PRIMARY KEY,
@@ -874,6 +1068,8 @@ class SQLiteRuntimeStore:
             CREATE INDEX IF NOT EXISTS idx_executions_perm_id ON executions(perm_id);
             CREATE INDEX IF NOT EXISTS idx_executions_executed_at ON executions(executed_at);
             CREATE INDEX IF NOT EXISTS idx_executions_recorded_at ON executions(recorded_at);
+            CREATE INDEX IF NOT EXISTS idx_executions_symbol_time_id
+                ON executions(UPPER(symbol), executed_at, recorded_at, execution_id);
             CREATE INDEX IF NOT EXISTS idx_executions_executed_recorded_id ON executions(executed_at DESC, recorded_at DESC, execution_id DESC);
             CREATE INDEX IF NOT EXISTS idx_executions_missing_executed_session_date
                 ON executions(session_date)
@@ -915,6 +1111,9 @@ class SQLiteRuntimeStore:
             CREATE INDEX IF NOT EXISTS idx_positions_symbol ON positions(symbol);
             CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
             CREATE INDEX IF NOT EXISTS idx_positions_active ON positions(active);
+            CREATE INDEX IF NOT EXISTS idx_positions_active_symbol_status
+                ON positions(active, UPPER(symbol), status)
+                WHERE active = 1;
 
             CREATE TABLE IF NOT EXISTS reconciliation_runs (
                 run_id TEXT PRIMARY KEY,
@@ -2217,6 +2416,105 @@ class SQLiteRuntimeStore:
             return "PNL_PENDING", exit_reason, status_raw
         return "CLOSED", exit_reason, status_raw
 
+    def _canonical_trade_matches_existing(
+        self,
+        existing: dict[str, Any] | None,
+        trade: Any,
+        *,
+        trade_status: str,
+        exit_reason: str,
+    ) -> bool:
+        if not existing:
+            return False
+        raw = parse_jsonish(existing.get("raw_json"))
+        if list(raw.get("buy_execution_ids") or []) != list(trade.buy_execution_ids or []):
+            return False
+        if list(raw.get("sell_execution_ids") or []) != list(trade.sell_execution_ids or []):
+            return False
+        text_fields = {
+            "status": trade_status,
+            "entry_fill_time": trade.entry_time,
+            "exit_fill_time": trade.exit_time,
+            "exit_reason": exit_reason,
+        }
+        if any(str(existing.get(key) or "") != str(value or "") for key, value in text_fields.items()):
+            return False
+        numeric_fields = {
+            "entry_price": trade.entry_price,
+            "exit_price": trade.exit_price,
+            "quantity": trade.quantity,
+            "gross_pnl": trade.gross_pnl,
+            "commission": trade.commission,
+            "net_pnl": trade.net_pnl,
+        }
+        return all(
+            abs((safe_float(existing.get(key)) or 0.0) - (safe_float(value) or 0.0)) <= 1e-9
+            for key, value in numeric_fields.items()
+        )
+
+    def _canonical_peak_inputs_match_existing(self, existing: dict[str, Any] | None, trade: Any) -> bool:
+        if not existing:
+            return False
+        raw = parse_jsonish(existing.get("raw_json"))
+        if list(raw.get("buy_execution_ids") or []) != list(trade.buy_execution_ids or []):
+            return False
+        if list(raw.get("sell_execution_ids") or []) != list(trade.sell_execution_ids or []):
+            return False
+        for key, value in {
+            "entry_fill_time": trade.entry_time,
+            "exit_fill_time": trade.exit_time,
+        }.items():
+            if str(existing.get(key) or "") != str(value or ""):
+                return False
+        return all(
+            abs((safe_float(existing.get(key)) or 0.0) - (safe_float(value) or 0.0)) <= 1e-9
+            for key, value in {
+                "entry_price": trade.entry_price,
+                "exit_price": trade.exit_price,
+                "quantity": trade.quantity,
+            }.items()
+        )
+
+    @staticmethod
+    def _is_reducer_trade_row(row: dict[str, Any]) -> bool:
+        trade_id = str(row.get("trade_id") or "")
+        raw_text = str(row.get("raw_json") or "")
+        return (
+            trade_id.startswith(("reconstructed:", "canonical:"))
+            or "sqlite_execution_reducer" in raw_text
+            or "canonical_fifo_execution_reducer" in raw_text
+            or "executions_pair_repair" in raw_text
+        )
+
+    def _component_matches(self, existing: dict[str, Any] | None, component: Any) -> bool:
+        if not existing:
+            return False
+        text_values = {
+            "trade_id": component.trade_id,
+            "symbol": component.symbol,
+            "session_date": component.session_date,
+            "buy_execution_id": component.buy_execution_id,
+            "sell_execution_id": component.sell_execution_id,
+            "entry_time": component.entry_time,
+            "exit_time": component.exit_time,
+        }
+        if any(str(existing.get(key) or "") != str(value or "") for key, value in text_values.items()):
+            return False
+        numeric_values = {
+            "matched_qty": component.matched_qty,
+            "buy_price": component.buy_price,
+            "sell_price": component.sell_price,
+            "buy_commission_alloc": component.buy_commission_alloc,
+            "sell_commission_alloc": component.sell_commission_alloc,
+            "realized_pnl_alloc": component.realized_pnl_alloc,
+            "gross_pnl": component.gross_pnl,
+            "net_pnl": component.net_pnl,
+        }
+        return all(
+            abs((safe_float(existing.get(key)) or 0.0) - (safe_float(value) or 0.0)) <= 1e-9
+            for key, value in numeric_values.items()
+        )
+
     def _rebuild_symbol_trade_state_canonical(
         self,
         symbol: str,
@@ -2227,7 +2525,16 @@ class SQLiteRuntimeStore:
     ) -> dict[str, Any]:
         rows = self._execution_rows_for_symbol(symbol, strategy_name)
         reducer_started_at = utc_now_iso()
-        self._clear_reducer_trades_for_symbol(symbol)
+        existing_trades = {
+            str(row.get("trade_id") or ""): row
+            for row in self.query("SELECT * FROM trades WHERE UPPER(symbol) = ?", [str(symbol or "").upper().strip()])
+            if row.get("trade_id")
+        }
+        existing_components = {
+            str(row.get("component_id") or ""): row
+            for row in self.query("SELECT * FROM trade_components WHERE UPPER(symbol) = ?", [str(symbol or "").upper().strip()])
+            if row.get("component_id")
+        }
         rebuild = build_canonical_fifo(rows, symbol=symbol)
         rows_by_id = {str(row.get("execution_id") or ""): row for row in rows if row.get("execution_id")}
         latest_strategy = strategy_name or "unknown"
@@ -2243,6 +2550,9 @@ class SQLiteRuntimeStore:
 
         execution_trade_ids: dict[str, set[str]] = {}
         peak_trade_ids_to_schedule: list[str] = []
+        expected_trade_ids: set[str] = set()
+        expected_component_ids: set[str] = set()
+        changed_trade_ids: set[str] = set()
         for trade in rebuild.trades:
             entry_metadata = self._entry_metadata_for_canonical_trade(trade, rows_by_id)
             persist_trade_id = self._canonical_persist_trade_id(trade, rows_by_id)
@@ -2251,12 +2561,28 @@ class SQLiteRuntimeStore:
                 rows_by_id,
                 broker_net_positions=broker_net_positions,
             )
-            raw = dict(trade.raw_json)
+            existing = existing_trades.get(persist_trade_id)
+            expected_trade_ids.add(persist_trade_id)
+            unchanged = self._canonical_trade_matches_existing(
+                existing, trade, trade_status=trade_status, exit_reason=exit_reason,
+            )
+            peak_inputs_unchanged = self._canonical_peak_inputs_match_existing(existing, trade)
+            raw = parse_jsonish(existing.get("raw_json")) if existing else {}
+            if not peak_inputs_unchanged:
+                for field in TRADE_PEAK_RAW_FIELDS:
+                    raw.pop(field, None)
+            canonical_raw = dict(trade.raw_json)
+            if peak_inputs_unchanged:
+                for field in TRADE_PEAK_RAW_FIELDS:
+                    canonical_raw.pop(field, None)
+            raw.update(canonical_raw)
             raw.update(
                 {
-                    "closed_trade_finalized_time": reducer_started_at,
+                    "closed_trade_finalized_time": (
+                        raw.get("closed_trade_finalized_time") if unchanged else reducer_started_at
+                    ),
                     "conservation_checked": True,
-                    "peak_rebuild_status": "needs_rebuild",
+                    "peak_rebuild_status": raw.get("peak_rebuild_status") if peak_inputs_unchanged else "needs_rebuild",
                     "canonical_trade_id": trade.trade_id,
                     "buy_execution_ids": trade.buy_execution_ids,
                     "sell_execution_ids": trade.sell_execution_ids,
@@ -2265,8 +2591,7 @@ class SQLiteRuntimeStore:
                 }
             )
             raw = self._merge_entry_metadata_into_raw(raw, entry_metadata)
-            self.upsert_trade(
-                {
+            trade_row = {
                     "trade_id": persist_trade_id,
                     "strategy_name": entry_metadata.get("strategy_name") or trade.strategy_name or latest_strategy,
                     "session_date": trade.session_date,
@@ -2282,13 +2607,13 @@ class SQLiteRuntimeStore:
                     "gross_pnl": trade.gross_pnl,
                     "commission": trade.commission,
                     "net_pnl": trade.net_pnl,
-                    "mfe_pct": None,
-                    "mae_pct": None,
-                    "peak_price": None,
-                    "low_price": None,
-                    "peak_unrealized_pnl": None,
-                    "max_adverse_unrealized_pnl": None,
-                    "giveback_from_peak": None,
+                    "mfe_pct": existing.get("mfe_pct") if peak_inputs_unchanged and existing else None,
+                    "mae_pct": existing.get("mae_pct") if peak_inputs_unchanged and existing else None,
+                    "peak_price": existing.get("peak_price") if peak_inputs_unchanged and existing else None,
+                    "low_price": existing.get("low_price") if peak_inputs_unchanged and existing else None,
+                    "peak_unrealized_pnl": existing.get("peak_unrealized_pnl") if peak_inputs_unchanged and existing else None,
+                    "max_adverse_unrealized_pnl": existing.get("max_adverse_unrealized_pnl") if peak_inputs_unchanged and existing else None,
+                    "giveback_from_peak": existing.get("giveback_from_peak") if peak_inputs_unchanged and existing else None,
                     "exit_reason": exit_reason,
                     "top100_rank": safe_int(entry_metadata.get("top100_rank")),
                     "top100_score": safe_float(entry_metadata.get("top100_score")),
@@ -2306,32 +2631,60 @@ class SQLiteRuntimeStore:
                     "ibkr_exit_confirmed": True,
                     "ibkr_position_flat_confirmed": True,
                     "ibkr_position_flat_confirmed_at": trade.exit_time,
-                    "updated_at": reducer_started_at,
+                    "updated_at": existing.get("updated_at") if unchanged and existing else reducer_started_at,
                     "raw_json": raw,
                 }
-            )
+            if not unchanged:
+                self.upsert_trade(trade_row)
+                changed_trade_ids.add(persist_trade_id)
             for component_index, component in enumerate(trade.components, start=1):
                 component.trade_id = persist_trade_id
                 component.component_id = (
                     f"component:{persist_trade_id}:"
                     f"{component.buy_execution_id}:{component.sell_execution_id}:{component_index:06d}"
                 )
-                self._insert_trade_component(component, updated_at=reducer_started_at)
+                expected_component_ids.add(component.component_id)
+                if not self._component_matches(existing_components.get(component.component_id), component):
+                    self._insert_trade_component(component, updated_at=reducer_started_at)
                 if component.buy_execution_id:
                     execution_trade_ids.setdefault(component.buy_execution_id, set()).add(component.trade_id)
                 if component.sell_execution_id:
                     execution_trade_ids.setdefault(component.sell_execution_id, set()).add(component.trade_id)
-            if trade_status in {"CLOSED", "COMMISSION_PENDING", "PNL_PENDING"}:
+            if not peak_inputs_unchanged and trade_status in {"CLOSED", "COMMISSION_PENDING", "PNL_PENDING"}:
                 peak_trade_ids_to_schedule.append(persist_trade_id)
+        reducer_trade_ids = {
+            trade_id for trade_id, row in existing_trades.items() if self._is_reducer_trade_row(row)
+        }
+        stale_component_ids = sorted(
+            component_id
+            for component_id, component in existing_components.items()
+            if component_id not in expected_component_ids
+            and str(component.get("trade_id") or "") in reducer_trade_ids
+        )
+        if stale_component_ids:
+            placeholders = ",".join("?" for _ in stale_component_ids)
+            self.execute(f"DELETE FROM trade_components WHERE component_id IN ({placeholders})", stale_component_ids)
+        stale_trade_ids = sorted(
+            trade_id for trade_id, row in existing_trades.items()
+            if trade_id not in expected_trade_ids and self._is_reducer_trade_row(row)
+        )
+        if stale_trade_ids:
+            placeholders = ",".join("?" for _ in stale_trade_ids)
+            self.execute(f"UPDATE executions SET trade_id = NULL WHERE trade_id IN ({placeholders})", stale_trade_ids)
+            self.execute(f"DELETE FROM trades WHERE trade_id IN ({placeholders})", stale_trade_ids)
         for execution_id, trade_ids in execution_trade_ids.items():
             if len(trade_ids) == 1:
-                self.execute("UPDATE executions SET trade_id = ? WHERE execution_id = ?", [next(iter(trade_ids)), execution_id])
+                target_trade_id = next(iter(trade_ids))
+                if str((rows_by_id.get(execution_id) or {}).get("trade_id") or "") != target_trade_id:
+                    self.execute("UPDATE executions SET trade_id = ? WHERE execution_id = ?", [target_trade_id, execution_id])
             else:
                 rows_for_exec = self.query("SELECT raw_json FROM executions WHERE execution_id = ?", [execution_id])
                 raw = parse_jsonish(rows_for_exec[0].get("raw_json")) if rows_for_exec else {}
-                raw["multi_trade_component"] = True
-                raw["trade_component_trade_ids"] = sorted(trade_ids)
-                self.execute("UPDATE executions SET trade_id = NULL, raw_json = ? WHERE execution_id = ?", [safe_json(raw), execution_id])
+                target_trade_ids = sorted(trade_ids)
+                if not raw.get("multi_trade_component") or list(raw.get("trade_component_trade_ids") or []) != target_trade_ids:
+                    raw["multi_trade_component"] = True
+                    raw["trade_component_trade_ids"] = target_trade_ids
+                    self.execute("UPDATE executions SET trade_id = NULL, raw_json = ? WHERE execution_id = ?", [safe_json(raw), execution_id])
         for peak_trade_id in peak_trade_ids_to_schedule:
             self.schedule_trade_peak_calculation(peak_trade_id)
 
@@ -2543,7 +2896,11 @@ class SQLiteRuntimeStore:
         conservation = self._trade_component_conservation_summary(symbol)
         return {
             "symbol": symbol,
+            "execution_rows_inspected": len(rows),
             "closed_trades": len(rebuild.trades),
+            "closed_trades_inspected": len(rebuild.trades),
+            "closed_trades_rebuilt": len(changed_trade_ids),
+            "closed_trades_unchanged": len(rebuild.trades) - len(changed_trade_ids),
             "open_quantity": open_qty,
             "suppressed_historical_open_quantity": suppressed_qty,
             "broker_target_quantity": broker_target_qty,
@@ -3397,7 +3754,15 @@ class SQLiteRuntimeStore:
             "suppressed_historical_open_symbols": suppressed_symbols,
             "suppressed_historical_open_symbols_count": len(suppressed_symbols),
             "broker_constrained": broker_net_positions is not None,
-            "closed_trades_rebuilt": sum(safe_int(row.get("closed_trades")) or 0 for row in results),
+            "execution_rows_inspected": sum(
+                safe_int(row.get("execution_rows_inspected")) or 0 for row in results
+            ),
+            "closed_trades_inspected": sum(
+                safe_int(row.get("closed_trades_inspected")) or 0 for row in results
+            ),
+            "closed_trades_rebuilt": sum(
+                safe_int(row.get("closed_trades_rebuilt")) or 0 for row in results
+            ),
         }
 
     def upsert_order(self, row: dict[str, Any]) -> str:
@@ -4009,6 +4374,7 @@ class SQLiteWriteQueue:
         self._closed = threading.Event()
         self._ready = threading.Event()
         self._status_lock = threading.Lock()
+        self._write_latencies_ms: deque[float] = deque(maxlen=1024)
         self._status: dict[str, Any] = {
             "queue_depth": 0,
             "max_queue_depth": 0,
@@ -4051,6 +4417,14 @@ class SQLiteWriteQueue:
     def status(self) -> dict[str, Any]:
         with self._status_lock:
             out = dict(self._status)
+            latencies = sorted(self._write_latencies_ms)
+        if latencies:
+            def percentile(fraction: float) -> float:
+                return round(latencies[min(len(latencies) - 1, int((len(latencies) - 1) * fraction))], 3)
+            out["write_latency_p50_ms"] = percentile(0.50)
+            out["write_latency_p95_ms"] = percentile(0.95)
+            out["write_latency_p99_ms"] = percentile(0.99)
+            out["write_latency_sample_count"] = len(latencies)
         queue_depth = self._queue.qsize()
         out["queue_depth"] = queue_depth
         out["max_queue_depth"] = max(int(out.get("max_queue_depth", 0) or 0), queue_depth)
@@ -4120,6 +4494,7 @@ class SQLiteWriteQueue:
                             f"oldest_queued_age_seconds={self._oldest_queued_age_seconds()}"
                         )
                     with self._status_lock:
+                        self._write_latencies_ms.append(latency_ms)
                         if request.exception is None:
                             self._status["write_count"] = int(self._status.get("write_count", 0) or 0) + 1
                             by_method = dict(self._status.get("write_count_by_method") or {})
@@ -4142,6 +4517,7 @@ class SQLiteWriteQueue:
                         self._status["queue_depth"] = queue_depth
                         self._status["max_queue_depth"] = max(int(self._status.get("max_queue_depth", 0) or 0), queue_depth)
                         self._status["writer_alive"] = int(self._thread.is_alive())
+                        self._status.update(store.peak_job_status())
                     self._release_coalesced_key(request.coalesce_key)
                     request.done.set()
                     self._queue.task_done()
