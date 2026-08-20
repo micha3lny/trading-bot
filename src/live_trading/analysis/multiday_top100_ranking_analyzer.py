@@ -39,6 +39,14 @@ VARIANTS = (
     "reversal", "hybrid_70_30", "hybrid_80_20", "hybrid_50_50", "stabilized",
 )
 
+ELIGIBLE = "ELIGIBLE"
+INSUFFICIENT_HISTORY = "INSUFFICIENT_HISTORY"
+MISSING_FEATURE_DATE = "MISSING_FEATURE_DATE"
+LIQUIDITY_INELIGIBLE = "LIQUIDITY_INELIGIBLE"
+DENYLISTED = "DENYLISTED"
+OUTCOME_UNAVAILABLE = "OUTCOME_UNAVAILABLE"
+RUNNER_THRESHOLDS = (5, 10, 15, 20)
+
 
 @dataclass(frozen=True)
 class BaselineSettings:
@@ -127,7 +135,8 @@ class SessionHistoryCache:
             return self.daily_histories[symbol], {}
         self.diagnostics.cache_misses += 1
         history_dates = _available_dates(self.history_dir, symbol, self.max_feature_date)[-self.max_lookback:]
-        required_dates = set(history_dates) | self.outcome_dates | self.feature_dates
+        # Session-D outcomes are loaded only after the D-1 ranking is frozen.
+        required_dates = set(history_dates) | self.feature_dates
         for current in self.feature_dates:
             required_dates.update(
                 parse_partition_date(path)
@@ -141,10 +150,6 @@ class SessionHistoryCache:
             if path.exists():
                 paths.append(path)
         frames = self._read_batch(paths)
-        for current in self.outcome_dates:
-            frame = frames.get(current)
-            if frame is not None:
-                self._remember_session((symbol, current), frame)
         sessions: list[dict[str, Any]] = []
         for current, frame in frames.items():
             metrics = _daily_metrics(frame)
@@ -365,6 +370,91 @@ def reproduce_baselines_from_cache(
     return result
 
 
+def build_production_populations_from_cache(
+    ranking_dates: list[date],
+    *,
+    symbols: list[str],
+    cache: SessionHistoryCache,
+    settings: BaselineSettings,
+) -> dict[date, pd.DataFrame]:
+    """Build one row per symbol, ranking every production-eligible symbol globally."""
+    requested = list(dict.fromkeys(ranking_dates))
+    rows_by_date: dict[date, list[dict[str, Any]]] = {current: [] for current in requested}
+    ineligible = combined_ineligible_symbols()
+    for symbol in symbols:
+        _daily, frames = cache.prepare_symbol(symbol)
+        for current in requested:
+            if symbol in ineligible:
+                rows_by_date[current].append({
+                    "symbol": symbol,
+                    "ranking_eligibility_status": DENYLISTED,
+                    "eligibility_reason": str(ineligible[symbol].get("reason") or "ineligible"),
+                })
+                continue
+            frame = frames.get(current)
+            if frame is None or frame.empty:
+                rows_by_date[current].append({
+                    "symbol": symbol,
+                    "ranking_eligibility_status": MISSING_FEATURE_DATE,
+                    "eligibility_reason": "missing_feature_date",
+                })
+                continue
+            item, reason = analyze_symbol(
+                symbol,
+                frame,
+                cache.prior_closes(symbol, current, settings.prior_sessions),
+                min_price=settings.min_price,
+                min_bars=settings.min_bars,
+                min_volume=settings.min_volume,
+                min_dollar_volume=settings.min_dollar_volume,
+            )
+            if item is not None:
+                row = ranking_to_row(0, item)
+                row.update({
+                    "ranking_eligibility_status": ELIGIBLE,
+                    "eligibility_reason": "",
+                })
+                rows_by_date[current].append(row)
+            else:
+                status = (
+                    INSUFFICIENT_HISTORY
+                    if str(reason or "").startswith("too_few_bars")
+                    else LIQUIDITY_INELIGIBLE
+                )
+                rows_by_date[current].append({
+                    "symbol": symbol,
+                    "ranking_eligibility_status": status,
+                    "eligibility_reason": reason or "rejected",
+                })
+
+    result: dict[date, pd.DataFrame] = {}
+    for current in requested:
+        population = pd.DataFrame(rows_by_date[current])
+        if population.empty:
+            result[current] = population
+            continue
+        eligible = population[population["ranking_eligibility_status"].eq(ELIGIBLE)].copy()
+        eligible = eligible.sort_values(
+            ["score", "dollar_volume", "intraday_high_pct", "symbol"],
+            ascending=[False, False, False, True],
+            kind="mergesort",
+        )
+        global_ranks = pd.Series(
+            range(1, len(eligible) + 1), index=eligible.index, dtype="Int64"
+        )
+        population["production_rank_global"] = pd.Series(
+            pd.NA, index=population.index, dtype="Int64"
+        )
+        population.loc[global_ranks.index, "production_rank_global"] = global_ranks
+        result[current] = population.sort_values(
+            ["production_rank_global", "symbol"],
+            na_position="last",
+            kind="mergesort",
+        ).reset_index(drop=True)
+    cache.diagnostics.production_baseline_builds += len(requested)
+    return result
+
+
 def compare_baseline(reproduced: pd.DataFrame, saved: pd.DataFrame) -> dict[str, Any]:
     reproduced_symbols = [normalize_symbol(value) for value in reproduced.get("symbol", pd.Series(dtype=str))]
     saved_symbols = [normalize_symbol(value) for value in saved.get("symbol", pd.Series(dtype=str))]
@@ -432,12 +522,19 @@ def attach_outcomes(
             if history_cache is not None
             else _daily_metrics(load_session_candles(history_dir, symbol, session_date))
         )
-        metrics.append({
-            "outcome_open_to_high_pct": daily.get("high_open_pct"), "outcome_return_pct": daily.get("close_open_pct"),
-            "outcome_dollar_volume": daily.get("dollar_volume"), "outcome_runner_5": int((daily.get("high_open_pct") or -999) >= 5),
-            "outcome_runner_10": int((daily.get("high_open_pct") or -999) >= 10),
-            "outcome_runner_15": int((daily.get("high_open_pct") or -999) >= 15), "outcome_runner_20": int((daily.get("high_open_pct") or -999) >= 20),
-        })
+        high_pct = daily.get("high_open_pct")
+        available = high_pct is not None and not pd.isna(high_pct)
+        row = {
+            "outcome_open_to_high_pct": high_pct if available else None,
+            "outcome_return_pct": daily.get("close_open_pct") if available else None,
+            "outcome_dollar_volume": daily.get("dollar_volume") if available else None,
+            "outcome_available": int(available),
+        }
+        for threshold in RUNNER_THRESHOLDS:
+            row[f"outcome_runner_{threshold}"] = (
+                int(float(high_pct) > threshold) if available else pd.NA
+            )
+        metrics.append(row)
     return pd.concat([out.reset_index(drop=True), pd.DataFrame(metrics)], axis=1)
 
 

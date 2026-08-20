@@ -12,10 +12,13 @@ from unittest.mock import patch
 import pandas as pd
 
 from src.live_trading.analysis.multiday_top100_ranking_analyzer import (
+    ELIGIBLE,
     VARIANTS,
     BaselineSettings,
     SessionHistoryCache,
     analyze_range,
+    attach_outcomes,
+    build_production_populations_from_cache,
     compare_baseline,
     portfolio_replays,
     reproduce_baseline,
@@ -154,9 +157,62 @@ class MultidayTop100RankingAnalyzerTests(unittest.TestCase):
             cache.get_daily_history("AAA")
             cache.get_daily_metrics("AAA", date(2026, 7, 29))
             cache.get_session("AAA", date(2026, 7, 29))
-            self.assertEqual(cache.diagnostics.parquet_read_operations, 1)
+            # D outcome is deliberately loaded after the D-1 feature batch.
+            self.assertEqual(cache.diagnostics.parquet_read_operations, 2)
             self.assertEqual(cache.diagnostics.parquet_files_read, 3)
-            self.assertGreaterEqual(cache.diagnostics.cache_hits, 3)
+            self.assertGreaterEqual(cache.diagnostics.cache_hits, 2)
+
+    def test_population_api_retains_full_universe_and_global_ranks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            history = Path(tmp) / "history"
+            current = date(2026, 7, 29)
+            self.write_candles(history, "AAA", current, base=10.0)
+            settings = BaselineSettings(
+                top_n=1, min_price=1, min_bars=1, min_volume=1,
+                min_dollar_volume=1, prior_sessions=0,
+            )
+            cache = SessionHistoryCache(
+                history,
+                max_feature_date=current,
+                feature_dates={current},
+                outcome_dates=set(),
+                baseline_prior_sessions=0,
+            )
+            population = build_production_populations_from_cache(
+                [current],
+                symbols=["AAA", "MISSING"],
+                cache=cache,
+                settings=settings,
+            )[current]
+            self.assertEqual(set(population["symbol"]), {"AAA", "MISSING"})
+            eligible = population[population["ranking_eligibility_status"].eq(ELIGIBLE)]
+            self.assertEqual(eligible.iloc[0]["production_rank_global"], 1)
+            self.assertTrue(
+                population.loc[population["symbol"].eq("MISSING"), "production_rank_global"].isna().all()
+            )
+
+    def test_session_outcome_is_loaded_only_after_feature_ranking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            history = Path(tmp) / "history"
+            feature_date = date(2026, 7, 29)
+            outcome_date = date(2026, 7, 30)
+            self.write_candles(history, "AAA", feature_date, base=10.0)
+            self.write_candles(history, "AAA", outcome_date, base=20.0)
+            cache = SessionHistoryCache(
+                history,
+                max_feature_date=feature_date,
+                feature_dates={feature_date},
+                outcome_dates={outcome_date},
+                baseline_prior_sessions=0,
+            )
+            _daily, frames = cache.prepare_symbol("AAA")
+            self.assertNotIn(outcome_date, frames)
+            self.assertNotIn(("AAA", outcome_date), cache.daily_metrics)
+            matrix = pd.DataFrame({"symbol": ["AAA"]})
+            attached = attach_outcomes(
+                matrix, history, outcome_date.isoformat(), history_cache=cache
+            )
+            self.assertEqual(attached.iloc[0]["outcome_available"], 1)
 
     def test_cached_baseline_preserves_missing_and_invalid_history_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
